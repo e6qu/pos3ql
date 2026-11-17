@@ -363,7 +363,13 @@ pub(crate) fn sql_function_body_inlinable(
     let Ok(name) = arena.alloc_str(routine.name.as_str()) else {
         return false;
     };
-    let Ok(body) = arena.alloc_str(routine.body.as_str()) else {
+    // A `RETURN` body is the expression of one `SELECT`.
+    let body = if routine.body_kind == crate::storage::RoutineBodyKind::Return {
+        arena.alloc_str_display(format_args!("SELECT {}", routine.body.as_str()))
+    } else {
+        arena.alloc_str(routine.body.as_str())
+    };
+    let Ok(body) = body else {
         return false;
     };
     let Ok(mut parser) = crate::sql::Parser::new(body, arena)

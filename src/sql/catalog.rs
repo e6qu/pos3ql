@@ -18884,78 +18884,129 @@ fn pg_statistic_ext<'a>(
     finish(definition, &rows[..count], arena)
 }
 
-fn extended_statistics_key_numbers(
+/// A statistics object's keys in PostgreSQL's order (`stxkeys` columns by
+/// attribute number, then its expressions as written): their positions in
+/// the definition and their numbers (an expression's negative).
+pub(crate) struct ExtendedStatisticsOrder {
+    pub(crate) positions: [u8; crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
+    pub(crate) numbers: [i16; crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
+}
+
+pub(crate) fn extended_statistics_order(
     storage: &Storage,
     statistics: &crate::storage::ExtendedStatisticsDef,
     txid: u32,
-) -> [i16; crate::storage::MAX_EXTENDED_STATISTICS_KEYS] {
+) -> ExtendedStatisticsOrder {
     let table = storage.table_def(usize::from(statistics.table), txid);
-    let mut numbers = [0i16; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
-    let mut expression = 0i16;
-    for (position, key) in statistics.keys_for(txid).iter().enumerate() {
-        numbers[position] = match key {
-            crate::storage::ExtendedStatisticsKey::Column(column) => table
+    let keys = statistics.keys_for(txid);
+    let mut order = ExtendedStatisticsOrder {
+        positions: [0; crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
+        numbers: [0; crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
+    };
+    let mut count = 0usize;
+    for (position, key) in keys.iter().enumerate() {
+        if let crate::storage::ExtendedStatisticsKey::Column(column) = key {
+            let number = table
                 .column_index(column.as_str())
                 .map(|column| table.attribute_number(column) as i16)
-                .expect("statistics column remains a table dependency"),
-            crate::storage::ExtendedStatisticsKey::Expression(_) => {
-                expression -= 1;
-                expression
+                .expect("statistics column remains a table dependency");
+            let mut at = count;
+            while at > 0 && order.numbers[at - 1] > number {
+                order.numbers[at] = order.numbers[at - 1];
+                order.positions[at] = order.positions[at - 1];
+                at -= 1;
             }
-        };
+            order.numbers[at] = number;
+            order.positions[at] = position as u8;
+            count += 1;
+        }
     }
-    numbers
+    let mut expression = 0i16;
+    for (position, key) in keys.iter().enumerate() {
+        if let crate::storage::ExtendedStatisticsKey::Expression(_) = key {
+            expression -= 1;
+            order.numbers[count] = expression;
+            order.positions[count] = position as u8;
+            count += 1;
+        }
+    }
+    order
 }
 
+fn statistics_text_overflow() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "extended statistics text exceeds its fixed buffer"
+    )
+}
+
+/// `pg_ndistinct_out`.
 fn extended_statistics_ndistinct(
     key_numbers: &[i16],
-    data: crate::storage::ExtendedStatisticsData,
-) -> StackStr<256> {
+    data: &crate::storage::ExtendedStatisticsData,
+) -> Result<StackStr<16384>, SqlError> {
     use core::fmt::Write as _;
     let mut output = StackStr::new();
-    let _ = output.write_str("{\"");
-    for (key, number) in key_numbers.iter().enumerate() {
-        if key != 0 {
+    let _ = output.write_char('{');
+    let mut position = 0usize;
+    crate::storage::extended_statistics_combinations(key_numbers.len(), &mut |combination| {
+        if position > 0 {
             let _ = output.write_str(", ");
         }
-        let _ = write!(output, "{}", number);
-    }
-    let _ = write!(output, "\": {}", data.distinct_values);
-    let _ = output.write_char('}');
-    output
-}
-
-fn extended_statistics_dependencies(
-    key_numbers: &[i16],
-    data: crate::storage::ExtendedStatisticsData,
-) -> StackStr<4096> {
-    use core::fmt::Write as _;
-    let mut output = StackStr::new();
-    let mut first = true;
-    let _ = output.write_char('{');
-    for determinant in 0..key_numbers.len() {
-        for dependent in 0..key_numbers.len() {
-            let strength = data.dependencies_ppm
-                [determinant * crate::storage::MAX_EXTENDED_STATISTICS_KEYS + dependent];
-            if strength == 0 {
-                continue;
-            }
-            if !first {
-                let _ = output.write_str(", ");
-            }
-            first = false;
+        for (at, key) in combination.iter().enumerate() {
             let _ = write!(
                 output,
-                "\"{} => {}\": {}.{:06}",
-                key_numbers[determinant],
-                key_numbers[dependent],
-                strength / 1_000_000,
-                strength % 1_000_000
+                "{}{}",
+                if at == 0 { "\"" } else { ", " },
+                key_numbers[usize::from(*key)]
             );
         }
-    }
+        let _ = write!(output, "\": {}", data.ndistinct[position]);
+        position += 1;
+    });
     let _ = output.write_char('}');
-    output
+    if output.is_truncated() {
+        return Err(statistics_text_overflow());
+    }
+    Ok(output)
+}
+
+/// `pg_dependencies_out`: the dependencies of a nonzero degree.
+fn extended_statistics_dependencies(
+    key_numbers: &[i16],
+    data: &crate::storage::ExtendedStatisticsData,
+) -> Result<StackStr<49152>, SqlError> {
+    use core::fmt::Write as _;
+    let mut output = StackStr::new();
+    let _ = output.write_char('{');
+    let mut position = 0usize;
+    let mut first = true;
+    crate::storage::extended_statistics_dependency_order(key_numbers.len(), &mut |dependency| {
+        let degree = f64::from_bits(data.dependency_degree_bits[position]);
+        position += 1;
+        if degree == 0.0 {
+            return;
+        }
+        if !first {
+            let _ = output.write_str(", ");
+        }
+        first = false;
+        let _ = output.write_char('"');
+        for (at, key) in dependency.iter().enumerate() {
+            if at + 1 == dependency.len() {
+                let _ = output.write_str(" => ");
+            } else if at > 0 {
+                let _ = output.write_str(", ");
+            }
+            let _ = write!(output, "{}", key_numbers[usize::from(*key)]);
+        }
+        let _ = write!(output, "\": {degree:.6}");
+    });
+    let _ = output.write_char('}');
+    if output.is_truncated() {
+        return Err(statistics_text_overflow());
+    }
+    Ok(output)
 }
 
 fn extended_statistics_mcv<'a>(
@@ -18974,14 +19025,6 @@ fn extended_statistics_mcv<'a>(
     fn value<'a>(raw: &'a [u8], dimension: usize) -> Datum<'a> {
         super::array::get(raw, super::types::ArrElem::Text, dimension)
             .expect("ANALYZE stores one MCV member per statistics key")
-    }
-
-    fn same_value(left: Datum<'_>, right: Datum<'_>) -> bool {
-        match (left, right) {
-            (Datum::Null, Datum::Null) => true,
-            (Datum::Text(left), Datum::Text(right)) => left == right,
-            _ => false,
-        }
     }
 
     let item_count = usize::from(data.n_mcv);
@@ -19069,24 +19112,7 @@ fn extended_statistics_mcv<'a>(
         }
         let frequency = data.mcv[item].count as f64 / data.rows.max(1) as f64;
         append(binary, &mut at, &frequency.to_ne_bytes());
-        let base_frequency = if data.mcv[item].base_frequency_bits != 0 {
-            f64::from_bits(data.mcv[item].base_frequency_bits)
-        } else {
-            // Legacy WAL/checkpoint records use the retained-MCV estimate
-            // until ANALYZE refreshes the statistic.
-            let mut estimate = 1.0f64;
-            for dimension in 0..key_count {
-                let sought = value(raw, dimension);
-                let marginal = values[..item_count]
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, candidate)| same_value(value(candidate, dimension), sought))
-                    .map(|(candidate, _)| data.mcv[candidate].count)
-                    .sum::<u64>();
-                estimate *= marginal as f64 / data.rows.max(1) as f64;
-            }
-            estimate
-        };
+        let base_frequency = f64::from_bits(data.mcv[item].base_frequency_bits);
         append(binary, &mut at, &base_frequency.to_ne_bytes());
         for dimension in 0..key_count {
             let index = values[..item]
@@ -19144,10 +19170,10 @@ fn pg_statistic_ext_data<'a>(
         if !data.valid {
             continue;
         }
-        let key_numbers = extended_statistics_key_numbers(storage, &statistics, txid);
-        let key_numbers = &key_numbers[..usize::from(statistics.n_keys)];
-        let ndistinct = extended_statistics_ndistinct(key_numbers, data);
-        let dependencies = extended_statistics_dependencies(key_numbers, data);
+        let order = extended_statistics_order(storage, &statistics, txid);
+        let key_numbers = &order.numbers[..usize::from(statistics.n_keys)];
+        let ndistinct = extended_statistics_ndistinct(key_numbers, &data)?;
+        let dependencies = extended_statistics_dependencies(key_numbers, &data)?;
         let mut expressions = [Datum::Null; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
         let mut n_expressions = 0usize;
         for (key, key_definition) in statistics.keys_for(txid).iter().enumerate() {
@@ -19168,12 +19194,12 @@ fn pg_statistic_ext_data<'a>(
                 Datum::Int4(3429),
                 Datum::Int4(statistics.oid()),
                 Datum::Bool(data.inherited),
-                if statistics.kinds.ndistinct() {
+                if data.ndistinct_built {
                     text(ndistinct.as_str(), arena)?
                 } else {
                     Datum::Null
                 },
-                if statistics.kinds.dependencies() {
+                if data.dependencies_built {
                     text(dependencies.as_str(), arena)?
                 } else {
                     Datum::Null
@@ -19224,8 +19250,9 @@ fn pg_stats_ext<'a>(
         let mut expressions = [Datum::Null; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
         let mut attribute_count = 0usize;
         let mut expression_count = 0usize;
-        for key in statistics.keys_for(txid) {
-            match key {
+        let order = extended_statistics_order(storage, &statistics, txid);
+        for &position in &order.positions[..usize::from(statistics.n_keys)] {
+            match &statistics.keys_for(txid)[usize::from(position)] {
                 crate::storage::ExtendedStatisticsKey::Column(name) => {
                     attribute_names[attribute_count] = text(name.as_str(), arena)?;
                     attribute_count += 1;
@@ -19236,10 +19263,9 @@ fn pg_stats_ext<'a>(
                 }
             }
         }
-        let key_numbers = extended_statistics_key_numbers(storage, &statistics, txid);
-        let key_numbers = &key_numbers[..usize::from(statistics.n_keys)];
-        let ndistinct = extended_statistics_ndistinct(key_numbers, data);
-        let dependencies = extended_statistics_dependencies(key_numbers, data);
+        let key_numbers = &order.numbers[..usize::from(statistics.n_keys)];
+        let ndistinct = extended_statistics_ndistinct(key_numbers, &data)?;
+        let dependencies = extended_statistics_dependencies(key_numbers, &data)?;
         let mut common_values = [Datum::Null;
             crate::storage::MAX_EXTENDED_STATISTICS_MCV
                 * crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
@@ -19273,33 +19299,11 @@ fn pg_stats_ext<'a>(
             let frequency = item.count as f64 / data.rows.max(1) as f64;
             common_frequencies[index] = Datum::Float8(frequency);
         }
-        let same_value = |left: Datum<'_>, right: Datum<'_>| match (left, right) {
-            (Datum::Null, Datum::Null) => true,
-            (Datum::Text(left), Datum::Text(right)) => left == right,
-            _ => false,
-        };
-        for (index, values) in parsed_values[..usize::from(data.n_mcv)].iter().enumerate() {
-            let base_frequency = if data.mcv[index].base_frequency_bits != 0 {
-                f64::from_bits(data.mcv[index].base_frequency_bits)
-            } else {
-                let mut estimate = 1.0f64;
-                for key in 0..key_numbers.len() {
-                    let sought = super::array::get(values, super::types::ArrElem::Text, key)
-                        .expect("validated MCV width");
-                    let marginal = parsed_values[..usize::from(data.n_mcv)]
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, candidate)| {
-                            super::array::get(candidate, super::types::ArrElem::Text, key)
-                                .is_some_and(|value| same_value(value, sought))
-                        })
-                        .map(|(candidate, _)| data.mcv[candidate].count)
-                        .sum::<u64>();
-                    estimate *= marginal as f64 / data.rows.max(1) as f64;
-                }
-                estimate
-            };
-            common_base_frequencies[index] = Datum::Float8(base_frequency);
+        for (slot, item) in common_base_frequencies
+            .iter_mut()
+            .zip(&data.mcv[..usize::from(data.n_mcv)])
+        {
+            *slot = Datum::Float8(f64::from_bits(item.base_frequency_bits));
         }
         let array = |values: &[Datum<'a>], element, arena: &'a Arena| {
             super::array::build(values, arena).map(|raw| Datum::Array { element, raw })
@@ -19331,22 +19335,15 @@ fn pg_stats_ext<'a>(
                     super::types::ArrElem::Name,
                     arena,
                 )?,
-                array(
-                    &expressions[..expression_count],
-                    super::types::ArrElem::Text,
-                    arena,
-                )?,
+                extended_statistics_expressions_by_oid(storage, txid, statistics.oid(), arena)?
+                    .unwrap_or(Datum::Null),
                 extended_statistics_kinds(&statistics, txid, arena)?,
                 Datum::Bool(data.inherited),
-                statistics
-                    .kinds
-                    .ndistinct()
+                data.ndistinct_built
                     .then(|| text(ndistinct.as_str(), arena))
                     .transpose()?
                     .unwrap_or(Datum::Null),
-                statistics
-                    .kinds
-                    .dependencies()
+                data.dependencies_built
                     .then(|| text(dependencies.as_str(), arena))
                     .transpose()?
                     .unwrap_or(Datum::Null),

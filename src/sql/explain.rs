@@ -4320,184 +4320,6 @@ fn expression_statistics_selectivity(
     None
 }
 
-/// Consumes a named PostgreSQL extended-statistics object only when the
-/// conjunction supplies every plain-column key with a constant equality.
-fn extended_statistics_selectivity<'a>(
-    storage: &Storage,
-    scope: &QueryScope<'_>,
-    table: usize,
-    expression: &Expr<'a>,
-    txid: u32,
-    arena: &Arena,
-) -> Option<f64> {
-    fn collect<'a>(
-        expression: &Expr<'a>,
-        scope: &QueryScope<'_>,
-        table: usize,
-        arena: &'a Arena,
-        columns: &mut [usize; crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
-        values: &mut [Datum<'a>; crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
-        count: &mut usize,
-    ) -> bool {
-        fn column_constant<'e>(
-            candidate: &Expr<'e>,
-            other: &'e Expr<'e>,
-            scope: &QueryScope<'_>,
-            table: usize,
-        ) -> Option<(usize, &'e Expr<'e>)> {
-            let Expr::Column { qualifier, name } = candidate else {
-                return None;
-            };
-            if !other.is_constant(false) || other.contains_call() {
-                return None;
-            }
-            match scope.find_column(*qualifier, name).ok()? {
-                query::ResolvedColumn::Table(owner, column) if owner == table => {
-                    Some((column, other))
-                }
-                _ => None,
-            }
-        }
-        match expression {
-            Expr::Binary {
-                operator: BinaryOp::And,
-                left,
-                right,
-                ..
-            } => {
-                collect(left, scope, table, arena, columns, values, count)
-                    && collect(right, scope, table, arena, columns, values, count)
-            }
-            Expr::Binary {
-                operator: BinaryOp::Eq,
-                left,
-                right,
-                ..
-            } => {
-                let Some((column, constant)) = column_constant(left, right, scope, table)
-                    .or_else(|| column_constant(right, left, scope, table))
-                else {
-                    return false;
-                };
-                if *count == columns.len() || columns[..*count].contains(&column) {
-                    return false;
-                }
-                let Ok(value) = crate::sql::eval::eval(
-                    constant,
-                    arena,
-                    crate::sql::eval::NO_PARAMS,
-                    &crate::sql::eval::NoColumns,
-                ) else {
-                    return false;
-                };
-                columns[*count] = column;
-                values[*count] = value;
-                *count += 1;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    if scope.derived[table].is_some() || scope.slots[table] == usize::MAX {
-        return None;
-    }
-    let mut columns = [0usize; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
-    let mut values = [Datum::Null; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
-    let mut count = 0usize;
-    if !collect(
-        expression,
-        scope,
-        table,
-        arena,
-        &mut columns,
-        &mut values,
-        &mut count,
-    ) || count < 2
-    {
-        return None;
-    }
-    for (slot, statistics) in storage.extended_statistics_for_table(scope.slots[table], txid) {
-        if statistics.keys_for(txid).len() != count
-            || statistics.keys_for(txid).iter().any(|key| {
-                let crate::storage::ExtendedStatisticsKey::Column(column) = key else {
-                    return true;
-                };
-                let definition = storage.table_def(scope.slots[table], txid);
-                definition
-                    .column_index(column.as_str())
-                    .is_none_or(|column| !columns[..count].contains(&column))
-            })
-        {
-            continue;
-        }
-        let data = storage.extended_statistics_data(slot, txid);
-        if !data.valid || data.rows == 0 {
-            continue;
-        }
-        let mut ordered = [Datum::Null; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
-        let indices = [0u16, 1, 2, 3, 4, 5, 6, 7];
-        for (position, key) in statistics.keys_for(txid).iter().enumerate() {
-            let crate::storage::ExtendedStatisticsKey::Column(column) = key else {
-                unreachable!("expression keys were rejected above")
-            };
-            let column = storage
-                .table_def(scope.slots[table], txid)
-                .column_index(column.as_str())?;
-            let source = columns[..count]
-                .iter()
-                .position(|candidate| *candidate == column)?;
-            ordered[position] = values[source];
-        }
-        if statistics.kinds.mcv() {
-            let hash = crate::sql::eval::hash_key_identified(&ordered[..count], &indices[..count])?;
-            if let Some(entry) = data.mcv[..usize::from(data.n_mcv)]
-                .iter()
-                .find(|entry| entry.hash == hash)
-            {
-                return Some((entry.count as f64 / data.rows as f64).clamp(0.0, 1.0));
-            }
-        }
-        if statistics.kinds.ndistinct() {
-            return Some(
-                (data.non_null_rows as f64 / data.rows as f64 / data.distinct_values.max(1) as f64)
-                    .clamp(0.0, 1.0),
-            );
-        }
-        if statistics.kinds.dependencies() {
-            let mut selectivities = [1.0f64; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
-            for (position, key) in statistics.keys_for(txid).iter().enumerate() {
-                let crate::storage::ExtendedStatisticsKey::Column(column) = key else {
-                    unreachable!("expression keys were rejected above")
-                };
-                let column = storage
-                    .table_def(scope.slots[table], txid)
-                    .column_index(column.as_str())?;
-                selectivities[position] =
-                    column_selectivity(storage, scope, table, column, txid, 0.005);
-            }
-            let mut estimate = selectivities.iter().take(count).product::<f64>();
-            for determinant in 0..count {
-                for dependent in 0..count {
-                    let strength = f64::from(
-                        data.dependencies_ppm[determinant
-                            * crate::storage::MAX_EXTENDED_STATISTICS_KEYS
-                            + dependent],
-                    ) / 1_000_000.0;
-                    if strength > 0.0 {
-                        let independent = selectivities[determinant] * selectivities[dependent];
-                        let dependent_estimate = selectivities[determinant]
-                            * (strength + (1.0 - strength) * selectivities[dependent]);
-                        estimate *= dependent_estimate / independent.max(f64::MIN_POSITIVE);
-                        return Some(estimate.clamp(0.0, 1.0));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 /// PostgreSQL's `cpu_tuple_cost` and `cpu_operator_cost`.
 const CPU_TUPLE_COST: f64 = 0.01;
 const CPU_OPERATOR_COST: f64 = 0.0025;
@@ -4889,11 +4711,6 @@ fn predicate_selectivity<'a>(
             right,
             ..
         } => {
-            if let Some(selectivity) =
-                extended_statistics_selectivity(storage, scope, table, expression, txid, arena)
-            {
-                return selectivity;
-            }
             let left = predicate_selectivity(storage, scope, table, left, txid, arena);
             let right = predicate_selectivity(storage, scope, table, right, txid, arena);
             (left * right).clamp(0.0, 1.0)
@@ -7602,6 +7419,19 @@ fn plan_pulled_select<'a>(
                     StackStr::from_str(scope.names[table])
                 };
                 scan.schema = function_schema(storage, txid, source);
+                let estimate = function_scan_estimate(
+                    storage,
+                    txid,
+                    scope,
+                    table,
+                    source,
+                    statement.where_clause.filter(|_| n == 1),
+                    arena,
+                )?;
+                scan.startup_cost = estimate.startup;
+                scan.total_cost = estimate.total;
+                scan.rows = estimate.rows;
+                scan.width = estimate.width;
                 scan = scan.with_verbose_qual(
                     QualLabel::FunctionCall,
                     function_call(storage, txid, scope, statement, source, arena)?,
@@ -7875,6 +7705,216 @@ fn function_schema(
         .map_or(StackStr::from_str("pg_catalog"), |schema| {
             StackStr::from_str(schema.as_str())
         })
+}
+
+struct FunctionScanEstimate {
+    startup: f64,
+    total: f64,
+    rows: u64,
+    width: u32,
+}
+
+/// `cost_functionscan` of the function `source`, FROM item `table` of
+/// `scope`, under the conditions `predicate`: the function's rows (its
+/// `prorows`, or what its support function computes of constant
+/// arguments), its call evaluated once at startup, then each row with the
+/// conditions; the width is `get_typavgwidth` of its columns.
+fn function_scan_estimate<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    table: usize,
+    source: &crate::sql::ast::TableRef<'a>,
+    predicate: Option<&Expr<'a>>,
+    arena: &'a Arena,
+) -> Result<FunctionScanEstimate, SqlError> {
+    let Some(args) = source.func_args else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a function scan has no function call"
+        ));
+    };
+    let unsupported = |name: &str| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a function scan of {} with a row-estimating support function is not supported",
+            name
+        )
+    };
+    let mark = arena.mark();
+    let result = (|| {
+        let definition = scope
+            .defs
+            .get(table)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "function scan has no columns"))?;
+        let empty = crate::sql::exec::CatalogCols {
+            remote_ctid: false,
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        };
+        let mut oids = [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        if args.len() > oids.len() {
+            return Err(unsupported(source.table));
+        }
+        for (oid, argument) in oids.iter_mut().zip(args) {
+            *oid = crate::sql::exec::infer_routine_argument_oid(argument, &empty)
+                .unwrap_or(crate::sql::types::oid::UNKNOWN);
+        }
+        let name = match source.schema {
+            Some(schema) => arena
+                .alloc_str_display(format_args!("{schema}.{}", source.table))
+                .map_err(|_| arena_full())?,
+            None => source.table,
+        };
+        let constant = |argument: &'a Expr<'a>| -> Option<Datum<'a>> {
+            if !argument.is_constant(false) {
+                return None;
+            }
+            let catalog = query::storage_catalog(storage, arena, txid);
+            let hooks = crate::sql::eval::EvalHooks {
+                catalog: Some(&catalog),
+                ..crate::sql::eval::NO_HOOKS
+            };
+            crate::sql::eval::eval_full(
+                argument,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+                &crate::sql::eval::NoColumns,
+                &hooks,
+            )
+            .ok()
+        };
+        // The function's own cost (`procost`) and rows (`prorows`).
+        let (procost, tuples) = match storage.select_routine_call(
+            name,
+            source.func_argument_names,
+            &oids[..args.len()],
+            source.func_variadic,
+            txid,
+            crate::storage::RoutineCallKind::Function,
+        ) {
+            crate::storage::RoutineCallSelection::Stored(slot) => {
+                let routine = storage.routine_for(slot, txid);
+                let set = routine.kind.is_set_returning();
+                (
+                    routine.attributes.cost_bits.map_or(
+                        if matches!(
+                            routine.language,
+                            crate::storage::RoutineLanguage::Native(_)
+                                | crate::storage::RoutineLanguage::Internal
+                        ) {
+                            1.0
+                        } else {
+                            100.0
+                        },
+                        f64::from_bits,
+                    ),
+                    routine
+                        .attributes
+                        .rows_bits
+                        .map_or(if set { 1000.0 } else { 1.0 }, f64::from_bits),
+                )
+            }
+            crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
+                let signature = crate::sql::catalog::builtin_callable_by_oid(oid)
+                    .ok_or_else(|| unsupported(source.table))?;
+                let rows = match signature.catalog.support_name {
+                    "" | "-" => signature.catalog.rows,
+                    "generate_series_int4_support"
+                    | "generate_series_int8_support"
+                    | "generate_series_numeric_support" => {
+                        let values = arena
+                            .alloc_slice_with(args.len(), |_| None)
+                            .map_err(|_| arena_full())?;
+                        for (value, argument) in values.iter_mut().zip(args) {
+                            *value = constant(argument);
+                        }
+                        let number = |value: &Option<Datum<'_>>| match value {
+                            Some(Datum::Int4(value)) => Some(f64::from(*value)),
+                            Some(Datum::Int8(value)) => Some(*value as f64),
+                            Some(Datum::Int2(value)) => Some(f64::from(*value)),
+                            _ => None,
+                        };
+                        if values
+                            .iter()
+                            .any(|value| matches!(value, Some(Datum::Null)))
+                        {
+                            0.0
+                        } else if signature.catalog.support_name
+                            == "generate_series_numeric_support"
+                            && values.iter().any(Option::is_some)
+                        {
+                            return Err(unsupported(source.table));
+                        } else {
+                            match (
+                                number(&values[0]),
+                                number(&values[1]),
+                                values.get(2).map_or(Some(1.0), number),
+                            ) {
+                                (Some(start), Some(finish), Some(step)) if step != 0.0 => {
+                                    ((finish - start + step) / step).floor()
+                                }
+                                _ => signature.catalog.rows,
+                            }
+                        }
+                    }
+                    "array_unnest_support" if args.len() == 1 => match constant(args[0]) {
+                        Some(Datum::Null) => 0.0,
+                        Some(Datum::Array { raw, .. }) => crate::sql::array::len(raw) as f64,
+                        // `estimate_array_length` of a non-constant array.
+                        _ => 10.0,
+                    },
+                    _ => return Err(unsupported(source.table)),
+                };
+                (signature.catalog.cost, rows)
+            }
+            _ => return Err(unsupported(source.table)),
+        };
+        // `expression_returns_set_rows` clamps the estimate (`clamp_row_est`).
+        let tuples = if tuples <= 1.0 {
+            1.0
+        } else {
+            tuples.round_ties_even()
+        };
+        // The call's argument costs, in `cost_qual_eval`'s half-operator units.
+        let arguments: f64 = args
+            .iter()
+            .map(|argument| query::qual_cost(argument, &empty, storage, txid, arena))
+            .sum();
+        let startup = procost * 0.0025 + arguments / 2.0 * 0.0025;
+        let columns = crate::sql::exec::AliasedDefCols {
+            definition,
+            alias: Some(scope.names[table]),
+            output_aliases: &[],
+            remote_ctid: false,
+        };
+        let (selectivity, qual) = match predicate {
+            Some(predicate) => (
+                predicate_selectivity(storage, scope, table, predicate, txid, arena),
+                query::qual_cost(predicate, &columns, storage, txid, arena) / 2.0 * 0.0025,
+            ),
+            None => (1.0, 0.0),
+        };
+        let rows = (tuples * selectivity).round_ties_even().max(1.0);
+        let width = definition
+            .columns()
+            .iter()
+            .map(|column| query::index_paths::type_average_width(column.ctype, column.type_mod))
+            .sum::<f64>();
+        Ok(FunctionScanEstimate {
+            startup,
+            total: startup + (0.01 + qual) * tuples,
+            rows: rows as u64,
+            width: width as u32,
+        })
+    })();
+    // SAFETY: the estimate holds no arena data.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 /// A `Function Scan`'s `Function Call`, its call as `VERBOSE` prints it.
@@ -13103,16 +13143,18 @@ fn plan_statement_nodes<'a>(
     // raises the folding's notices and errors (`eval_const_expressions`).
     // PostgreSQL's folding also replaces a call of a SQL function whose body
     // is one plain expression by that expression (`inline_function`), which
-    // then prints, costs, estimates and matches index keys in its place;
-    // pos3ql plans the call itself, so it refuses such a statement.
-    let (statement, inlinable) = crate::sql::eval::folding_inlinable_calls(|| {
+    // then prints, costs, estimates and matches index keys in its place. A
+    // call the folding could not decide (an argument reading an enclosing
+    // query's column, a packed variadic or polymorphic call, a `BEGIN
+    // ATOMIC` body) is refused.
+    let (statement, uninlined) = crate::sql::eval::folding_uninlined_calls(|| {
         fold_statement(storage, txid, statement, arena)
     });
     let statement = statement?;
-    if inlinable {
+    if uninlined {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "EXPLAIN of a call of a SQL function PostgreSQL inlines is not supported"
+            "EXPLAIN of a call of a SQL function PostgreSQL inlines, with an outer column, packed variadic or polymorphic argument or a BEGIN ATOMIC body, is not supported"
         ));
     }
     if block != BlockId::ROOT {
@@ -13253,7 +13295,7 @@ fn fold_statement<'a>(
 ) -> Result<&'a Stmt<'a>, SqlError> {
     let folded = match statement {
         Stmt::Select(select) if select.with.iter().all(|cte| cte.dml.is_none()) => {
-            let folded = query::fold_select_constants(select, arena, storage, txid)?;
+            let folded = preprocess_select(select, storage, txid, arena)?;
             if core::ptr::eq(folded, select) {
                 return Ok(statement);
             }
@@ -13273,6 +13315,134 @@ fn fold_statement<'a>(
     arena
         .alloc(folded)
         .map(|folded| &*folded)
+        .map_err(|_| arena_full())
+}
+
+/// `subquery_planner`'s preprocessing of a query level: its views expanded
+/// (the rewriter's), its set-returning SQL functions in FROM inlined, each
+/// subquery in FROM preprocessed in turn, then its expressions folded, so a
+/// subquery the planner pulls up brings its folded, inlined expressions.
+fn preprocess_select<'a>(
+    select: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let expanded = if select.with.is_empty() && storage.has_any_view() {
+        query::expand_ctes(select, storage, txid, arena)?
+    } else {
+        select
+    };
+    let inlined = inline_set_returning_functions(expanded, storage, txid, arena)?;
+    let inlined = match &inlined.from {
+        Some(from) if inlined.with.is_empty() => {
+            let preprocess = |item: &crate::sql::ast::TableRef<'a>| {
+                Ok::<_, SqlError>(match item.subquery {
+                    Some(body) if !item.lateral && item.join_members.is_none() => {
+                        let folded = preprocess_select(body, storage, txid, arena)?;
+                        (!core::ptr::eq(folded, body)).then_some(folded)
+                    }
+                    _ => None,
+                })
+            };
+            let base = preprocess(&from.base)?;
+            let mut joins = None;
+            for (at, join) in from.joins.iter().enumerate() {
+                if let Some(folded) = preprocess(&join.table)? {
+                    let copy = match &mut joins {
+                        Some(copy) => copy,
+                        None => joins.insert(
+                            arena
+                                .alloc_slice_copy(from.joins)
+                                .map_err(|_| arena_full())?,
+                        ),
+                    };
+                    copy[at].table.subquery = Some(folded);
+                }
+            }
+            if base.is_none() && joins.is_none() {
+                inlined
+            } else {
+                let mut copy = *inlined;
+                let mut from = *from;
+                if let Some(base) = base {
+                    from.base.subquery = Some(base);
+                }
+                if let Some(joins) = joins {
+                    from.joins = joins;
+                }
+                copy.from = Some(from);
+                arena
+                    .alloc(copy)
+                    .map(|copy| &*copy)
+                    .map_err(|_| arena_full())?
+            }
+        }
+        _ => inlined,
+    };
+    let folded = query::fold_select_constants(inlined, arena, storage, txid)?;
+    Ok(
+        if core::ptr::eq(folded, expanded) && core::ptr::eq(expanded, select) {
+            select
+        } else {
+            folded
+        },
+    )
+}
+
+/// `inline_set_returning_functions`: each FROM item calling a SQL function
+/// PostgreSQL inlines becomes a subquery of its body, which the planner then
+/// pulls up like any other.
+fn inline_set_returning_functions<'a>(
+    select: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    use crate::sql::planner_inputs::inline::{SetInlining, inline_set_returning_call};
+    let Some(from) = &select.from else {
+        return Ok(select);
+    };
+    let inline = |item: &crate::sql::ast::TableRef<'a>| {
+        Ok(
+            match inline_set_returning_call(item, storage, txid, arena)? {
+                SetInlining::Kept => None,
+                SetInlining::Inlined(inlined) => Some(*inlined),
+                SetInlining::Unmodeled => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN of a SQL function in FROM PostgreSQL inlines, with a default, variadic, polymorphic or lateral argument, a body with WITH, windows or a column coercion, is not supported"
+                    ));
+                }
+            },
+        )
+    };
+    let base = inline(&from.base)?;
+    let mut joins = None;
+    for (at, join) in from.joins.iter().enumerate() {
+        if let Some(inlined) = inline(&join.table)? {
+            let copy = match &mut joins {
+                Some(copy) => copy,
+                None => joins.insert(
+                    arena
+                        .alloc_slice_copy(from.joins)
+                        .map_err(|_| arena_full())?,
+                ),
+            };
+            copy[at].table = inlined;
+        }
+    }
+    if base.is_none() && joins.is_none() {
+        return Ok(select);
+    }
+    let mut copy = *select;
+    copy.from = Some(crate::sql::ast::FromClause {
+        base: base.unwrap_or(from.base),
+        joins: joins.map_or(from.joins, |joins| &*joins),
+    });
+    arena
+        .alloc(copy)
+        .map(|copy| &*copy)
         .map_err(|_| arena_full())
 }
 

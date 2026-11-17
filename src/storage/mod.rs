@@ -201,7 +201,7 @@ use snapshot_reclamation::SnapshotReclamation;
 pub(crate) use snapshot_reclamation::{HistoryReclamation, SnapshotCleanup};
 pub(crate) mod column_attributes;
 pub(crate) mod constraint_names;
-mod statistics;
+pub(crate) mod statistics;
 mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
 pub(crate) use statistics::distribution::ColumnDistribution;
@@ -5227,38 +5227,114 @@ impl ExtendedStatisticsKey {
     const EMPTY: Self = Self::Column(SqlName::EMPTY);
 }
 
+/// One item of an MCV list (`statext_mcv_build`): a combination of key
+/// values as a text array of each value's output, how many sampled rows
+/// held it, and the product of its values' sample frequencies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExtendedStatisticsMcv {
-    pub(crate) valid: bool,
-    pub(crate) hash: u64,
     pub(crate) count: u64,
-    /// IEEE-754 bits of PostgreSQL's independent/base frequency. Zero marks
-    /// legacy statistics that predate persisted base frequencies.
     pub(crate) base_frequency_bits: u64,
     pub(crate) values: StackStr<EXTENDED_STATISTICS_MCV_TEXT_MAX>,
 }
 
 impl ExtendedStatisticsMcv {
     pub(crate) const EMPTY: Self = Self {
-        valid: false,
-        hash: 0,
         count: 0,
         base_frequency_bits: 0,
         values: StackStr::new(),
     };
 }
 
+/// `statext_ndistinct_build` keeps one estimate per combination of two or
+/// more keys: `2^n - n - 1` of `n` keys.
+pub(crate) const MAX_EXTENDED_STATISTICS_NDISTINCT: usize =
+    (1 << MAX_EXTENDED_STATISTICS_KEYS) - MAX_EXTENDED_STATISTICS_KEYS - 1;
+
+/// `statext_dependencies_build` weighs, for each `k` of 2..=n, every
+/// combination of `k - 1` determining keys with each other key: `n * 2^(n-1)
+/// - n` dependencies of `n` keys.
+pub(crate) const MAX_EXTENDED_STATISTICS_DEPENDENCIES: usize = MAX_EXTENDED_STATISTICS_KEYS
+    * (1 << (MAX_EXTENDED_STATISTICS_KEYS - 1))
+    - MAX_EXTENDED_STATISTICS_KEYS;
+
+/// Visits, in `statext_ndistinct_build`'s order, each combination of two or
+/// more of `keys` keys (positions in key order).
+pub(crate) fn extended_statistics_combinations(keys: usize, visit: &mut dyn FnMut(&[u8])) {
+    fn recurse(
+        keys: usize,
+        k: usize,
+        current: &mut [u8],
+        index: usize,
+        start: usize,
+        visit: &mut dyn FnMut(&[u8]),
+    ) {
+        if index == k {
+            visit(&current[..k]);
+            return;
+        }
+        for key in start..keys {
+            current[index] = key as u8;
+            recurse(keys, k, current, index + 1, key + 1, visit);
+        }
+    }
+    let mut current = [0u8; MAX_EXTENDED_STATISTICS_KEYS];
+    for k in 2..=keys {
+        recurse(keys, k, &mut current, 0, 0, visit);
+    }
+}
+
+/// Visits, in `statext_dependencies_build`'s order, each dependency among
+/// `keys` keys: its determining keys, then the key they determine.
+pub(crate) fn extended_statistics_dependency_order(keys: usize, visit: &mut dyn FnMut(&[u8])) {
+    fn recurse(
+        keys: usize,
+        k: usize,
+        current: &mut [u8],
+        index: usize,
+        start: usize,
+        visit: &mut dyn FnMut(&[u8]),
+    ) {
+        if index + 1 < k {
+            for key in start..keys {
+                current[index] = key as u8;
+                recurse(keys, k, current, index + 1, key + 1, visit);
+            }
+            return;
+        }
+        for key in 0..keys {
+            if current[..index].contains(&(key as u8)) {
+                continue;
+            }
+            current[index] = key as u8;
+            visit(&current[..k]);
+        }
+    }
+    let mut current = [0u8; MAX_EXTENDED_STATISTICS_KEYS];
+    for k in 2..=keys {
+        recurse(keys, k, &mut current, 0, 0, visit);
+    }
+}
+
+/// What ANALYZE computed for one statistics object, as `statext_store`
+/// keeps it: the sample it read, each kind the object builds and the
+/// statistics of its expressions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExtendedStatisticsData {
     pub(crate) valid: bool,
     pub(crate) inherited: bool,
     pub(crate) analyzed_generation: u64,
+    /// The sampled rows (`numrows`).
     pub(crate) rows: u64,
-    pub(crate) non_null_rows: u64,
-    pub(crate) distinct_values: u64,
-    /// Pairwise functional-dependency strengths in millionths. Entry i,j is
-    /// the degree to which key i determines key j; diagonal entries are zero.
-    pub(crate) dependencies_ppm: [u32; MAX_EXTENDED_STATISTICS_KEYS * MAX_EXTENDED_STATISTICS_KEYS],
+    /// `pg_ndistinct`, built when `ndistinct_built`: each combination's
+    /// estimate in [`extended_statistics_combinations`] order.
+    pub(crate) ndistinct_built: bool,
+    pub(crate) ndistinct: [u64; MAX_EXTENDED_STATISTICS_NDISTINCT],
+    /// `pg_dependencies`, built when `dependencies_built`: each
+    /// dependency's degree (IEEE-754 bits) in
+    /// [`extended_statistics_dependency_order`] order; a zero degree is no
+    /// dependency.
+    pub(crate) dependencies_built: bool,
+    pub(crate) dependency_degree_bits: [u64; MAX_EXTENDED_STATISTICS_DEPENDENCIES],
     pub(crate) expression_statistics: [ColumnStatistics; MAX_EXTENDED_STATISTICS_KEYS],
     pub(crate) mcv: [ExtendedStatisticsMcv; MAX_EXTENDED_STATISTICS_MCV],
     pub(crate) n_mcv: u16,
@@ -5270,9 +5346,10 @@ impl ExtendedStatisticsData {
         inherited: false,
         analyzed_generation: 0,
         rows: 0,
-        non_null_rows: 0,
-        distinct_values: 0,
-        dependencies_ppm: [0; MAX_EXTENDED_STATISTICS_KEYS * MAX_EXTENDED_STATISTICS_KEYS],
+        ndistinct_built: false,
+        ndistinct: [0; MAX_EXTENDED_STATISTICS_NDISTINCT],
+        dependencies_built: false,
+        dependency_degree_bits: [0; MAX_EXTENDED_STATISTICS_DEPENDENCIES],
         expression_statistics: [ColumnStatistics::EMPTY; MAX_EXTENDED_STATISTICS_KEYS],
         mcv: [ExtendedStatisticsMcv::EMPTY; MAX_EXTENDED_STATISTICS_MCV],
         n_mcv: 0,
@@ -39536,7 +39613,7 @@ impl Storage {
     /// four-byte length header of a value built in memory, where a stored
     /// short value has a one-byte header.
     #[expect(clippy::too_many_arguments, reason = "the sampled column is explicit")]
-    fn analyzed_values<'w>(
+    pub(crate) fn analyzed_values<'w>(
         &self,
         txid: u32,
         ctype: ColType,
@@ -53657,53 +53734,6 @@ impl Storage {
             });
         catalog.definitions[slot].data = data;
         Self::clear_pending_extended_statistics_data(&mut catalog, slot);
-    }
-
-    /// Hash summaries are caches. Keep counts and dependencies, but retire old
-    /// enum MCV hashes before they can be compared with stable member hashes.
-    pub(crate) fn retire_legacy_extended_statistics_hash(&mut self, slot: usize) {
-        let (database, table, keys, n_keys) = {
-            let catalog = self
-                .extended_statistics_catalog
-                .lock()
-                .expect("extended-statistics catalog lock poisoned");
-            let definition = &catalog.definitions[slot];
-            (
-                definition.database,
-                definition.table,
-                definition.keys,
-                definition.n_keys,
-            )
-        };
-        let has_enums = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned")
-            .enums
-            .iter()
-            .any(|enumeration| enumeration.database == database && enumeration.visible_to(0));
-        if !has_enums {
-            return;
-        }
-        let affects_enum = {
-            let definition = self.tables[usize::from(table)].definition();
-            keys[..usize::from(n_keys)].iter().any(|key| match key {
-                ExtendedStatisticsKey::Column(name) => definition
-                    .column_index(name.as_str())
-                    .is_some_and(|column| {
-                        matches!(definition.columns[column].ctype, ColType::Enum(_))
-                    }),
-                ExtendedStatisticsKey::Expression(_) => true,
-            })
-        };
-        if affects_enum {
-            self.extended_statistics_catalog
-                .lock()
-                .expect("extended-statistics catalog lock poisoned")
-                .definitions[slot]
-                .data
-                .n_mcv = 0;
-        }
     }
 
     pub(crate) fn install_extended_statistics_data(

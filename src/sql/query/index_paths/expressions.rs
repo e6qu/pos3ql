@@ -235,13 +235,6 @@ pub(crate) fn key_variable<'a>(
     let Some(text) = index.expressions[position] else {
         return Ok(None);
     };
-    if index
-        .expression_dependencies_of(crate::storage::ExpressionOwner::IndexKey(position as u8))
-        .next()
-        .is_some()
-    {
-        return Ok(None);
-    }
     let Some((bound, ctype)) = crate::sql::exec::analyze_indexes::expression_key(
         storage,
         txid,
@@ -253,6 +246,18 @@ pub(crate) fn key_variable<'a>(
     )?
     else {
         return Ok(None);
+    };
+    let bound = if index
+        .expression_dependencies_of(crate::storage::ExpressionOwner::IndexKey(position as u8))
+        .next()
+        .is_some()
+    {
+        match inlined_key(storage, txid, definition, bound, arena)? {
+            Some(inlined) => inlined,
+            None => return Ok(None),
+        }
+    } else {
+        bound
     };
     let resolve = |qualifier: Option<&str>, name: &str| {
         qualifier
@@ -272,6 +277,43 @@ pub(crate) fn key_variable<'a>(
         unique: false,
         indexed: false,
     }))
+}
+
+/// `expression`, an index key bound to user-defined objects, as the planner
+/// reads it (`RelationGetIndexExpressions` folds it with
+/// `eval_const_expressions`, inlining SQL function calls); `None` when it
+/// still calls a user-defined routine or reads a user-defined type, which
+/// the model does not evaluate.
+fn inlined_key<'a>(
+    storage: &Storage,
+    txid: u32,
+    definition: &TableDef,
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let columns = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
+        definition: Some(crate::storage::RelationDefinition::from_definition(
+            definition,
+        )),
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    let folded = crate::sql::eval::fold_constants_in_scope(expression, arena, &catalog, &columns)?;
+    let mut dependencies = storage.empty_stored_query_dependencies(arena)?;
+    crate::sql::query::collect_runtime_expression(
+        folded,
+        storage,
+        txid,
+        &mut dependencies,
+        arena,
+        &columns,
+    )?;
+    Ok(dependencies.entries().is_empty().then_some(folded))
 }
 
 /// The value of variable `column` in the table row `values`: a column's, or
@@ -353,16 +395,27 @@ impl<'a> KeyReader<'a> {
                         position + 1
                     )
                 })?;
-                expressions[at] = Some(
-                    crate::sql::exec::expression_bindings::bound_index_expression(
-                        text.as_str(),
-                        storage,
-                        &definition,
-                        crate::storage::ExpressionOwner::IndexKey(expression.position),
-                        txid,
-                        arena,
-                    )?,
-                );
+                let owner = crate::storage::ExpressionOwner::IndexKey(expression.position);
+                let bound = crate::sql::exec::expression_bindings::bound_index_expression(
+                    text.as_str(),
+                    storage,
+                    &definition,
+                    owner,
+                    txid,
+                    arena,
+                )?;
+                // A key over an inlinable SQL function evaluates its body.
+                let bound = if definition
+                    .expression_dependencies_of(owner)
+                    .next()
+                    .is_some()
+                {
+                    let table = storage.table_def(slot, txid);
+                    inlined_key(storage, txid, &table, bound, arena)?.unwrap_or(bound)
+                } else {
+                    bound
+                };
+                expressions[at] = Some(bound);
             }
         }
         Ok(Self { expressions })

@@ -4937,7 +4937,12 @@ impl Checkpointer {
                         data: crate::storage::ExtendedStatisticsData::EMPTY,
                     });
                 }
-                Some("estatdata") => {
+                Some("estatdata" | "estatdep" | "estatmcv" | "estatmcvbase") => {
+                    return Err(CheckpointSetupError::Corrupt(
+                        "extended statistics of an earlier pos3ql format are not supported; ANALYZE again on the release that wrote them is required before upgrading",
+                    ));
+                }
+                Some("estatdata3") => {
                     let created_at: u64 = parse_field(words.next(), "estatdata identity")?;
                     let statistics = extended_statistics
                         .iter_mut()
@@ -4949,31 +4954,49 @@ impl Checkpointer {
                     if statistics.data.valid {
                         return Err(CheckpointSetupError::Corrupt("duplicate estatdata"));
                     }
+                    let flag = |value: u8| match value {
+                        0 => Ok(false),
+                        1 => Ok(true),
+                        _ => Err(CheckpointSetupError::Corrupt("invalid estatdata flag")),
+                    };
                     statistics.data.valid = true;
                     statistics.data.inherited =
-                        match parse_field::<u8>(words.next(), "estatdata inherited")? {
-                            0 => false,
-                            1 => true,
-                            _ => {
-                                return Err(CheckpointSetupError::Corrupt(
-                                    "invalid estatdata inherited",
-                                ));
-                            }
-                        };
+                        flag(parse_field(words.next(), "estatdata inherited")?)?;
                     statistics.data.analyzed_generation =
                         parse_field(words.next(), "estatdata generation")?;
                     statistics.data.rows = parse_field(words.next(), "estatdata rows")?;
-                    statistics.data.non_null_rows = parse_field(words.next(), "estatdata nonnull")?;
-                    statistics.data.distinct_values =
-                        parse_field(words.next(), "estatdata distinct")?;
+                    statistics.data.ndistinct_built =
+                        flag(parse_field(words.next(), "estatdata ndistinct")?)?;
+                    statistics.data.dependencies_built =
+                        flag(parse_field(words.next(), "estatdata dependencies")?)?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("malformed estatdata"));
                     }
                 }
-                Some("estatdep") => {
+                Some("estatnd") => {
+                    let created_at: u64 = parse_field(words.next(), "estatnd identity")?;
+                    let index: usize = parse_field(words.next(), "estatnd index")?;
+                    let value: u64 = parse_field(words.next(), "estatnd value")?;
+                    let statistics = extended_statistics
+                        .iter_mut()
+                        .find(|statistics| {
+                            statistics.database == storage.current_database_oid()
+                                && statistics.created_at == created_at
+                        })
+                        .ok_or(CheckpointSetupError::Corrupt("estatnd precedes estat"))?;
+                    if !statistics.data.ndistinct_built
+                        || index >= statistics.data.ndistinct.len()
+                        || statistics.data.ndistinct[index] != 0
+                        || words.next().is_some()
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid estatnd"));
+                    }
+                    statistics.data.ndistinct[index] = value;
+                }
+                Some("estatdep3") => {
                     let created_at: u64 = parse_field(words.next(), "estatdep identity")?;
                     let index: usize = parse_field(words.next(), "estatdep index")?;
-                    let strength: u32 = parse_field(words.next(), "estatdep strength")?;
+                    let bits: u64 = parse_field(words.next(), "estatdep degree")?;
                     let statistics = extended_statistics
                         .iter_mut()
                         .find(|statistics| {
@@ -4981,14 +5004,15 @@ impl Checkpointer {
                                 && statistics.created_at == created_at
                         })
                         .ok_or(CheckpointSetupError::Corrupt("estatdep precedes estat"))?;
-                    if index >= statistics.data.dependencies_ppm.len()
-                        || strength > 1_000_000
-                        || statistics.data.dependencies_ppm[index] != 0
+                    if !statistics.data.dependencies_built
+                        || index >= statistics.data.dependency_degree_bits.len()
+                        || !(0.0..=1.0).contains(&f64::from_bits(bits))
+                        || statistics.data.dependency_degree_bits[index] != 0
                         || words.next().is_some()
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid estatdep"));
                     }
-                    statistics.data.dependencies_ppm[index] = strength;
+                    statistics.data.dependency_degree_bits[index] = bits;
                 }
                 Some("estatexpr") => {
                     let created_at: u64 = parse_field(words.next(), "estatexpr identity")?;
@@ -5022,10 +5046,10 @@ impl Checkpointer {
                     }
                     statistics.data.expression_statistics[key] = column;
                 }
-                Some("estatmcv") => {
+                Some("estatmcv3") => {
                     let created_at: u64 = parse_field(words.next(), "estatmcv identity")?;
-                    let hash: u64 = parse_field(words.next(), "estatmcv hash")?;
                     let count: u64 = parse_field(words.next(), "estatmcv count")?;
+                    let base_frequency_bits: u64 = parse_field(words.next(), "estatmcv base")?;
                     let encoded = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("estatmcv value missing"))?;
@@ -5038,6 +5062,7 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("estatmcv precedes estat"))?;
                     let position = usize::from(statistics.data.n_mcv);
                     if position >= crate::storage::MAX_EXTENDED_STATISTICS_MCV
+                        || !(0.0..=1.0).contains(&f64::from_bits(base_frequency_bits))
                         || words.next().is_some()
                     {
                         return Err(CheckpointSetupError::Corrupt(
@@ -5050,39 +5075,11 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("estatmcv value is too long"));
                     }
                     statistics.data.mcv[position] = crate::storage::ExtendedStatisticsMcv {
-                        valid: true,
-                        hash,
                         count,
-                        base_frequency_bits: 0,
+                        base_frequency_bits,
                         values,
                     };
                     statistics.data.n_mcv += 1;
-                }
-                Some("estatmcvbase") => {
-                    let created_at: u64 = parse_field(words.next(), "estatmcvbase identity")?;
-                    let hash: u64 = parse_field(words.next(), "estatmcvbase hash")?;
-                    let bits: u64 = parse_field(words.next(), "estatmcvbase bits")?;
-                    if words.next().is_some() {
-                        return Err(CheckpointSetupError::Corrupt("invalid estatmcvbase"));
-                    }
-                    let statistics = extended_statistics
-                        .iter_mut()
-                        .find(|statistics| {
-                            statistics.database == storage.current_database_oid()
-                                && statistics.created_at == created_at
-                        })
-                        .ok_or(CheckpointSetupError::Corrupt("estatmcvbase precedes estat"))?;
-                    let entry = statistics.data.mcv[..usize::from(statistics.data.n_mcv)]
-                        .iter_mut()
-                        .find(|entry| entry.hash == hash)
-                        .ok_or(CheckpointSetupError::Corrupt(
-                            "estatmcvbase precedes estatmcv",
-                        ))?;
-                    let base_frequency = f64::from_bits(bits);
-                    if !base_frequency.is_finite() || !(0.0..=1.0).contains(&base_frequency) {
-                        return Err(CheckpointSetupError::Corrupt("invalid estatmcvbase bits"));
-                    }
-                    entry.base_frequency_bits = bits;
                 }
                 Some("tsch") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
@@ -11711,20 +11708,28 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "estatdata {} {} {} {} {} {}",
+                    "estatdata3 {} {} {} {} {} {}",
                     statistics.created_at,
                     u8::from(data.inherited),
                     data.analyzed_generation,
                     data.rows,
-                    data.non_null_rows,
-                    data.distinct_values,
+                    u8::from(data.ndistinct_built),
+                    u8::from(data.dependencies_built),
                 ),
             )?;
-            for (index, strength) in data.dependencies_ppm.iter().copied().enumerate() {
-                if strength != 0 {
+            for (index, value) in data.ndistinct.iter().copied().enumerate() {
+                if data.ndistinct_built && value != 0 {
                     write_manifest(
                         &mut self.manifest_output,
-                        format_args!("estatdep {} {index} {strength}", statistics.created_at),
+                        format_args!("estatnd {} {index} {value}", statistics.created_at),
+                    )?;
+                }
+            }
+            for (index, bits) in data.dependency_degree_bits.iter().copied().enumerate() {
+                if data.dependencies_built && bits != 0 {
+                    write_manifest(
+                        &mut self.manifest_output,
+                        format_args!("estatdep3 {} {index} {bits}", statistics.created_at),
                     )?;
                 }
             }
@@ -11752,22 +11757,13 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "estatmcv {} {} {} {}",
+                        "estatmcv3 {} {} {} {}",
                         statistics.created_at,
-                        entry.hash,
                         entry.count,
+                        entry.base_frequency_bits,
                         value_hex.as_str(),
                     ),
                 )?;
-                if entry.base_frequency_bits != 0 {
-                    write_manifest(
-                        &mut self.manifest_output,
-                        format_args!(
-                            "estatmcvbase {} {} {}",
-                            statistics.created_at, entry.hash, entry.base_frequency_bits,
-                        ),
-                    )?;
-                }
             }
         }
         for (slot, entry) in storage.checkpoint_foreign_wrappers() {

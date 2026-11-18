@@ -329,10 +329,113 @@ pub(crate) fn raw_value_length(value: &Datum<'_>) -> usize {
                 (if short { 2 } else { 4 }) + 2 * number.ndigits()
             }
         }
+        Datum::Array { element, raw } => array_data_length(*element, raw),
+        Datum::TsVector(text) => tsvector_data_length(text.as_str()),
         other => {
             crate::storage::rowenc::encoded_len(core::slice::from_ref(other)).saturating_sub(3)
         }
     }
+}
+
+/// The canonical text of a `tsvector` as `(lexeme length, positions)` pairs,
+/// each lexeme quoted with embedded quotes doubled and backslashes escaped.
+pub(crate) fn tsvector_entries(text: &str, mut visit: impl FnMut(&[u8], usize)) {
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    let mut lexeme = [0u8; 2048];
+    while at < bytes.len() {
+        if bytes[at] == b' ' {
+            at += 1;
+            continue;
+        }
+        if bytes[at] != b'\'' {
+            return;
+        }
+        at += 1;
+        let mut length = 0usize;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' if at + 1 < bytes.len() => {
+                    at += 1;
+                }
+                b'\'' if bytes.get(at + 1) == Some(&b'\'') => {
+                    at += 1;
+                }
+                b'\'' => break,
+                _ => {}
+            }
+            if length < lexeme.len() {
+                lexeme[length] = bytes[at];
+            }
+            length += 1;
+            at += 1;
+        }
+        at += 1;
+        let mut positions = 0usize;
+        if bytes.get(at) == Some(&b':') {
+            positions = 1;
+            while at < bytes.len() && bytes[at] != b' ' {
+                if bytes[at] == b',' {
+                    positions += 1;
+                }
+                at += 1;
+            }
+        }
+        visit(&lexeme[..length.min(lexeme.len())], positions);
+    }
+}
+
+/// The bytes of a stored `tsvector` after its four-byte varlena header: a
+/// count, a four-byte entry per lexeme, then each lexeme and, when it has
+/// positions, its count and positions at two-byte alignment.
+fn tsvector_data_length(text: &str) -> usize {
+    let mut entries = 0usize;
+    let mut data = 0usize;
+    tsvector_entries(text, |lexeme, positions| {
+        entries += 1;
+        data += lexeme.len();
+        if positions > 0 {
+            data = data.next_multiple_of(2) + 2 + 2 * positions;
+        }
+    });
+    4 + 4 * entries + data
+}
+
+/// The bytes of a PostgreSQL array after its four-byte varlena header
+/// (`ARR_OVERHEAD_*`: the type, flags, dimensions and lower bounds, a null
+/// bitmap when an element is NULL, then each non-NULL element at its type's
+/// alignment, a varlena with its four-byte header).
+fn array_data_length(element: crate::sql::types::ArrElem, raw: &[u8]) -> usize {
+    let ctype = element.to_coltype();
+    let layout = ctype.physical_layout();
+    let align = match layout.alignment {
+        b'd' => 8,
+        b'i' => 4,
+        b's' => 2,
+        _ => 1,
+    };
+    let count = crate::sql::array::len(raw);
+    let dimensions = crate::sql::array::shape(raw).map_or(1, |shape| shape.dimension_count());
+    let mut nulls = false;
+    let mut data = 0usize;
+    for index in 0..count {
+        let value = crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null);
+        if value.is_null() {
+            nulls = true;
+            continue;
+        }
+        data = data.next_multiple_of(align)
+            + if layout.length > 0 {
+                layout.length as usize
+            } else {
+                raw_value_length(&value) + 4
+            };
+        data = data.next_multiple_of(align);
+    }
+    // The 16-byte header counts the varlena header, which `raw` excludes.
+    let header =
+        (16 + 8 * dimensions + if nulls { count.div_ceil(8) } else { 0 }).next_multiple_of(8) - 4;
+    header + data
 }
 
 /// `VARSIZE_ANY` of a stored value of `raw` data bytes: a one-byte header

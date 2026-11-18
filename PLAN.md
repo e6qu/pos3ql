@@ -812,9 +812,7 @@ correlation as a table column's, at most 16 KiB each; a larger one fails
 ANALYZE with a named error), pg_stats_ext_exprs shows it, and a condition on
 an expression the object holds is estimated from it as `examine_variable`
 does, alone or with the object's other keys through its MCV list and
-dependencies (`differential_exact/899`, `900`, `901`). pg_stats_ext_exprs
-leaves the array-element columns (`most_common_elems` and the two after it)
-NULL.
+dependencies (`differential_exact/899`, `900`, `901`).
 An index key or predicate may call a PL/pgSQL function
 A `DROP TABLE ... CASCADE` drops every foreign key that references the table in one statement and changes each referencing relation once (`differential_exact/898`); a transaction that changes one relation in more than `max_catalog_versions_per_object` statements fails with that named capacity error.
 (`differential_exact/755`): a utility statement that evaluates outside a
@@ -2018,7 +2016,7 @@ domain and composite values, and an array column's values as an array of
 arrays. Range, multirange and `tsvector` columns count every value distinct
 and a type without equality leaves `n_distinct` unknown, as PostgreSQL's
 `compute_range_stats`, `compute_tsvector_stats` and `compute_trivial_stats`
-do. Remaining: the element statistics of arrays and `tsvector` columns, range
+do. An array column's (and a statistics expression's) ANALYZE also keeps the most common elements, their frequencies and the histogram of distinct element counts (`compute_array_stats`'s lossy counting, `differential_exact/903`), and an array's `avg_width` is its on-disk size. A `tsvector` column keeps its most common lexemes (`compute_tsvector_stats`, sorted by length then bytes) and its width is its stored size, and an array-valued index expression's element statistics show in `pg_stats` (`differential_exact/904`). When more elements pass the cutoff than the statistics target allows, PostgreSQL keeps the most frequent in the order its hash table iterates them (a `dynahash` seq scan over `hash_bytes` buckets, `qsort` unstable among equal frequencies), which depends on that table's growth history and cannot be reproduced without porting `dynahash`; pos3ql keeps ties in first-seen order. Remaining: range
 and multirange histograms, `compute_distinct_stats` for types without an
 ordering, the widths of values PostgreSQL compresses, and the binary form
 of a composite value inside a statistics array, which pos3ql sends as

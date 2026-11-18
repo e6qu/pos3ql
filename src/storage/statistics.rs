@@ -2,6 +2,7 @@
 
 mod columns;
 pub(crate) mod distribution;
+pub(crate) mod elements;
 pub(crate) mod heap_layout;
 pub(crate) mod scalar;
 pub(crate) use columns::{AnalyzedColumn, ColumnImages, INHERITED};

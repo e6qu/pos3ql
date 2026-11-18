@@ -39777,6 +39777,28 @@ impl Storage {
         };
         let mut distribution: &[u8] = &[];
         let image = if scalar {
+            // An array column's element statistics, from the sample in its
+            // own order (`compute_array_stats`).
+            let elements = match ctype {
+                ColType::Array(element) if element.to_coltype().has_builtin_ordering() => {
+                    statistics::elements::compute(
+                        value_at,
+                        sampled,
+                        target,
+                        element,
+                        &mut |left, right| {
+                            crate::sql::eval::compare_datums_collated(
+                                self, txid, collation, left, right,
+                            )
+                        },
+                        &mut |value| {
+                            hash_key_catalog(self, txid, core::slice::from_ref(value), &[0])
+                        },
+                        arena,
+                    )?
+                }
+                _ => None,
+            };
             let computed = statistics::scalar::compute(
                 statistics::scalar::SampleColumn {
                     values: &mut items[..count],
@@ -39797,9 +39819,13 @@ impl Storage {
             if !computed.mcv.is_empty()
                 || !computed.histogram.is_empty()
                 || computed.correlation.is_some()
+                || elements.is_some()
             {
-                let length =
-                    statistics::distribution::encoded_len(computed.mcv, computed.histogram);
+                let length = statistics::distribution::encoded_len(
+                    computed.mcv,
+                    computed.histogram,
+                    elements.as_ref(),
+                );
                 let bytes = arena
                     .alloc_slice_with(length, |_| 0u8)
                     .map_err(|_| arena_full())?;
@@ -39807,6 +39833,7 @@ impl Storage {
                     computed.correlation,
                     computed.mcv,
                     computed.histogram,
+                    elements.as_ref(),
                     bytes,
                 );
                 distribution = bytes;
@@ -39849,6 +39876,18 @@ impl Storage {
                     },
                 )
             };
+            // `compute_tsvector_stats`: the most common lexemes.
+            if ctype == ColType::TsVector
+                && let Some(set) =
+                    statistics::elements::compute_lexemes(value_at, sampled, target, arena)?
+            {
+                let length = statistics::distribution::encoded_len(&[], &[], Some(&set));
+                let bytes = arena
+                    .alloc_slice_with(length, |_| 0u8)
+                    .map_err(|_| arena_full())?;
+                statistics::distribution::encode(None, &[], &[], Some(&set), bytes);
+                distribution = bytes;
+            }
             ColumnStatistics {
                 valid: true,
                 null_fraction,

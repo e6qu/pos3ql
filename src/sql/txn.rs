@@ -468,6 +468,10 @@ pub struct TxnState {
     pub(super) procedure_restart: bool,
     pub(super) cache_capacity_wait: Option<CacheCapacityWait>,
     pub(super) checkpoint_request: Option<crate::checkpoint::CheckpointRequest>,
+    /// The checkpoint the suspended statement, which found the memtable
+    /// full, waits for; the statement runs again once it publishes. It
+    /// survives the rollback of an implicit transaction the statement ran in.
+    memtable_wait: core::cell::Cell<Option<crate::checkpoint::CheckpointRequest>>,
     /// Current statement identity. Snapshot K sees own writes with identifiers
     /// below K. Nested SQL temporarily uses a separately issued identity.
     command_id: u32,
@@ -1449,6 +1453,7 @@ impl TxnState {
             procedure_restart: false,
             cache_capacity_wait: None,
             checkpoint_request: None,
+            memtable_wait: core::cell::Cell::new(None),
             command_id: 1,
             command_counter: 1,
             trigger_depth: 0,
@@ -1729,6 +1734,8 @@ impl TxnState {
         } else if let Some(wait) = &self.cache_capacity_wait {
             super::datetime::restore_statement_clock(wait.clock);
         } else {
+            // A new statement owes no checkpoint yet.
+            self.memtable_wait.set(None);
             super::datetime::begin_statement();
             if let Some(start) = self.transaction_start {
                 super::datetime::restore_transaction_clock(start);
@@ -1987,6 +1994,19 @@ impl TxnState {
         self.awaited_parent_read = None;
         self.cache_capacity_wait = None;
         self.checkpoint_request = None;
+    }
+
+    /// The checkpoint the statement running again waits for to make room in
+    /// the memtable; none for a statement that has not waited.
+    pub(super) fn memtable_wait(&self) -> Option<crate::checkpoint::CheckpointRequest> {
+        self.memtable_wait.get()
+    }
+
+    pub(super) fn set_memtable_wait(
+        &mut self,
+        request: Option<crate::checkpoint::CheckpointRequest>,
+    ) {
+        self.memtable_wait.set(request);
     }
 
     /// Runs as `command` again, an earlier command of the running statement

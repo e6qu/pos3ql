@@ -21,7 +21,10 @@ use crate::sql::types::Datum;
 use crate::storage::Storage;
 
 use super::index_paths::join_query::ModeledJoin;
-use super::index_paths::joins::{ClauseList, JoinType, Keys, MAX_JOIN_RELS, PathKind, Relids};
+use super::index_paths::joins::{
+    ClauseList, JoinType, KEY_CLASS, KEY_DESCENDING, KEY_NULLS_FIRST, Keys, MAX_JOIN_RELS,
+    PathKind, Relids,
+};
 use super::scan::{JoinRow, JoinRowValues, PaxFullRowReason, PaxReadDemand};
 use super::{QueryScope, arena_full};
 
@@ -624,7 +627,7 @@ fn datum_type_hashable(ctype: crate::sql::types::ColType) -> bool {
 /// The value hashes `ExecHashGetHashValue` combines: each type's hash
 /// support function (`hashint4`, `hashint8`, `hashtext` under a
 /// deterministic collation, `hashchar` for `bool`).
-fn datum_hash(value: &Datum<'_>) -> Option<u32> {
+pub(super) fn datum_hash(value: &Datum<'_>) -> Option<u32> {
     use crate::sql::identity::{hash_bytea, hash_int64_input, hash_uint32};
     Some(match value {
         Datum::Int2(value) => hash_uint32(*value as i32 as u32),
@@ -1262,6 +1265,8 @@ impl<'r, 'a> Runner<'r, 'a> {
                 clauses,
                 materialize_inner,
                 inner_unique,
+                descending,
+                nulls_first,
             } => self.merge_join(
                 id,
                 jointype,
@@ -1272,6 +1277,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 &clauses,
                 materialize_inner,
                 inner_unique,
+                (descending, nulls_first),
                 bound,
                 sink,
             ),
@@ -1298,6 +1304,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         clauses: &ClauseList,
         materialize_inner: bool,
         inner_unique: bool,
+        (descending, nulls_first): (u32, u32),
         bound: &mut Bound<'a>,
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
@@ -1315,14 +1322,15 @@ impl<'r, 'a> Runner<'r, 'a> {
             && clauses.as_slice().len() == merge.as_slice().len();
         let outer_input = self.merge_input(id, outer, &outer_sort, 0, bound)?;
         let outer_rows = outer_input.rows;
-        // `MJEvalOuterValues` and `MJEvalInnerValues`: a NULL first key ends
-        // the join unless the join returns that side's unmatched rows.
+        // `MJEvalOuterValues` and `MJEvalInnerValues`: a NULL first key
+        // sorted last ends the join unless the join returns that side's
+        // unmatched rows.
         let eval = |row: &Bound<'a>, outer_side: bool| -> MergeEval {
             let fills = if outer_side { fill_outer } else { fill_inner };
             let mut result = MergeEval::Matchable;
             for (at, &(o, i)) in Self::keys(&keys).enumerate() {
                 if Self::value(row, if outer_side { o } else { i }).is_null() {
-                    if at == 0 && !fills {
+                    if at == 0 && nulls_first & 1 == 0 && !fills {
                         return MergeEval::EndOfJoin;
                     }
                     result = MergeEval::NonMatchable;
@@ -1410,21 +1418,48 @@ impl<'r, 'a> Runner<'r, 'a> {
                 }
             }};
         }
+        // `MJCompare`: each key compared as its sort orders it
+        // (`ApplySortComparator`), NULL equal to NULL only to order the
+        // rows, never to join them.
         let compare =
             |outer_row: &Bound<'a>, inner_row: &Bound<'a>| -> Result<Ordering, SqlError> {
-                for &(o, i) in Self::keys(&keys) {
-                    let order = crate::sql::eval::compare_datums_collated(
-                        self.storage,
-                        self.txid,
-                        self.collation(o),
-                        &Self::value(outer_row, o),
-                        &Self::value(inner_row, i),
-                    )?;
+                let mut null_equals_null = false;
+                for (at, &(o, i)) in Self::keys(&keys).enumerate() {
+                    let (one, two) = (Self::value(outer_row, o), Self::value(inner_row, i));
+                    let first = nulls_first >> at & 1 != 0;
+                    let order = match (one.is_null(), two.is_null()) {
+                        (true, true) => {
+                            null_equals_null = true;
+                            continue;
+                        }
+                        (true, false) if first => Ordering::Less,
+                        (true, false) => Ordering::Greater,
+                        (false, true) if first => Ordering::Greater,
+                        (false, true) => Ordering::Less,
+                        (false, false) => {
+                            let order = crate::sql::eval::compare_datums_collated(
+                                self.storage,
+                                self.txid,
+                                self.collation(o),
+                                &one,
+                                &two,
+                            )?;
+                            if descending >> at & 1 != 0 {
+                                order.reverse()
+                            } else {
+                                order
+                            }
+                        }
+                    };
                     if order != Ordering::Equal {
                         return Ok(order);
                     }
                 }
-                Ok(Ordering::Equal)
+                Ok(if null_equals_null {
+                    Ordering::Greater
+                } else {
+                    Ordering::Equal
+                })
             };
         let out_of_order = || {
             crate::sql_err!(
@@ -2991,12 +3026,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         bound: &mut Bound<'a>,
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
-        /// `SH_FILLFACTOR`, `SH_GROW_MAX_DIB`, `SH_GROW_MAX_MOVE` and
-        /// `SH_GROW_MIN_FILLFACTOR`.
-        const FILL: f64 = 0.9;
-        const MAX_DIB: u64 = 25;
-        const MAX_MOVE: u64 = 150;
-        const MIN_FILL: f64 = 0.1;
         let held = self.hold(input, bound)?;
         let rows = held.rows.borrowed_slice();
         let relids = self.model.plan.path(input).relids;
@@ -3004,20 +3033,13 @@ impl<'r, 'a> Runner<'r, 'a> {
         let column = |member: &super::index_paths::joins::Member| {
             (usize::from(member.rel), usize::from(member.column))
         };
-        let murmur = |mut h: u32| {
-            h ^= h >> 16;
-            h = h.wrapping_mul(0x85eb_ca6b);
-            h ^= h >> 13;
-            h = h.wrapping_mul(0xc2b2_ae35);
-            h ^ (h >> 16)
-        };
-        let row_hash = |row: &Bound<'a>| -> Result<u32, SqlError> {
+        let mut row_hash = |row: usize| -> Result<u32, SqlError> {
             let mut hash = 0u32;
             for (at, member) in keys.iter().enumerate() {
                 if at != 0 {
                     hash = hash.rotate_left(1);
                 }
-                let value = Self::value(row, column(member));
+                let value = Self::value(&rows[row], column(member));
                 if value.is_null() {
                     continue;
                 }
@@ -3028,13 +3050,13 @@ impl<'r, 'a> Runner<'r, 'a> {
                     )
                 })?;
             }
-            Ok(murmur(hash))
+            Ok(super::simplehash::murmur32(hash))
         };
-        let same = |a: &Bound<'a>, b: &Bound<'a>| -> Result<bool, SqlError> {
+        let mut same = |a: usize, b: usize| -> Result<bool, SqlError> {
             for member in keys {
                 let (one, two) = (
-                    Self::value(a, column(member)),
-                    Self::value(b, column(member)),
+                    Self::value(&rows[a], column(member)),
+                    Self::value(&rows[b], column(member)),
                 );
                 let equal = match (one.is_null(), two.is_null()) {
                     (true, true) => true,
@@ -3057,117 +3079,17 @@ impl<'r, 'a> Runner<'r, 'a> {
         };
         // `SH_CREATE` of the planned buckets.
         let buckets = super::index_paths::plain_hash_buckets(width, groups);
-        let sized = |elements: f64| ((elements as u64).max(2)).next_power_of_two();
-        let mut size = sized(buckets as f64 / FILL);
-        // Each bucket: the group's hash and its first row, or `None`.
-        let mut table = self
-            .arena
-            .alloc_slice_with(size as usize, |_| None::<(u32, u32)>)
-            .map_err(|_| arena_full())?;
-        let mut members = 0u64;
-        let mut threshold = (size as f64 * FILL) as u64;
-        for (row_at, row) in rows.iter().enumerate() {
-            let hash = row_hash(row)?;
-            'restart: loop {
-                if members >= threshold {
-                    // `SH_GROW`: each entry moved, from the first bucket that
-                    // is empty or holds an entry at its optimal place.
-                    let old = &*table;
-                    let old_size = size;
-                    size *= 2;
-                    let mask = size - 1;
-                    let grown = self
-                        .arena
-                        .alloc_slice_with(size as usize, |_| None::<(u32, u32)>)
-                        .map_err(|_| arena_full())?;
-                    let old_mask = old_size - 1;
-                    let start = (0..old_size)
-                        .find(|&at| {
-                            old[at as usize]
-                                .is_none_or(|(hash, _)| u64::from(hash) & old_mask == at)
-                        })
-                        .expect("an empty bucket");
-                    for step in 0..old_size {
-                        let at = (start + step) % old_size;
-                        if let Some(entry) = old[at as usize] {
-                            let mut place = u64::from(entry.0) & mask;
-                            while grown[place as usize].is_some() {
-                                place = (place + 1) & mask;
-                            }
-                            grown[place as usize] = Some(entry);
-                        }
-                    }
-                    table = grown;
-                    threshold = (size as f64 * FILL) as u64;
-                }
-                let mask = size - 1;
-                let start = u64::from(hash) & mask;
-                let mut place = start;
-                let mut distance = 0u64;
-                loop {
-                    let Some((held_hash, held_row)) = table[place as usize] else {
-                        table[place as usize] = Some((hash, row_at as u32));
-                        members += 1;
-                        break 'restart;
-                    };
-                    if held_hash == hash && same(&rows[held_row as usize], row)? {
-                        break 'restart;
-                    }
-                    let optimal = u64::from(held_hash) & mask;
-                    let held_distance = (place + size - optimal) & mask;
-                    if distance > held_distance {
-                        // Robin hood: shift the run forward to the next empty
-                        // bucket and take this one.
-                        let mut empty = place;
-                        let mut moved = 0u64;
-                        loop {
-                            empty = (empty + 1) & mask;
-                            if table[empty as usize].is_none() {
-                                break;
-                            }
-                            moved += 1;
-                            if moved > MAX_MOVE && members as f64 / size as f64 >= MIN_FILL {
-                                threshold = 0;
-                                continue 'restart;
-                            }
-                        }
-                        let mut at = empty;
-                        while at != place {
-                            let previous = (at + size - 1) & mask;
-                            table[at as usize] = table[previous as usize];
-                            at = previous;
-                        }
-                        table[place as usize] = Some((hash, row_at as u32));
-                        members += 1;
-                        break 'restart;
-                    }
-                    place = (place + 1) & mask;
-                    distance += 1;
-                    if distance > MAX_DIB && members as f64 / size as f64 >= MIN_FILL {
-                        threshold = 0;
-                        continue 'restart;
-                    }
-                }
-            }
-        }
-        // `SH_START_ITERATE` and `SH_ITERATE`: backwards from the first
-        // empty bucket.
-        let mask = size - 1;
-        let end = (0..size)
-            .find(|&at| table[at as usize].is_none())
-            .expect("an empty bucket");
-        let mut current = end;
-        loop {
-            let entry = table[current as usize];
-            current = (current + size - 1) & mask;
-            if let Some((_, row_at)) = entry {
-                self.bind(bound, &rows[row_at as usize], relids);
-                if !sink(bound)? {
-                    return Ok(false);
-                }
-            }
-            if current == end {
-                break;
+        let order = super::simplehash::iteration_order(
+            rows.len(),
+            buckets,
+            self.arena,
+            &mut row_hash,
+            &mut same,
+        )?;
+        for &row in order {
+            self.bind(bound, &rows[row as usize], relids);
+            if !sink(bound)? {
+                return Ok(false);
             }
         }
         Ok(true)
@@ -3184,33 +3106,44 @@ impl<'r, 'a> Runner<'r, 'a> {
         if keys.as_slice().is_empty() {
             return Ok(order);
         }
-        let mut columns = [(0usize, 0usize); 8];
-        for (at, &class) in keys.as_slice().iter().enumerate() {
+        let mut columns = [((0usize, 0usize), 0u8); 8];
+        for (at, &key) in keys.as_slice().iter().enumerate() {
+            let class = key & KEY_CLASS;
             let members = self.model.plan.classes[usize::from(class)].members();
             let member = members
                 .iter()
                 .position(|member| relids & 1 << member.rel != 0)
                 .expect("a sort key reads its input");
-            columns[at] = self.model.member(class, member as u8);
+            columns[at] = (self.model.member(class, member as u8), key);
         }
         let columns = &columns[..keys.as_slice().len()];
         crate::sql::pg_qsort::pg_qsort(order, &mut |a, b| {
-            for &column in columns {
+            for &(column, key) in columns {
                 let (one, two) = (
                     Self::value(&rows[a as usize], column),
                     Self::value(&rows[b as usize], column),
                 );
+                let first = key & KEY_NULLS_FIRST != 0;
                 let order = match (one.is_null(), two.is_null()) {
                     (true, true) => Ordering::Equal,
+                    (true, false) if first => Ordering::Less,
                     (true, false) => Ordering::Greater,
+                    (false, true) if first => Ordering::Greater,
                     (false, true) => Ordering::Less,
-                    (false, false) => crate::sql::eval::compare_datums_collated(
-                        self.storage,
-                        self.txid,
-                        self.collation(column),
-                        &one,
-                        &two,
-                    )?,
+                    (false, false) => {
+                        let order = crate::sql::eval::compare_datums_collated(
+                            self.storage,
+                            self.txid,
+                            self.collation(column),
+                            &one,
+                            &two,
+                        )?;
+                        if key & KEY_DESCENDING != 0 {
+                            order.reverse()
+                        } else {
+                            order
+                        }
+                    }
                 };
                 if order != Ordering::Equal {
                     return Ok(order);

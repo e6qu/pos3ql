@@ -6445,7 +6445,9 @@ fn plan_pulled_select<'a>(
                 order[usize::from(model.sort_items[at])]
             })
             .map_err(|_| arena_full())?;
-        // Each key shows its class's first member the target list holds.
+        // Each key shows its class's first member the target list holds,
+        // a relation no node scans (a dummy one's) unqualified.
+        let scanned = joins::scanned_rels(&model.plan, model.plan.top);
         for (key, &(table, column)) in sorted.iter_mut().zip(model.sort_shown) {
             let Some(definition) = scope.defs.stored(table) else {
                 continue;
@@ -6464,23 +6466,26 @@ fn plan_pulled_select<'a>(
                 .map_err(|_| arena_full())?;
         }
         let sorted: &[KeyItem<'_>] = sorted;
-        let sort_keys = plan_keys(
+        let unscanned = if scanned == 0 { 0 } else { !u64::from(scanned) };
+        let sort_keys = plan_keys_unscanned(
             storage,
             txid,
             Some(scope),
             statement,
             KeyLabel::Sort,
             sorted,
+            unscanned,
             arena,
         )?;
         let presorted = match model.plan.upper.sort {
-            Some((_, _, presorted)) if presorted > 0 => Some(plan_keys(
+            Some((_, _, presorted)) if presorted > 0 => Some(plan_keys_unscanned(
                 storage,
                 txid,
                 Some(scope),
                 statement,
                 KeyLabel::Sort,
                 &sorted[..usize::from(presorted)],
+                unscanned,
                 arena,
             )?),
             _ => None,
@@ -6526,12 +6531,102 @@ fn plan_pulled_select<'a>(
         } else {
             None
         };
+        // A `GROUP BY`'s `HashAggregate`, or its `GroupAggregate` over the
+        // joined rows sorted by its keys.
+        let mut group_nodes = [PlanNode::EMPTY; 2];
+        let mut group_count = 0;
+        if let (Some(group), Some(chosen)) = (model.group, model.plan.upper.group) {
+            let items = arena
+                .alloc_slice_with(group.keys.len(), |at| {
+                    let (position, flags) = group.keys[at];
+                    (
+                        statement.group_by[position],
+                        Some((
+                            flags & query::index_paths::joins::KEY_DESCENDING != 0,
+                            flags & query::index_paths::joins::KEY_NULLS_FIRST != 0,
+                        )),
+                    )
+                })
+                .map_err(|_| arena_full())?;
+            let unsorted = arena
+                .alloc_slice_with(items.len(), |at| (items[at].0, None))
+                .map_err(|_| arena_full())?;
+            let group_keys = plan_keys(
+                storage,
+                txid,
+                Some(scope),
+                statement,
+                KeyLabel::Group,
+                unsorted,
+                arena,
+            )?;
+            group_nodes[0] = PlanNode {
+                name: StackStr::from_str(if group.hashed {
+                    "HashAggregate"
+                } else {
+                    "GroupAggregate"
+                }),
+                key: Some(NodeKey::new(block, Role::Aggregate)),
+                startup_cost: chosen.startup,
+                total_cost: chosen.total,
+                rows: chosen.rows as u64,
+                width: chosen.width as u32,
+                keys: group_keys,
+                ..PlanNode::EMPTY
+            };
+            group_count = 1;
+            if let Some((startup, total, presorted)) = chosen.input_sort {
+                let mut node = PlanNode {
+                    name: StackStr::from_str(if presorted == 0 {
+                        "Sort"
+                    } else {
+                        "Incremental Sort"
+                    }),
+                    key: Some(NodeKey::new(block, Role::GroupSort)),
+                    startup_cost: startup,
+                    total_cost: total,
+                    rows: chosen.input.rows as u64,
+                    width: model.output_width as u32,
+                    keys: plan_keys(
+                        storage,
+                        txid,
+                        Some(scope),
+                        statement,
+                        KeyLabel::Sort,
+                        items,
+                        arena,
+                    )?,
+                    ..PlanNode::EMPTY
+                };
+                if presorted > 0 {
+                    let prefix = plan_keys(
+                        storage,
+                        txid,
+                        Some(scope),
+                        statement,
+                        KeyLabel::Sort,
+                        &items[..usize::from(presorted)],
+                        arena,
+                    )?;
+                    node = node
+                        .with_qual(QualLabel::PresortedKey, presorted_text(&prefix, false))
+                        .with_verbose_qual(QualLabel::PresortedKey, presorted_text(&prefix, true));
+                }
+                group_nodes[1] = node;
+                group_count = 2;
+            }
+        }
         let mut plan = joins::join_plan(
             storage,
             txid,
             scope,
             &model,
-            (sort_keys, presorted, aggregate_node),
+            (
+                sort_keys,
+                presorted,
+                aggregate_node,
+                &group_nodes[..group_count],
+            ),
             block,
             arena,
         )?;
@@ -10066,6 +10161,22 @@ fn plan_keys(
     keys: &[KeyItem<'_>],
     arena: &Arena,
 ) -> Result<PlanKeys, SqlError> {
+    plan_keys_unscanned(storage, txid, scope, statement, label, keys, 0, arena)
+}
+
+/// [`plan_keys`] of a plan that does not scan the relations of
+/// `unscanned` (a join's dummy relations), whose columns print unqualified.
+#[expect(clippy::too_many_arguments, reason = "explain key plumbing")]
+fn plan_keys_unscanned(
+    storage: &Storage,
+    txid: u32,
+    scope: Option<&QueryScope<'_>>,
+    statement: &Select<'_>,
+    label: KeyLabel,
+    keys: &[KeyItem<'_>],
+    unscanned: u64,
+    arena: &Arena,
+) -> Result<PlanKeys, SqlError> {
     // A query without FROM reads no relation.
     let relations = scope.map_or(0, |scope| scope.n);
     if keys.is_empty() {
@@ -10073,6 +10184,19 @@ fn plan_keys(
     }
     let Some(joined) = key_relations(scope, statement, arena)? else {
         return Ok(PlanKeys::NONE);
+    };
+    let joined = if unscanned == 0 {
+        joined
+    } else {
+        &*arena
+            .alloc_slice_with(joined.len(), |table| {
+                let mut relation = joined[table];
+                if unscanned & 1 << table != 0 {
+                    relation.printed = "";
+                }
+                relation
+            })
+            .map_err(|_| arena_full())?
     };
     let mut shown = PlanKeys {
         label,
@@ -14117,11 +14241,25 @@ pub(super) fn visit_text_rows<E>(
                 }
                 let _ = write!(
                     line,
-                    "{label} Groups: {}  Sort Method: quicksort  Average Memory: {}kB  Peak Memory: {}kB",
+                    "{label} Groups: {}  Sort Method{}",
                     kind.count,
-                    (kind.total_bytes / kind.count as usize).div_ceil(1024),
-                    kind.peak_bytes.div_ceil(1024)
+                    if kind.methods().count() > 1 {
+                        "s: "
+                    } else {
+                        ": "
+                    }
                 );
+                for (at, name) in kind.methods().enumerate() {
+                    let _ = write!(line, "{}{name}", if at > 0 { ", " } else { "" });
+                }
+                if kind.peak_kb > 0 {
+                    let _ = write!(
+                        line,
+                        "  Average Memory: {}kB  Peak Memory: {}kB",
+                        kind.average_kb(),
+                        kind.peak_kb
+                    );
+                }
                 emit(line.as_str())?;
             }
         }
@@ -15419,13 +15557,10 @@ fn structured_node(
             }
             document.open_group("Incremental Sort Groups", Some(label), true);
             document.number("Group Count", kind.count);
-            document.list("Sort Methods Used", core::iter::once("quicksort"));
+            document.list("Sort Methods Used", kind.methods());
             document.open_group("Sort Space", Some("Sort Space Memory"), true);
-            document.number(
-                "Average Sort Space Used",
-                (kind.total_bytes / kind.count as usize).div_ceil(1024),
-            );
-            document.number("Peak Sort Space Used", kind.peak_bytes.div_ceil(1024));
+            document.number("Average Sort Space Used", kind.average_kb());
+            document.number("Peak Sort Space Used", kind.peak_kb);
             document.close_group("Sort Space", true);
             document.close_group("Incremental Sort Groups", true);
         }

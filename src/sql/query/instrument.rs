@@ -223,20 +223,53 @@ pub(crate) enum MergeChange {
     Delete,
 }
 
-/// The batches of one kind an incremental sort sorted: their count and the
-/// bytes of rows they held, summed and at most.
+/// The batches of one kind an incremental sort sorted
+/// (`IncrementalSortGroupInfo`).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) struct SortGroups {
     pub(crate) count: u64,
-    pub(crate) total_bytes: usize,
-    pub(crate) peak_bytes: usize,
+    /// The kilobytes each group reported, summed, and their peak
+    /// (`totalMemorySpaceUsed`, `maxMemorySpaceUsed`).
+    pub(crate) total_kb: u64,
+    pub(crate) peak_kb: u64,
+    /// The sort methods the groups used (`sortMethods`): a top-N heapsort
+    /// and a quicksort.
+    pub(crate) top_n: bool,
+    pub(crate) quicksort: bool,
+    /// The most memory the batches' sort held so far
+    /// (`tuplesort_updatemax`), which each group reports.
+    max_space: usize,
 }
 
 impl SortGroups {
-    fn add(&mut self, bytes: usize) {
+    /// `instrumentSortedGroup` after a batch whose sort held `bytes`.
+    pub(crate) fn add_sorted(&mut self, bytes: usize, top_n: bool) {
+        self.max_space = self.max_space.max(bytes);
+        let kb = self.max_space.div_ceil(1024) as u64;
         self.count += 1;
-        self.total_bytes = self.total_bytes.saturating_add(bytes);
-        self.peak_bytes = self.peak_bytes.max(bytes);
+        self.total_kb += kb;
+        self.peak_kb = self.peak_kb.max(kb);
+        self.top_n |= top_n;
+        self.quicksort |= !top_n;
+    }
+
+    fn add(&mut self, bytes: usize) {
+        self.add_sorted(bytes, false);
+    }
+
+    /// The methods' names in `show_incremental_sort_group_info`'s order.
+    pub(crate) fn methods(&self) -> impl Iterator<Item = &'static str> {
+        [
+            (self.top_n, "top-N heapsort"),
+            (self.quicksort, "quicksort"),
+        ]
+        .into_iter()
+        .filter_map(|(used, name)| used.then_some(name))
+    }
+
+    /// The average kilobytes a group reported.
+    pub(crate) fn average_kb(&self) -> u64 {
+        self.total_kb / self.count.max(1)
     }
 }
 
@@ -281,8 +314,11 @@ impl IncrementalSortBatches {
     pub(crate) const fn new() -> Self {
         const NONE: SortGroups = SortGroups {
             count: 0,
-            total_bytes: 0,
-            peak_bytes: 0,
+            total_kb: 0,
+            peak_kb: 0,
+            top_n: false,
+            quicksort: false,
+            max_space: 0,
         };
         Self {
             groups: IncrementalGroups {

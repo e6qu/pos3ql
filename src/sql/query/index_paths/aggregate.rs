@@ -360,6 +360,20 @@ pub(crate) fn hash_agg_sizing(
     })
 }
 
+/// The buckets `build_hash_table` asks of a hash aggregate of `groups`
+/// estimated groups over rows `width` bytes wide (`hash_choose_num_buckets`).
+pub(crate) fn hash_agg_buckets(aggregates: &AggregateCosts, groups: f64, width: f64) -> usize {
+    let entry_size =
+        hash_agg_entry_size(aggregates.transitions, width, aggregates.transition_space);
+    let (memory, _, _) = hash_agg_set_limits(entry_size, groups);
+    crate::sql::query::postgres_memory::HashAggSizing::buckets(
+        entry_size,
+        groups,
+        memory,
+        aggregates.transitions,
+    )
+}
+
 /// The buckets `build_hash_table` asks of a hash aggregate without
 /// transition states over `groups` estimated groups of rows `width` bytes
 /// wide (`hash_choose_num_buckets`).

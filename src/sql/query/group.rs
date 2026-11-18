@@ -20,8 +20,7 @@ use super::aggregate::AggState;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
     JoinRow, Outcome, QueryScope, ScopeSchema, arena_full, expr_contains_node, instrument,
-    pax_column_demand, resolve_order_target, scan_source_recycling_with_pax_columns,
-    scan_source_with_pax_columns, sql_fail, sql_ok,
+    pax_column_demand, resolve_order_target, sql_fail, sql_ok,
 };
 use crate::storage::Storage;
 
@@ -239,7 +238,9 @@ pub(super) fn groups_for_mask<'a>(
         let mut at = 0u32;
         // Keying the rows is not one of the plan's scans; the update pass is.
         let _keying = instrument::suspend();
-        scan_source_recycling_with_pax_columns(
+        super::join_exec::scan_statement_source(
+            statement,
+            true,
             storage,
             scope,
             from,
@@ -358,7 +359,9 @@ pub(super) fn groups_for_mask<'a>(
             // Keying the rows is not one of the plan's scans; the update
             // pass is.
             let _keying = instrument::suspend();
-            scan_source_with_pax_columns(
+            super::join_exec::scan_statement_source(
+                statement,
+                false,
                 storage,
                 scope,
                 from,
@@ -873,12 +876,112 @@ pub(super) fn groups_for_mask<'a>(
     let out_rows = arena
         .alloc_slice_with(output_count, |_| empty)
         .map_err(|_| arena_full())?;
+    let order = match outer {
+        None if statement.grouping_sets.is_empty() => modeled_group_order(
+            storage,
+            scope,
+            txid,
+            statement,
+            params,
+            arena,
+            group_of,
+            rep_keys,
+            group_collations,
+        )?,
+        _ => None,
+    };
     let mut output = 0usize;
-    for rows in per_group {
+    for at in 0..n_groups {
+        let rows = per_group[order.map_or(at, |order| order[at] as usize)];
         out_rows[output..output + rows.len()].copy_from_slice(rows);
         output += rows.len();
     }
     Ok(out_rows)
+}
+
+/// The order a join's grouping PostgreSQL's planner plans returns its
+/// groups in: a `HashAggregate` its hash table's (`TupleHashTableHash` of
+/// the keys, inserted in the join's row order), a `GroupAggregate` its
+/// sort's. `group_of` gives each joined row's group, by its keys'
+/// ascending order, and `keys` each group's keys.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+fn modeled_group_order<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    txid: u32,
+    statement: &'a Select<'a>,
+    params: &[Datum<'a>],
+    arena: &'a Arena,
+    group_of: &[u32],
+    keys: &[&[u8]],
+    group_collations: &[Collation],
+) -> Result<Option<&'a [u32]>, SqlError> {
+    let Some(model) = super::index_paths::join_query::modeled_join(
+        storage, txid, statement, scope, params, arena,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(group) = model.group else {
+        return Ok(None);
+    };
+    let order = arena
+        .alloc_slice_with(keys.len(), |at| at as u32)
+        .map_err(|_| arena_full())?;
+    if group.hashed {
+        // Each group's hash: its keys' hashes, each earlier one rotated left
+        // a bit, a null key hashing to zero (`ExecBuildHash32FromAttrs`).
+        let hashes = arena
+            .alloc_slice_with(keys.len(), |_| 0u32)
+            .map_err(|_| arena_full())?;
+        for (hash, key) in hashes.iter_mut().zip(keys) {
+            let mut combined = 0u32;
+            for &(position, _) in group.keys {
+                combined = combined.rotate_left(1);
+                let value = crate::sql::exec::decode_projected_col_record(key, position, arena)?;
+                if !matches!(value, Datum::Null) {
+                    combined ^= super::join_exec::datum_hash(&value).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "the hash order of this grouping key type is not supported"
+                        )
+                    })?;
+                }
+            }
+            *hash = super::simplehash::murmur32(combined);
+        }
+        let firsts = super::simplehash::iteration_order(
+            group_of.len(),
+            group.buckets,
+            arena,
+            &mut |row| Ok(hashes[group_of[row] as usize]),
+            &mut |left, right| Ok(group_of[left] == group_of[right]),
+        )?;
+        for (slot, &row) in order.iter_mut().zip(firsts) {
+            *slot = group_of[row as usize];
+        }
+    } else {
+        crate::util::try_sort_unstable_by(order, |&left, &right| {
+            for &(position, flags) in group.keys {
+                let ordering = super::materialize::compare_ordered_key(
+                    storage,
+                    txid,
+                    group_collations[position],
+                    (
+                        flags & super::index_paths::joins::KEY_DESCENDING != 0,
+                        flags & super::index_paths::joins::KEY_NULLS_FIRST != 0,
+                    ),
+                    crate::sql::exec::ProjectedValue::column(keys[left as usize], position),
+                    crate::sql::exec::ProjectedValue::column(keys[right as usize], position),
+                )?;
+                if !ordering.is_eq() {
+                    return Ok(ordering);
+                }
+            }
+            Ok(core::cmp::Ordering::Equal)
+        })?;
+    }
+    Ok(Some(order))
 }
 
 /// The row-producing half of grouped/aggregate execution: runs the scans,
@@ -961,7 +1064,9 @@ pub(super) fn grouped_rows<'a>(
     if !statement.group_by.is_empty() {
         // Sizing the groups is not one of the plan's scans.
         let _sizing = instrument::suspend();
-        scan_source_recycling_with_pax_columns(
+        super::join_exec::scan_statement_source(
+            statement,
+            true,
             storage,
             scope,
             from,
@@ -1193,6 +1298,29 @@ pub(super) fn grouped_rows<'a>(
             )?,
             _ => instrument::SortSpace::postgres(out_rows, Some(&columns[..count]), false),
         };
+        // The `Sort` over a join's grouping PostgreSQL's planner plans is
+        // its tuplesort, over the groups in their grouping's order.
+        let modeled = outer.is_none()
+            && scope.n > 1
+            && super::index_paths::join_query::modeled_join(
+                storage, txid, statement, scope, params, arena,
+            )?
+            .is_some_and(|model| model.group.is_some());
+        if modeled {
+            let held = arena.alloc_slice_copy(out_rows).map_err(|_| arena_full())?;
+            let order = arena
+                .alloc_slice_with(held.len(), |at| at as u32)
+                .map_err(|_| arena_full())?;
+            let kept = crate::sql::pg_qsort::pg_tuplesort(order, bounded, &mut |a, b| {
+                compare(&held[a as usize], &held[b as usize])
+            })?;
+            for (slot, &at) in out_rows.iter_mut().zip(&order[..kept]) {
+                *slot = held[at as usize];
+            }
+            stages.sort.sorted(space);
+            let out_rows = &mut out_rows[..kept];
+            return Ok((out_rows, width));
+        }
         match bound {
             Some(bound) => {
                 crate::mem::arena::try_stable_top_n_via(arena, out_rows, bound, compare, |_| {

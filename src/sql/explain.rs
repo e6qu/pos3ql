@@ -6436,6 +6436,12 @@ fn plan_pulled_select<'a>(
             let Some((table, column)) = shown else {
                 continue;
             };
+            if let Some(id) =
+                query::index_paths::joins::Member::plain(0, column as u16).expression_id()
+            {
+                key.0 = model.expressions[id].expression;
+                continue;
+            }
             let Some(definition) = scope.defs.stored(table) else {
                 continue;
             };
@@ -6618,8 +6624,9 @@ fn plan_pulled_select<'a>(
         // The window clauses' nodes, top first, above any grouping.
         let mut upper_nodes = [PlanNode::EMPTY; 2 + 2 * query::index_paths::joins::MAX_WINDOWS];
         let mut upper_count = 0;
+        let mut window_names: &[&str] = &[];
         if !model.windows.is_empty() {
-            let (nodes, _, _) = window_stages(
+            let (nodes, _, names) = window_stages(
                 storage,
                 txid,
                 Some(scope),
@@ -6638,6 +6645,7 @@ fn plan_pulled_select<'a>(
                 block,
                 arena,
             )?;
+            window_names = names;
             for node in nodes.iter().rev() {
                 upper_nodes[upper_count] = *node;
                 // Execution computes windows over the joined rows only.
@@ -6653,12 +6661,53 @@ fn plan_pulled_select<'a>(
             upper_nodes[upper_count] = *node;
             upper_count += 1;
         }
+        // `VERBOSE`'s target lists of a join without row locks: the join
+        // computes the scan/join target, the grouping and window nodes
+        // theirs, the `Sort` and `Limit` above them return their input's.
+        let verbose_targets = if statement.locking.is_empty() {
+            let mut stages = [targets::Stage {
+                name: "Join",
+                passthrough: false,
+            }; 3 + 2 + 2 * query::index_paths::joins::MAX_WINDOWS];
+            let mut count = 1;
+            for node in upper_nodes[..upper_count].iter().rev() {
+                stages[count].name = node.name.as_str();
+                count += 1;
+            }
+            for (present, name) in [
+                (model.plan.upper.sort.is_some(), "Sort"),
+                (model.plan.upper.limit.is_some(), "Limit"),
+            ] {
+                if present {
+                    stages[count].name = name;
+                    count += 1;
+                }
+            }
+            targets::BlockTargets::new(
+                storage,
+                txid,
+                statement,
+                Some(scope),
+                true,
+                &stages[..count],
+                &[],
+                window_names,
+                aggregate,
+                true,
+                &[],
+                arena,
+            )?
+            .filter(|found| (0..scope.n).all(|table| !found.reads_whole_row(table)))
+        } else {
+            None
+        };
         let mut plan = joins::join_plan(
             storage,
             txid,
             scope,
             &model,
             (sort_keys, presorted, &upper_nodes[..upper_count]),
+            verbose_targets.as_ref(),
             block,
             arena,
         )?;
@@ -9569,6 +9618,9 @@ fn windowed_scan_path<'a>(
         .scan(storage, txid, path, &[], arena)?
         .path;
     let upper = model.plan.upper;
+    // The scan computes the windows' input (`make_window_input_target`).
+    scan.width = model.output_width as u32;
+    scan.total_cost = upper.top_total;
     scan.sort = match upper.sort {
         None => query::index_paths::SortKind::None,
         Some((_, _, 0)) => query::index_paths::SortKind::Full,
@@ -10683,6 +10735,51 @@ fn join_node(kind: Option<crate::sql::ast::JoinKind>, hash: bool) -> &'static st
         (_, true) => "Hash Join",
         (_, false) => "Nested Loop",
     }
+}
+
+/// pos3ql plans no parallel query. With `max_parallel_workers_per_gather`
+/// above zero PostgreSQL gives a scan of a relation of at least
+/// `min_parallel_table_scan_size` pages partial paths (`create_plain_partial_paths`
+/// through `compute_parallel_worker`), which may win: such a plan's EXPLAIN
+/// fails with `0A000` rather than print a plan PostgreSQL may not choose.
+/// Smaller relations get no parallel workers, so their plans are exact at
+/// any setting.
+pub(super) fn refuse_parallel_candidates(
+    plan: &Plan<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    if crate::sql::guc::planner_value("max_parallel_workers_per_gather") == 0.0 {
+        return Ok(());
+    }
+    let nodes = &plan.nodes[..plan.count];
+    // A write or a row lock is never planned in parallel
+    // (`standard_planner`'s `parallelModeOK`, `max_parallel_hazard`).
+    if nodes.iter().any(|node| {
+        let name = node.name.as_str();
+        ["LockRows", "Insert", "Update", "Delete", "Merge"].contains(&name)
+    }) {
+        return Ok(());
+    }
+    let threshold = crate::sql::guc::planner_value("min_parallel_table_scan_size");
+    for node in nodes {
+        // Only a relation's own scan gets partial paths.
+        if node.relation.is_empty() || !node.name.as_str().ends_with("Scan") {
+            continue;
+        }
+        let schema = (!node.schema.is_empty()).then_some(node.schema.as_str());
+        let Some(slot) = relation_slot(storage, txid, schema, node.relation.as_str()) else {
+            continue;
+        };
+        if query::index_paths::relation_size(storage, slot, txid).pages >= threshold {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN of a scan of \"{}\", which PostgreSQL may run in parallel, is not supported with max_parallel_workers_per_gather above 0",
+                node.relation.as_str()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn relation_slot(storage: &Storage, txid: u32, schema: Option<&str>, name: &str) -> Option<usize> {

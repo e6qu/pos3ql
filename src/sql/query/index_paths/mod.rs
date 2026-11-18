@@ -944,6 +944,7 @@ impl IndexInfo {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct Planner<'s, 'a> {
     /// The key expressions of the table's indexes, numbered after its
     /// columns.
@@ -1075,8 +1076,9 @@ impl<'s, 'a: 's> Planner<'s, 'a> {
         if stadistinct < 0.0 {
             return (clamp_row_est(-stadistinct * tuples), false);
         }
+        // A small relation's rows, which is no default.
         if tuples < DEFAULT_NUM_DISTINCT {
-            return (clamp_row_est(tuples), true);
+            return (clamp_row_est(tuples), false);
         }
         (DEFAULT_NUM_DISTINCT, true)
     }

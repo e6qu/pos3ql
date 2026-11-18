@@ -126,7 +126,7 @@ impl<'a> ExpressionVariables<'a> {
 /// `expression` with each column it reads named by `definition`'s column
 /// name, unqualified; `None` when a column is no column of the table, or
 /// the expression reads a whole row or a subquery.
-fn canonical<'a>(
+pub(super) fn canonical<'a>(
     expression: &'a Expr<'a>,
     resolve: &dyn Fn(Option<&str>, &str) -> Option<usize>,
     definition: &TableDef,

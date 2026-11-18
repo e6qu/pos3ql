@@ -54,6 +54,9 @@ split-debuginfo = "off"
 # for the large library test executable. Keep development assertions and checks.
 [profile.native-ci]
 inherits = "dev"
+# CI runners are discarded after each job, so the unpacked object files cost
+# nothing there; keep the platform's split-debuginfo setting for link time.
+split-debuginfo = "unpacked"
 opt-level = 0
 debug = "line-tables-only"
 debug-assertions = true

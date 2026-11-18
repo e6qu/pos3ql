@@ -390,6 +390,11 @@ long report keeps its selected versions until it finishes.
 **Done today:** row metadata, foreground row work, table definitions, index
 bindings, analyzed columns and procedural execution state share explicit pools.
 [Architecture](docs/architecture.md#memory-and-physical-size) lists them.
+With object storage on, a write that finds the memtable full no longer fails
+while committed rows can spill: the statement rolls back, waits for a
+checkpoint the reactor drives, and runs again. Only a statement (with its
+transaction) whose own uncommitted rows exceed `memtable_bytes` fails, with
+`54000`.
 
 **Remaining:**
 
@@ -1062,27 +1067,68 @@ inputs extend the grouping's pathkeys by the keys most of them share
 (`differential_exact/887`); a query of one relation is planned through the
 same search for either. An `EXPLAIN` showing costs of a scan, aggregate or
 window whose estimates the planner model did not produce fails with
-`0A000` rather than print pos3ql's own figures. Remaining for windows:
-partition or order keys that are expressions, window functions inside
+`0A000` rather than print pos3ql's own figures. pos3ql plans no parallel
+query. `max_parallel_workers_per_gather` is PostgreSQL's setting (default 2,
+0 to 1024, shown by `EXPLAIN (SETTINGS)`): a relation below
+`min_parallel_table_scan_size` gets no parallel workers in PostgreSQL
+(`compute_parallel_worker`), so its plans match at any value, and with the
+setting above 0 an `EXPLAIN` of a query scanning a relation at least that
+large fails with `0A000`, since PostgreSQL may choose a `Gather` there (a
+write or a row lock is never parallel, so its plan prints); at 0 every plan
+is exact (`differential_exact/931`). A join condition whose
+side is an expression of one relation's columns (`a.k + 1 = b.k`,
+`lower(a.t) = lower(b.t)`) makes the expression a member of its
+equivalence class (`process_equivalence`), computed by its relation's scan:
+it hashes, merges (its sort's key and the `Merge Cond` reading it from the
+sort parenthesized), keys a `Memoize` cache (`(b.w * 2)`), parameterizes an
+index scan of the other side and, through an index on the expression, of
+its own (`match_index_to_operand`, the index's statistics read by
+`examine_variable`), estimated without statistics otherwise
+(`get_variable_numdistinct`, `estimate_num_groups` reading its columns);
+an `ORDER BY`, window partition or order key or ordered aggregate input
+of such an expression sorts by its class, a window's input computing it
+(`make_window_input_target`). A full join's merged `USING` column, or a
+`COALESCE` of its compared columns, equated with a constant equates each
+side with the constant instead (`reconsider_full_join_clause`,
+`differential_exact/888`). `EXPLAIN VERBOSE` of a plan that search builds
+prints each node's target list as `createplan.c` builds it: the top join
+computes the select list, a lower join its relations' columns needed above
+it in its first building pair's order (`build_joinrel_tlist`), a scan under
+a `Hash`, `Sort`, `Materialize` or `Memoize` or a batched hash join's outer
+scan only the columns needed, another scan its physical columns (an
+index-only scan its index's), a unique-ified relation's input and a merge
+join's sort the compared expressions they compute, and a join with a
+unique inner relation `Inner Unique: true` (`differential_exact/930`);
+under grouping and windows the join computes their input target and each
+node its own list, a window's `ORDER BY` keys entering the list before its
+`PARTITION BY` keys (`transformWindowDefinitions`). A join with row locks is
+planned outside that search. An expression of several relations compared
+with a constant (`(a.x + b.y) = 10`, a `COALESCE` whose operands no full
+join clause matches in order, such as `COALESCE(b.k, a.k) = 30` under
+`a FULL JOIN b ON a.k = b.k`) filters the join's rows, estimated as
+`eqjoinsel` of operands without statistics (`DEFAULT_NUM_DISTINCT`) or the
+default inequality selectivity. A relation with a statistics object joins:
+its parameterized scans' estimates apply no statistics object, as
+`find_single_rel_for_clauses` finds no single relation for a list holding
+a join clause (`differential_exact/889`). Remaining for windows: window functions inside
 expressions or the `ORDER BY`, windows over one relation's groups, the
 merging of window clauses equal once `optimize_window_clauses` frees their
 frames, run conditions (`find_window_run_conditions`, which needs the
 subquery scan below), and `EXPLAIN ANALYZE` of windows over an index scan,
 under a limit directly above them or over a join's groups (`0A000`:
 execution reads the input by its own scan); for presorted aggregates:
-`ORDER BY` or `DISTINCT` inputs that are expressions, and `EXPLAIN
-ANALYZE` of their sort (`0A000`: its tuples' memory is not modeled).
-Remaining for that search: join conditions of
-expressions (`a.k + 1 = b.k`) and conditions over several relations
-other than comparisons of columns (`COALESCE(a.id, 0) < b.id`), an `OR`
+`EXPLAIN ANALYZE` of their sort (`0A000`: its tuples' memory is not modeled).
+Remaining for that search: an equality whose side reads several
+relations (`a.x + b.y = c.z`, an equivalence class member PostgreSQL hashes
+and merges by) and other conditions comparing expressions of several
+relations with each other (`COALESCE(a.id, 0) < b.id`), an `OR`
 of join conditions that a semi or anti join evaluates
 (`clauselist_selectivity_or` under `eqjoinsel_semi`), an `OR` join clause
 that an indexed relation's parameterized scan evaluates (as a filter, or
 as a `BitmapOr` of parameterized index scans), a merge join over a partly sorted outer input (`Incremental
 Sort`), a right-nested outer join (`a LEFT JOIN (b JOIN c) ON ...`) and
 derived tables kept as subqueries (`SubqueryScan`), self-join removal
-(`remove_useless_self_joins`), a constant equated with a full join's
-compared column (`reconsider_full_join_clause`) or with an outer join's
+(`remove_useless_self_joins`), a constant equated with an outer join's
 column another outer join nulls, `UPDATE ... FROM` and `DELETE ...
 USING` through the same search, more relations than
 `join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,

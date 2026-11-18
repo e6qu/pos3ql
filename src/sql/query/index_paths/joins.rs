@@ -65,11 +65,34 @@ impl Member {
         }
     }
 
+    /// Expression `id` of the query's [`EXPRESSION_COLUMN`] numbering, read
+    /// at relation `rel`'s scan.
+    pub(crate) const fn expression(rel: u8, id: u16) -> Self {
+        Self::plain(rel, EXPRESSION_COLUMN | id)
+    }
+
+    /// The query expression the member is, when it is no plain column.
+    pub(crate) const fn expression_id(&self) -> Option<usize> {
+        if self.column & EXPRESSION_COLUMN != 0 {
+            Some((self.column & !EXPRESSION_COLUMN) as usize)
+        } else {
+            None
+        }
+    }
+
     /// `em_relids`.
     pub(crate) const fn relids(&self) -> Relids {
         1 << self.rel | self.nulling
     }
 }
+
+/// The bit of a [`Member::column`] that makes it an expression of its
+/// relation's columns rather than a column: an `EquivalenceMember` whose
+/// `em_expr` is no `Var`, such as `a.k + 1`, which the relation's scan
+/// computes.
+pub(crate) const EXPRESSION_COLUMN: u16 = 0x8000;
+/// Expressions one query's classes hold.
+pub(crate) const MAX_JOIN_EXPRESSIONS: usize = 16;
 
 /// An equivalence class of columns compared by one btree and hash
 /// operator family. A class holding a constant joins nothing: its members
@@ -84,6 +107,21 @@ pub(crate) struct EquivalenceClass {
 impl EquivalenceClass {
     pub(crate) fn members(&self) -> &[Member] {
         &self.members[..usize::from(self.count)]
+    }
+
+    /// The member a sort of rows of `relids` sorts by
+    /// (`prepare_sort_from_pathkeys`): the first column among the input's
+    /// target list, else the first expression it can compute.
+    pub(crate) fn sort_member(&self, relids: Relids) -> Option<usize> {
+        let members = self.members();
+        members
+            .iter()
+            .position(|member| relids & 1 << member.rel != 0 && member.expression_id().is_none())
+            .or_else(|| {
+                members
+                    .iter()
+                    .position(|member| relids & 1 << member.rel != 0)
+            })
     }
 
     /// `ec_relids`.
@@ -157,6 +195,10 @@ pub(crate) struct Clause {
     pub(crate) operands: Option<(Member, Member)>,
     /// What a semi or anti join estimates another condition by.
     pub(crate) other: OtherShape,
+    /// A constant (the `true` an outer join clause gave way to), which a
+    /// right or full merge join evaluates as a join condition
+    /// (`select_mergejoin_clauses`).
+    pub(crate) constant: bool,
     /// `cost_qual_eval`'s per-tuple cost.
     pub(crate) cost: f64,
     /// Its selectivity for an inner join (`norm_selec`), once computed.
@@ -508,6 +550,8 @@ pub(crate) enum PathKind {
         hash: ClauseList,
         buckets: u32,
         batches: u32,
+        /// The inner relation is unique for the join's clauses.
+        inner_unique: bool,
     },
     MergeJoin {
         jointype: JoinType,
@@ -873,6 +917,9 @@ pub(crate) struct JoinProblem<'p> {
     /// (`source` `None`).
     pub(crate) clauses: &'p [Clause],
     pub(crate) needed: &'p [NeededColumn],
+    /// Each expression member's evaluation cost per row
+    /// (`cost_qual_eval` of `em_expr`), by [`Member::expression_id`].
+    pub(crate) expression_costs: &'p [f64],
     pub(crate) settings: JoinSettings,
     /// The query's foreign keys, as `root->fkey_list` holds them.
     pub(crate) foreign_keys: &'p [ForeignKeyJoin],
@@ -1922,16 +1969,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         }
         let members = self.problem.classes[usize::from(class)].members();
         let relids = members[usize::from(outer)].relids() | members[usize::from(inner)].relids();
-        let cost = self
-            .clauses
-            .borrowed_slice()
-            .iter()
-            .find(
-                |clause| matches!(clause.form, ClauseForm::Equality { class: c, .. } if c == class),
-            )
-            .map_or(self.problem.settings.costs.cpu_operator, |clause| {
-                clause.cost
-            });
+        let cost = self.problem.settings.costs.cpu_operator
+            + self.member_cost(members[usize::from(outer)])
+            + self.member_cost(members[usize::from(inner)]);
         let id = self.clauses.len();
         if id >= MAX_CLAUSES {
             return Err(too_many());
@@ -1954,6 +1994,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 outer_relids: 0,
                 operands: None,
                 other: OtherShape::Plain,
+                constant: false,
                 source: None,
             })
             .map_err(|_| arena_full())?;
@@ -3047,7 +3088,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 continue;
             }
             let Some((_, _, left, right)) = self.sides(id) else {
-                nonmergeable = true;
+                nonmergeable |= !self.clause(id).constant;
                 continue;
             };
             if self.outer_is_left(id, outer, inner).is_none() {
@@ -3649,6 +3690,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             .push((id, rescan_startup, rescan_total))
             .map_err(|_| arena_full())?;
         Ok(Some(id))
+    }
+
+    /// A member's evaluation cost per row: none for a column.
+    fn member_cost(&self, member: Member) -> f64 {
+        member
+            .expression_id()
+            .map_or(0.0, |id| self.problem.expression_costs[id])
     }
 
     /// The width of a base relation's column, as its target list has it.
@@ -4500,7 +4548,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         startup += inner_path.total;
         startup += (costs.cpu_operator * clauses + costs.cpu_tuple) * inner_path.rows;
         run += costs.cpu_operator * clauses * outer_path.rows;
-        let sizing = choose_hash_table_size(inner_path.rows, inner_path.width, settings);
+        // Costing always reserves the skew table (`useskew`).
+        let sizing = choose_hash_table_size(inner_path.rows, inner_path.width, true, settings);
         if sizing.batches > 1 {
             let outer_pages = page_size(outer_path.rows, outer_path.width);
             let inner_pages = page_size(inner_path.rows, inner_path.width);
@@ -4583,6 +4632,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     hash,
                     buckets: sizing.buckets,
                     batches: sizing.batches,
+                    inner_unique: inputs.inner_unique,
                 },
                 relids: joined,
                 rows: param_rows.unwrap_or(rel.rows),
@@ -4691,6 +4741,7 @@ pub(crate) struct HashSizing {
 pub(crate) fn choose_hash_table_size(
     tuples: f64,
     width: f64,
+    useskew: bool,
     settings: JoinSettings,
 ) -> HashSizing {
     /// `HJTUPLE_OVERHEAD` and `MAXALIGN(SizeofMinimalTupleHeader)`.
@@ -4705,7 +4756,11 @@ pub(crate) fn choose_hash_table_size(
     // `bytes_per_mcv`: the tuple, eight bucket pointers, the skew bucket
     // number and the `HashSkewBucket`.
     let per_mcv = tuple_size + 8.0 * POINTER + 4.0 + 16.0;
-    let mut skew_mcvs = ((table_bytes / per_mcv).trunc() * 2.0 / 100.0).trunc();
+    let mut skew_mcvs = if useskew {
+        ((table_bytes / per_mcv).trunc() * 2.0 / 100.0).trunc()
+    } else {
+        0.0
+    };
     if skew_mcvs > 0.0 {
         table_bytes -= skew_mcvs * per_mcv;
     }
@@ -5002,7 +5057,7 @@ mod tests {
     fn hash_table_sizes_follow_exec_choose_hash_table_size() {
         // 1000 rows of 12 bytes fit work_mem's doubled hash memory.
         assert_eq!(
-            choose_hash_table_size(1000.0, 12.0, settings()),
+            choose_hash_table_size(1000.0, 12.0, true, settings()),
             HashSizing {
                 buckets: 1024,
                 batches: 1,
@@ -5011,7 +5066,7 @@ mod tests {
             }
         );
         assert_eq!(
-            choose_hash_table_size(5000.0, 12.0, settings()).buckets,
+            choose_hash_table_size(5000.0, 12.0, true, settings()).buckets,
             8192
         );
     }
@@ -5113,6 +5168,7 @@ mod tests {
                 outer_relids: 0,
                 operands: None,
                 other: OtherShape::Plain,
+                constant: false,
                 source: Some(0),
             }],
             needed: &[
@@ -5131,6 +5187,7 @@ mod tests {
                     output: true,
                 },
             ],
+            expression_costs: &[],
             settings: settings(),
             foreign_keys: &[],
             removed: 0,

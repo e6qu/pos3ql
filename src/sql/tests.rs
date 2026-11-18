@@ -103000,3 +103000,101 @@ fn schema_drop_journals_view_triggers_before_their_view() {
         ["0"]
     );
 }
+
+#[test]
+fn a_write_that_finds_the_memtable_full_waits_for_a_checkpoint_to_spill_committed_rows() {
+    let mut config = test_config("memtable-full-waits");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("memtable-full-waits-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session =
+        ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
+    session.success(
+        &mut engine,
+        "CREATE TABLE spill_rows(id integer, note text)",
+        true,
+    );
+    // A waiting statement runs again from the same source text.
+    let insert = |engine: &mut Engine, session: &mut ConfiguredTransactionSession, rows: u32| {
+        // The arena keeps a waiting statement's retained inputs.
+        if session.transaction.suspended_statement_deadline().is_none() {
+            session.arena.reset();
+        }
+        let sql = match rows {
+            20 => {
+                "INSERT INTO spill_rows SELECT i, repeat('x', 8192) FROM generate_series(1, 20) AS g(i)"
+            }
+            60 => {
+                "INSERT INTO spill_rows SELECT i, repeat('x', 8192) FROM generate_series(1, 60) AS g(i)"
+            }
+            _ => {
+                "INSERT INTO spill_rows SELECT i, repeat('x', 8192) FROM generate_series(1, 200) AS g(i)"
+            }
+        };
+        let mut responder = Responder::new(&mut session.send);
+        engine
+            .execute_simple_from(
+                sql,
+                0,
+                &session.arena,
+                &mut session.transaction,
+                &mut session.pool,
+                &mut session.cursors,
+                &session.guc,
+                &mut responder,
+                session.connection_id,
+                false,
+            )
+            .unwrap()
+    };
+    // Committed rows fill most of the memtable.
+    for _ in 0..4 {
+        assert_eq!(
+            insert(&mut engine, &mut session, 20),
+            ExecutionStatus::Complete
+        );
+    }
+    // One more statement does not fit beside them: it waits for the
+    // checkpoint instead of failing, then runs.
+    session.send.clear();
+    assert!(matches!(
+        insert(&mut engine, &mut session, 60),
+        ExecutionStatus::Blocked {
+            wait: StatementWait::ObjectIo,
+            ..
+        }
+    ));
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        insert(&mut engine, &mut session, 60),
+        ExecutionStatus::Complete
+    );
+    assert!(error_sqlstates(session.send.readable()).is_empty());
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM spill_rows", true)),
+        ["140"]
+    );
+    // A statement whose own rows exceed the memtable fails once a
+    // checkpoint has made all the room it can.
+    session.send.clear();
+    assert!(matches!(
+        insert(&mut engine, &mut session, 200),
+        ExecutionStatus::Blocked {
+            wait: StatementWait::ObjectIo,
+            ..
+        }
+    ));
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        insert(&mut engine, &mut session, 200),
+        ExecutionStatus::Complete
+    );
+    assert_eq!(error_sqlstates(session.send.readable()), ["54000"]);
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}

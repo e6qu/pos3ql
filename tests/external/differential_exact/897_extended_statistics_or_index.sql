@@ -1,8 +1,9 @@
+-- The rows of each statement stay under the forced-spill run's 256 KiB memtable.
 -- A bitmap OR, and an index scan whose conditions come from an OR, estimate
 -- each arm's conditions through the statistics objects of the table
 -- (`generate_bitmap_or_paths` calls `clauselist_selectivity` on each arm).
 CREATE TABLE o897 (a integer, b integer, c integer);
-INSERT INTO o897 SELECT g % 100, g % 100, g FROM generate_series(1, 6000) g;
+INSERT INTO o897 SELECT g % 100, g % 100, g FROM generate_series(1, 1500) g;
 CREATE INDEX o897_a ON o897 (a);
 CREATE INDEX o897_b ON o897 (b);
 CREATE INDEX o897_ab ON o897 (a, b);

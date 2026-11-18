@@ -19,7 +19,8 @@ use super::join_tree::{self, Placed, Qual, Shape, Tree, TreeJoin, TreeNode, VarL
 use super::joins::{
     BASE_RELIDS, BasePath, BaseRel, Clause, ClauseForm, ClauseList, EquivalenceClass,
     ForeignKeyJoin, JoinPlan, JoinProblem, JoinSettings, JoinStatistics, KEY_CLASS, Keys,
-    MAX_CLAUSES, MAX_JOIN_RELS, MAX_MEMBERS, Member, NO_KEY_CLASS, NeededColumn, Relids,
+    MAX_CLAUSES, MAX_JOIN_EXPRESSIONS, MAX_JOIN_RELS, MAX_MEMBERS, Member, NO_KEY_CLASS,
+    NeededColumn, Relids,
 };
 use super::paths::JoinCandidate;
 use super::{
@@ -131,12 +132,17 @@ impl<'a> ModeledRel<'a> {
     }
 }
 
-/// A plain column reference `relation.column`.
+/// A member as an expression: a plain column reference
+/// `relation.column`, or the expression an expression member is.
 fn column_expression<'a>(
     scope: &QueryScope<'a>,
+    expressions: &Expressions<'a>,
     member: Member,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
+    if let Some(id) = member.expression_id() {
+        return Ok(expressions.get(id).expression);
+    }
     let table = usize::from(member.rel);
     let definition = scope.defs.stored(table).expect("plain table");
     let name = arena
@@ -158,12 +164,13 @@ fn column_expression<'a>(
 /// `left = right`, each a column named by its relation.
 fn equality<'a>(
     scope: &QueryScope<'a>,
+    expressions: &Expressions<'a>,
     left: Member,
     right: Member,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
-    let left = column_expression(scope, left, arena)?;
-    let right = column_expression(scope, right, arena)?;
+    let left = column_expression(scope, expressions, left, arena)?;
+    let right = column_expression(scope, expressions, right, arena)?;
     arena
         .alloc(Expr::Binary {
             source_position: crate::sql::ast::SourcePosition::UNKNOWN,
@@ -178,11 +185,12 @@ fn equality<'a>(
 /// `member.column = value`, the column named by its relation.
 fn equals_constant<'a>(
     scope: &QueryScope<'a>,
+    expressions: &Expressions<'a>,
     member: Member,
     value: &'a Expr<'a>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
-    let column = column_expression(scope, member, arena)?;
+    let column = column_expression(scope, expressions, member, arena)?;
     arena
         .alloc(Expr::Binary {
             source_position: crate::sql::ast::SourcePosition::UNKNOWN,
@@ -254,6 +262,8 @@ pub(crate) struct ModeledJoin<'a> {
     /// The column each sort key shows: its class's first member the
     /// target list holds; `None` for an expression's key.
     pub(crate) sort_shown: &'a [Option<(usize, usize)>],
+    /// The classes' expression members, by [`Member::expression_id`].
+    pub(crate) expressions: &'a [JoinExpression<'a>],
 }
 
 /// How the plan groups the joined rows.
@@ -473,10 +483,15 @@ impl<'a> Constants<'a> {
 /// `find_nonnullable_vars` of `expression` (`top_level` within an `AND`
 /// list), or `None` for an expression whose strictness the model does not
 /// read.
-fn nonnullable(scope: &QueryScope<'_>, expression: &Expr<'_>, top_level: bool) -> Option<VarList> {
+fn nonnullable(
+    scope: &QueryScope<'_>,
+    strict_call: &dyn Fn(&Expr<'_>) -> Option<bool>,
+    expression: &Expr<'_>,
+    top_level: bool,
+) -> Option<VarList> {
     let union = |left: &Expr<'_>, right: &Expr<'_>, top: bool| -> Option<VarList> {
-        let mut all = nonnullable(scope, left, top)?;
-        for &var in nonnullable(scope, right, top)?.as_slice() {
+        let mut all = nonnullable(scope, strict_call, left, top)?;
+        for &var in nonnullable(scope, strict_call, right, top)?.as_slice() {
             all.add(var)?;
         }
         Some(all)
@@ -508,8 +523,8 @@ fn nonnullable(scope: &QueryScope<'_>, expression: &Expr<'_>, top_level: bool) -
         } => {
             // The columns every arm is strict for.
             let (one, two) = (
-                nonnullable(scope, left, top_level)?,
-                nonnullable(scope, right, top_level)?,
+                nonnullable(scope, strict_call, left, top_level)?,
+                nonnullable(scope, strict_call, right, top_level)?,
             );
             let mut both = VarList::default();
             for &var in one.as_slice() {
@@ -540,14 +555,53 @@ fn nonnullable(scope: &QueryScope<'_>, expression: &Expr<'_>, top_level: bool) -
             operator: UnaryOp::Not | UnaryOp::Neg,
             operand,
             ..
-        } => nonnullable(scope, operand, false),
+        } => nonnullable(scope, strict_call, operand, false),
         Expr::IsNull { operand, negated } => {
             if *negated && top_level {
-                nonnullable(scope, operand, false)
+                nonnullable(scope, strict_call, operand, false)
             } else {
                 Some(VarList::default())
             }
         }
+        // A cast is strict (`RelabelType`, `CoerceViaIO` or a strict
+        // cast function), as is a collation.
+        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => {
+            nonnullable(scope, strict_call, operand, false)
+        }
+        // `COALESCE`, `GREATEST`, `LEAST` and `NULLIF` are expressions of
+        // their own, never strict (`find_nonnullable_vars`).
+        Expr::Call {
+            name,
+            over: None,
+            filter: None,
+            ..
+        } if ["coalesce", "greatest", "least", "nullif"]
+            .iter()
+            .any(|form| name.eq_ignore_ascii_case(form)) =>
+        {
+            Some(VarList::default())
+        }
+        // `func_strict`: a strict function is null when an argument is.
+        Expr::Call {
+            args,
+            over: None,
+            filter: None,
+            distinct: false,
+            star: false,
+            order_by: [],
+            ..
+        } => match strict_call(expression)? {
+            true => {
+                let mut all = VarList::default();
+                for argument in *args {
+                    for &var in nonnullable(scope, strict_call, argument, false)?.as_slice() {
+                        all.add(var)?;
+                    }
+                }
+                Some(all)
+            }
+            false => Some(VarList::default()),
+        },
         Expr::Like {
             operand,
             pattern,
@@ -590,20 +644,300 @@ fn plain_constant<'a>(expression: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
     .then_some(expression)
 }
 
+/// An expression of one relation's columns that an equivalence class
+/// holds (an `EquivalenceMember` whose `em_expr` is no `Var`): `a.k + 1` of
+/// `a.k + 1 = b.k`, which the relation's scan computes for each row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JoinExpression<'a> {
+    pub(crate) rel: u8,
+    /// As written, its columns read in the query's scope.
+    pub(crate) expression: &'a Expr<'a>,
+    /// With its columns named by the relation's own column names, the form
+    /// equal expressions share (`equal()` of `em_expr`).
+    canonical: &'a Expr<'a>,
+    pub(crate) ctype: ColType,
+    pub(crate) collation: crate::sql::ast::Collation,
+    /// `get_expr_width`.
+    pub(crate) width: f64,
+    /// `cost_qual_eval`'s per-row cost.
+    pub(crate) cost: f64,
+    /// The columns it reads.
+    pub(crate) vars: VarList,
+}
+
+/// The expression members of one query, by [`Member::expression_id`].
+pub(crate) struct Expressions<'a> {
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    held: [Option<JoinExpression<'a>>; MAX_JOIN_EXPRESSIONS],
+    count: usize,
+}
+
+impl<'a> Expressions<'a> {
+    fn new(storage: &'a Storage, txid: u32, arena: &'a Arena) -> Self {
+        Self {
+            storage,
+            txid,
+            arena,
+            held: [None; MAX_JOIN_EXPRESSIONS],
+            count: 0,
+        }
+    }
+
+    /// Expression `id`.
+    pub(crate) fn get(&self, id: usize) -> &JoinExpression<'a> {
+        self.held[id].as_ref().expect("a registered expression")
+    }
+
+    /// The expressions, in the arena.
+    fn alloc(&self) -> Result<&'a [JoinExpression<'a>], SqlError> {
+        self.arena
+            .alloc_slice_with(self.count, |at| self.held[at].expect("dense expressions"))
+            .map(|held| &*held)
+            .map_err(|_| crate::sql::eval::arena_full())
+    }
+
+    /// `func_strict` of the routine a call runs.
+    fn strict_call(&self, scope: &QueryScope<'a>, expression: &Expr<'_>) -> Option<bool> {
+        if let Expr::Call {
+            bound_strict: Some(strict),
+            ..
+        } = expression
+        {
+            return Some(*strict);
+        }
+        let columns = crate::sql::query::CatalogScopeCols {
+            scope,
+            outer: None,
+            storage: self.storage,
+            txid: self.txid,
+            arena: self.arena,
+        };
+        super::super::plan::routine_strict(expression, &columns, self.storage, self.txid)
+    }
+
+    /// The expression member `expression` already is, if any.
+    fn find(&self, scope: &QueryScope<'a>, expression: &'a Expr<'a>) -> Option<Member> {
+        if column_of(scope, expression).is_some() || self.count == 0 {
+            return None;
+        }
+        let vars = qual_vars(scope, expression)?;
+        let rel = vars.as_slice().first()?.0;
+        if vars.as_slice().iter().any(|&(other, _)| other != rel) {
+            return None;
+        }
+        let table = usize::from(rel);
+        let definition = scope.defs.stored(table)?;
+        let resolve = |qualifier: Option<&str>, name: &str| match scope.find_column(qualifier, name)
+        {
+            Ok(ResolvedColumn::Table(at, column)) if at == table => Some(column),
+            _ => None,
+        };
+        let canonical =
+            super::expressions::canonical(expression, &resolve, definition, self.arena).ok()??;
+        self.held[..self.count]
+            .iter()
+            .flatten()
+            .position(|held| held.rel == rel && *held.canonical == *canonical)
+            .map(|id| Member::expression(rel, id as u16))
+    }
+
+    /// The class member `expression` is, with its type and collation: a
+    /// column, or an expression of one relation's columns of a type the
+    /// model hashes and merges; `None` for anything else.
+    fn member(
+        &mut self,
+        scope: &QueryScope<'a>,
+        expression: &'a Expr<'a>,
+    ) -> Result<Option<(Member, ColType, crate::sql::ast::Collation)>, SqlError> {
+        if let Some((table, column)) = column_of(scope, expression) {
+            let meta = &scope.defs.stored(table).expect("plain table").columns()[column];
+            return Ok(Some((
+                Member::plain(table as u8, column as u16),
+                meta.ctype,
+                meta.collation,
+            )));
+        }
+        let Some(vars) = qual_vars(scope, expression) else {
+            return Ok(None);
+        };
+        let rels = vars
+            .as_slice()
+            .iter()
+            .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
+        if rels.count_ones() != 1
+            || expression.contains_volatile_function().is_some()
+            || crate::sql::query::expr_has_window(expression)
+            || crate::sql::query::expression_has_project_set(expression, self.storage, self.txid)
+        {
+            return Ok(None);
+        }
+        let table = rels.trailing_zeros() as usize;
+        let columns = crate::sql::query::CatalogScopeCols {
+            scope,
+            outer: None,
+            storage: self.storage,
+            txid: self.txid,
+            arena: self.arena,
+        };
+        if crate::sql::query::expr_has_aggregate(expression, self.storage, self.txid, &columns)? {
+            return Ok(None);
+        }
+        let Ok((type_oid, type_mod)) = crate::sql::exec::infer_type_res(expression, &columns)
+        else {
+            return Ok(None);
+        };
+        let Some((ctype, None)) =
+            crate::sql::exec::catalog_column_type(self.storage, self.txid, type_oid)
+        else {
+            return Ok(None);
+        };
+        if !joinable(ctype) {
+            return Ok(None);
+        }
+        let collation = scope.expression_collation(self.storage, self.arena, expression)?;
+        let definition = scope.defs.stored(table).expect("plain table");
+        let resolve = |qualifier: Option<&str>, name: &str| match scope.find_column(qualifier, name)
+        {
+            Ok(ResolvedColumn::Table(at, column)) if at == table => Some(column),
+            _ => None,
+        };
+        let Some(canonical) =
+            super::expressions::canonical(expression, &resolve, definition, self.arena)?
+        else {
+            return Ok(None);
+        };
+        let found = self.held[..self.count]
+            .iter()
+            .flatten()
+            .position(|held| usize::from(held.rel) == table && *held.canonical == *canonical);
+        let id = match found {
+            Some(id) => id,
+            None => {
+                if self.count == MAX_JOIN_EXPRESSIONS {
+                    return Ok(None);
+                }
+                self.held[self.count] = Some(JoinExpression {
+                    rel: table as u8,
+                    expression,
+                    canonical,
+                    ctype,
+                    collation,
+                    width: super::type_average_width(ctype, i32::from(type_mod)),
+                    cost: super::super::plan::qual_cost(
+                        expression,
+                        &columns,
+                        self.storage,
+                        self.txid,
+                        self.arena,
+                    ) / 2.0
+                        * Costs::current().cpu_operator,
+                    vars,
+                });
+                self.count += 1;
+                self.count - 1
+            }
+        };
+        Ok(Some((
+            Member::expression(table as u8, id as u16),
+            ctype,
+            collation,
+        )))
+    }
+}
+
+/// Two relations' columns, `(relation, column)` each.
+type ColumnPair = ((usize, usize), (usize, usize));
+
 /// A condition as the preparation reads it, or `None` when it is outside
 /// the model.
 fn analyze_qual<'a>(
     scope: &QueryScope<'a>,
     expression: &'a Expr<'a>,
     constants: &mut Constants<'a>,
-) -> Option<Qual> {
-    let vars = qual_vars(scope, expression)?;
+    expressions: &mut Expressions<'a>,
+    full_merged: &dyn Fn(usize) -> Option<ColumnPair>,
+) -> Result<Option<Qual>, SqlError> {
+    // `COALESCE(left, right) = constant` of a full join's merged column or
+    // a written `COALESCE` of two relations' columns.
+    if let Expr::Binary {
+        operator: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = expression
+    {
+        let coalesced = |side: &Expr<'_>| -> Option<ColumnPair> {
+            match side {
+                Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
+                    Ok(ResolvedColumn::Merged(merged)) => full_merged(merged),
+                    _ => None,
+                },
+                Expr::Call {
+                    name,
+                    args: [one, two],
+                    over: None,
+                    filter: None,
+                    distinct: false,
+                    star: false,
+                    ..
+                } if name.eq_ignore_ascii_case("coalesce") => {
+                    Some((column_of(scope, one)?, column_of(scope, two)?))
+                }
+                _ => None,
+            }
+        };
+        let found = match (coalesced(left), coalesced(right)) {
+            (Some(sides), None) => plain_constant(right).map(|value| (sides, value)),
+            (None, Some(sides)) => plain_constant(left).map(|value| (sides, value)),
+            _ => None,
+        };
+        if let Some(((one, two), value)) = found {
+            let meta = |(table, column): (usize, usize)| {
+                let meta = &scope.defs.stored(table).expect("plain table").columns()[column];
+                (meta.ctype, meta.collation)
+            };
+            if one.0 == two.0 || meta(one) != meta(two) || !joinable(meta(one).0) {
+                return Ok(None);
+            }
+            let Some(constant) = constants.id(value, meta(one).0) else {
+                return Ok(None);
+            };
+            let (one, two) = ((one.0 as u8, one.1 as u16), (two.0 as u8, two.1 as u16));
+            let mut vars = VarList::default();
+            if vars.add(one).is_none() || vars.add(two).is_none() {
+                return Ok(None);
+            }
+            return Ok(Some(Qual {
+                rels: 1 << one.0 | 1 << two.0,
+                vars,
+                // `COALESCE` is not strict.
+                nonnullable: 0,
+                strict_vars: VarList::default(),
+                forced_null: None,
+                shape: Shape::Coalesce {
+                    left: one,
+                    right: two,
+                    constant,
+                },
+            }));
+        }
+    }
+    let Some(vars) = qual_vars(scope, expression) else {
+        return Ok(None);
+    };
     let rels: Relids = vars
         .as_slice()
         .iter()
         .fold(0, |relids, &(rel, _)| relids | 1 << rel);
     let volatile = expression.contains_volatile_function().is_some();
-    let strict = nonnullable(scope, expression, true);
+    let strict = nonnullable(
+        scope,
+        &|call| expressions.strict_call(scope, call),
+        expression,
+        true,
+    );
     let forced_null = match expression {
         Expr::IsNull {
             operand,
@@ -611,53 +945,66 @@ fn analyze_qual<'a>(
         } => column_of(scope, operand).map(|(table, column)| (table as u8, column as u16)),
         _ => None,
     };
-    let ctype = |(table, column): (usize, usize)| {
-        let meta = &scope.defs.stored(table).expect("plain table").columns()[column];
-        (meta.ctype, meta.collation)
-    };
+    let var = |member: Member| (member.rel, member.column);
     let shape = match expression {
         Expr::Binary {
             operator: BinaryOp::Eq,
             left,
             right,
             ..
-        } if !volatile => match (column_of(scope, left), column_of(scope, right)) {
-            (Some(one), Some(two)) if one.0 != two.0 => {
-                let ((left_type, left_collation), (right_type, right_collation)) =
-                    (ctype(one), ctype(two));
-                if comparable_types(left_type, right_type)
-                    && joinable(left_type)
-                    && left_collation == right_collation
-                {
-                    Shape::Columns((one.0 as u8, one.1 as u16), (two.0 as u8, two.1 as u16))
-                } else {
-                    Shape::Other
+        } if !volatile => {
+            // `process_equivalence`: each side a column, an expression of
+            // one relation's columns, or a constant.
+            let one = match plain_constant(left) {
+                Some(_) => None,
+                None => expressions.member(scope, left)?,
+            };
+            let two = match plain_constant(right) {
+                Some(_) => None,
+                None => expressions.member(scope, right)?,
+            };
+            match (one, two) {
+                (
+                    Some((one, left_type, left_collation)),
+                    Some((two, right_type, right_collation)),
+                ) if one.rel != two.rel => {
+                    if comparable_types(left_type, right_type)
+                        && joinable(left_type)
+                        && left_collation == right_collation
+                    {
+                        Shape::Columns(var(one), var(two))
+                    } else {
+                        Shape::Other
+                    }
                 }
-            }
-            (Some(column), None) | (None, Some(column)) => {
-                let value = if column_of(scope, left).is_some() {
-                    right
-                } else {
-                    left
-                };
-                match plain_constant(value) {
-                    Some(value) if joinable(ctype(column).0) => Shape::Constant {
-                        var: (column.0 as u8, column.1 as u16),
-                        constant: constants.id(value, ctype(column).0)?,
-                    },
-                    _ => Shape::Other,
+                (Some((member, ctype, _)), None) | (None, Some((member, ctype, _))) => {
+                    let value = if one.is_some() { right } else { left };
+                    match plain_constant(value) {
+                        Some(value) if joinable(ctype) => {
+                            let Some(constant) = constants.id(value, ctype) else {
+                                return Ok(None);
+                            };
+                            Shape::Constant {
+                                var: var(member),
+                                constant,
+                            }
+                        }
+                        _ => Shape::Other,
+                    }
                 }
+                _ => Shape::Other,
             }
-            _ => Shape::Other,
-        },
+        }
         _ => Shape::Other,
     };
     // A condition above one relation must be one the model estimates.
     if rels.count_ones() > 1 && shape == Shape::Other && !join_condition(scope, expression) {
-        return None;
+        return Ok(None);
     }
-    let strict = strict?;
-    Some(Qual {
+    let Some(strict) = strict else {
+        return Ok(None);
+    };
+    Ok(Some(Qual {
         rels,
         vars,
         nonnullable: strict
@@ -667,7 +1014,7 @@ fn analyze_qual<'a>(
         strict_vars: strict,
         forced_null,
         shape,
-    })
+    }))
 }
 
 /// A condition of several relations the model estimates: a comparison of
@@ -720,6 +1067,7 @@ fn join_condition(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
             join_comparison(scope, expression)
                 || join_inequality(scope, expression)
                 || join_equality(scope, expression)
+                || several_relations_constant(scope, expression).is_some()
         }
     }
 }
@@ -774,6 +1122,7 @@ fn and_estimate<'a>(
     expression: &'a Expr<'a>,
     reader: &RelStatistics<'_, '_, '_>,
     restriction: &dyn Fn(usize, &'a Expr<'a>) -> Result<Option<(f64, f64)>, SqlError>,
+    expression_cost: &dyn Fn(&'a Expr<'a>) -> f64,
     costs: Costs,
     arena: &'a Arena,
 ) -> Result<Option<(f64, f64)>, SqlError> {
@@ -820,7 +1169,15 @@ fn and_estimate<'a>(
         } else if rels == 0 {
             None
         } else {
-            join_estimate(scope, conjuncts[at], reader, restriction, costs, arena)?
+            join_estimate(
+                scope,
+                conjuncts[at],
+                reader,
+                restriction,
+                expression_cost,
+                costs,
+                arena,
+            )?
         };
         let Some((own_selectivity, own_cost)) = estimate else {
             return Ok(None);
@@ -836,6 +1193,7 @@ fn join_estimate<'a>(
     expression: &'a Expr<'a>,
     reader: &RelStatistics<'_, '_, '_>,
     restriction: &dyn Fn(usize, &'a Expr<'a>) -> Result<Option<(f64, f64)>, SqlError>,
+    expression_cost: &dyn Fn(&'a Expr<'a>) -> f64,
     costs: Costs,
     arena: &'a Arena,
 ) -> Result<Option<(f64, f64)>, SqlError> {
@@ -866,9 +1224,25 @@ fn join_estimate<'a>(
                     ..
                 }
             ) {
-                and_estimate(scope, arm, reader, restriction, costs, arena)?
+                and_estimate(
+                    scope,
+                    arm,
+                    reader,
+                    restriction,
+                    expression_cost,
+                    costs,
+                    arena,
+                )?
             } else {
-                join_estimate(scope, arm, reader, restriction, costs, arena)?
+                join_estimate(
+                    scope,
+                    arm,
+                    reader,
+                    restriction,
+                    expression_cost,
+                    costs,
+                    arena,
+                )?
             };
             let Some((arm_selectivity, arm_cost)) = estimate else {
                 return Ok(None);
@@ -883,6 +1257,19 @@ fn join_estimate<'a>(
     }
     if join_comparison(scope, expression) {
         return Ok(Some((super::DEFAULT_INEQ_SEL, costs.cpu_operator)));
+    }
+    // An expression of several relations compared with a constant: the
+    // join selectivity of operands without statistics, whose distinct count
+    // is the default (`eqjoinsel` and `neqjoinsel` over
+    // `DEFAULT_NUM_DISTINCT`, `scalarineqsel`'s default).
+    if let Some(operator) = several_relations_constant(scope, expression) {
+        let equal = 1.0 / super::DEFAULT_NUM_DISTINCT;
+        let selectivity = match operator {
+            BinaryOp::Eq => equal,
+            BinaryOp::NotEq => 1.0 - equal,
+            _ => super::DEFAULT_INEQ_SEL,
+        };
+        return Ok(Some((selectivity, expression_cost(expression))));
     }
     let equality = join_equality(scope, expression);
     if equality || join_inequality(scope, expression) {
@@ -900,6 +1287,39 @@ fn join_estimate<'a>(
         return Ok(Some((selectivity, costs.cpu_operator)));
     }
     Ok(None)
+}
+
+/// The comparison operator of an expression of several relations' columns
+/// with a plain constant (`(a.x + b.y) = 10`, `COALESCE(b.k, a.k) = 30`).
+fn several_relations_constant(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<BinaryOp> {
+    let Expr::Binary {
+        operator:
+            operator @ (BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq),
+        left,
+        right,
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    let side = match (plain_constant(left), plain_constant(right)) {
+        (None, Some(_)) => left,
+        (Some(_), None) => right,
+        _ => return None,
+    };
+    if side.contains_volatile_function().is_some() {
+        return None;
+    }
+    let rels = qual_vars(scope, side)?
+        .as_slice()
+        .iter()
+        .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
+    (rels.count_ones() > 1).then_some(*operator)
 }
 
 /// `left <> right` of columns of two relations of one joinable type, which
@@ -1519,6 +1939,12 @@ pub(crate) fn modeled_join<'a>(
         held: [(&Expr::Null, ColType::Int4); MAX_QUALS],
         count: 0,
     };
+    let mut expressions = Expressions::new(storage, txid, arena);
+    // A full join's merged column: the two columns its `COALESCE` reads.
+    let full_merged = |merged: usize| match merged_parts(merged) {
+        &[one, two] => Some((one, two)),
+        _ => None,
+    };
     let sources = from
         .joins
         .iter()
@@ -1544,7 +1970,14 @@ pub(crate) fn modeled_join<'a>(
             return Ok(None);
         }
         for &conjunct in &conjuncts[..count] {
-            let Some(qual) = analyze_qual(scope, conjunct, &mut constants) else {
+            let Some(qual) = analyze_qual(
+                scope,
+                conjunct,
+                &mut constants,
+                &mut expressions,
+                &full_merged,
+            )?
+            else {
                 return Ok(None);
             };
             let Some(id) = tree.qual(node, qual) else {
@@ -1552,6 +1985,14 @@ pub(crate) fn modeled_join<'a>(
             };
             quals[usize::from(id)] = conjunct;
         }
+    }
+    for (id, vars) in tree
+        .expression_vars
+        .iter_mut()
+        .enumerate()
+        .take(expressions.count)
+    {
+        *vars = expressions.get(id).vars;
     }
     let Ok(mut prepared) = join_tree::prepare(&tree) else {
         return Ok(None);
@@ -1603,7 +2044,7 @@ pub(crate) fn modeled_join<'a>(
         let Expr::Binary { left, right, .. } = quals[usize::from(qual)] else {
             return None;
         };
-        Some(if column_of(scope, left).is_some() {
+        Some(if plain_constant(right).is_some() {
             right
         } else {
             left
@@ -1621,12 +2062,13 @@ pub(crate) fn modeled_join<'a>(
                 };
                 (
                     usize::from(member.rel),
-                    equals_constant(scope, member, value, arena)?,
+                    equals_constant(scope, &expressions, member, value, arena)?,
                 )
             }
-            Placed::Equated { left, right } => {
-                (usize::from(left.rel), equality(scope, left, right, arena)?)
-            }
+            Placed::Equated { left, right } => (
+                usize::from(left.rel),
+                equality(scope, &expressions, left, right, arena)?,
+            ),
             Placed::Join(_) => continue,
         };
         restrictions[table] = Some(match restrictions[table] {
@@ -1650,6 +2092,7 @@ pub(crate) fn modeled_join<'a>(
         outer_relids: 0,
         operands: None,
         other: super::joins::OtherShape::Plain,
+        constant: false,
         source: None,
     }; MAX_CLAUSES];
     let mut clause_count = 0;
@@ -1660,14 +2103,22 @@ pub(crate) fn modeled_join<'a>(
         if clause_count == MAX_CLAUSES {
             return Ok(None);
         }
-        let form = match join.merge {
-            Some((left, right, left_class, right_class)) => ClauseForm::Join {
-                left,
-                right,
-                left_class,
-                right_class,
-            },
-            None => ClauseForm::Other,
+        let member_cost = |member: Member| {
+            member
+                .expression_id()
+                .map_or(0.0, |id| expressions.get(id).cost)
+        };
+        let (form, cost) = match join.merge {
+            Some((left, right, left_class, right_class)) => (
+                ClauseForm::Join {
+                    left,
+                    right,
+                    left_class,
+                    right_class,
+                },
+                costs.cpu_operator + member_cost(left) + member_cost(right),
+            ),
+            None => (ClauseForm::Other, costs.cpu_operator),
         };
         clauses[clause_count] = Clause {
             form,
@@ -1676,12 +2127,13 @@ pub(crate) fn modeled_join<'a>(
             pushed_down: join.pushed_down,
             clone: join.clone,
             incompatible: join.incompatible,
-            cost: costs.cpu_operator,
+            cost,
             selectivity: None,
             outer_selectivity: None,
             outer_relids: join.outer_relids,
             operands: None,
             other: super::joins::OtherShape::Plain,
+            constant: matches!(quals[usize::from(join.qual)], Expr::Bool(true)),
             source: Some(u16::from(join.qual)),
         };
         clause_count += 1;
@@ -1817,36 +2269,44 @@ pub(crate) fn modeled_join<'a>(
                 if expression.is_constant(false) {
                     continue;
                 }
-                let class = match expression_classes[..expression_class_count]
-                    .iter()
-                    .find(|&&(_, held)| *held == *expression)
+                // An expression of one relation's columns sorting the joined
+                // rows is a member of its class (`get_eclass_for_sort_expr`).
+                if !(grouped || aggregated || windowed)
+                    && let Some((member, ..)) = expressions.member(scope, expression)?
                 {
-                    Some(&(class, _)) => usize::from(class),
-                    None => {
-                        if class_count == extended.len() {
-                            return Ok(None);
-                        }
-                        extended[class_count].count = 0;
-                        extended[class_count].has_const = false;
-                        expression_classes[expression_class_count] =
-                            (class_count as u8, expression);
-                        expression_class_count += 1;
-                        class_count += 1;
-                        class_count - 1
-                    }
-                };
-                if extended[class].has_const
-                    || sort_keys
-                        .as_slice()
+                    (usize::from(member.rel), usize::from(member.column))
+                } else {
+                    let class = match expression_classes[..expression_class_count]
                         .iter()
-                        .any(|&key| usize::from(key & KEY_CLASS) == class)
-                {
+                        .find(|&&(_, held)| *held == *expression)
+                    {
+                        Some(&(class, _)) => usize::from(class),
+                        None => {
+                            if class_count == extended.len() {
+                                return Ok(None);
+                            }
+                            extended[class_count].count = 0;
+                            extended[class_count].has_const = false;
+                            expression_classes[expression_class_count] =
+                                (class_count as u8, expression);
+                            expression_class_count += 1;
+                            class_count += 1;
+                            class_count - 1
+                        }
+                    };
+                    if extended[class].has_const
+                        || sort_keys
+                            .as_slice()
+                            .iter()
+                            .any(|&key| usize::from(key & KEY_CLASS) == class)
+                    {
+                        continue;
+                    }
+                    sort_shown[sort_keys.as_slice().len()] = None;
+                    sort_items[sort_keys.as_slice().len()] = item;
+                    let _ = sort_keys.push_class(class as u8 | flags);
                     continue;
                 }
-                sort_shown[sort_keys.as_slice().len()] = None;
-                sort_items[sort_keys.as_slice().len()] = item;
-                let _ = sort_keys.push_class(class as u8 | flags);
-                continue;
             }
         };
         let member = Member {
@@ -1912,9 +2372,13 @@ pub(crate) fn modeled_join<'a>(
                             .map(|column| (table, column))
                             .find(|&entry| in_class(entry))
                     }),
-                SelectItem::Expr { expression, .. } => {
-                    column_of(scope, expression).filter(|&entry| in_class(entry))
-                }
+                SelectItem::Expr { expression, .. } => column_of(scope, expression)
+                    .or_else(|| {
+                        expressions
+                            .find(scope, expression)
+                            .map(|member| (usize::from(member.rel), usize::from(member.column)))
+                    })
+                    .filter(|&entry| in_class(entry)),
                 SelectItem::RecordStar(_) => None,
             };
             if found.is_some() {
@@ -2026,20 +2490,17 @@ pub(crate) fn modeled_join<'a>(
                 if expression.is_constant(false) {
                     continue;
                 }
-                let Some((table, column)) = column_of(scope, expression) else {
+                // A column, or an expression of one relation's columns
+                // (`get_eclass_for_sort_expr`).
+                let Some((member, ctype, _)) = expressions.member(scope, expression)? else {
                     return Ok(None);
                 };
-                let ctype = scope
-                    .defs
-                    .stored(table)
-                    .map(|def| def.columns()[column].ctype);
-                if column >= 64 || !ctype.is_some_and(joinable) {
+                if (member.expression_id().is_none() && member.column >= 64) || !joinable(ctype) {
                     return Ok(None);
                 }
                 let member = Member {
-                    rel: table as u8,
-                    column: column as u16,
-                    nulling: nulling_relids[table] & !BASE_RELIDS,
+                    nulling: nulling_relids[usize::from(member.rel)] & !BASE_RELIDS,
+                    ..member
                 };
                 let class = match extended[..class_count]
                     .iter()
@@ -2138,6 +2599,10 @@ pub(crate) fn modeled_join<'a>(
     // each with its pathkeys (`make_pathkeys_for_window`) and costs.
     let mut windows = super::joins::WindowsProblem::NONE;
     let mut window_kept = [([0u8; super::joins::MAX_KEYS], 0u8); super::joins::MAX_WINDOWS];
+    // The expression members the window clauses sort by, and the columns
+    // only they read, which the windows' input does not carry.
+    let mut window_expressions = 0u32;
+    let mut key_only_columns = [0u64; MAX_JOIN_RELS];
     if windowed {
         let columns = crate::sql::query::CatalogScopeCols {
             scope,
@@ -2172,34 +2637,113 @@ pub(crate) fn modeled_join<'a>(
                 if spec.partition_by[..at].contains(&expression) {
                     continue;
                 }
-                let Some((table, column)) = column_of(scope, expression) else {
-                    return Ok(None);
+                let member = match column_of(scope, expression) {
+                    Some((table, column)) => Member::plain(table as u8, column as u16),
+                    None if !(grouped || aggregated) => {
+                        match expressions.member(scope, expression)? {
+                            Some((member, ..)) => member,
+                            None => return Ok(None),
+                        }
+                    }
+                    None => return Ok(None),
                 };
                 if usize::from(window.partition_count) == super::joins::MAX_KEYS {
                     return Ok(None);
                 }
-                window.partition[usize::from(window.partition_count)] =
-                    Member::plain(table as u8, column as u16);
+                window.partition[usize::from(window.partition_count)] = member;
                 window.partition_count += 1;
             }
             for (at, order) in spec.order_by.iter().enumerate() {
                 if spec.order_by[..at].contains(order) {
                     continue;
                 }
-                let Some((table, column)) = column_of(scope, order.expression) else {
-                    return Ok(None);
+                let member = match column_of(scope, order.expression) {
+                    Some((table, column)) => Member::plain(table as u8, column as u16),
+                    None if !(grouped || aggregated) => {
+                        match expressions.member(scope, order.expression)? {
+                            Some((member, ..)) => member,
+                            None => return Ok(None),
+                        }
+                    }
+                    None => return Ok(None),
                 };
                 if usize::from(window.order_count) == super::joins::MAX_KEYS {
                     return Ok(None);
                 }
-                window.order[usize::from(window.order_count)] =
-                    Member::plain(table as u8, column as u16);
+                window.order[usize::from(window.order_count)] = member;
                 window.order_count += 1;
             }
             let keys = crate::sql::query::window_sort_keys(spec, arena)?;
             for (at, key) in keys.iter().enumerate() {
                 let Some((table, column)) = column_of(scope, key.expression) else {
-                    return Ok(None);
+                    // An expression of one relation's columns: the windows'
+                    // input computes it (`make_window_input_target`), and
+                    // the query's target list holds it.
+                    if grouped || aggregated {
+                        return Ok(None);
+                    }
+                    let Some((member, ..)) = expressions.member(scope, key.expression)? else {
+                        return Ok(None);
+                    };
+                    let id = member.expression_id().expect("an expression member");
+                    let member = Member {
+                        nulling: nulling_relids[usize::from(member.rel)] & !BASE_RELIDS,
+                        ..member
+                    };
+                    if window_expressions & 1 << id == 0 {
+                        window_expressions |= 1 << id;
+                        let held = expressions.get(id);
+                        for &(rel, column) in held.vars.as_slice() {
+                            let (rel, column) = (usize::from(rel), usize::from(column));
+                            if output[rel] & 1 << column == 0 {
+                                key_only_columns[rel] |= 1 << column;
+                            }
+                            output[rel] |= 1 << column;
+                            note(rel, column);
+                        }
+                    }
+                    let class = match extended[..class_count]
+                        .iter()
+                        .position(|class| class.members().contains(&member))
+                    {
+                        Some(class) => class,
+                        None => {
+                            if class_count == extended.len() {
+                                return Ok(None);
+                            }
+                            extended[class_count].members[0] = member;
+                            extended[class_count].count = 1;
+                            extended[class_count].has_const = false;
+                            class_count += 1;
+                            class_count - 1
+                        }
+                    };
+                    if extended[class].has_const
+                        || window
+                            .keys
+                            .as_slice()
+                            .iter()
+                            .any(|&held| usize::from(held & KEY_CLASS) == class)
+                    {
+                        continue;
+                    }
+                    let flags = if key.descending {
+                        super::joins::KEY_DESCENDING
+                    } else {
+                        0
+                    } | if key.nulls_first {
+                        super::joins::KEY_NULLS_FIRST
+                    } else {
+                        0
+                    };
+                    let kept = &mut window_kept[index];
+                    if usize::from(kept.1) == super::joins::MAX_KEYS {
+                        return Ok(None);
+                    }
+                    kept.0[usize::from(kept.1)] = at as u8;
+                    kept.1 += 1;
+                    let _ = window.keys.push_class(class as u8 | flags);
+                    continue;
                 };
                 let ctype = scope
                     .defs
@@ -2213,6 +2757,7 @@ pub(crate) fn modeled_join<'a>(
                     column: column as u16,
                     nulling: nulling_relids[table] & !BASE_RELIDS,
                 };
+                key_only_columns[table] &= !(1 << column);
                 if !statement.items.iter().any(|item| match item {
                     SelectItem::Wildcard(_) => true,
                     SelectItem::TableWildcard(qualifier) => scope.names[table] == *qualifier,
@@ -2412,6 +2957,43 @@ pub(crate) fn modeled_join<'a>(
             .iter()
             .position(|class| class.members().contains(&member))
     };
+    // Each expression member's variable among its relation's index key
+    // expressions, by which an index on the expression orders and
+    // parameterizes the relation's scans.
+    let mut expression_keys = [None::<u16>; MAX_JOIN_EXPRESSIONS];
+    for table in 0..n {
+        if !(0..expressions.count).any(|id| usize::from(expressions.get(id).rel) == table) {
+            continue;
+        }
+        let slot = scope.slots[table];
+        let Some(catalog) = super::paths::catalog_indexes(storage, txid, slot, arena)? else {
+            return Ok(None);
+        };
+        let (keyed, _) = super::expressions::table_expressions(
+            storage,
+            txid,
+            slot,
+            scope.defs.stored(table).expect("plain table"),
+            &storage.table_statistics(slot, txid),
+            catalog,
+            arena,
+        )?;
+        for (id, key) in expression_keys
+            .iter_mut()
+            .enumerate()
+            .take(expressions.count)
+        {
+            let held = expressions.get(id);
+            if usize::from(held.rel) != table {
+                continue;
+            }
+            *key = keyed
+                .variables
+                .iter()
+                .position(|variable| *variable.canonical == *held.canonical)
+                .and_then(|at| u16::try_from(keyed.first + at).ok());
+        }
+    }
     for table in 0..n {
         if removed & 1 << table == 0 {
             total_table_pages += super::relation_size(storage, scope.slots[table], txid).pages;
@@ -2427,8 +3009,19 @@ pub(crate) fn modeled_join<'a>(
                 && class.relids() & relids != 0
                 && class.relids() & !relids != 0
         });
-        for (column, slot) in scan.classes.iter_mut().enumerate().take(width(table)) {
-            let Some(class) = member_class(Member::plain(table as u8, column as u16)) else {
+        // Each column, then each expression member an index keys by its
+        // variable (`match_index_to_operand`).
+        let keyed_expressions = (0..expressions.count).filter_map(|id| {
+            let column = usize::from(expression_keys[id]?);
+            (usize::from(expressions.get(id).rel) == table && column < 64)
+                .then(|| (column, Member::expression(table as u8, id as u16)))
+        });
+        let members = (0..width(table))
+            .map(|column| (column, Member::plain(table as u8, column as u16)))
+            .chain(keyed_expressions);
+        for (column, member) in members {
+            let slot = &mut scan.classes[column];
+            let Some(class) = member_class(member) else {
                 continue;
             };
             let held = &classes[class];
@@ -2535,6 +3128,12 @@ pub(crate) fn modeled_join<'a>(
             else {
                 continue;
             };
+            // An expression no index keys parameterizes no scan.
+            if let Some(id) = own.expression_id()
+                && expression_keys[id].is_none()
+            {
+                continue;
+            }
             if class.has_const || class.count <= 1 {
                 continue;
             }
@@ -2548,7 +3147,7 @@ pub(crate) fn modeled_join<'a>(
                 }
                 scan.params[at] = (class_id as u8, other.rel);
                 scan.param_nulling[at] = other.nulling;
-                join_conjuncts[table][at] = equality(scope, *own, *other, arena)?;
+                join_conjuncts[table][at] = equality(scope, &expressions, *own, *other, arena)?;
                 scan.param_count += 1;
             }
         }
@@ -2757,6 +3356,22 @@ pub(crate) fn modeled_join<'a>(
             });
         }
     }
+    // Each expression member's width, which a `Memoize` keyed by it
+    // counts (`get_expr_width`).
+    for id in 0..expressions.count {
+        let expression = expressions.get(id);
+        if needed_count == needed.len() {
+            return Ok(None);
+        }
+        needed[needed_count] = NeededColumn {
+            rel: expression.rel,
+            column: Member::expression(expression.rel, id as u16).column,
+            width: expression.width,
+            needed_by: 0,
+            output: false,
+        };
+        needed_count += 1;
+    }
     // The join clauses the base relations' index paths derive, in the
     // order and orientation `create_index_paths` creates them: each index's
     // key columns equated with the other members of their class, then the
@@ -2776,6 +3391,11 @@ pub(crate) fn modeled_join<'a>(
         }
         let members = classes[usize::from(class)].members();
         let relids = members[usize::from(left)].relids() | members[usize::from(right)].relids();
+        let member_cost = |member: Member| {
+            member
+                .expression_id()
+                .map_or(0.0, |id| expressions.get(id).cost)
+        };
         clauses[clause_count] = Clause {
             form: ClauseForm::Equality { class, left, right },
             relids,
@@ -2783,12 +3403,15 @@ pub(crate) fn modeled_join<'a>(
             pushed_down: true,
             clone: super::joins::CloneKind::None,
             incompatible: 0,
-            cost: costs.cpu_operator,
+            cost: costs.cpu_operator
+                + member_cost(members[usize::from(left)])
+                + member_cost(members[usize::from(right)]),
             selectivity: None,
             outer_selectivity: None,
             outer_relids: 0,
             operands: None,
             other: super::joins::OtherShape::Plain,
+            constant: false,
             source: None,
         };
         clause_count += 1;
@@ -2864,7 +3487,11 @@ pub(crate) fn modeled_join<'a>(
             column
                 .and_then(|column| {
                     members.iter().position(|member| {
-                        member.relids() == 1 << table && usize::from(member.column) == column
+                        member.relids() == 1 << table
+                            && match member.expression_id() {
+                                Some(id) => expression_keys[id] == Some(column as u16),
+                                None => usize::from(member.column) == column,
+                            }
                     })
                 })
                 .or_else(|| {
@@ -2893,6 +3520,18 @@ pub(crate) fn modeled_join<'a>(
                 let Some(own) = member_of(class, None) else {
                     continue;
                 };
+                // A scan parameterized by other clauses would filter by an
+                // expression no index keys, which the model's scans leave.
+                if held.members()[own]
+                    .expression_id()
+                    .is_some_and(|id| expression_keys[id].is_none())
+                    && held
+                        .members()
+                        .iter()
+                        .any(|member| member.relids() & !param == 0)
+                {
+                    return None;
+                }
                 let Some(outer) = held
                     .members()
                     .iter()
@@ -2911,12 +3550,11 @@ pub(crate) fn modeled_join<'a>(
                 continue;
             }
             for position in 0..info.n_cols {
-                if info.expression_keys[position]
-                    || info.pattern_keys[position]
-                    || !info.column_collation[position]
-                {
+                if info.pattern_keys[position] || !info.column_collation[position] {
                     continue;
                 }
+                // An expression key is its variable, whose class an
+                // expression member gave it.
                 let column = usize::from(info.columns[position]);
                 let class = rel.scan.classes.get(column).copied().unwrap_or(NO_CLASS);
                 if class == NO_CLASS {
@@ -3039,6 +3677,7 @@ pub(crate) fn modeled_join<'a>(
             joins[at] = if reversed {
                 equality(
                     scope,
+                    &expressions,
                     members[usize::from(other)],
                     members[usize::from(own)],
                     arena,
@@ -3058,15 +3697,82 @@ pub(crate) fn modeled_join<'a>(
     let statistics: [Option<TableStatistics>; MAX_JOIN_RELS] = core::array::from_fn(|table| {
         (table < n).then(|| storage.table_statistics(scope.slots[table], txid))
     });
+    // Each relation's variables: its indexes' key expressions
+    // (`examine_variable` reads their statistics), then its expression
+    // members that no key expression is.
+    let mut variables = [None::<super::ExpressionVariables<'a>>; MAX_JOIN_RELS];
+    let mut expression_columns = [0usize; MAX_JOIN_EXPRESSIONS];
+    let mut expression_vars = [VarList::default(); MAX_JOIN_EXPRESSIONS];
+    for table in 0..n {
+        let ids =
+            (0..expressions.count).filter(|&id| usize::from(expressions.get(id).rel) == table);
+        if ids.clone().next().is_none() {
+            continue;
+        }
+        let definition = scope.defs.stored(table).expect("plain table");
+        let indexes = planned_paths[table].map_or(&[][..], |paths| paths.indexes);
+        let catalog = arena
+            .alloc_slice_with(indexes.len(), |at| indexes[at].catalog)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let (keyed, _) = super::expressions::table_expressions(
+            storage,
+            txid,
+            scope.slots[table],
+            definition,
+            statistics[table].as_ref().expect("a relation's statistics"),
+            catalog,
+            arena,
+        )?;
+        let mut held = [None::<super::expressions::ExpressionVariable<'a>>;
+            super::expressions::MAX_EXPRESSION_VARIABLES + MAX_JOIN_EXPRESSIONS];
+        for (slot, variable) in held.iter_mut().zip(keyed.variables) {
+            *slot = Some(*variable);
+        }
+        let mut count = keyed.variables.len();
+        for id in ids {
+            let expression = expressions.get(id);
+            expression_vars[id] = expression.vars;
+            let number = match keyed
+                .variables
+                .iter()
+                .position(|variable| *variable.canonical == *expression.canonical)
+            {
+                // An index's key expression, whose statistics ANALYZE
+                // gathered (`examine_variable`).
+                Some(number) => number,
+                None => {
+                    held[count] = Some(super::expressions::ExpressionVariable {
+                        canonical: expression.canonical,
+                        bound: expression.expression,
+                        ctype: expression.ctype,
+                        collation: expression.collation,
+                        statistics: None,
+                        extended: None,
+                        unique: false,
+                        indexed: false,
+                    });
+                    count += 1;
+                    count - 1
+                }
+            };
+            expression_columns[id] = keyed.first + number;
+        }
+        variables[table] = Some(super::ExpressionVariables {
+            first: keyed.first,
+            variables: arena
+                .alloc_slice_with(count, |at| held[at].expect("dense variables"))
+                .map_err(|_| crate::sql::eval::arena_full())?,
+        });
+    }
     let planners: [Option<Planner<'_, 'a>>; MAX_JOIN_RELS] = core::array::from_fn(|table| {
         let statistics = statistics[table].as_ref()?;
         let slot = scope.slots[table];
         let definition = scope.defs.stored(table)?;
         Some(Planner {
-            variables: super::ExpressionVariables {
+            variables: variables[table].unwrap_or(super::ExpressionVariables {
                 first: definition.columns().len(),
                 variables: &[],
-            },
+            }),
             storage,
             txid,
             slot,
@@ -3086,6 +3792,8 @@ pub(crate) fn modeled_join<'a>(
     let early_reader = RelStatistics {
         planners: &planners,
         rels: &base,
+        expression_columns: &expression_columns,
+        expression_vars: &expression_vars,
     };
     let restriction =
         |table: usize, expression: &'a Expr<'a>| -> Result<Option<(f64, f64)>, SqlError> {
@@ -3094,6 +3802,18 @@ pub(crate) fn modeled_join<'a>(
             let planner = planners[table].as_ref().expect("planned");
             super::paths::restriction_estimate(planner, &single, expression, params, arena)
         };
+    // `cost_qual_eval` of a condition over several relations.
+    let scope_columns = crate::sql::query::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    let expression_cost = |expression: &'a Expr<'a>| {
+        super::super::plan::qual_cost(expression, &scope_columns, storage, txid, arena) / 2.0
+            * costs.cpu_operator
+    };
     let mut single_rel_columns = [0u64; MAX_JOIN_RELS];
     for (id, clause) in clauses[..placed_join_count].iter_mut().enumerate() {
         if clause.form != ClauseForm::Other {
@@ -3127,7 +3847,15 @@ pub(crate) fn modeled_join<'a>(
                 }
             }
         } else {
-            match join_estimate(scope, expression, &early_reader, &restriction, costs, arena)? {
+            match join_estimate(
+                scope,
+                expression,
+                &early_reader,
+                &restriction,
+                &expression_cost,
+                costs,
+                arena,
+            )? {
                 Some(estimate) => estimate,
                 None => {
                     return Ok(None);
@@ -3356,12 +4084,35 @@ pub(crate) fn modeled_join<'a>(
             };
         }
     }
+    // The window clauses' expression keys: the windows' input computes
+    // each, and the query's target list holds those it does not list.
+    let mut window_input_cost = 0.0;
+    // Those the select list does not hold, which the final target list
+    // computes again in its costs.
+    let mut window_resjunk_cost = 0.0;
+    let mut window_keys_width = 0.0;
+    for id in (0..MAX_JOIN_EXPRESSIONS).filter(|id| window_expressions & 1 << id != 0) {
+        let held = expressions.get(id);
+        window_input_cost += held.cost;
+        window_keys_width += held.width;
+        let listed = statement.items.iter().any(|item| {
+            matches!(item, SelectItem::Expr { expression, .. }
+                if expressions.find(scope, expression)
+                    == Some(Member::expression(held.rel, id as u16)))
+        });
+        if !listed {
+            output_width += held.width;
+            window_resjunk_cost += held.cost;
+        }
+    }
     // The windows' input is each column the select list, their keys and
-    // their functions read, once (`make_window_input_target`).
+    // their functions read, once, an expression key's columns as the
+    // expression (`make_window_input_target`).
     let final_width = output_width;
     if windowed && !(grouped || aggregated) {
-        windows.input_width = 0.0;
+        windows.input_width = window_keys_width;
         for (table, &mask) in output.iter().enumerate().take(n) {
+            let mask = mask & !key_only_columns[table];
             for column in (0..64).filter(|column| mask & 1 << column != 0) {
                 windows.input_width += column_width((table, column));
             }
@@ -3451,9 +4202,18 @@ pub(crate) fn modeled_join<'a>(
     } else {
         None
     };
+    let expression_costs: [f64; MAX_JOIN_EXPRESSIONS] = core::array::from_fn(|id| {
+        if id < expressions.count {
+            expressions.get(id).cost
+        } else {
+            0.0
+        }
+    });
     let reader = RelStatistics {
         planners: &planners,
         rels: &base,
+        expression_columns: &expression_columns,
+        expression_vars: &expression_vars,
     };
     let subproblems = &prepared.subproblems[..prepared.subproblem_count];
     let problem = JoinProblem {
@@ -3463,6 +4223,7 @@ pub(crate) fn modeled_join<'a>(
         subproblems,
         clauses: &clauses[..clause_count],
         needed: &needed[..needed_count],
+        expression_costs: &expression_costs,
         foreign_keys: &foreign_keys[..foreign_count],
         removed,
         upper: super::joins::UpperProblem {
@@ -3481,10 +4242,13 @@ pub(crate) fn modeled_join<'a>(
             } else {
                 final_width
             },
-            // A grouping's input is the columns it reads, as are the
-            // windows'; a `DISTINCT`'s the final target list.
-            target_cost: if (group.is_some() && !distinct) || windowed {
+            // A grouping's input is the columns it reads; the windows' the
+            // columns and expression keys they read; a `DISTINCT`'s the
+            // final target list.
+            target_cost: if group.is_some() && !distinct {
                 0.0
+            } else if windowed {
+                window_input_cost
             } else {
                 target_cost
             },
@@ -3500,7 +4264,7 @@ pub(crate) fn modeled_join<'a>(
             windows_output_cost: if grouped || aggregated {
                 group_target_cost
             } else {
-                target_cost
+                target_cost + window_resjunk_cost
             },
         },
         dummy: prepared.contradictory,
@@ -3523,14 +4287,20 @@ pub(crate) fn modeled_join<'a>(
     };
     // A hashed unique-ified relation returns its groups in its hash table's
     // order, by the hash values only some key types have here.
+    // The type of a class member.
+    let member_type = |member: &Member| match member.expression_id() {
+        Some(id) => expressions.get(id).ctype,
+        None => {
+            scope
+                .defs
+                .stored(usize::from(member.rel))
+                .expect("plain table")
+                .columns()[usize::from(member.column)]
+            .ctype
+        }
+    };
     if reaches_hashed_unique(&plan, &|member| {
-        let ctype = scope
-            .defs
-            .stored(usize::from(member.rel))
-            .expect("plain table")
-            .columns()[usize::from(member.column)]
-        .ctype;
-        crate::sql::query::join_exec::datum_type_hashable(ctype)
+        crate::sql::query::join_exec::datum_type_hashable(member_type(member))
     }) {
         return Ok(None);
     }
@@ -3556,13 +4326,7 @@ pub(crate) fn modeled_join<'a>(
                     ClauseForm::Join { left, .. } => left,
                     ClauseForm::Other => return true,
                 };
-                let ctype = scope
-                    .defs
-                    .stored(usize::from(member.rel))
-                    .expect("plain table")
-                    .columns()[usize::from(member.column)]
-                .ctype;
-                !crate::sql::query::join_exec::datum_type_hashable(ctype)
+                !crate::sql::query::join_exec::datum_type_hashable(member_type(&member))
             })
         {
             return Ok(None);
@@ -3643,6 +4407,7 @@ pub(crate) fn modeled_join<'a>(
         sort_shown: arena
             .alloc_slice_copy(&sort_shown[..sort_keys.as_slice().len()])
             .map_err(|_| crate::sql::eval::arena_full())?,
+        expressions: expressions.alloc()?,
     }))
 }
 
@@ -3817,6 +4582,10 @@ fn plain_table(
 struct RelStatistics<'r, 's, 'a> {
     planners: &'r [Option<Planner<'s, 'a>>; MAX_JOIN_RELS],
     rels: &'r [BaseRel<'r>; MAX_JOIN_RELS],
+    /// Each expression member's variable in its relation's planner.
+    expression_columns: &'r [usize; MAX_JOIN_EXPRESSIONS],
+    /// Each expression member's columns.
+    expression_vars: &'r [VarList; MAX_JOIN_EXPRESSIONS],
 }
 
 impl RelStatistics<'_, '_, '_> {
@@ -3824,6 +4593,45 @@ impl RelStatistics<'_, '_, '_> {
         self.planners[usize::from(member.rel)]
             .as_ref()
             .expect("a member's relation has statistics")
+    }
+
+    /// The planner's variable of a member: its column, or the variable of
+    /// its expression (`examine_variable`).
+    fn column(&self, member: Member) -> usize {
+        match member.expression_id() {
+            Some(id) => self.expression_columns[id],
+            None => usize::from(member.column),
+        }
+    }
+
+    /// The variables `estimate_num_groups` counts for the members of one
+    /// relation: a column, an expression with statistics or a unique
+    /// index of its own, else the columns the expression reads.
+    fn group_columns(&self, members: &[Member], rel: u8, columns: &mut [usize; 64]) -> usize {
+        let mut count = 0;
+        let mut add = |column: usize, count: &mut usize| {
+            if *count < columns.len() {
+                columns[*count] = column;
+                *count += 1;
+            }
+        };
+        for member in members.iter().filter(|member| member.rel == rel) {
+            let column = self.column(*member);
+            if member.expression_id().is_none() {
+                add(column, &mut count);
+                continue;
+            }
+            let variable = self.planner(*member).variable(column);
+            if variable.analyzed || variable.unique {
+                add(column, &mut count);
+                continue;
+            }
+            let id = member.expression_id().expect("an expression");
+            for &(_, var) in self.expression_vars[id].as_slice() {
+                add(usize::from(var), &mut count);
+            }
+        }
+        count
     }
 
     /// `get_variable_range` of an analyzed column: the least and greatest
@@ -3882,8 +4690,8 @@ impl RelStatistics<'_, '_, '_> {
 impl JoinStatistics for RelStatistics<'_, '_, '_> {
     fn equality(&self, left: Member, right: Member) -> Result<f64, SqlError> {
         let (first, second) = (self.planner(left), self.planner(right));
-        let one = first.variable(usize::from(left.column));
-        let two = second.variable(usize::from(right.column));
+        let one = first.variable(self.column(left));
+        let two = second.variable(self.column(right));
         let (nd1, _) = first.distinct(&one);
         let (nd2, _) = second.distinct(&two);
         let mcv1 = one
@@ -3967,8 +4775,8 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
 
     fn semi(&self, outer: Member, inner: Member, inner_rows: f64) -> Result<f64, SqlError> {
         let (first, second) = (self.planner(outer), self.planner(inner));
-        let one = first.variable(usize::from(outer.column));
-        let two = second.variable(usize::from(inner.column));
+        let one = first.variable(self.column(outer));
+        let two = second.variable(self.column(inner));
         let (mut nd1, default1) = first.distinct(&one);
         let (mut nd2, mut default2) = second.distinct(&two);
         // The inner side has no more distinct values than rows, its base
@@ -4051,12 +4859,8 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
                 continue;
             }
             done |= 1 << member.rel;
-            let mut columns = [0usize; super::joins::MAX_KEYS];
-            let mut count = 0;
-            for other in members.iter().filter(|other| other.rel == member.rel) {
-                columns[count] = usize::from(other.column);
-                count += 1;
-            }
+            let mut columns = [0usize; 64];
+            let count = self.group_columns(members, member.rel, &mut columns);
             let (factor, default) = super::paths::relation_groups(
                 self.planner(*member),
                 &columns[..count],
@@ -4079,12 +4883,8 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
                 continue;
             }
             done |= 1 << member.rel;
-            let mut columns = [0usize; super::joins::MAX_KEYS];
-            let mut count = 0;
-            for other in members.iter().filter(|other| other.rel == member.rel) {
-                columns[count] = usize::from(other.column);
-                count += 1;
-            }
+            let mut columns = [0usize; 64];
+            let count = self.group_columns(members, member.rel, &mut columns);
             groups *= super::paths::relation_groups(
                 self.planner(*member),
                 &columns[..count],
@@ -4097,7 +4897,7 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
 
     fn bucket(&self, member: Member, buckets: f64) -> Result<(f64, f64), SqlError> {
         let planner = self.planner(member);
-        let variable = planner.variable(usize::from(member.column));
+        let variable = planner.variable(self.column(member));
         let mcv_frequency = variable
             .distribution
             .filter(|distribution| variable.analyzed && distribution.mcv_len() > 0)
@@ -4136,7 +4936,7 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
         nulls_first: bool,
     ) -> Result<Option<[f64; 4]>, SqlError> {
         let (first, second) = (self.planner(left), self.planner(right));
-        let (left_column, right_column) = (usize::from(left.column), usize::from(right.column));
+        let (left_column, right_column) = (self.column(left), self.column(right));
         let mut range = [0.0, 1.0, 0.0, 1.0];
         let (Some((left_low, left_high)), Some((right_low, right_high))) = (
             self.range(first, left_column)?,

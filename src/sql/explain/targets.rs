@@ -619,11 +619,13 @@ impl<'a> BlockTargets<'a> {
             let active = window_calls
                 .iter()
                 .any(|call| matches!(call, Expr::Call { over: Some(used), .. } if **used == *spec));
+            // `transformWindowDefinitions` adds the `ORDER BY` keys the list
+            // lacks before the `PARTITION BY` ones.
             for key in spec
-                .partition_by
+                .order_by
                 .iter()
-                .copied()
-                .chain(spec.order_by.iter().map(|order| order.expression))
+                .map(|order| order.expression)
+                .chain(spec.partition_by.iter().copied())
             {
                 let at = keyed(&mut targets, key, false)?;
                 mark(&mut targets, at, &|target| {
@@ -1052,6 +1054,11 @@ impl<'a> BlockTargets<'a> {
             let _ = output.write_str(entry.text);
         }
         checked(output)
+    }
+
+    /// `table`'s physical columns, `None` when its scan must project.
+    pub(super) fn physical(&self, table: usize) -> Option<Result<Output, SqlError>> {
+        self.physical[table].map(render)
     }
 
     /// The values `table`'s scan returns under a `Hash` (`CP_SMALL_TLIST`),

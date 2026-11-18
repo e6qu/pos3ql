@@ -79,6 +79,14 @@ pub(crate) enum Shape {
     /// `column = constant` of a constant of the column's type; equal
     /// constants share `constant`.
     Constant { var: Var, constant: u16 },
+    /// `COALESCE(left, right) = constant` (a full join's merged `USING`
+    /// column), which `reconsider_full_join_clause` matches with a full
+    /// join's clause `left = right`.
+    Coalesce {
+        left: Var,
+        right: Var,
+        constant: u16,
+    },
     /// Any other qual.
     Other,
 }
@@ -144,6 +152,9 @@ pub(crate) struct Tree {
     /// `enable_hashagg`, which lets a semi join's inner relation be made
     /// unique by hashing.
     pub(crate) enable_hashagg: bool,
+    /// The columns each expression member reads
+    /// ([`super::joins::Member::expression_id`]).
+    pub(crate) expression_vars: [VarList; super::joins::MAX_JOIN_EXPRESSIONS],
 }
 
 impl Tree {
@@ -166,6 +177,7 @@ impl Tree {
             qual_count: 0,
             rels,
             enable_hashagg: true,
+            expression_vars: [VarList::default(); super::joins::MAX_JOIN_EXPRESSIONS],
         }
     }
 
@@ -465,6 +477,13 @@ struct Prep<'t> {
     right_count: usize,
     full_join: [Pending; MAX_QUALS],
     full_count: usize,
+    /// The `COALESCE(left, right) = constant` quals of the query's join
+    /// domain: the qual, its sides and its constant.
+    coalesce: [(u8, Var, Var, u16); MAX_QUALS],
+    /// Each held `COALESCE`'s placement, which an ordinary filter of the
+    /// joined rows takes when no full join clause matches it.
+    coalesce_join: [Option<JoinQual>; MAX_QUALS],
+    coalesce_count: usize,
     /// Each node's join domain (`JoinDomain`): the query's is 0.
     domain: [u8; MAX_NODES],
     domain_count: u8,
@@ -542,6 +561,9 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         right_count: 0,
         full_join: [Pending { join: empty_join() }; MAX_QUALS],
         full_count: 0,
+        coalesce: [(0, (0, 0), (0, 0), 0); MAX_QUALS],
+        coalesce_join: [None; MAX_QUALS],
+        coalesce_count: 0,
         domain: [0; MAX_NODES],
         domain_count: 1,
         domain_root: [None; MAX_NODES],
@@ -1510,6 +1532,22 @@ impl Prep<'_> {
                     return Err("a constant equality of a nulled column");
                 }
             }
+            // `process_equivalence` of the `COALESCE` with the constant,
+            // held for `reconsider_full_join_clause`.
+            Shape::Coalesce {
+                left,
+                right,
+                constant,
+            } => {
+                if !maybe_equivalence || self.domain[usize::from(node)] != 0 {
+                    return Err("a COALESCE equated with a constant below the query's join domain");
+                }
+                *self.coalesce.get_mut(self.coalesce_count).ok_or(FULL)? =
+                    (qual_id, left, right, constant);
+                self.coalesce_join[self.coalesce_count] = Some(join);
+                self.coalesce_count += 1;
+                return Ok(());
+            }
             Shape::Other => {}
         }
         self.distribute_restrictinfo(join)
@@ -1819,8 +1857,35 @@ impl Prep<'_> {
                     })?;
                 }
             }
+            let mut at = 0;
+            while at < self.full_count {
+                let join = self.full_join[at].join;
+                if !self.reconsider_full_join_clause(join)? {
+                    at += 1;
+                    continue;
+                }
+                found = true;
+                self.full_join.copy_within(at + 1..self.full_count, at);
+                self.full_count -= 1;
+                self.distribute_restrictinfo(JoinQual {
+                    qual: TRUE_QUAL,
+                    relids: 0,
+                    merge: None,
+                    ..join
+                })?;
+            }
             if !found {
                 break;
+            }
+        }
+        // A `COALESCE` no full join clause matched (its operands in the
+        // other order, say) filters the joined rows by an expression of
+        // several relations.
+        for at in 0..self.coalesce_count {
+            if self.coalesce[at].0 != NO_QUAL {
+                self.coalesce[at].0 = NO_QUAL;
+                let join = self.coalesce_join[at].expect("held with its placement");
+                self.distribute_restrictinfo(join)?;
             }
         }
         let constant = |prep: &Self, member: Member| {
@@ -1846,6 +1911,43 @@ impl Prep<'_> {
             self.distribute_restrictinfo(entry.join)?;
         }
         Ok(())
+    }
+
+    /// `reconsider_full_join_clause` of `join`: a `COALESCE` of its two
+    /// sides equated with a constant equates each side with the constant
+    /// inside its own join domain, and the `COALESCE` member leaves its
+    /// class, so no filter tests it.
+    fn reconsider_full_join_clause(&mut self, join: JoinQual) -> Result<bool, Outside> {
+        let (left, right, ..) = join.merge.expect("mergeable");
+        let Some(at) =
+            self.coalesce[..self.coalesce_count]
+                .iter()
+                .position(|&(qual, one, two, _)| {
+                    qual != NO_QUAL
+                        && one == (left.rel, left.column)
+                        && two == (right.rel, right.column)
+                })
+        else {
+            return Ok(false);
+        };
+        let (qual, _, _, constant) = self.coalesce[at];
+        for side in [left, right] {
+            if side.nulling != 0 {
+                return Err("a full join clause of a nulled column equated with a constant");
+            }
+            let Some(node) = self.tree.nodes[..self.tree.node_count]
+                .iter()
+                .position(|node| matches!(node, TreeNode::Rel(rel) if *rel == side.rel))
+            else {
+                return Err("a full join's side outside the join tree");
+            };
+            let domain = self.domain[node];
+            self.process_equivalence(qual, side, None, Some(constant), domain)?;
+            let derived = self.class_of(side).expect("just equated");
+            self.classes[usize::from(derived)].derived = true;
+        }
+        self.coalesce[at].0 = NO_QUAL;
+        Ok(true)
     }
 
     /// `reconsider_outer_join_clause` of `join`, whose outer column is its
@@ -1937,6 +2039,13 @@ impl Prep<'_> {
             }
             let relids = held.class.relids();
             for &member in members {
+                // An expression's columns (`pull_var_clause` of `em_expr`).
+                if let Some(id) = member.expression_id() {
+                    for &var in self.tree.expression_vars[id].as_slice() {
+                        self.note_needed(var, relids, NO_QUAL)?;
+                    }
+                    continue;
+                }
                 self.note_needed((member.rel, member.column), relids, NO_QUAL)?;
             }
         }

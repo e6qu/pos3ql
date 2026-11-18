@@ -1002,3 +1002,30 @@ fn in_subqueries_with_inlined_with_queries_pull_up() {
         ["16", "17", "18", "19", "20"]
     );
 }
+
+#[test]
+fn explain_refuses_scans_postgresql_may_run_in_parallel() {
+    let (mut session, mut engine) = setup("parallel-candidates");
+    // A relation below `min_parallel_table_scan_size` gets no workers: its
+    // plan is PostgreSQL's at any `max_parallel_workers_per_gather`.
+    assert_eq!(
+        plan(&mut session, &mut engine, "COSTS OFF", "SELECT * FROM pn_t"),
+        ["Seq Scan on pn_t"]
+    );
+    session.success(&mut engine, "SET min_parallel_table_scan_size = 0", true);
+    let error = String::from_utf8_lossy(&session.execute(
+        &mut engine,
+        "EXPLAIN (COSTS OFF) SELECT * FROM pn_t",
+        true,
+    ))
+    .into_owned();
+    assert!(
+        error.contains("which PostgreSQL may run in parallel, is not supported"),
+        "{error}"
+    );
+    session.success(&mut engine, "SET max_parallel_workers_per_gather = 0", true);
+    assert_eq!(
+        plan(&mut session, &mut engine, "COSTS OFF", "SELECT * FROM pn_t"),
+        ["Seq Scan on pn_t"]
+    );
+}

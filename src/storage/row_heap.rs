@@ -1022,12 +1022,22 @@ impl HeapRelocation<'_> {
     }
 }
 
+/// The start of the message of a write the memtable has no room for.
+const MEMTABLE_FULL: &str = "memtable is full";
+
+/// Whether `error` is a write the memtable had no room for, which a
+/// checkpoint may make room for by spilling committed rows.
+pub(crate) fn is_memtable_full(error: &SqlError) -> bool {
+    error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED
+        && error.message.as_str().starts_with(MEMTABLE_FULL)
+}
+
 impl RowHeapState {
     fn check_capacity(&self, start: usize, len: usize) -> Result<(), SqlError> {
         if len > self.capacity - start {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "memtable is full ({} bytes); with object storage on, rows spill at the next checkpoint — retry, raise memtable_bytes, or enable object storage",
+                "{MEMTABLE_FULL} ({} bytes) of rows that cannot spill yet; raise memtable_bytes or split the transaction",
                 self.capacity
             ));
         }

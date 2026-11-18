@@ -852,12 +852,11 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         let info = &self.index(index).catalog;
         let mut keys = Keys::NONE;
         for position in 0..info.n_cols {
-            if info.pattern_keys[position]
-                || !info.column_collation[position]
-                || info.expression_keys[position]
-            {
+            if info.pattern_keys[position] || !info.column_collation[position] {
                 break;
             }
+            // An expression key's variable has a class when an expression
+            // member of the join is the key.
             let column = usize::from(info.columns[position]);
             if self.fixed.contains(column) {
                 continue;
@@ -935,7 +934,8 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     /// `btcostestimate`: startup and total cost, selectivity, correlation.
     /// The cost of evaluating the operands an index's conditions compare
     /// its keys with: a constant or an InitPlan's output costs nothing, a
-    /// stable expression its functions.
+    /// stable expression or an expression of a join's outer row its
+    /// operators and functions.
     fn operand_cost(&self, clauses: &[IndexClause<'a>]) -> f64 {
         let planner = self.planner;
         let columns = crate::sql::exec::AliasedDefCols {
@@ -949,8 +949,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             .filter_map(|clause| match clause.restriction.clause {
                 Clause::Compare { operand, .. }
                     if !operand.is_constant(false)
-                        && !matches!(operand, Expr::Param(_) | Expr::Subquery(_))
-                        && self.param_of(clause.restriction).is_none() =>
+                        && !matches!(operand, Expr::Param(_) | Expr::Subquery(_)) =>
                 {
                     Some(
                         super::super::plan::qual_cost(
@@ -2463,10 +2462,17 @@ pub(crate) fn scan_path<'a>(
         {
             return Ok(Planned::Outside("a join clause other than a comparison"));
         }
+        // The relation's side: a column, or an expression of its columns
+        // (an index on the expression may apply it).
         let own = |side: &Expr<'_>| {
-            matches!(side, Expr::Column { qualifier, name }
-                if matches!(scope.find_column(*qualifier, name),
-                    Ok(super::super::scope::ResolvedColumn::Table(0, _))))
+            let (mut read, mut foreign) = (false, false);
+            side.for_each_column_reference(&mut |qualifier, name| match scope
+                .find_column(qualifier, name)
+            {
+                Ok(super::super::scope::ResolvedColumn::Table(0, _)) => read = true,
+                _ => foreign = true,
+            });
+            read && !foreign
         };
         outer_operands[at] = match (own(left), own(right)) {
             (true, false) => right,
@@ -2911,17 +2917,19 @@ pub(crate) fn scan_path<'a>(
             Err(shape) => Planned::Outside(shape),
         });
     }
-    // A statistics object would estimate a join clause with the
-    // restrictions it covers (`statext_clauselist_selectivity`).
-    if join_count > 0
-        && storage
-            .extended_statistics_for_table(slot, txid)
-            .next()
-            .is_some()
-    {
-        return Ok(Planned::Outside("a statistics object on a join's relation"));
-    }
-    let rows = clamp_row_est(planner.size.tuples * planner.selectivity(restrictions)?);
+    // A parameterized scan's conditions include join clauses, which read
+    // another relation: `clauselist_selectivity` finds no single relation
+    // for them (`find_single_rel_for_clauses`) and applies no statistics
+    // object (`get_parameterized_baserel_size`).
+    let estimating = Planner {
+        extended: if join_count > 0 {
+            &[]
+        } else {
+            planner.extended
+        },
+        ..planner
+    };
+    let rows = clamp_row_est(planner.size.tuples * estimating.selectivity(restrictions)?);
     paths.rows = rows;
     match build(
         &mut paths,

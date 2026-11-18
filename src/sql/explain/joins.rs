@@ -5,6 +5,7 @@
 
 use core::fmt::Write as _;
 
+use super::targets::{BlockTargets, Demand, Output};
 use super::{
     KeyLabel, Plan, PlanKeys, PlanNode, QualLabel, chosen_scan_node, single_relation_quals,
 };
@@ -15,13 +16,17 @@ use crate::sql::query::index_paths::joins::{ClauseList, JoinType, Keys, Path, Pa
 use crate::sql::query::{self, QueryScope};
 use crate::util::StackStr;
 
-/// The planned join's nodes, the top join first.
+/// The planned join's nodes, the top join first. `targets` holds the
+/// query's target lists for `VERBOSE` when it has no grouping or windows,
+/// its stages the join, then the `Sort` and `Limit` above it.
+#[expect(clippy::too_many_arguments, reason = "plan context")]
 pub(super) fn join_plan<'a>(
     storage: &crate::storage::Storage,
     txid: u32,
     scope: &QueryScope<'_>,
     model: &ModeledJoin<'_>,
     (sort_keys, presorted, group): (PlanKeys, Option<PlanKeys>, &[PlanNode]),
+    targets: Option<&BlockTargets<'_>>,
     block: query::instrument::BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
@@ -37,7 +42,13 @@ pub(super) fn join_plan<'a>(
             + u8::from(model.plan.upper.sort.is_some())
             + group.len() as u8,
         scanned: scanned_rels(&model.plan, model.plan.top),
+        targets,
     };
+    // The stages' outputs, bottom up: the join's, the grouping and window
+    // nodes' (`group`, top first), the `Sort`'s, the `Limit`'s.
+    let stage_output = |index: usize| targets.map(|targets| targets.stage(index));
+    let sort_stage = 1 + group.len();
+    let stages = sort_stage + usize::from(model.plan.upper.sort.is_some());
     // The query's `Limit` and `Sort` above the join, with the target
     // list's width.
     let upper = model.plan.upper;
@@ -65,7 +76,8 @@ pub(super) fn join_plan<'a>(
             total_cost: total,
             rows: rows as u64,
             width,
-            output_unprintable: true,
+            output_unprintable: stage_output(stages).is_none(),
+            output: stage_output(stages).unwrap_or_default(),
             ..PlanNode::EMPTY
         })?;
         depth += 1;
@@ -87,7 +99,8 @@ pub(super) fn join_plan<'a>(
             rows: rows as u64,
             width,
             keys: sort_keys,
-            output_unprintable: true,
+            output_unprintable: stage_output(sort_stage).is_none(),
+            output: stage_output(sort_stage).unwrap_or_default(),
             ..PlanNode::EMPTY
         };
         if let Some(prefix) = presorted {
@@ -104,12 +117,29 @@ pub(super) fn join_plan<'a>(
         plan.push(node)?;
         depth += 1;
     }
-    for node in group {
-        plan.push(PlanNode { depth, ..*node })?;
+    for (at, node) in group.iter().enumerate() {
+        let mut node = PlanNode { depth, ..*node };
+        if targets.is_some() {
+            node.set_output(stage_output(group.len() - at));
+        }
+        plan.push(node)?;
         depth += 1;
     }
-    writer.path(&mut plan, model.plan.top, depth)?;
+    writer.path(&mut plan, model.plan.top, depth, Demand::Exact)?;
     Ok(plan)
+}
+
+/// The target lists of a sort's input and of the sort, each `None` when
+/// unprintable.
+type SortLists = (Option<Output>, Option<Output>);
+
+/// A node that does not project (`Hash`, `Sort`, `Materialize`,
+/// `Memoize`) returns its input's target list: the node at `at` takes the
+/// list of the node pushed after it.
+fn pass_through(plan: &mut Plan<'_>, at: usize) {
+    let input = plan.nodes[at + 1];
+    plan.nodes[at].output = input.output;
+    plan.nodes[at].output_unprintable = input.output_unprintable;
 }
 
 struct Writer<'w, 'm, 's, 'a> {
@@ -125,6 +155,8 @@ struct Writer<'w, 'm, 's, 'a> {
     /// another (a dummy relation's) prints without its relation's name, as
     /// EXPLAIN names only the range table entries the plan scans.
     scanned: Relids,
+    /// The query's target lists, which `VERBOSE` prints.
+    targets: Option<&'w BlockTargets<'w>>,
 }
 
 /// The base relations the plan under path `id` scans.
@@ -190,7 +222,48 @@ impl Writer<'_, '_, '_, '_> {
         }
     }
 
-    fn path(&mut self, plan: &mut Plan<'_>, id: u32, depth: u8) -> Result<(), SqlError> {
+    /// The target list a join (or a scan left alone by removed joins)
+    /// returns: the top one computes the scan/join target, a lower one its
+    /// relations' columns needed above it (`build_joinrel_tlist`).
+    fn join_output(&self, relids: Relids, depth: u8) -> Result<Option<Output>, SqlError> {
+        let Some(targets) = self.targets else {
+            return Ok(None);
+        };
+        if depth == self.top_depth {
+            return targets.scan_join().map(Some);
+        }
+        self.columns_output(relids)
+    }
+
+    /// The columns of `relids`' target list, in its order.
+    fn columns_output(&self, relids: Relids) -> Result<Option<Output>, SqlError> {
+        let mut output = Output::new();
+        let mut failed = Ok(());
+        self.model.plan.target_list(relids, &mut |needed| {
+            if failed.is_err() {
+                return;
+            }
+            let mut text = StackStr::<512>::new();
+            failed = self.column(
+                (usize::from(needed.rel), usize::from(needed.column)),
+                &mut text,
+            );
+            if !output.is_empty() {
+                let _ = output.write_str(", ");
+            }
+            let _ = output.write_str(text.as_str());
+        });
+        failed?;
+        Ok((!output.is_truncated()).then_some(output))
+    }
+
+    fn path(
+        &mut self,
+        plan: &mut Plan<'_>,
+        id: u32,
+        depth: u8,
+        demand: Demand,
+    ) -> Result<(), SqlError> {
         let path = *self.model.plan.path(id);
         match path.kind {
             PathKind::Dummy => {
@@ -202,17 +275,20 @@ impl Writer<'_, '_, '_, '_> {
                     node.with_qual(QualLabel::OneTimeFilter, Some(StackStr::from_str("false"))),
                 )
             }
-            PathKind::Scan { rel, path } => self.scan(plan, usize::from(rel), path, depth),
+            PathKind::Scan { rel, path } => self.scan(plan, usize::from(rel), path, depth, demand),
             PathKind::Material { input } => {
                 let node = self.node("Materialize", &path, depth);
+                let at = plan.count;
                 plan.push(self.keyed(node, query::instrument::Role::Materialize, id))?;
-                self.path(plan, input, depth + 1)
+                self.path(plan, input, depth + 1, Demand::Small)?;
+                pass_through(plan, at);
+                Ok(())
             }
             PathKind::Unique {
                 input,
                 method: query::index_paths::joins::UniqueMethod::Noop,
                 ..
-            } => self.path(plan, input, depth),
+            } => self.path(plan, input, depth, demand),
             PathKind::Unique {
                 input,
                 keys,
@@ -235,7 +311,7 @@ impl Writer<'_, '_, '_, '_> {
                     self.operand(
                         (usize::from(member.rel), usize::from(member.column)),
                         &mut text,
-                    );
+                    )?;
                     for held in [&mut shown.plain, &mut shown.verbose] {
                         if !held.is_empty() {
                             let _ = write!(held, "{}", super::KEY_SEPARATOR);
@@ -244,8 +320,20 @@ impl Writer<'_, '_, '_, '_> {
                     }
                 }
                 node.keys = shown;
+                let keys = &keys[..usize::from(key_count)];
+                let input_relids = self.model.plan.path(input).relids;
+                node.set_output(self.columns_output(input_relids)?);
                 plan.push(node)?;
-                self.path(plan, input, depth + 1)
+                // `create_unique_plan`: the input returns its columns and the
+                // compared expressions it lacks, or under `CP_LABEL_TLIST`
+                // its physical columns when it lacks none.
+                let computed = self.unique_input(input_relids, keys, false)?;
+                let at = plan.count;
+                self.path(plan, input, depth + 1, Demand::Any)?;
+                if computed.as_ref().is_none_or(|(_, added)| *added) {
+                    self.project(plan, at, computed.map(|(output, _)| output));
+                }
+                Ok(())
             }
             PathKind::Unique {
                 input,
@@ -254,13 +342,22 @@ impl Writer<'_, '_, '_, '_> {
                 ..
             } => {
                 // `create_unique_plan`: a `Unique` over a `Sort` of the
-                // compared columns (`label_sort_with_costsize`).
+                // compared columns (`label_sort_with_costsize`), both
+                // returning their input's columns and the compared
+                // expressions it computes.
                 const UNSUPPORTED: Option<&str> =
                     Some("EXPLAIN ANALYZE of a semi join's unique-ified relation is not supported");
-                plan.push(PlanNode {
+                let keys = &keys[..usize::from(key_count)];
+                let input_relids = self.model.plan.path(input).relids;
+                let above = self
+                    .unique_input(input_relids, keys, true)?
+                    .map(|(output, _)| output);
+                let mut unique = PlanNode {
                     analyze_unsupported: UNSUPPORTED,
                     ..self.node("Unique", &path, depth)
-                })?;
+                };
+                unique.set_output(above);
+                plan.push(unique)?;
                 let input_path = *self.model.plan.path(input);
                 let (startup, total) =
                     query::index_paths::joins::sort_cost(&input_path, self.model.plan.settings);
@@ -280,12 +377,9 @@ impl Writer<'_, '_, '_, '_> {
                     label: KeyLabel::Sort,
                     ..PlanKeys::NONE
                 };
-                for member in &keys[..usize::from(key_count)] {
+                for member in keys {
                     let mut text = StackStr::<512>::new();
-                    self.operand(
-                        (usize::from(member.rel), usize::from(member.column)),
-                        &mut text,
-                    );
+                    self.referenced(*member, &mut text)?;
                     for held in [&mut shown.plain, &mut shown.verbose] {
                         if !held.is_empty() {
                             let _ = write!(held, "{}", super::KEY_SEPARATOR);
@@ -294,8 +388,15 @@ impl Writer<'_, '_, '_, '_> {
                     }
                 }
                 sort.keys = shown;
+                sort.set_output(above);
                 plan.push(sort)?;
-                self.path(plan, input, depth + 2)
+                let computed = self
+                    .unique_input(input_relids, keys, false)?
+                    .map(|(output, _)| output);
+                let at = plan.count;
+                self.path(plan, input, depth + 2, Demand::Small)?;
+                self.project(plan, at, computed);
+                Ok(())
             }
             PathKind::Memoize {
                 input,
@@ -312,7 +413,7 @@ impl Writer<'_, '_, '_, '_> {
                     self.column(
                         (usize::from(member.rel), usize::from(member.column)),
                         &mut key,
-                    );
+                    )?;
                 }
                 let node = self
                     .node("Memoize", &path, depth)
@@ -325,25 +426,36 @@ impl Writer<'_, '_, '_, '_> {
                             "logical"
                         })),
                     );
+                let at = plan.count;
                 plan.push(self.keyed(node, query::instrument::Role::Memoize, id))?;
-                self.path(plan, input, depth + 1)
+                self.path(plan, input, depth + 1, Demand::Small)?;
+                pass_through(plan, at);
+                Ok(())
             }
             PathKind::NestLoop {
                 jointype,
                 outer,
                 inner,
                 clauses,
-                ..
+                inner_unique,
             } => {
                 let (join_filter, filter) =
                     self.split(&clauses, path.relids, jointype, &ClauseList::EMPTY);
-                let node = self
+                let mut node = self
                     .node(join_name("Nested Loop", jointype).as_str(), &path, depth)
-                    .with_qual(QualLabel::JoinFilter, self.conditions(&join_filter, None)?)
-                    .with_qual(QualLabel::Filter, self.conditions(&filter, None)?);
+                    .with_qual(
+                        QualLabel::JoinFilter,
+                        self.conditions(&join_filter, None, (false, false))?,
+                    )
+                    .with_qual(
+                        QualLabel::Filter,
+                        self.conditions(&filter, None, (false, false))?,
+                    );
+                node.set_output(self.join_output(path.relids, depth)?);
+                node.inner_unique = inner_unique;
                 plan.push(self.keyed(node, query::instrument::Role::Join, id))?;
-                self.path(plan, outer, depth + 1)?;
-                self.path(plan, inner, depth + 1)
+                self.path(plan, outer, depth + 1, Demand::Any)?;
+                self.path(plan, inner, depth + 1, Demand::Any)
             }
             PathKind::HashJoin {
                 jointype,
@@ -351,27 +463,47 @@ impl Writer<'_, '_, '_, '_> {
                 inner,
                 hash,
                 clauses,
+                batches,
+                inner_unique,
                 ..
             } => {
                 let outer_relids = self.model.plan.path(outer).relids;
                 let (join_filter, filter) = self.split(&clauses, path.relids, jointype, &hash);
-                let node = self
+                let mut node = self
                     .node(join_name("Hash", jointype).as_str(), &path, depth)
                     .with_qual(
                         QualLabel::HashCond,
-                        self.conditions(&hash, Some(outer_relids))?,
+                        self.conditions(&hash, Some(outer_relids), (false, false))?,
                     )
-                    .with_qual(QualLabel::JoinFilter, self.conditions(&join_filter, None)?)
-                    .with_qual(QualLabel::Filter, self.conditions(&filter, None)?);
+                    .with_qual(
+                        QualLabel::JoinFilter,
+                        self.conditions(&join_filter, None, (false, false))?,
+                    )
+                    .with_qual(
+                        QualLabel::Filter,
+                        self.conditions(&filter, None, (false, false))?,
+                    );
+                node.set_output(self.join_output(path.relids, depth)?);
+                node.inner_unique = inner_unique;
                 plan.push(self.keyed(node, query::instrument::Role::Join, id))?;
-                self.path(plan, outer, depth + 1)?;
+                // `create_hashjoin_plan`: a batched join's outer input
+                // returns only the columns needed.
+                let outer_demand = if batches > 1 {
+                    Demand::Small
+                } else {
+                    Demand::Any
+                };
+                self.path(plan, outer, depth + 1, outer_demand)?;
                 let inner_path = *self.model.plan.path(inner);
                 let hash_node = PlanNode {
                     startup_cost: inner_path.total,
                     ..self.node("Hash", &inner_path, depth + 1)
                 };
+                let at = plan.count;
                 plan.push(self.keyed(hash_node, query::instrument::Role::Hash, id))?;
-                self.path(plan, inner, depth + 2)
+                self.path(plan, inner, depth + 2, Demand::Small)?;
+                pass_through(plan, at);
+                Ok(())
             }
             PathKind::MergeJoin {
                 jointype,
@@ -382,18 +514,34 @@ impl Writer<'_, '_, '_, '_> {
                 outer_sort,
                 inner_sort,
                 materialize_inner,
+                inner_unique,
                 ..
             } => {
                 let outer_relids = self.model.plan.path(outer).relids;
                 let (join_filter, filter) = self.split(&clauses, path.relids, jointype, &merge);
-                let node = self
+                let mut node = self
                     .node(join_name("Merge", jointype).as_str(), &path, depth)
                     .with_qual(
                         QualLabel::MergeCond,
-                        self.conditions(&merge, Some(outer_relids))?,
+                        self.conditions(
+                            &merge,
+                            Some(outer_relids),
+                            (
+                                !outer_sort.as_slice().is_empty(),
+                                !inner_sort.as_slice().is_empty(),
+                            ),
+                        )?,
                     )
-                    .with_qual(QualLabel::JoinFilter, self.conditions(&join_filter, None)?)
-                    .with_qual(QualLabel::Filter, self.conditions(&filter, None)?);
+                    .with_qual(
+                        QualLabel::JoinFilter,
+                        self.conditions(&join_filter, None, (false, false))?,
+                    )
+                    .with_qual(
+                        QualLabel::Filter,
+                        self.conditions(&filter, None, (false, false))?,
+                    );
+                node.set_output(self.join_output(path.relids, depth)?);
+                node.inner_unique = inner_unique;
                 plan.push(self.keyed(node, query::instrument::Role::Join, id))?;
                 self.sorted(plan, id, outer, outer_sort, false, 0, depth + 1)?;
                 self.sorted(plan, id, inner, inner_sort, materialize_inner, 1, depth + 1)
@@ -445,6 +593,7 @@ impl Writer<'_, '_, '_, '_> {
         };
         let below = sorted.unwrap_or(input);
         let mut depth = depth;
+        let material_at = materialize.then_some(plan.count);
         if materialize {
             let (startup, total) = query::index_paths::joins::material_cost(
                 below.startup,
@@ -462,9 +611,10 @@ impl Writer<'_, '_, '_, '_> {
             plan.push(self.keyed(node, query::instrument::Role::Materialize, join))?;
             depth += 1;
         }
+        let sort_at = sorted.is_some().then_some(plan.count);
         if let Some(sorted) = sorted {
             let mut node = self.node("Sort", &sorted, depth);
-            node.keys = self.sort_keys(&keys, input.relids);
+            node.keys = self.sort_keys(&keys, input.relids)?;
             plan.push(self.keyed(
                 node,
                 |number| query::instrument::Role::MergeSort(number, side),
@@ -472,7 +622,77 @@ impl Writer<'_, '_, '_, '_> {
             ))?;
             depth += 1;
         }
-        self.path(plan, id, depth)
+        // `create_mergejoin_plan`: a sorted input returns only the columns
+        // needed.
+        let demand = if sorted.is_some() {
+            Demand::Small
+        } else {
+            Demand::Any
+        };
+        self.path(plan, id, depth, demand)?;
+        if let Some(at) = sort_at {
+            pass_through(plan, at);
+            // A key the input does not hold is computed by the input as a
+            // resjunk entry (`prepare_sort_from_pathkeys`), which the sort
+            // reads.
+            if let Some((input_list, sort_list)) =
+                self.computed_keys(plan, at, &keys, input.relids)?
+            {
+                self.project(plan, at + 1, input_list);
+                plan.nodes[at].set_output(sort_list);
+            }
+        }
+        if let Some(at) = material_at {
+            pass_through(plan, at);
+        }
+        Ok(())
+    }
+
+    /// The target lists of a sort's input and of the sort when it sorts by
+    /// an expression its input computes, `None` when it computes none.
+    fn computed_keys(
+        &self,
+        plan: &Plan<'_>,
+        at: usize,
+        keys: &Keys,
+        relids: Relids,
+    ) -> Result<Option<SortLists>, SqlError> {
+        use query::index_paths::joins::KEY_CLASS;
+        let base = plan.nodes[at + 1];
+        let (mut input, mut sort) = (base.output, base.output);
+        let mut computed = false;
+        for &key in keys.as_slice() {
+            let class = key & KEY_CLASS;
+            let Some(at) = self.model.plan.classes[usize::from(class)].sort_member(relids) else {
+                continue;
+            };
+            let member = self.model.member(class, at as u8);
+            if query::index_paths::joins::Member::plain(0, member.1 as u16)
+                .expression_id()
+                .is_none()
+            {
+                continue;
+            }
+            computed = true;
+            let mut text = StackStr::<512>::new();
+            self.column(member, &mut text)?;
+            for (list, shown) in [(&mut input, false), (&mut sort, true)] {
+                if !list.is_empty() {
+                    let _ = list.write_str(", ");
+                }
+                if shown {
+                    let _ = write!(list, "({})", text.as_str());
+                } else {
+                    let _ = list.write_str(text.as_str());
+                }
+            }
+        }
+        if !computed {
+            return Ok(None);
+        }
+        let printable =
+            |list: Output| (!base.output_unprintable && !list.is_truncated()).then_some(list);
+        Ok(Some((printable(input), printable(sort))))
     }
 
     /// The scan of path `path` of relation `rel`: its index conditions,
@@ -484,6 +704,7 @@ impl Writer<'_, '_, '_, '_> {
         rel: usize,
         path: u16,
         depth: u8,
+        demand: Demand,
     ) -> Result<(), SqlError> {
         let modeled = self.model.rels[rel];
         let scan = modeled.scan(self.storage, self.txid, path, &[], self.arena)?;
@@ -495,27 +716,34 @@ impl Writer<'_, '_, '_, '_> {
             self.scope,
             scan.param & query::index_paths::joins::BASE_RELIDS,
         );
+        // Each condition as printed, and as `VERBOSE` prints it with its
+        // columns qualified.
         let quals = |index: Option<&query::IndexAccessPlan<'_>>| {
-            single_relation_quals(
-                self.storage,
-                self.txid,
-                single.names[0],
-                definition,
-                &[],
-                scan.condition,
-                &[],
-                index,
-                false,
-                self.arena,
-            )
+            let printed = |verbose| {
+                single_relation_quals(
+                    self.storage,
+                    self.txid,
+                    single.names[0],
+                    definition,
+                    &[],
+                    scan.condition,
+                    &[],
+                    index,
+                    verbose,
+                    self.arena,
+                )
+            };
+            Ok::<_, SqlError>((printed(false)?, printed(true)?))
         };
         let printed = (|| {
-            let (index_cond, filter) = quals(used.as_ref())?;
+            let ((index_cond, filter), (verbose_index_cond, verbose_filter)) =
+                quals(used.as_ref())?;
             let recheck = match (scan.path.kind, used.as_ref()) {
                 (query::index_paths::ScanKind::Bitmap, Some(used)) => {
-                    quals(Some(&used.written()))?.0
+                    let (plain, verbose) = quals(Some(&used.written()))?;
+                    (plain.0, verbose.0)
                 }
-                _ => None,
+                _ => (None, None),
             };
             let mut leaves = [(None, None); 64];
             for (at, node) in scan.path.bitmap.iter().enumerate().take(64) {
@@ -525,20 +753,30 @@ impl Writer<'_, '_, '_, '_> {
                         recheck: &[],
                         absorbed: &[],
                     });
-                    leaves[at] = (quals(Some(&leaf))?.0, None);
+                    let (plain, verbose) = quals(Some(&leaf))?;
+                    leaves[at] = (plain.0, verbose.0);
                 }
             }
-            Ok::<_, SqlError>((index_cond, filter, recheck, leaves))
+            Ok::<_, SqlError>((
+                (index_cond, verbose_index_cond),
+                (filter, verbose_filter),
+                recheck,
+                leaves,
+            ))
         })();
         super::pop_outer_relations(pushed);
         let (index_cond, filter, recheck, leaves) = printed?;
         node = node
-            .with_qual(QualLabel::IndexCond, index_cond)
-            .with_qual(QualLabel::Filter, filter);
-        if recheck.is_some() {
-            node = node.with_qual(QualLabel::RecheckCond, recheck);
+            .with_qual(QualLabel::IndexCond, index_cond.0)
+            .with_qual(QualLabel::Filter, filter.0)
+            .with_verbose_qual(QualLabel::IndexCond, index_cond.1)
+            .with_verbose_qual(QualLabel::Filter, filter.1);
+        if recheck.0.is_some() {
+            node = node
+                .with_qual(QualLabel::RecheckCond, recheck.0)
+                .with_verbose_qual(QualLabel::RecheckCond, recheck.1);
         }
-        node.output_unprintable = true;
+        node.set_output(self.scan_output(rel, &scan.path, depth, demand)?);
         // A scan left alone by removed joins carries the query's output.
         if depth == 0 {
             node.width = self.model.output_width as u32;
@@ -562,8 +800,146 @@ impl Writer<'_, '_, '_, '_> {
         super::push_scan(plan, node)
     }
 
-    /// `relation.column`, as the join prints a column.
-    fn column(&self, (table, column): (usize, usize), text: &mut StackStr<512>) {
+    /// The target list of a unique-ified relation's input
+    /// (`create_unique_plan`): `relids`' columns, then each compared
+    /// expression they lack, as the input computes it or, `referenced`, as
+    /// a node above reads it. Whether any expression was added.
+    fn unique_input(
+        &self,
+        relids: Relids,
+        keys: &[query::index_paths::joins::Member],
+        referenced: bool,
+    ) -> Result<Option<(Output, bool)>, SqlError> {
+        let Some(mut output) = self.columns_output(relids)? else {
+            return Ok(None);
+        };
+        let mut added = false;
+        for member in keys {
+            let mut text = StackStr::<512>::new();
+            let computed = if referenced {
+                self.referenced(*member, &mut text)?
+            } else {
+                self.operand(
+                    (usize::from(member.rel), usize::from(member.column)),
+                    &mut text,
+                )?;
+                self.referenced(*member, &mut StackStr::new())?
+            };
+            if !computed {
+                continue;
+            }
+            if !output.is_empty() {
+                let _ = output.write_str(", ");
+            }
+            let _ = output.write_str(text.as_str());
+            added = true;
+        }
+        Ok((!output.is_truncated()).then_some((output, added)))
+    }
+
+    /// A compared member as a node above the one computing it reads it:
+    /// an expression, or a column its operator reads relabeled, in
+    /// parentheses (`get_variable`). Whether it is computed (no plain
+    /// column).
+    fn referenced(
+        &self,
+        member: query::index_paths::joins::Member,
+        text: &mut StackStr<512>,
+    ) -> Result<bool, SqlError> {
+        let at = (usize::from(member.rel), usize::from(member.column));
+        let mut operand = StackStr::<512>::new();
+        self.operand(at, &mut operand)?;
+        let mut column = StackStr::<512>::new();
+        self.column(at, &mut column)?;
+        let computed = member.expression_id().is_some() || operand.as_str() != column.as_str();
+        if computed {
+            let _ = write!(text, "({})", operand.as_str());
+        } else {
+            let _ = text.write_str(column.as_str());
+        }
+        Ok(computed)
+    }
+
+    /// Gives the node at `at`, a scan or join, the target list `output`
+    /// its parent sets (`create_unique_plan`, `prepare_sort_from_pathkeys`);
+    /// a node that cannot project would need a `Result` above it, which
+    /// the plan does not hold.
+    fn project(&self, plan: &mut Plan<'_>, at: usize, output: Option<Output>) {
+        let node = &mut plan.nodes[at];
+        let projects = !matches!(
+            node.name.as_str(),
+            "Materialize" | "Memoize" | "Hash" | "Sort" | "Unique" | "HashAggregate"
+        );
+        node.set_output(output.filter(|_| projects));
+    }
+
+    /// The target list of relation `rel`'s scan by `path`: the scan/join
+    /// target when it is the plan's top node, else, as `create_scan_plan`
+    /// builds it, the relation's physical columns when the parent accepts
+    /// any (`use_physical_tlist`; an index-only scan's are its index's), or
+    /// the columns needed above it.
+    fn scan_output(
+        &self,
+        rel: usize,
+        path: &query::index_paths::ScanPath<'_>,
+        depth: u8,
+        demand: Demand,
+    ) -> Result<Option<Output>, SqlError> {
+        use query::index_paths::ScanKind;
+        let Some(targets) = self.targets else {
+            return Ok(None);
+        };
+        if depth == self.top_depth {
+            return targets.scan_join().map(Some);
+        }
+        let needed = self.columns_output(1 << rel)?;
+        if demand != Demand::Any {
+            return Ok(needed);
+        }
+        match path.kind {
+            ScanKind::IndexOnly => {
+                let mut output = Output::new();
+                for key in path.keys {
+                    if key.expression.is_some() {
+                        return Ok(None);
+                    }
+                    let mut text = StackStr::<512>::new();
+                    self.column((rel, key.column), &mut text)?;
+                    if !output.is_empty() {
+                        let _ = output.write_str(", ");
+                    }
+                    let _ = output.write_str(text.as_str());
+                }
+                Ok((!output.is_truncated()).then_some(output))
+            }
+            // A bitmap scan returning no columns keeps its empty list.
+            ScanKind::Bitmap if needed.as_ref().is_some_and(|list| list.is_empty()) => Ok(needed),
+            _ => match targets.physical(rel) {
+                Some(physical) => physical.map(Some),
+                None => Ok(needed),
+            },
+        }
+    }
+
+    /// `relation.column`, as the join prints a column; an expression
+    /// member as `ruleutils.c` prints the expression.
+    fn column(
+        &self,
+        (table, column): (usize, usize),
+        text: &mut StackStr<512>,
+    ) -> Result<(), SqlError> {
+        if let Some(id) = query::index_paths::joins::Member::plain(0, column as u16).expression_id()
+        {
+            let Some(printed) = self.deparse_as(self.model.expressions[id].expression, false)?
+            else {
+                return Err(crate::sql_err!(
+                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN of this join key expression is not supported"
+                ));
+            };
+            let _ = write!(text, "{}", printed.as_str());
+            return Ok(());
+        }
         let definition = self.scope.defs.stored(table).expect("a plain table");
         // A plan scanning nothing names every relation (`set_rtable_names`
         // with no relations used).
@@ -575,7 +951,7 @@ impl Writer<'_, '_, '_, '_> {
                     definition.columns()[column].name.as_str()
                 )
             );
-            return;
+            return Ok(());
         }
         let _ = write!(
             text,
@@ -583,34 +959,54 @@ impl Writer<'_, '_, '_, '_> {
             crate::sql::catalog::deparse::printed_name(self.scope.names[table]),
             crate::sql::catalog::deparse::printed_name(definition.columns()[column].name.as_str())
         );
+        Ok(())
     }
 
     /// A column as an equality's operand: a type without its own equality
     /// operator prints relabeled to the type whose operator compares it
     /// (`varchar` as `text`, `cidr` as `inet`).
-    fn operand(&self, (table, column): (usize, usize), text: &mut StackStr<512>) {
-        let definition = self.scope.defs.stored(table).expect("a plain table");
-        let relabeled = match definition.columns()[column].ctype {
+    fn operand(
+        &self,
+        (table, column): (usize, usize),
+        text: &mut StackStr<512>,
+    ) -> Result<(), SqlError> {
+        let ctype = match query::index_paths::joins::Member::plain(0, column as u16).expression_id()
+        {
+            Some(id) => self.model.expressions[id].ctype,
+            None => {
+                self.scope
+                    .defs
+                    .stored(table)
+                    .expect("a plain table")
+                    .columns()[column]
+                    .ctype
+            }
+        };
+        let relabeled = match ctype {
             crate::sql::types::ColType::Varchar => Some("text"),
             crate::sql::types::ColType::Cidr => Some("inet"),
             _ => None,
         };
         let Some(relabeled) = relabeled else {
-            self.column((table, column), text);
-            return;
+            return self.column((table, column), text);
         };
         let _ = write!(text, "(");
-        self.column((table, column), text);
+        self.column((table, column), text)?;
         let _ = write!(text, ")::{relabeled}");
+        Ok(())
     }
 
     /// The conditions of `clauses` ANDed, an equality with the column of
     /// `outer` first when given (`get_switched_clauses`), as written
     /// otherwise.
+    /// A merge join's side its own `Sort` orders (`sorted`, outer side
+    /// first) reads an expression key from the sort's target list, which
+    /// prints parenthesized (`get_variable`).
     fn conditions(
         &self,
         clauses: &ClauseList,
         outer: Option<Relids>,
+        sorted: (bool, bool),
     ) -> Result<Option<StackStr<512>>, SqlError> {
         // The constant `true` an outer join clause gave way to
         // (`reconsider_outer_join_clauses`) prints as nothing.
@@ -655,10 +1051,24 @@ impl Writer<'_, '_, '_, '_> {
             {
                 core::mem::swap(&mut left, &mut right);
             }
+            let sorted_operand = |side: (usize, usize), sorted: bool, text: &mut StackStr<512>| {
+                let computed = sorted
+                    && query::index_paths::joins::Member::plain(0, side.1 as u16)
+                        .expression_id()
+                        .is_some();
+                if computed {
+                    let _ = write!(text, "(");
+                }
+                self.operand(side, text)?;
+                if computed {
+                    let _ = write!(text, ")");
+                }
+                Ok::<_, SqlError>(())
+            };
             let _ = write!(text, "(");
-            self.operand(left, &mut text);
+            sorted_operand(left, sorted.0, &mut text)?;
             let _ = write!(text, " = ");
-            self.operand(right, &mut text);
+            sorted_operand(right, sorted.1, &mut text)?;
             let _ = write!(text, ")");
         }
         if ids.len() > 1 {
@@ -672,6 +1082,16 @@ impl Writer<'_, '_, '_, '_> {
     fn deparse(
         &self,
         expression: &crate::sql::ast::Expr<'_>,
+    ) -> Result<Option<StackStr<512>>, SqlError> {
+        self.deparse_as(expression, true)
+    }
+
+    /// A condition (`qual`), or a value of its own type, as `ruleutils.c`
+    /// prints it in the join, its columns qualified by their relations.
+    fn deparse_as(
+        &self,
+        expression: &crate::sql::ast::Expr<'_>,
+        qual: bool,
     ) -> Result<Option<StackStr<512>>, SqlError> {
         let joined = self
             .arena
@@ -703,11 +1123,29 @@ impl Writer<'_, '_, '_, '_> {
             folded: true,
             bare: None,
         };
-        super::deparse_qual(&context, &[expression], self.arena)
+        if qual {
+            return super::deparse_qual(&context, &[expression], self.arena);
+        }
+        let mark = self.arena.mark();
+        let printed = crate::sql::catalog::deparse::deparse_expression(
+            &context,
+            expression,
+            crate::sql::catalog::deparse::Destination::Value,
+            self.arena,
+        )
+        .map(|part| {
+            part.and_then(|part| {
+                let text = StackStr::<512>::from_str(part);
+                (!text.is_truncated()).then_some(text)
+            })
+        });
+        // SAFETY: the text was copied out of the arena.
+        unsafe { self.arena.rewind_to(mark) };
+        printed
     }
 
     /// A sort's keys: each class's first member among `relids`.
-    fn sort_keys(&self, keys: &Keys, relids: Relids) -> PlanKeys {
+    fn sort_keys(&self, keys: &Keys, relids: Relids) -> Result<PlanKeys, SqlError> {
         let mut shown = PlanKeys {
             label: KeyLabel::Sort,
             ..PlanKeys::NONE
@@ -715,15 +1153,23 @@ impl Writer<'_, '_, '_, '_> {
         use query::index_paths::joins::{KEY_CLASS, KEY_DESCENDING, KEY_NULLS_FIRST};
         for &key in keys.as_slice() {
             let class = key & KEY_CLASS;
-            let members = self.model.plan.classes[usize::from(class)].members();
-            let Some(at) = members
-                .iter()
-                .position(|member| relids & 1 << member.rel != 0)
-            else {
+            let Some(at) = self.model.plan.classes[usize::from(class)].sort_member(relids) else {
                 continue;
             };
             let mut text = StackStr::<512>::new();
-            self.column(self.model.member(class, at as u8), &mut text);
+            let member = self.model.member(class, at as u8);
+            // An expression a sort computes is its input's target list
+            // entry, which prints parenthesized (`get_variable`).
+            let expression = query::index_paths::joins::Member::plain(0, member.1 as u16)
+                .expression_id()
+                .is_some();
+            if expression {
+                let _ = write!(text, "(");
+            }
+            self.column(member, &mut text)?;
+            if expression {
+                let _ = write!(text, ")");
+            }
             // `show_sortorder_options`.
             let descending = key & KEY_DESCENDING != 0;
             let nulls_first = key & KEY_NULLS_FIRST != 0;
@@ -742,7 +1188,7 @@ impl Writer<'_, '_, '_, '_> {
                 let _ = write!(held, "{}", text.as_str());
             }
         }
-        shown
+        Ok(shown)
     }
 }
 

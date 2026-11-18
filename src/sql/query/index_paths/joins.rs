@@ -323,13 +323,21 @@ pub(crate) trait JoinStatistics {
     /// `estimate_num_groups` of the columns `members` over `calls` rows;
     /// `calls` when a column's distinct count is a default.
     fn groups(&self, members: &[Member], calls: f64) -> Result<f64, SqlError>;
+    /// `estimate_num_groups` of `members` over `rows` input rows.
+    fn num_groups(&self, members: &[Member], rows: f64) -> Result<f64, SqlError>;
     /// `estimate_hash_bucket_stats` of `member` over `buckets`: its most
     /// common value's frequency and its bucket size fraction.
     fn bucket(&self, member: Member, buckets: f64) -> Result<(f64, f64), SqlError>;
-    /// `mergejoinscansel` of `left = right` merged ascending:
+    /// `mergejoinscansel` of `left = right` merged in the given direction:
     /// `(leftstart, leftend, rightstart, rightend)`.
     /// `None` when PostgreSQL's estimate is outside the model.
-    fn merge_range(&self, left: Member, right: Member) -> Result<Option<[f64; 4]>, SqlError>;
+    fn merge_range(
+        &self,
+        left: Member,
+        right: Member,
+        descending: bool,
+        nulls_first: bool,
+    ) -> Result<Option<[f64; 4]>, SqlError>;
 }
 
 /// The planner settings a join search reads.
@@ -513,6 +521,11 @@ pub(crate) enum PathKind {
         /// The inner relation is unique: each outer row stops at its first
         /// match, and with no other clause the inner input is never marked.
         inner_unique: bool,
+        /// Each merge clause's sort direction, the outer pathkey's of its
+        /// class (`mergeStrategies`, `mergeNullsFirst`): bit `i` of each
+        /// for merge clause `i`.
+        descending: u32,
+        nulls_first: u32,
     },
 }
 
@@ -650,6 +663,183 @@ pub(crate) struct UpperProblem {
     /// The per-row cost of the target list's expressions, which the
     /// joined relation's paths take on (`create_projection_path`).
     pub(crate) target_cost: f64,
+    /// The query's `GROUP BY`, whose pathkeys `sort` then holds as the
+    /// query's pathkeys.
+    pub(crate) group: Option<GroupProblem>,
+    /// The query's window clauses, evaluated between the join and the
+    /// sort.
+    pub(crate) windows: WindowsProblem,
+    /// The per-row cost of the target list the top window computes.
+    pub(crate) windows_output_cost: f64,
+}
+
+impl UpperProblem {
+    /// `query_pathkeys`: the first window's, else a grouping's, else
+    /// [`Self::sort`].
+    pub(crate) fn query_keys(&self) -> Keys {
+        match (self.windows.as_slice().first(), self.group) {
+            (Some(window), _) => window.keys,
+            (None, Some(group)) if !group.distinct && !group.keys.as_slice().is_empty() => {
+                group.keys
+            }
+            _ => self.sort,
+        }
+    }
+}
+
+/// The most window clauses a modeled query evaluates.
+pub(crate) const MAX_WINDOWS: usize = 8;
+
+/// The window clauses above the join, in the order PostgreSQL evaluates
+/// them (`select_active_windows`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WindowsProblem {
+    pub(crate) clauses: [WindowProblem; MAX_WINDOWS],
+    pub(crate) count: u8,
+    /// The width of the joined rows the bottom window reads
+    /// (`make_window_input_target`).
+    pub(crate) input_width: f64,
+}
+
+impl WindowsProblem {
+    pub(crate) const NONE: Self = Self {
+        clauses: [WindowProblem::NONE; MAX_WINDOWS],
+        count: 0,
+        input_width: 0.0,
+    };
+
+    pub(crate) fn as_slice(&self) -> &[WindowProblem] {
+        &self.clauses[..usize::from(self.count)]
+    }
+}
+
+/// How far a window clause's frame reaches past the current row, which
+/// sets the rows its first output row reads
+/// (`get_windowclause_startup_tuples`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FrameEnd {
+    UnboundedFollowing,
+    /// `CURRENT ROW` in `ROWS` mode (`rows`), or in `RANGE` or `GROUPS`
+    /// mode.
+    CurrentRow {
+        rows: bool,
+    },
+    OffsetPreceding,
+    /// `n FOLLOWING`: the offset when it is an integer constant (a NULL's
+    /// is one), else `None`.
+    OffsetFollowing {
+        rows: bool,
+        offset: Option<f64>,
+    },
+}
+
+/// One window clause (`create_one_window_path`, `cost_windowagg`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WindowProblem {
+    /// `make_pathkeys_for_window`: its partition, then order pathkeys.
+    pub(crate) keys: Keys,
+    /// Its `PARTITION BY` and `ORDER BY` columns, as
+    /// `estimate_num_groups` reads them.
+    pub(crate) partition: [Member; MAX_KEYS],
+    pub(crate) partition_count: u8,
+    pub(crate) order: [Member; MAX_KEYS],
+    pub(crate) order_count: u8,
+    pub(crate) frame_end: FrameEnd,
+    /// Its window functions' startup cost and cost per row.
+    pub(crate) startup_cost: f64,
+    pub(crate) per_row: f64,
+    /// The width its functions' results add to the rows (for a window
+    /// below the top one).
+    pub(crate) added_width: f64,
+}
+
+impl WindowProblem {
+    pub(crate) const NONE: Self = Self {
+        keys: Keys::NONE,
+        partition: [Member::plain(0, 0); MAX_KEYS],
+        partition_count: 0,
+        order: [Member::plain(0, 0); MAX_KEYS],
+        order_count: 0,
+        frame_end: FrameEnd::UnboundedFollowing,
+        startup_cost: 0.0,
+        per_row: 0.0,
+        added_width: 0.0,
+    };
+}
+
+/// A window clause's nodes as the plan chose them: the sort of its input
+/// (startup and total cost, presorted keys, width), and its `WindowAgg`'s
+/// startup and total cost and width.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WindowStep {
+    pub(crate) sort: Option<(f64, f64, u8)>,
+    pub(crate) sort_width: f64,
+    pub(crate) startup: f64,
+    pub(crate) total: f64,
+    pub(crate) width: f64,
+}
+
+/// A `GROUP BY` of plain columns, or the one group of a query's plain
+/// aggregates, above the join (`create_grouping_paths`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GroupProblem {
+    /// `group_pathkeys`, in `processed_groupClause` order, then the keys
+    /// of the ordered aggregates it presorts for
+    /// (`adjust_group_pathkeys_for_groupagg`); none for plain aggregation
+    /// (`AGG_PLAIN`) of no presorted aggregate.
+    pub(crate) keys: Keys,
+    /// The grouping's own keys among [`Self::keys`]
+    /// (`num_groupby_pathkeys`).
+    pub(crate) columns: u8,
+    /// `sort_pathkeys` of the query's `ORDER BY` of the groups.
+    pub(crate) sort: Keys,
+    /// Each key's grouping column, which `get_number_of_groups` counts the
+    /// groups of.
+    pub(crate) members: [Member; MAX_KEYS],
+    pub(crate) aggregates: super::aggregate::AggregateCosts,
+    /// The width of the joined rows the aggregate reads and of the groups
+    /// it returns.
+    pub(crate) input_width: f64,
+    pub(crate) output_width: f64,
+    /// Every grouping column's type hashes (`GROUPING_CAN_USE_HASH`).
+    pub(crate) hashable: bool,
+    pub(crate) hashagg: bool,
+    pub(crate) group_by_reordering: bool,
+    /// A `DISTINCT` (`create_final_distinct_paths`): a `Unique` over the
+    /// rows sorted by its keys rather than a `GroupAggregate`, and a
+    /// `HashAggregate` only with `enable_hashagg` on;
+    /// `group_by_reordering` is then `enable_distinct_reordering`.
+    pub(crate) distinct: bool,
+    /// The `HAVING` qualification's cost and selectivity.
+    pub(crate) having: Option<super::aggregate::QualCosts>,
+    /// The per-group cost of the grouping's target list.
+    pub(crate) target_cost: f64,
+}
+
+/// The grouping above the join that `add_paths_to_grouping_rel` chose.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GroupPlan {
+    /// A `HashAggregate` rather than a `GroupAggregate`.
+    pub(crate) hashed: bool,
+    /// The pathkeys a `GroupAggregate` groups by, its `Group Key` order.
+    pub(crate) keys: Keys,
+    /// The sort of the joined rows below a `GroupAggregate`: its startup
+    /// and total cost and the keys the rows are already sorted by.
+    pub(crate) input_sort: Option<(f64, f64, u8)>,
+    pub(crate) startup: f64,
+    pub(crate) total: f64,
+    pub(crate) rows: f64,
+    pub(crate) width: f64,
+    /// The groups estimated before any `HAVING` (`numGroups`).
+    pub(crate) groups: f64,
+    /// The join's rows as the aggregate reads them.
+    pub(crate) input: AggregateInput,
+}
+
+/// The rows and cost of an aggregate's input.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AggregateInput {
+    pub(crate) rows: f64,
 }
 
 /// The query's nodes above the join, as `create_ordered_paths` and
@@ -663,6 +853,10 @@ pub(crate) struct UpperPlan {
     pub(crate) limit: Option<(f64, f64, f64)>,
     /// The join path's total cost with its target list's.
     pub(crate) top_total: f64,
+    /// The grouping between the join and the sort, when the query groups.
+    pub(crate) group: Option<GroupPlan>,
+    /// The window clauses between the join and the sort, bottom first.
+    pub(crate) windows: [WindowStep; MAX_WINDOWS],
 }
 
 /// The join problem.
@@ -689,6 +883,10 @@ pub(crate) struct JoinProblem<'p> {
     /// A class equates two constants in the query's join domain: the
     /// joined relation is dummy.
     pub(crate) dummy: bool,
+    /// The base relations a class equating two constants inside an outer
+    /// join empties: one dummy relation, or the join of several, whose
+    /// restriction list holds the constant false condition.
+    pub(crate) false_relids: Relids,
 }
 
 struct Search<'p, 'a, 's> {
@@ -730,7 +928,19 @@ pub(crate) fn search<'a>(
     arena: &'a Arena,
 ) -> Result<Result<JoinPlan<'a>, Outside>, SqlError> {
     let n = problem.rels.len();
-    if !(2..=MAX_JOIN_RELS).contains(&n) {
+    // One relation is planned for the windows or ordered aggregates above
+    // it.
+    let least = if problem.upper.windows.count > 0
+        || problem
+            .upper
+            .group
+            .is_some_and(|group| group.aggregates.ordered)
+    {
+        1
+    } else {
+        2
+    };
+    if !(least..=MAX_JOIN_RELS).contains(&n) {
         return Ok(Err("a join of more relations than join_collapse_limit"));
     }
     if problem.clauses.len() > MAX_CLAUSES {
@@ -783,6 +993,12 @@ pub(crate) fn search<'a>(
             first: (relids, 0),
             unique: None,
         });
+        // A relation its constant false condition empties is dummy
+        // (`relation_excluded_by_constraints`, `set_dummy_rel_pathlist`).
+        if problem.false_relids == relids {
+            search.mark_dummy(relids)?;
+            continue;
+        }
         for (at, base) in rel.paths.iter().enumerate() {
             search.add_path(
                 relids,
@@ -1518,7 +1734,27 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             }
             Some(_) => {}
         }
+        if self.is_dummy(joined) {
+            return Ok(());
+        }
         let kind = special.map(|id| self.special(id).kind);
+        // `populate_joinrel_with_paths`' proofs of an empty join: a dummy
+        // input or the constant false condition of a class of two
+        // constants, which is pushed down wherever it is evaluated.
+        let false_relids = self.problem.false_relids;
+        let constant_false = false_relids.count_ones() > 1
+            && false_relids & !(joined & BASE_RELIDS) == 0
+            && false_relids & !rel1 != 0
+            && false_relids & !rel2 != 0;
+        let (dummy1, dummy2) = (self.is_dummy(rel1), self.is_dummy(rel2));
+        let empty = match kind {
+            None | Some(SpecialKind::Semi) => dummy1 || dummy2 || constant_false,
+            Some(SpecialKind::Left | SpecialKind::Anti) => dummy1 || constant_false,
+            Some(SpecialKind::Full) => (dummy1 && dummy2) || constant_false,
+        };
+        if empty {
+            return self.mark_dummy(joined);
+        }
         let pairs: [(Relids, Relids, JoinType); 2] = match kind {
             None => [(rel1, rel2, JoinType::Inner), (rel2, rel1, JoinType::Inner)],
             Some(SpecialKind::Left) => {
@@ -1552,6 +1788,38 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions"
             ));
         }
+        Ok(())
+    }
+
+    /// `is_dummy_rel`.
+    fn is_dummy(&self, relids: Relids) -> bool {
+        let rel = self.rel(relids);
+        rel.count > 0 && matches!(self.path(rel.cheapest_total).kind, PathKind::Dummy)
+    }
+
+    /// `mark_dummy_rel`: the relation returns no rows, its one path a
+    /// `Result` whose condition is constant false.
+    fn mark_dummy(&mut self, relids: Relids) -> Result<(), SqlError> {
+        let mut rel = self.rel(relids);
+        let id = self.push_path(Path {
+            kind: PathKind::Dummy,
+            relids: rel.relids,
+            rows: 0.0,
+            width: rel.width,
+            startup: 0.0,
+            total: 0.0,
+            disabled: 0,
+            keys: Keys::NONE,
+            param: 0,
+        })?;
+        rel.rows = 0.0;
+        rel.paths[0] = id;
+        rel.count = 1;
+        rel.cheapest_total = id;
+        rel.cheapest_startup = id;
+        rel.parameterized[0] = id;
+        rel.parameterized_count = 1;
+        self.rels[(relids & BASE_RELIDS) as usize] = Some(rel);
         Ok(())
     }
 
@@ -1926,57 +2194,66 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     fn upper_paths(&mut self, rel: &Rel) -> Result<(u32, UpperPlan), SqlError> {
         const MAX_UPPER: usize = 2 * MAX_REL_PATHS;
         let upper = self.problem.upper;
+        if let Some(group) = upper.group {
+            return self.grouped_paths(rel, group);
+        }
         let settings = self.problem.settings;
         let sort = upper.sort;
         let sort_len = usize::from(sort.len);
         let limit_tuples = upper
             .limit
             .and_then(|(count, offset)| count.map(|count| count.max(1.0) + offset.max(0.0)));
-        let cheapest = rel.cheapest_total;
+        // The paths `create_ordered_paths` reads: the joined relation's
+        // under its target list, or the window relation's.
+        let mut inputs = [(
+            0u32,
+            self.path(rel.cheapest_total),
+            [WindowStep::default(); MAX_WINDOWS],
+        ); MAX_REL_PATHS];
+        let (input_count, cheapest) = if upper.windows.count > 0 {
+            // The joined rows carry the windows' input target list.
+            let mut candidates = [(0u32, self.path(rel.cheapest_total)); MAX_REL_PATHS];
+            for (at, &id) in rel.paths[..usize::from(rel.count)].iter().enumerate() {
+                let mut path = self.path(id);
+                path.width = upper.windows.input_width;
+                path.total += upper.target_cost * path.rows;
+                candidates[at] = (id, path);
+            }
+            self.window_paths(
+                &candidates[..usize::from(rel.count)],
+                rel.cheapest_total,
+                &mut inputs,
+            )?
+        } else {
+            let mut cheapest = 0;
+            for (at, &id) in rel.paths[..usize::from(rel.count)].iter().enumerate() {
+                let mut input = self.path(id);
+                input.total += upper.target_cost * input.rows;
+                inputs[at] = (id, input, [WindowStep::default(); MAX_WINDOWS]);
+                if id == rel.cheapest_total {
+                    cheapest = at;
+                }
+            }
+            (usize::from(rel.count), cheapest)
+        };
         // Each upper path, the join path below it and its sort and limit.
-        let mut store = [self.path(cheapest); MAX_UPPER];
-        let mut below = [(cheapest, None::<(f64, f64, u8)>); MAX_UPPER];
+        let mut store = [inputs[cheapest].1; MAX_UPPER];
+        let mut below = [(inputs[cheapest].0, None::<(f64, f64, u8)>, cheapest); MAX_UPPER];
         let mut stored = 0usize;
         let mut ordered = [0u32; MAX_REL_PATHS];
         let mut ordered_count = 0usize;
-        for &id in &rel.paths[..usize::from(rel.count)] {
-            let mut input = self.path(id);
-            input.total += upper.target_cost * input.rows;
+        for (at, &(id, input, _)) in inputs[..input_count].iter().enumerate() {
             let mut path = input;
             let mut sorted = None;
             let presorted = sort.common_prefix(&input.keys);
             if sort_len > 0 && presorted < sort_len {
                 let incremental = presorted > 0 && settings.incremental_sort;
-                if id != cheapest && !incremental {
+                if at != cheapest && !incremental {
                     continue;
                 }
                 let costs = settings.costs;
                 let (startup, total) = if incremental {
-                    let input_tuples = input.rows.max(2.0);
-                    let mut members = [Member::plain(0, 0); MAX_KEYS];
-                    for (at, &key) in sort.as_slice()[..presorted].iter().enumerate() {
-                        members[at] = self.problem.classes[usize::from(key & KEY_CLASS)].members[0];
-                    }
-                    let groups = self
-                        .statistics
-                        .groups(&members[..presorted], input_tuples)?;
-                    let group_tuples = input_tuples / groups;
-                    let input_run = input.total - input.startup;
-                    let group_input_run = input_run / groups;
-                    let (group_startup, group_run) = super::paths::tuplesort_cost(
-                        group_tuples,
-                        upper.width,
-                        limit_tuples,
-                        costs,
-                    );
-                    let startup = group_startup + input.startup + group_input_run;
-                    let mut run = group_run
-                        + (group_run + group_startup) * (groups - 1.0)
-                        + group_input_run * (groups - 1.0);
-                    // `create_incremental_sort_path` passes no comparison cost.
-                    run += costs.cpu_tuple * input_tuples;
-                    run += 2.0 * costs.cpu_tuple * groups;
-                    (startup, startup + run)
+                    self.incremental_sort_cost(&input, &sort, presorted, upper.width, limit_tuples)?
                 } else {
                     let (startup, run) =
                         super::paths::tuplesort_cost(input.rows, upper.width, limit_tuples, costs);
@@ -1999,12 +2276,12 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 ordered[ordered_count] = stored as u32;
                 ordered_count += 1;
                 store[stored] = path;
-                below[stored] = (id, None);
+                below[stored] = (id, None, at);
                 stored += 1;
                 continue;
             }
             store[stored] = path;
-            below[stored] = (id, sorted);
+            below[stored] = (id, sorted, at);
             let (count, accepted) = add_to_pathlist(
                 &mut ordered,
                 ordered_count,
@@ -2064,7 +2341,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 chosen = at;
             }
         }
-        let (top, sort) = below[chosen as usize];
+        let (top, sort, input) = below[chosen as usize];
         let joined = self.path(top);
         Ok((
             top,
@@ -2072,6 +2349,616 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 sort,
                 limit: limits[chosen as usize],
                 top_total: joined.total + upper.target_cost * joined.rows,
+                group: None,
+                windows: inputs[input].2,
+            },
+        ))
+    }
+
+    /// `create_window_paths`: a window path over the joined relation's
+    /// cheapest path and over each path sorted by a prefix of the first
+    /// window's pathkeys, each window clause sorting its input unless it is
+    /// already sorted (incrementally when it is by a prefix of its keys),
+    /// kept as `add_path` keeps them. `candidates` are the input relation's
+    /// paths under the windows' input target list, each tagged. Fills `out`
+    /// with each kept path, its input's tag and its windows' nodes, and
+    /// returns their count and the cheapest's position (`set_cheapest`).
+    fn window_paths(
+        &self,
+        candidates: &[(u32, Path)],
+        cheapest_tag: u32,
+        out: &mut [(u32, Path, [WindowStep; MAX_WINDOWS]); MAX_REL_PATHS],
+    ) -> Result<(usize, usize), SqlError> {
+        let upper = self.problem.upper;
+        let settings = self.problem.settings;
+        let costs = settings.costs;
+        let windows = upper.windows.as_slice();
+        let mut built =
+            [(0u32, candidates[0].1, [WindowStep::default(); MAX_WINDOWS]); MAX_REL_PATHS];
+        let mut kept = [0u32; MAX_REL_PATHS];
+        let mut kept_count = 0usize;
+        let mut count = 0usize;
+        for &(tag, input) in candidates {
+            let mut path = input;
+            let first = windows[0].keys;
+            if tag != cheapest_tag
+                && !first.contained_in(&path.keys)
+                && first.common_prefix(&path.keys) == 0
+            {
+                continue;
+            }
+            let mut steps = [WindowStep::default(); MAX_WINDOWS];
+            for (at, window) in windows.iter().enumerate() {
+                let step = &mut steps[at];
+                if !window.keys.contained_in(&path.keys) {
+                    let presorted = window.keys.common_prefix(&path.keys);
+                    let (startup, total) = if presorted == 0 || !settings.incremental_sort {
+                        let (startup, run) =
+                            super::paths::tuplesort_cost(path.rows, path.width, None, costs);
+                        path.disabled += u32::from(!settings.sort);
+                        (startup + path.total, startup + path.total + run)
+                    } else {
+                        self.incremental_sort_cost(
+                            &path,
+                            &window.keys,
+                            presorted,
+                            path.width,
+                            None,
+                        )?
+                    };
+                    step.sort = Some((
+                        startup,
+                        total,
+                        if presorted == 0 || !settings.incremental_sort {
+                            0
+                        } else {
+                            presorted as u8
+                        },
+                    ));
+                    step.sort_width = path.width;
+                    path.startup = startup;
+                    path.total = total;
+                    path.keys = window.keys;
+                }
+                // `cost_windowagg`.
+                let rows = path.rows;
+                let input_startup = path.startup + window.startup_cost;
+                let mut total = path.total + window.per_row * rows;
+                total += costs.cpu_operator
+                    * f64::from(window.partition_count + window.order_count)
+                    * rows;
+                total += costs.cpu_tuple * rows;
+                let mut startup = input_startup;
+                let startup_tuples = self.window_startup_tuples(window, rows)?;
+                if startup_tuples > 1.0 {
+                    startup += (total - input_startup) / rows * (startup_tuples - 1.0);
+                }
+                // The top window computes the query's target list.
+                if at + 1 == windows.len() {
+                    total += upper.windows_output_cost * rows;
+                    path.width = upper.width;
+                } else {
+                    path.width = (path.width + window.added_width).round();
+                }
+                path.startup = startup;
+                path.total = total;
+                step.startup = startup;
+                step.total = total;
+                step.width = path.width;
+            }
+            built[count] = (tag, path, steps);
+            let (held, accepted) = add_to_pathlist(
+                &mut kept,
+                kept_count,
+                (count as u32, path),
+                &|at| built[at as usize].1,
+                self.consider_startup,
+            )?;
+            kept_count = held;
+            count += usize::from(accepted);
+        }
+        let mut cheapest = 0usize;
+        for (at, &id) in kept[..kept_count].iter().enumerate() {
+            out[at] = built[id as usize];
+            let compared = compare_costs(&out[cheapest].1, &out[at].1, false);
+            if at > 0
+                && (compared > 0
+                    || (compared == 0
+                        && compare_keys(&out[cheapest].1.keys, &out[at].1.keys)
+                            == KeysOrder::Better2))
+            {
+                cheapest = at;
+            }
+        }
+        Ok((kept_count, cheapest))
+    }
+
+    /// `get_windowclause_startup_tuples`: the rows `window` reads from its
+    /// `input_tuples` rows before it returns its first.
+    fn window_startup_tuples(
+        &self,
+        window: &WindowProblem,
+        input_tuples: f64,
+    ) -> Result<f64, SqlError> {
+        let partition_count = usize::from(window.partition_count);
+        let order_count = usize::from(window.order_count);
+        let partition_tuples = if partition_count > 0 {
+            input_tuples
+                / self
+                    .statistics
+                    .num_groups(&window.partition[..partition_count], input_tuples)?
+        } else {
+            input_tuples
+        };
+        let peer_tuples = if order_count > 0 {
+            partition_tuples
+                / self
+                    .statistics
+                    .num_groups(&window.order[..order_count], partition_tuples)?
+        } else {
+            1.0
+        };
+        let return_tuples = match window.frame_end {
+            FrameEnd::UnboundedFollowing => partition_tuples,
+            FrameEnd::CurrentRow { rows: true } | FrameEnd::OffsetPreceding => 1.0,
+            FrameEnd::CurrentRow { rows: false } if order_count == 0 => partition_tuples,
+            FrameEnd::CurrentRow { rows: false } => peer_tuples,
+            FrameEnd::OffsetFollowing { rows, offset } => {
+                // `DEFAULT_INEQ_SEL` of the partition's peer groups for an
+                // offset that is no integer constant.
+                let offset =
+                    offset.unwrap_or(partition_tuples / peer_tuples * 0.333_333_333_333_333_3);
+                if rows {
+                    offset + 1.0
+                } else {
+                    peer_tuples * (offset + 1.0)
+                }
+            }
+        };
+        let return_tuples = if partition_count > 0 || order_count > 0 {
+            (return_tuples + 1.0).min(partition_tuples)
+        } else {
+            return_tuples.min(partition_tuples)
+        };
+        Ok(clamp_row_est(return_tuples))
+    }
+
+    /// `cost_incremental_sort` of `input`'s rows of `width`, sorted by
+    /// `keys` of which the first `presorted` already are: its startup and
+    /// total cost.
+    fn incremental_sort_cost(
+        &self,
+        input: &Path,
+        keys: &Keys,
+        presorted: usize,
+        width: f64,
+        limit_tuples: Option<f64>,
+    ) -> Result<(f64, f64), SqlError> {
+        let costs = self.problem.settings.costs;
+        let input_tuples = input.rows.max(2.0);
+        let mut members = [Member::plain(0, 0); MAX_KEYS];
+        for (at, &key) in keys.as_slice()[..presorted].iter().enumerate() {
+            members[at] = self.problem.classes[usize::from(key & KEY_CLASS)].members[0];
+        }
+        let groups = self
+            .statistics
+            .groups(&members[..presorted], input_tuples)?;
+        let group_tuples = input_tuples / groups;
+        let input_run = input.total - input.startup;
+        let group_input_run = input_run / groups;
+        let (group_startup, group_run) =
+            super::paths::tuplesort_cost(group_tuples, width, limit_tuples, costs);
+        let startup = group_startup + input.startup + group_input_run;
+        let mut run = group_run
+            + (group_run + group_startup) * (groups - 1.0)
+            + group_input_run * (groups - 1.0);
+        // `create_incremental_sort_path` passes no comparison cost.
+        run += costs.cpu_tuple * input_tuples;
+        run += 2.0 * costs.cpu_tuple * groups;
+        Ok((startup, startup + run))
+    }
+
+    /// `add_paths_to_grouping_rel` of a `GROUP BY` without `HAVING`: a
+    /// `GroupAggregate` over each joined path sorted by the grouping
+    /// pathkeys or by an order of them its pathkeys begin
+    /// (`get_useful_group_keys_orderings`, `make_ordered_path`), and a
+    /// `HashAggregate` over the cheapest; then `create_ordered_paths` and
+    /// `create_limit_path` over the grouped paths.
+    fn grouped_paths(
+        &mut self,
+        rel: &Rel,
+        group: GroupProblem,
+    ) -> Result<(u32, UpperPlan), SqlError> {
+        use super::aggregate::{AggInput, AggStrategy, cost_agg};
+        const MAX_GROUPED: usize = 3 * MAX_REL_PATHS;
+        let upper = self.problem.upper;
+        let settings = self.problem.settings;
+        let costs = settings.costs;
+        let columns = usize::from(group.columns);
+        let sort_len = group.keys.as_slice().len();
+        let plain = columns == 0;
+        let cheapest = rel.cheapest_total;
+        // `get_number_of_groups` over the joined relation's rows; plain
+        // aggregation returns one.
+        let groups = if plain {
+            1.0
+        } else {
+            self.statistics
+                .num_groups(&group.members[..columns], self.path(cheapest).rows)?
+        };
+        // `create_agg_path`: `cost_agg` with the `HAVING` quals, then the
+        // target list's cost per group it returns.
+        let aggregate = |strategy: AggStrategy, input: AggInput| {
+            let (startup, total, rows) = super::aggregate::with_having(
+                cost_agg(strategy, &group.aggregates, columns, groups, input),
+                group.having,
+            );
+            (startup, total + group.target_cost * rows, rows)
+        };
+        // Each grouped path, the join path below it and its plan.
+        let mut store = [self.path(cheapest); MAX_GROUPED];
+        let mut plans = [(cheapest, None::<GroupPlan>); MAX_GROUPED];
+        let mut stored = 0usize;
+        let mut grouped = [0u32; MAX_REL_PATHS];
+        let mut grouped_count = 0usize;
+        for &id in &rel.paths[..usize::from(rel.count)] {
+            let mut input = self.path(id);
+            if input.param != 0 {
+                continue;
+            }
+            input.total += upper.target_cost * input.rows;
+            let mut orderings = [group.keys; 2];
+            let mut ordering_count = 1;
+            if group.group_by_reordering
+                && input.keys.len > 0
+                && !input.keys.contained_in(&group.keys)
+            {
+                // `group_keys_reorder_by_pathkeys`: the path's leading
+                // grouping keys first, then the others in their order.
+                let mut reordered = Keys::NONE;
+                let grouping = &group.keys.as_slice()[..columns];
+                for &key in input.keys.as_slice() {
+                    if reordered.as_slice().len() >= columns || !grouping.contains(&key) {
+                        break;
+                    }
+                    let _ = reordered.push(key);
+                }
+                let matched = reordered.as_slice().len();
+                for &key in grouping {
+                    if !reordered.as_slice().contains(&key) {
+                        let _ = reordered.push(key);
+                    }
+                }
+                // The presorted aggregates' keys stay last.
+                for &key in &group.keys.as_slice()[columns..] {
+                    let _ = reordered.push(key);
+                }
+                if matched > 0
+                    && (settings.incremental_sort || matched == columns)
+                    && reordered != group.keys
+                {
+                    orderings[1] = reordered;
+                    ordering_count = 2;
+                }
+            }
+            for ordering in &orderings[..ordering_count] {
+                let presorted = ordering.common_prefix(&input.keys);
+                let mut sorted = input;
+                let mut input_sort = None;
+                if presorted < sort_len {
+                    let incremental = presorted > 0 && settings.incremental_sort;
+                    if id != cheapest && !incremental {
+                        continue;
+                    }
+                    let (startup, total) = if incremental {
+                        self.incremental_sort_cost(
+                            &input,
+                            ordering,
+                            presorted,
+                            group.input_width,
+                            None,
+                        )?
+                    } else {
+                        let (startup, run) = super::paths::tuplesort_cost(
+                            input.rows,
+                            group.input_width,
+                            None,
+                            costs,
+                        );
+                        sorted.disabled += u32::from(!settings.sort);
+                        (startup + input.total, startup + input.total + run)
+                    };
+                    sorted.startup = startup;
+                    sorted.total = total;
+                    sorted.keys = *ordering;
+                    input_sort = Some((
+                        startup,
+                        total,
+                        if incremental { presorted as u8 } else { 0 },
+                    ));
+                }
+                let (startup, total, rows) = if group.distinct {
+                    // `create_upper_unique_path`.
+                    (
+                        sorted.startup,
+                        sorted.total + costs.cpu_operator * input.rows * columns as f64,
+                        groups,
+                    )
+                } else {
+                    aggregate(
+                        if plain {
+                            AggStrategy::Plain
+                        } else {
+                            AggStrategy::Sorted
+                        },
+                        AggInput {
+                            startup: sorted.startup,
+                            total: sorted.total,
+                            rows: input.rows,
+                            width: group.input_width,
+                        },
+                    )
+                };
+                if stored == MAX_GROUPED {
+                    return Err(too_many());
+                }
+                let path = Path {
+                    startup,
+                    total,
+                    rows,
+                    width: group.output_width,
+                    keys: if plain { Keys::NONE } else { sorted.keys },
+                    ..sorted
+                };
+                store[stored] = path;
+                plans[stored] = (
+                    id,
+                    Some(GroupPlan {
+                        hashed: false,
+                        keys: *ordering,
+                        input_sort,
+                        startup,
+                        total,
+                        rows,
+                        width: group.output_width,
+                        groups,
+                        input: AggregateInput { rows: input.rows },
+                    }),
+                );
+                let (count, accepted) = add_to_pathlist(
+                    &mut grouped,
+                    grouped_count,
+                    (stored as u32, path),
+                    &|at| store[at as usize],
+                    self.consider_startup,
+                )?;
+                grouped_count = count;
+                stored += usize::from(accepted);
+            }
+        }
+        // A `DISTINCT` hashes only with `enable_hashagg` on, unless it has
+        // no other path.
+        if group.hashable && !plain && (!group.distinct || group.hashagg || grouped_count == 0) {
+            let mut input = self.path(cheapest);
+            input.total += upper.target_cost * input.rows;
+            let (startup, total, rows) = aggregate(
+                AggStrategy::Hashed,
+                AggInput {
+                    startup: input.startup,
+                    total: input.total,
+                    rows: input.rows,
+                    width: group.input_width,
+                },
+            );
+            if stored == MAX_GROUPED {
+                return Err(too_many());
+            }
+            let path = Path {
+                startup,
+                total,
+                rows,
+                width: group.output_width,
+                keys: Keys::NONE,
+                disabled: input.disabled + u32::from(!group.hashagg),
+                ..input
+            };
+            store[stored] = path;
+            plans[stored] = (
+                cheapest,
+                Some(GroupPlan {
+                    hashed: true,
+                    keys: group.keys,
+                    input_sort: None,
+                    startup,
+                    total,
+                    rows,
+                    width: group.output_width,
+                    groups,
+                    input: AggregateInput { rows: input.rows },
+                }),
+            );
+            let (count, accepted) = add_to_pathlist(
+                &mut grouped,
+                grouped_count,
+                (stored as u32, path),
+                &|at| store[at as usize],
+                self.consider_startup,
+            )?;
+            grouped_count = count;
+            stored += usize::from(accepted);
+        }
+        // `set_cheapest` of the grouped relation.
+        let mut cheapest_grouped = grouped[0];
+        for &at in &grouped[1..grouped_count] {
+            let compared = compare_costs(
+                &store[cheapest_grouped as usize],
+                &store[at as usize],
+                false,
+            );
+            if compared > 0
+                || (compared == 0
+                    && compare_keys(
+                        &store[cheapest_grouped as usize].keys,
+                        &store[at as usize].keys,
+                    ) == KeysOrder::Better2)
+            {
+                cheapest_grouped = at;
+            }
+        }
+        // `create_window_paths` over the grouped paths, each window path
+        // stored with its grouped path's plan.
+        let mut window_steps = [[WindowStep::default(); MAX_WINDOWS]; MAX_GROUPED];
+        let mut sort_width = group.output_width;
+        if upper.windows.count > 0 {
+            let mut candidates = [(0u32, store[cheapest_grouped as usize]); MAX_REL_PATHS];
+            for (at, &id) in grouped[..grouped_count].iter().enumerate() {
+                candidates[at] = (id, store[id as usize]);
+            }
+            let mut windowed = [(
+                0u32,
+                store[cheapest_grouped as usize],
+                [WindowStep::default(); MAX_WINDOWS],
+            ); MAX_REL_PATHS];
+            let (count, cheapest) = self.window_paths(
+                &candidates[..grouped_count],
+                cheapest_grouped,
+                &mut windowed,
+            )?;
+            grouped_count = 0;
+            for (at, &(tag, path, steps)) in windowed[..count].iter().enumerate() {
+                if stored == MAX_GROUPED {
+                    return Err(too_many());
+                }
+                store[stored] = path;
+                plans[stored] = plans[tag as usize];
+                window_steps[stored] = steps;
+                grouped[grouped_count] = stored as u32;
+                grouped_count += 1;
+                if at == cheapest {
+                    cheapest_grouped = stored as u32;
+                }
+                stored += 1;
+            }
+            sort_width = upper.width;
+        }
+        // `create_ordered_paths` over the grouped paths, then
+        // `create_limit_path`.
+        let sort = group.sort;
+        let sort_len = usize::from(sort.len);
+        let limit_tuples = upper
+            .limit
+            .and_then(|(count, offset)| count.map(|count| count.max(1.0) + offset.max(0.0)));
+        let mut sorts = [None::<(f64, f64, u8)>; MAX_GROUPED];
+        let mut ordered = [0u32; MAX_REL_PATHS];
+        let mut ordered_count = 0usize;
+        for &at in &grouped[..grouped_count] {
+            let input = store[at as usize];
+            let mut path = input;
+            let mut sorted = None;
+            let presorted = sort.common_prefix(&input.keys);
+            if sort_len > 0 && presorted < sort_len {
+                let incremental = presorted > 0 && settings.incremental_sort;
+                if at != cheapest_grouped && !incremental {
+                    continue;
+                }
+                let (startup, total) = if incremental {
+                    self.incremental_sort_cost(&input, &sort, presorted, sort_width, limit_tuples)?
+                } else {
+                    let (startup, run) =
+                        super::paths::tuplesort_cost(input.rows, sort_width, limit_tuples, costs);
+                    path.disabled += u32::from(!settings.sort);
+                    (startup + input.total, startup + input.total + run)
+                };
+                path.startup = startup;
+                path.total = total;
+                path.keys = sort;
+                sorted = Some((
+                    startup,
+                    total,
+                    if incremental { presorted as u8 } else { 0 },
+                ));
+            }
+            if stored == MAX_GROUPED {
+                return Err(too_many());
+            }
+            store[stored] = path;
+            plans[stored] = plans[at as usize];
+            window_steps[stored] = window_steps[at as usize];
+            sorts[stored] = sorted;
+            if sort_len == 0 {
+                ordered[ordered_count] = stored as u32;
+                ordered_count += 1;
+                stored += 1;
+                continue;
+            }
+            let (count, accepted) = add_to_pathlist(
+                &mut ordered,
+                ordered_count,
+                (stored as u32, path),
+                &|at| store[at as usize],
+                self.consider_startup,
+            )?;
+            ordered_count = count;
+            stored += usize::from(accepted);
+        }
+        let mut finals = [0u32; MAX_REL_PATHS];
+        let mut final_count = 0usize;
+        let mut limits = [None::<(f64, f64, f64)>; MAX_GROUPED];
+        for &at in &ordered[..ordered_count] {
+            let mut path = store[at as usize];
+            let mut limit = None;
+            if let Some((count, offset)) = upper.limit {
+                let (startup, total, rows) = super::paths::adjust_limit_rows_costs(
+                    path.startup,
+                    path.total,
+                    path.rows,
+                    count,
+                    offset,
+                );
+                path.startup = startup;
+                path.total = total;
+                path.rows = rows;
+                limit = Some((startup, total, rows));
+            }
+            if stored == MAX_GROUPED {
+                return Err(too_many());
+            }
+            store[stored] = path;
+            plans[stored] = plans[at as usize];
+            window_steps[stored] = window_steps[at as usize];
+            sorts[stored] = sorts[at as usize];
+            limits[stored] = limit;
+            let (count, accepted) = add_to_pathlist(
+                &mut finals,
+                final_count,
+                (stored as u32, path),
+                &|at| store[at as usize],
+                self.consider_startup,
+            )?;
+            final_count = count;
+            stored += usize::from(accepted);
+        }
+        let mut chosen = finals[0];
+        for &at in &finals[1..final_count] {
+            let compared = compare_costs(&store[chosen as usize], &store[at as usize], false);
+            if compared > 0
+                || (compared == 0
+                    && compare_keys(&store[chosen as usize].keys, &store[at as usize].keys)
+                        == KeysOrder::Better2)
+            {
+                chosen = at;
+            }
+        }
+        let (top, plan) = plans[chosen as usize];
+        let joined = self.path(top);
+        Ok((
+            top,
+            UpperPlan {
+                sort: sorts[chosen as usize],
+                limit: limits[chosen as usize],
+                top_total: joined.total + upper.target_cost * joined.rows,
+                group: plan,
+                windows: window_steps[chosen as usize],
             },
         ))
     }
@@ -2122,7 +3009,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             }
         }
         // `pathkeys_useful_for_ordering`.
-        let useful = useful.max(self.problem.upper.sort.common_prefix(outer));
+        let useful = useful.max(self.problem.upper.query_keys().common_prefix(outer));
         outer.truncated(useful)
     }
 
@@ -2132,7 +3019,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let wanted = self
             .problem
             .upper
-            .sort
+            .query_keys()
             .as_slice()
             .iter()
             .find(|&&query| query & KEY_CLASS == key & KEY_CLASS)
@@ -2275,7 +3162,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         if count == 0 {
             return all;
         }
-        let query = self.problem.upper.sort;
+        let query = self.problem.upper.query_keys();
         if query.len > 0 {
             let matches = query
                 .as_slice()
@@ -2346,11 +3233,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     let _ = outer_keys.push(class);
                 }
             }
-            let Some(merge) = self.mergeclauses_for_outer_keys(&outer_keys, inputs) else {
-                self.outside = Some("a merge join ordered descending or with NULLs first");
-                return Ok(());
-            };
-            let inner_keys = self.inner_keys_for_merge(&merge, inputs);
+            let merge = self.mergeclauses_for_outer_keys(&outer_keys, inputs);
+            let inner_keys = self.inner_keys_for_merge(&merge, inputs, &outer_keys);
             let keys = self.join_keys(joined, inputs.path_jointype(), &outer_keys);
             self.try_mergejoin(
                 joined,
@@ -2366,10 +3250,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         Ok(())
     }
 
-    /// `find_mergeclauses_for_outer_pathkeys`; `None` for a merge in a
-    /// direction other than ascending with NULLs last, which the model
-    /// leaves out.
-    fn mergeclauses_for_outer_keys(&self, keys: &Keys, inputs: &JoinInputs) -> Option<ClauseList> {
+    /// `find_mergeclauses_for_outer_pathkeys`.
+    fn mergeclauses_for_outer_keys(&self, keys: &Keys, inputs: &JoinInputs) -> ClauseList {
         let mut merge = ClauseList::EMPTY;
         for &key in keys.as_slice() {
             let mut matched = false;
@@ -2382,23 +3264,36 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             if !matched {
                 break;
             }
-            if key & !KEY_CLASS != 0 {
-                return None;
-            }
         }
-        Some(merge)
+        merge
+    }
+
+    /// The direction flags of the outer pathkey of merge clause `id`'s
+    /// outer class.
+    fn merge_direction(&self, id: u8, inputs: &JoinInputs, outer_keys: &Keys) -> u8 {
+        let (class, _) = self.merge_classes(id, inputs.outer, inputs.inner);
+        outer_keys
+            .as_slice()
+            .iter()
+            .find(|&&key| key & KEY_CLASS == class)
+            .map_or(0, |&key| key & !KEY_CLASS)
     }
 
     /// `make_inner_pathkeys_for_merge`: each merge clause's inner class,
-    /// once.
-    fn inner_keys_for_merge(&self, merge: &ClauseList, inputs: &JoinInputs) -> Keys {
+    /// once, sorted in its outer pathkey's direction.
+    fn inner_keys_for_merge(
+        &self,
+        merge: &ClauseList,
+        inputs: &JoinInputs,
+        outer_keys: &Keys,
+    ) -> Keys {
         let mut keys = Keys::NONE;
         for &id in merge.as_slice() {
             let (_, class) = self.merge_classes(id, inputs.outer, inputs.inner);
             if !self.problem.classes[usize::from(class)].has_const
-                && !keys.as_slice().contains(&class)
+                && !keys.as_slice().iter().any(|&key| key & KEY_CLASS == class)
             {
-                let _ = keys.push(class);
+                let _ = keys.push(class | self.merge_direction(id, inputs, outer_keys));
             }
         }
         keys
@@ -2946,17 +3841,14 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         use_all: bool,
     ) -> Result<(), SqlError> {
         let outer_keys = self.path(outer).keys;
-        let Some(merge) = self.mergeclauses_for_outer_keys(&outer_keys, inputs) else {
-            self.outside = Some("a merge join ordered descending or with NULLs first");
-            return Ok(());
-        };
+        let merge = self.mergeclauses_for_outer_keys(&outer_keys, inputs);
         if merge.len == 0 && inputs.jointype != JoinType::Full {
             return Ok(());
         }
         if use_all && merge.len != inputs.mergeable.len {
             return Ok(());
         }
-        let inner_keys = self.inner_keys_for_merge(&merge, inputs);
+        let inner_keys = self.inner_keys_for_merge(&merge, inputs, &outer_keys);
         self.try_mergejoin(
             joined,
             inputs,
@@ -3031,7 +3923,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let Some(&first) = keys.first() else {
             return trimmed;
         };
-        let (mut current, mut next) = (first, 1);
+        let (mut current, mut next) = (first & KEY_CLASS, 1);
         let mut matched = false;
         for &id in merge.as_slice() {
             let (_, class) = self.merge_classes(id, inputs.outer, inputs.inner);
@@ -3039,7 +3931,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 if !matched || next == keys.len() {
                     break;
                 }
-                current = keys[next];
+                current = keys[next] & KEY_CLASS;
                 next += 1;
             }
             if class == current {
@@ -3339,14 +4231,28 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         }
         let outer_rows = outer_path.rows.max(1.0);
         let inner_rows_all = inner_path.rows.max(1.0);
-        // `mergejoinscansel` of the first clause, which a full join and an
-        // outer join's preserved side do not use.
+        // Each merge clause sorts in its outer pathkey's direction.
+        let outer_keys = outer_sort.unwrap_or(outer_path.keys);
+        let (mut descending, mut nulls_first) = (0u32, 0u32);
+        for (at, &id) in merge.as_slice().iter().enumerate() {
+            let flags = self.merge_direction(id, inputs, &outer_keys);
+            descending |= u32::from(flags & KEY_DESCENDING != 0) << at;
+            nulls_first |= u32::from(flags & KEY_NULLS_FIRST != 0) << at;
+        }
+        // `mergejoinscansel` of the first clause in its direction, which a
+        // full join and an outer join's preserved side do not use.
         let mut range = [0.0, 1.0, 0.0, 1.0];
         if let Some(&first) = merge.as_slice().first()
             && inputs.jointype != JoinType::Full
         {
             let (left, right, ..) = self.sides(first).expect("a merge clause");
-            let Some(estimate) = self.statistics.merge_range(left, right)? else {
+            let Some(estimate) = self.statistics.merge_range(
+                left,
+                right,
+                descending & 1 != 0,
+                nulls_first & 1 != 0,
+            )?
+            else {
                 self.outside = Some("a merge join range estimate outside the model");
                 return Ok(());
             };
@@ -3451,6 +4357,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     inner_sort: inner_sort.unwrap_or(Keys::NONE),
                     materialize_inner,
                     inner_unique: inputs.inner_unique,
+                    descending,
+                    nulls_first,
                 },
                 relids: joined,
                 rows: param_rows.unwrap_or(rel.rows),
@@ -4120,11 +5028,20 @@ mod tests {
         fn bucket(&self, _: Member, buckets: f64) -> Result<(f64, f64), SqlError> {
             Ok((0.0, (1.0 / 1000.0_f64).max(1.0 / buckets)))
         }
-        fn merge_range(&self, _: Member, _: Member) -> Result<Option<[f64; 4]>, SqlError> {
+        fn merge_range(
+            &self,
+            _: Member,
+            _: Member,
+            _: bool,
+            _: bool,
+        ) -> Result<Option<[f64; 4]>, SqlError> {
             Ok(Some([0.0, 1.0, 0.0, 1.0]))
         }
         fn groups(&self, _: &[Member], calls: f64) -> Result<f64, SqlError> {
             Ok(calls)
+        }
+        fn num_groups(&self, _: &[Member], rows: f64) -> Result<f64, SqlError> {
+            Ok(rows)
         }
     }
 
@@ -4222,8 +5139,12 @@ mod tests {
                 limit: None,
                 width: 20.0,
                 target_cost: 0.0,
+                group: None,
+                windows: WindowsProblem::NONE,
+                windows_output_cost: 0.0,
             },
             dummy: false,
+            false_relids: 0,
         };
         let plan = search(&problem, &Uniform, &arena).unwrap().unwrap();
         let top = plan.path(plan.top);

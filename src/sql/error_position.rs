@@ -1080,6 +1080,20 @@ pub(crate) fn preserving_pending<R>(probe: impl FnOnce() -> R) -> R {
     result
 }
 
+/// The analysis error recorded so far, for [`restore_pending`] to put back
+/// when a lookup that failed is answered elsewhere: its position and notes
+/// belong to no error the statement reports.
+#[must_use]
+pub(crate) struct SavedPending(Option<Pending>);
+
+pub(crate) fn save_pending() -> SavedPending {
+    SavedPending(PENDING.with(|pending| pending.borrow().clone()))
+}
+
+pub(crate) fn restore_pending(saved: SavedPending) {
+    PENDING.with(|pending| *pending.borrow_mut() = saved.0);
+}
+
 /// Restores a position [`take_position`] removed.
 pub(crate) fn restore_position(error: &SqlError, position: usize) {
     record(error, Some(position), None);

@@ -10762,7 +10762,7 @@ fn drop_table_kind_with_columns(
                                 })
                                 .map(|foreign_key| (child, foreign_key))
                         });
-                        let Some((child, foreign_key)) = inbound else {
+                        let Some((child, _)) = inbound else {
                             break;
                         };
                         if !statement.cascade {
@@ -10772,46 +10772,89 @@ fn drop_table_kind_with_columns(
                                 def.name.as_str()
                             ));
                         }
-                        // The key's copies on the referencing table's
-                        // partitions go with it.
-                        let copies = match arena.alloc_slice_with(storage.table_count() + 1, |_| {
+                        // Every key of the referencing table on the dropped
+                        // one goes in this one statement, with its copies on
+                        // the referencing table's partitions, and each
+                        // table's definition changes once.
+                        let child_definition = storage.table_def(child, txn.txid);
+                        let dropped = storage.table_position(index);
+                        let references = |foreign_key: &crate::storage::ForeignKey| {
+                            (foreign_key.parent_schema == def.schema
+                                && foreign_key.parent == def.name)
+                                || foreign_key.identity.is_some_and(|identity| {
+                                    child_definition.fkey_clone(identity, dropped).is_some()
+                                })
+                        };
+                        let key_count = child_definition
+                            .fkeys()
+                            .iter()
+                            .filter(|key| references(key))
+                            .count();
+                        let width = storage.table_count() + 1;
+                        let pairs = match arena.alloc_slice_with(key_count * width, |_| {
                             (0usize, crate::storage::SqlName::EMPTY)
                         }) {
+                            Ok(pairs) => pairs,
+                            Err(_) => return sql_fail(arena_full()),
+                        };
+                        let copies = match arena
+                            .alloc_slice_with(width, |_| (0usize, crate::storage::SqlName::EMPTY))
+                        {
                             Ok(copies) => copies,
                             Err(_) => return sql_fail(arena_full()),
                         };
-                        let key = storage.table_def(child, txn.txid).fkeys()[foreign_key];
-                        copies[0] = (child, key.name);
-                        let mut copy_count = 1usize;
-                        foreign_key_clones::inherited_key_copies(
-                            storage,
-                            txn.txid,
-                            child,
-                            key.oid(),
-                            copies,
-                            &mut copy_count,
-                        );
-                        for &(child, constraint) in copies[..copy_count].iter() {
-                            let (child_target, child_definition) =
-                                storage.select_table_definition(child, txn.txid);
-                            let lsn = storage.bump_lsn();
-                            if let Err(error) = wal.stage_reserved(
+                        let mut pair_count = 0usize;
+                        for key in child_definition
+                            .fkeys()
+                            .iter()
+                            .filter(|key| references(key))
+                        {
+                            copies[0] = (child, key.name);
+                            let mut copy_count = 1usize;
+                            foreign_key_clones::inherited_key_copies(
+                                storage,
                                 txn.txid,
-                                lsn,
-                                &WalOp::DropTableFk {
-                                    schema: child_definition.schema.as_str(),
-                                    table: child_definition.name.as_str(),
-                                    fk_name: constraint.as_str(),
-                                },
-                            ) {
-                                return sql_fail(error);
+                                child,
+                                key.oid(),
+                                copies,
+                                &mut copy_count,
+                            );
+                            pairs[pair_count..pair_count + copy_count]
+                                .copy_from_slice(&copies[..copy_count]);
+                            pair_count += copy_count;
+                        }
+                        // The definitions change below: release the read.
+                        drop(child_definition);
+                        for at in 0..pair_count {
+                            let table = pairs[at].0;
+                            if pairs[..at].iter().any(|(earlier, _)| *earlier == table) {
+                                continue;
                             }
+                            let (child_target, child_definition) =
+                                storage.select_table_definition(table, txn.txid);
                             let mut updated = TableDefBuilder::from_definition(&child_definition);
-                            if !drop_named_constraint(&mut updated, constraint.as_str()) {
-                                return sql_fail(sql_err!(
-                                    sqlstate::INTERNAL_ERROR,
-                                    "inbound foreign key vanished during DROP TABLE"
-                                ));
+                            for &(_, constraint) in pairs[at..pair_count]
+                                .iter()
+                                .filter(|(own, _)| *own == table)
+                            {
+                                let lsn = storage.bump_lsn();
+                                if let Err(error) = wal.stage_reserved(
+                                    txn.txid,
+                                    lsn,
+                                    &WalOp::DropTableFk {
+                                        schema: child_definition.schema.as_str(),
+                                        table: child_definition.name.as_str(),
+                                        fk_name: constraint.as_str(),
+                                    },
+                                ) {
+                                    return sql_fail(error);
+                                }
+                                if !drop_named_constraint(&mut updated, constraint.as_str()) {
+                                    return sql_fail(sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "inbound foreign key vanished during DROP TABLE"
+                                    ));
+                                }
                             }
                             let mut identity_mapping = [None; MAX_COLUMNS];
                             for (column, target) in identity_mapping
@@ -97667,6 +97710,30 @@ pub(crate) fn truncate(
 /// Mirrors `pg_cast` (castcontext in {'a','i'}) over this engine's types, plus
 /// the I/O rule: any type casts *to* a string type as an assignment, but *from*
 /// a string type is explicit-only (needs USING).
+/// Whether `ALTER COLUMN ... TYPE` converts a value of the column's type to
+/// the new one without `USING`: through the assignment cast of the base type
+/// for a domain, and only from the same type for an enum or composite.
+fn alter_type_auto_castable_to(
+    storage: &Storage,
+    txid: u32,
+    (from, from_user): (ColType, Option<crate::storage::UserTypeName>),
+    (to, to_user): (ColType, Option<crate::storage::UserTypeName>),
+) -> bool {
+    let Some(identity) = to_user else {
+        return alter_type_auto_castable(from, to);
+    };
+    if from_user == to_user {
+        return true;
+    }
+    if storage
+        .domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+        .is_some()
+    {
+        return alter_type_auto_castable(from, to);
+    }
+    from == to
+}
+
 fn alter_type_auto_castable(from: ColType, to: ColType) -> bool {
     use ColType::*;
     if from == to {
@@ -99135,6 +99202,9 @@ enum ColSource<'a> {
     Cast {
         orig: usize,
         target: ColType,
+        /// The domain, enum or composite the column is declared as, whose
+        /// checks and input the rewritten value passes through.
+        user_type: Option<crate::storage::UserTypeName>,
         type_mod: i32,
         using: Option<&'a Expr<'a>>,
     },
@@ -104181,36 +104251,65 @@ fn alter_table_relation(
                     }
                     invalidated_statistics.insert(usize::from(attribute - 1));
                 }
-                let Some(target) = ColType::from_sql_name(type_name) else {
-                    // A type that exists but is not built in: rewriting the
-                    // column through its checks is not modelled.
-                    if resolve_routine_type(storage, txn.txid, type_name).is_ok() {
-                        return sql_fail(crate::sql::error_position::at_subject(
-                            sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "ALTER COLUMN TYPE to the user-defined type \"{}\" is not supported",
-                                type_name
-                            ),
-                            type_name,
-                        ));
+                let (target, target_user) = match ColType::from_sql_name(type_name) {
+                    Some(target) => (target, None),
+                    None => {
+                        let bound = resolve_routine_type(storage, txn.txid, type_name)
+                            .and_then(|resolved| storage.bind_routine_result(resolved, txn.txid));
+                        match bound {
+                            Ok(bound) => {
+                                if let Some(identity) = bound.user_type
+                                    && identity.relation_row_type_creation().is_none()
+                                    && identity.information_schema_domain_binding().is_none()
+                                    && let Err(error) = storage.require_type_usage(
+                                        identity.schema.as_str(),
+                                        identity.name.as_str(),
+                                        txn.txid,
+                                    )
+                                {
+                                    return sql_fail(error);
+                                }
+                                (bound.ctype, bound.user_type)
+                            }
+                            Err(_) => {
+                                return sql_fail(crate::sql::error_position::at_subject(
+                                    crate::sql::type_name_miss::TypeNameMiss::in_storage(
+                                        storage, txn.txid, type_name,
+                                    )
+                                    .error(),
+                                    type_name,
+                                ));
+                            }
+                        }
                     }
-                    return sql_fail(crate::sql::error_position::at_subject(
-                        crate::sql::type_name_miss::TypeNameMiss::in_storage(
-                            storage, txn.txid, type_name,
-                        )
-                        .error(),
-                        type_name,
-                    ));
+                };
+                let target_name = match target_user {
+                    Some(identity) => crate::util::StackStr::<64>::from_str(identity.name.as_str()),
+                    None => crate::util::StackStr::from_str(target.name()),
                 };
                 // Without USING, the stored value casts through the assignment
                 // cast; a cast that is explicit-only (e.g. text→int) is refused
                 // with PostgreSQL's 42804, telling the user to add USING.
-                if using.is_none() && !alter_type_auto_castable(new_def.columns[i].ctype, target) {
-                    return sql_fail(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "column \"{}\" cannot be cast automatically to type {}",
-                        column,
-                        target.name()
+                if using.is_none()
+                    && !alter_type_auto_castable_to(
+                        storage,
+                        txn.txid,
+                        (new_def.columns[i].ctype, new_def.columns[i].user_type),
+                        (target, target_user),
+                    )
+                {
+                    return sql_fail(crate::sql::error_position::with_computed_hint(
+                        sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "column \"{}\" cannot be cast automatically to type {}",
+                            column,
+                            target_name.as_str()
+                        ),
+                        format_args!(
+                            "You might need to specify \"USING {}::{}\".",
+                            column,
+                            target_name.as_str()
+                        ),
                     ));
                 }
                 // The column takes the new type's collation unless `COLLATE`
@@ -104219,7 +104318,7 @@ fn alter_table_relation(
                 let target_collation = match ddl::assigned_collation(
                     storage,
                     txn.txid,
-                    (target, None),
+                    (target, target_user),
                     collation.map(|written| (written, *collation_position)),
                 ) {
                     Ok(collation) => collation,
@@ -104236,6 +104335,7 @@ fn alter_table_relation(
                         source[i] = ColSource::Cast {
                             orig,
                             target,
+                            user_type: target_user,
                             type_mod: *type_mod,
                             using: *using,
                         };
@@ -104246,6 +104346,26 @@ fn alter_table_relation(
                 // The column's folded default is a typed runtime value, not
                 // merely catalog text. Rebind it with the row representation
                 // so a later INSERT cannot encode the former type's bytes.
+                if target_user.is_some()
+                    && matches!(
+                        target,
+                        ColType::Enum(_) | ColType::Composite(_) | ColType::Array(_)
+                    )
+                    && new_def.columns[i].default.expression().is_some()
+                    && !alter_type_auto_castable_to(
+                        storage,
+                        txn.txid,
+                        (new_def.columns[i].ctype, new_def.columns[i].user_type),
+                        (target, target_user),
+                    )
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "default for column \"{}\" cannot be cast automatically to type {}",
+                        column,
+                        target_name.as_str()
+                    ));
+                }
                 if let Some(default) = new_def.columns[i].default.constant().copied() {
                     let value = match super::enum_values::materialize(
                         default.as_datum(),
@@ -104269,7 +104389,7 @@ fn alter_table_relation(
                         crate::storage::ColumnDefault::Constant { value, expression };
                 }
                 new_def.columns[i].ctype = target;
-                new_def.columns[i].user_type = None;
+                new_def.columns[i].user_type = target_user;
                 new_def.columns[i].type_mod = *type_mod;
                 new_def.columns[i].collation = target_collation;
             }
@@ -105196,6 +105316,7 @@ fn alter_table_relation(
                         ColSource::Cast {
                             orig,
                             target,
+                            user_type,
                             type_mod,
                             using,
                         } => {
@@ -105230,15 +105351,42 @@ fn alter_table_relation(
                                 }
                                 None => old_values[orig],
                             };
-                            match super::enum_values::materialize(
+                            // An enum or composite value is already of its type
+                            // (the cast was refused, or USING made it); any
+                            // other converts to the column's representation.
+                            let converted = super::enum_values::materialize(
                                 cast_source,
                                 storage,
                                 txn.txid,
                                 arena,
                             )
-                            .and_then(|value| cast_to(value, target, arena))
-                            .and_then(|v| apply_typmod(v, target, type_mod, arena))
-                            {
+                            .and_then(|value| {
+                                if user_type.is_some()
+                                    && matches!(target, ColType::Enum(_) | ColType::Composite(_))
+                                {
+                                    Ok(value)
+                                } else {
+                                    cast_to(value, target, arena)
+                                        .and_then(|v| apply_typmod(v, target, type_mod, arena))
+                                }
+                            })
+                            .and_then(|value| {
+                                // A domain's checks and a composite's field
+                                // rules apply as an assignment's do.
+                                if user_type.is_some() {
+                                    coerce_column_value(
+                                        value,
+                                        &new_def.columns[c],
+                                        storage,
+                                        txn.txid,
+                                        arena,
+                                        None,
+                                    )
+                                } else {
+                                    Ok(value)
+                                }
+                            });
+                            match converted {
                                 Ok(v) => v,
                                 Err(e) => return sql_fail(e),
                             }

@@ -68,6 +68,7 @@ pub(crate) fn pull_up_subqueries<'a>(
     // assigns their levels before planning.
     let mut current =
         super::aggregate_levels::assign_aggregate_levels(select, storage, txid, arena)?;
+    current = flatten_parenthesized_joins(current, arena)?;
     let mut next = 0usize;
     // A grouped query names a subquery's columns in its ungrouped-column
     // errors, which merging the subquery would rename; there a subquery that
@@ -113,6 +114,136 @@ pub(crate) fn pull_up_subqueries<'a>(
         }
     }
     Ok(current)
+}
+
+/// Merges each unaliased parenthesized join into the FROM clause where its
+/// members joined left-deep are the same join tree, as PostgreSQL's
+/// `deconstruct_jointree` reads a nested join: the first item's
+/// (`(a JOIN b ON x) JOIN c` is `a JOIN b ON x JOIN c`), a comma-separated
+/// item's without a `RIGHT` or `FULL` join, and an inner join's of inner
+/// joins only, whose condition then joins its last member
+/// (`a JOIN (b JOIN c ON x) ON y` is `a CROSS JOIN b JOIN c ON x AND y`).
+/// Its members' names were visible outside it, so no reference changes.
+fn flatten_parenthesized_joins<'a>(
+    select: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let Some(from) = select.from.as_ref() else {
+        return Ok(select);
+    };
+    let count = 1 + from.joins.len();
+    let members = |table: &TableRef<'a>| -> Option<&'a FromClause<'a>> {
+        if table.alias.is_some()
+            || table.col_alias.is_some()
+            || table.lateral
+            || table.join_members.is_none()
+        {
+            return None;
+        }
+        table.subquery?.from.as_ref()
+    };
+    let Some(position) = (0..count).find(|&index| {
+        let Some(inner) = members(item(from, index)) else {
+            return false;
+        };
+        let kinds = || inner.joins.iter().map(|join| join.kind);
+        match index.checked_sub(1).map(|at| &from.joins[at]) {
+            None => true,
+            Some(join) if join.kind == JoinKind::Comma => {
+                kinds().all(|kind| !matches!(kind, JoinKind::Right | JoinKind::Full))
+            }
+            Some(join) if matches!(join.kind, JoinKind::Inner | JoinKind::Cross) => {
+                join.using.is_none()
+                    && !join.natural
+                    && inner.joins.iter().all(|member| {
+                        matches!(member.kind, JoinKind::Inner | JoinKind::Cross)
+                            && member.using.is_none()
+                            && !member.natural
+                    })
+            }
+            Some(_) => false,
+        }
+    }) else {
+        return Ok(select);
+    };
+    let inner = members(item(from, position)).expect("found");
+    let mut joins = crate::mem::arena::ArenaList::new(arena);
+    let push = |joins: &mut crate::mem::arena::ArenaList<'a, Join<'a>>, join: Join<'a>| {
+        joins.push(join).map_err(|_| arena_full())
+    };
+    let base = if position == 0 {
+        for &join in inner.joins {
+            push(&mut joins, join)?;
+        }
+        for &join in from.joins {
+            push(&mut joins, join)?;
+        }
+        inner.base
+    } else {
+        for &join in &from.joins[..position - 1] {
+            push(&mut joins, join)?;
+        }
+        let outer = from.joins[position - 1];
+        // The inner chain's first member takes the outer join's place;
+        // an inner join's condition joins its last member.
+        let first_kind = if outer.kind == JoinKind::Comma {
+            JoinKind::Comma
+        } else {
+            JoinKind::Cross
+        };
+        let last = inner.joins.len();
+        let condition = |at: usize, on: Option<&'a Expr<'a>>| {
+            if outer.kind != JoinKind::Comma && at == last {
+                super::view_write::and_where(on, outer.on, arena)
+            } else {
+                Ok(on)
+            }
+        };
+        let first_on = condition(0, None)?;
+        push(
+            &mut joins,
+            Join {
+                table: inner.base,
+                kind: if first_on.is_some() {
+                    JoinKind::Inner
+                } else {
+                    first_kind
+                },
+                on: first_on,
+                using: None,
+                natural: false,
+            },
+        )?;
+        for (at, &join) in inner.joins.iter().enumerate() {
+            let on = condition(at + 1, join.on)?;
+            push(
+                &mut joins,
+                Join {
+                    kind: if on.is_some() && join.kind == JoinKind::Cross {
+                        JoinKind::Inner
+                    } else {
+                        join.kind
+                    },
+                    on,
+                    ..join
+                },
+            )?;
+        }
+        for &join in &from.joins[position..] {
+            push(&mut joins, join)?;
+        }
+        from.base
+    };
+    let flattened = arena
+        .alloc(Select {
+            from: Some(FromClause {
+                base,
+                joins: joins.into_mut_slice().map_err(|_| arena_full())?,
+            }),
+            ..*select
+        })
+        .map_err(|_| arena_full())?;
+    flatten_parenthesized_joins(flattened, arena)
 }
 
 /// Moves each `HAVING` conjunct without aggregates, volatile functions or

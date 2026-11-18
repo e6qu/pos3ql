@@ -1651,6 +1651,25 @@ pub(crate) fn window_sort_keys<'a>(
     Ok(&keys[..n])
 }
 
+/// A window function whose support function frees its window clause's
+/// frame (`SupportRequestOptimizeWindowClause`): the clause then runs `ROWS
+/// UNBOUNDED PRECEDING` when every function of it is one.
+pub(crate) fn frame_independent(node: &Expr<'_>) -> bool {
+    let Expr::Call { name, .. } = node else {
+        return false;
+    };
+    [
+        "row_number",
+        "rank",
+        "dense_rank",
+        "percent_rank",
+        "cume_dist",
+        "ntile",
+    ]
+    .iter()
+    .any(|function| name.eq_ignore_ascii_case(function))
+}
+
 pub(crate) fn window_spec<'a>(node: &'a Expr<'a>) -> Result<&'a WindowSpec<'a>, SqlError> {
     match node {
         Expr::Call {

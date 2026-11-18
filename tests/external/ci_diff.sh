@@ -296,6 +296,24 @@ printf '%s\n' 'Starting pos3ql'
 "$P3_BIN" --config "$WORK/p3.conf" >> "$WORK/p3.log" 2>&1 &
 P3_PID=$!
 
+# A query's output, with a failure marker appended when psql fails, so a
+# server that errors where another returns rows (or both error) is never
+# mistaken for a match: the marker carries the server's first error line.
+capture() { # psql command...
+  local output status errors
+  errors=$(mktemp "$WORK/capture.XXXXXX")
+  output=$("$@" 2>"$errors")
+  status=$?
+  printf '%s' "$output"
+  if (( status != 0 )); then
+    printf '\n<psql failed (%s): %s>' "$status" "$(grep -m1 -E 'ERROR:|FATAL:' "$errors")"
+  fi
+  rm -f "$errors"
+}
+capture_failed() { # captured output
+  [[ "$1" == *'<psql failed ('* ]]
+}
+
 wait_up() { # host port
   for _ in $(seq 1 100); do
     psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && return 0
@@ -525,14 +543,15 @@ IMPORT FOREIGN SCHEMA public LIMIT TO (pos3ql_fdw_source)
   FROM SERVER reference_server INTO public;
 SQL
 foreign_pos3ql_status=$?
-foreign_reference=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+foreign_reference=$(capture psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
   -X -At -F '|' -v ON_ERROR_STOP=1 \
-  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id" 2>/dev/null)
-foreign_pos3ql=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id")
+foreign_pos3ql=$(capture psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -At -F '|' -v ON_ERROR_STOP=1 \
-  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id" 2>/dev/null)
-if [[ $foreign_reference_status -eq 0 && $foreign_pos3ql_status -eq 0 \
-      && "$foreign_pos3ql" == "$foreign_reference" ]]; then
+  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id")
+if [[ $foreign_reference_status -eq 0 && $foreign_pos3ql_status -eq 0 ]] \
+    && ! capture_failed "$foreign_reference" && ! capture_failed "$foreign_pos3ql" \
+    && [[ "$foreign_pos3ql" == "$foreign_reference" ]]; then
   ok "foreign schema import and typed scan match PostgreSQL"
 else
   bad "foreign schema import and typed scan"
@@ -558,8 +577,8 @@ else
   bad "foreign scan driver behavior"
   cat "$WORK/foreign_driver.out"
 fi
-foreign_session_pool=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
-  -X -Atq -v ON_ERROR_STOP=1 <<SQL 2>/dev/null
+foreign_session_pool=$(capture psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -Atq -v ON_ERROR_STOP=1 <<SQL
 CREATE SERVER reference_server_second FOREIGN DATA WRAPPER postgres_fdw
   OPTIONS (host '$PGHOST', port '$PGPORT', dbname 'postgres', sslmode 'disable',
            application_name 'pos3ql-second');
@@ -593,8 +612,8 @@ else
   bad "foreign session pool transaction behavior"
   printf 'pos3ql:\n%s\n' "$foreign_session_pool"
 fi
-foreign_mutation=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
-  -X -Atq -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null
+foreign_mutation=$(capture psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -Atq -v ON_ERROR_STOP=1 <<'SQL'
 BEGIN;
 INSERT INTO pos3ql_fdw_source (id, scores, pair, note)
   VALUES (4, ARRAY[7,8], ROW(40,'four')::public.pos3ql_fdw_pair, 'quote '' is data')
@@ -614,9 +633,9 @@ COMMIT;
 SELECT id, pair::text, note FROM pos3ql_fdw_source WHERE id >= 4 ORDER BY id;
 SQL
 )
-foreign_mutation_reference=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+foreign_mutation_reference=$(capture psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
   -X -Atq -F '|' -v ON_ERROR_STOP=1 \
-  -c "SELECT id, pair::text, note FROM public.pos3ql_fdw_source WHERE id >= 4 ORDER BY id" 2>/dev/null)
+  -c "SELECT id, pair::text, note FROM public.pos3ql_fdw_source WHERE id >= 4 ORDER BY id")
 if [[ "$foreign_mutation" == $'4|(40,four)|quote \' is data\n4|quote \' is data updated\n4|quote \' is data updated\n4|(40,four)|quote \' is data updated' \
       && "$foreign_mutation_reference" == $'4|(40,four)|quote \' is data updated' ]]; then
   ok "foreign INSERT, UPDATE and DELETE use Bind, RETURNING, commit and savepoint boundaries"
@@ -806,11 +825,12 @@ fi
 if printf '6\tCOPY from pos3ql\n' | psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -v ON_ERROR_STOP=1 -c 'COPY pos3ql_fdw_source (id, note) FROM STDIN' \
   > "$WORK/foreign_copy_in.out" 2>&1; then
-  foreign_copy=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
-    -X -Atq -v ON_ERROR_STOP=1 -c 'COPY (SELECT id, note FROM pos3ql_fdw_source ORDER BY id) TO STDOUT' 2>/dev/null)
-  foreign_copy_reference=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
-    -X -Atq -v ON_ERROR_STOP=1 -c 'COPY (SELECT id, note FROM public.pos3ql_fdw_source ORDER BY id) TO STDOUT' 2>/dev/null)
-  if [[ "$foreign_copy" == "$foreign_copy_reference" ]]; then
+  foreign_copy=$(capture psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+    -X -Atq -v ON_ERROR_STOP=1 -c 'COPY (SELECT id, note FROM pos3ql_fdw_source ORDER BY id) TO STDOUT')
+  foreign_copy_reference=$(capture psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+    -X -Atq -v ON_ERROR_STOP=1 -c 'COPY (SELECT id, note FROM public.pos3ql_fdw_source ORDER BY id) TO STDOUT')
+  if ! capture_failed "$foreign_copy" && ! capture_failed "$foreign_copy_reference" \
+    && [[ "$foreign_copy" == "$foreign_copy_reference" ]]; then
     ok "foreign COPY FROM and query-form export keep remote rows and text framing"
   else
     bad "foreign COPY row parity"
@@ -882,9 +902,9 @@ CREATE USER MAPPING FOR pos3ql_fdw_reader SERVER reference_server OPTIONS (user 
 GRANT SELECT (id) ON pos3ql_fdw_source TO pos3ql_fdw_reader;
 SQL
 foreign_privilege_setup_status=$?
-foreign_allowed=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+foreign_allowed=$(capture psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -Atq -v ON_ERROR_STOP=1 \
-  -c 'SET ROLE pos3ql_fdw_reader; SELECT id FROM pos3ql_fdw_source ORDER BY id' 2>/dev/null)
+  -c 'SET ROLE pos3ql_fdw_reader; SELECT id FROM pos3ql_fdw_source ORDER BY id')
 if psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 \
   -c 'SET ROLE pos3ql_fdw_reader; SELECT note FROM pos3ql_fdw_source' \
@@ -904,10 +924,10 @@ if psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
 else
   foreign_merge_denied_status=$?
 fi
-foreign_hidden=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+foreign_hidden=$(capture psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -Atq -v ON_ERROR_STOP=1 \
   -c 'SET ROLE pos3ql_fdw_observer; SELECT bool_and(umoptions IS NULL) FROM pg_user_mapping' \
-  2>/dev/null)
+ )
 if [[ $foreign_privilege_setup_status -eq 0 && "$foreign_allowed" == $'1\n2\n3\n4\n6\n7' \
       && $foreign_denied_status -ne 0 && $foreign_merge_denied_status -ne 0 \
       && "$foreign_hidden" == t ]]; then
@@ -919,12 +939,12 @@ else
   printf 'allowed:\n%s\nhidden:\n%s\n' "$foreign_allowed" "$foreign_hidden"
 fi
 restart_p3 || exit 1
-foreign_recovered=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+foreign_recovered=$(capture psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -At -F '|' -v ON_ERROR_STOP=1 \
-  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id" 2>/dev/null)
-if [[ "$foreign_recovered" == "$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id")
+if ! capture_failed "$foreign_recovered" && [[ "$foreign_recovered" == "$(capture psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
   -X -At -F '|' -v ON_ERROR_STOP=1 \
-  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id" 2>/dev/null)" ]]; then
+  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id")" ]]; then
   ok "foreign metadata and typed scans survive WAL restart"
 else
   bad "foreign metadata restart recovery"
@@ -932,8 +952,8 @@ else
 fi
 if psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 -c 'TRUNCATE pos3ql_fdw_source' > "$WORK/foreign_truncate.out" 2>&1 \
-  && [[ $(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -Atq \
-      -v ON_ERROR_STOP=1 -c 'SELECT count(*) FROM public.pos3ql_fdw_source' 2>/dev/null) == 0 ]]; then
+  && [[ $(capture psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -Atq \
+      -v ON_ERROR_STOP=1 -c 'SELECT count(*) FROM public.pos3ql_fdw_source') == 0 ]]; then
   ok "foreign TRUNCATE changes only the remote relation"
 else
   bad "foreign TRUNCATE"
@@ -964,7 +984,7 @@ else
   # sequences, setval positions, views, matviews, indexes and data must all
   # come back through WAL replay rather than surviving only in memory.
   restart_p3 || exit 1
-  dump_observed=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -At -F '|' \
+  dump_observed=$(capture psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -At -F '|' \
     -v ON_ERROR_STOP=1 -c "
       SELECT count(*) FROM app.entry;
       SELECT state,n FROM app.entry_counts ORDER BY state;
@@ -972,7 +992,7 @@ else
         VALUES (1,'sad','third','{\"c\":3}',ARRAY['x','y'],3)
         RETURNING id,doubled;
       SELECT nextval('app.ticket_seq');
-    " 2>/dev/null)
+    ")
   expected_dump_observed=$'2\nsad|1\nhappy|1\n3|6\nINSERT 0 1\n30'
   if [[ "$dump_observed" == "$expected_dump_observed" ]]; then
     ok "PostgreSQL 18.4 plain dump restores and survives restart"
@@ -1014,7 +1034,7 @@ if [[ $extension_setup_status -ne 0 || $extension_dump_status -ne 0 || $extensio
   tail -40 "$WORK/extension_dump.out"
   tail -40 "$WORK/extension_restore.out"
 else
-  extension_observed=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+  extension_observed=$(capture psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
     -X -At -F '|' -v ON_ERROR_STOP=1 -c "
       SELECT e.extname,e.extversion,n.nspname
         FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace
@@ -1027,7 +1047,7 @@ else
       SELECT count(*) FROM pg_foreign_server WHERE srvname='extension_member_server';
       SELECT count(*) FROM pg_foreign_table WHERE ftrelid='extension_dump.extension_member_foreign'::regclass;
       SELECT count(*) FROM pg_event_trigger WHERE evtname='extension_member_event';
-    " 2>/dev/null)
+    ")
   expected_extension_observed=$'pos3ql_base|1.0|extension_dump\npos3ql_ext|2.0|extension_dump\n0\nuser row|f\nrestored\n42\n1\n1\n1\n1'
   if [[ "$extension_observed" == "$expected_extension_observed" ]]; then
     ok "SQL extension definitions and configuration rows survive pg_dump into PostgreSQL 18"
@@ -1335,7 +1355,7 @@ if [[ $outbound_setup_status -ne 0 || $outbound_dump_status -ne 0 || $outbound_r
   tail -40 "$WORK/outbound_dump.out"
   tail -40 "$WORK/outbound_restore.out"
 else
-  outbound_observed=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+  outbound_observed=$(capture psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
     -X -At -F '|' -v ON_ERROR_STOP=1 -c "
       SELECT id,mood,(location).east,(location).y,(location).z IS NULL,moods[1],
              (locations[1]).y,(marked_location).east,(marked_locations[1]).y,note
@@ -1499,7 +1519,7 @@ else
        ORDER BY relname;
       SELECT id,value FROM outbound_dump.transient_rows;
       SELECT last_value,is_called FROM outbound_dump.transient_sequence;
-    " 2>/dev/null)
+    ")
   expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n1|$."items"[*]?(@."active" == true)|{"$.\\"items\\"[*].\\"price\\"","strict $.\\"missing\\""}|t\n1|1|1|12.50\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\n9|nine\nINSERT 0 1\n9|nine\noutbound_redirect|t|dumped rewrite rule\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1\nbyte_order|c|t|latin1_to_utf8|t\none\nthree\ntwo\nc3a9\ndumped collation|dumped conversion\n1|\'42\':2 \'cats\':1|\'cats\' & \'42\'|t\n2|\'7\':2 \'dogs\':1|\'dogs\'|t\n\'9\':2 \'birds\':1|{birds}\ndumped search configuration\n4\noutbound_search_expression_idx\noutbound_search_query_idx\noutbound_search_terms_idx\nsearch_documents_pkey'
   expected_outbound_observed+=$'\noutbound_dump_changes|outbound_reader|f|t|t|f|f|f|n\noutbound_dump|publication_rows|{id,visible}|(id > 0)'
   expected_outbound_observed+=$'\ntransient_rows|u\ntransient_rows_id_seq|u\ntransient_sequence|u\n1|dumped unlogged row\n71|t'
@@ -1510,13 +1530,13 @@ else
     printf 'expected:\n%s\nobserved:\n%s\n' \
       "$expected_outbound_observed" "$outbound_observed"
   fi
-  outbound_statistics=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+  outbound_statistics=$(capture psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
     -X -At -F '|' -v ON_ERROR_STOP=1 -c "
       SELECT stxname,stxstattarget,pg_get_statisticsobjdef_columns(oid)
         FROM pg_statistic_ext
        WHERE stxnamespace='outbound_dump'::regnamespace
        ORDER BY stxname;
-    " 2>/dev/null)
+    ")
   expected_outbound_statistics=$'outbound_items_mood_note|25|mood, note\noutbound_items_note_lower||lower(note)'
   if [[ "$outbound_statistics" == "$expected_outbound_statistics" ]]; then
     ok "pos3ql statistics definitions survive pg_dump and PostgreSQL restore"
@@ -1525,12 +1545,12 @@ else
     printf 'expected:\n%s\nobserved:\n%s\n' \
       "$expected_outbound_statistics" "$outbound_statistics"
   fi
-  outbound_large_object=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+  outbound_large_object=$(capture psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
     -X -At -F '|' -v ON_ERROR_STOP=1 -c "
       SELECT encode(lo_get(94001::oid), 'hex'),
              obj_description(94001, 'pg_largeobject'),
              has_largeobject_privilege('outbound_reader', 94001, 'SELECT');
-    " 2>/dev/null)
+    ")
   if [[ "$outbound_large_object" == "6f7574626f756e642d6c617267652d6f626a656374|dumped large object|t" ]]; then
     ok "pos3ql large objects survive pg_dump into PostgreSQL 18"
   else
@@ -1600,12 +1620,12 @@ else
       tail -40 "$WORK/pg_restore_transaction_size.out"
     fi
     restart_p3 || exit 1
-    archive_observed=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -At -F '|' \
+    archive_observed=$(capture psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -At -F '|' \
       -v ON_ERROR_STOP=1 -c "
         SELECT count(*) FROM app.entry;
         SELECT state,n FROM app.entry_counts ORDER BY state;
         SELECT nextval('app.ticket_seq');
-      " 2>/dev/null)
+      ")
     expected_archive_observed=$'2\nsad|1\nhappy|1\n30'
     if [[ $archive_single_status -eq 0
           && $archive_sized_status -eq 0
@@ -1650,20 +1670,40 @@ run_corpus() { # host port outfile file diagnostics
     --stderr "$3.stderr" --input-diagnostics verbose --diagnostics "$diagnostics" \
     > "$3" || return 1
 }
+# One reset statement. Dropping what an earlier CASCADE already removed is
+# not an error (every statement is IF EXISTS); any other failure aborts the
+# run, naming the statement, so a server that cannot drop an object cannot
+# leak it into later fixtures unnoticed.
+reset_exec() { # host port statement
+  local output
+  if ! output=$(psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
+    -v ON_ERROR_STOP=1 -c "$3" 2>&1 >/dev/null); then
+    printf 'FAIL: reset statement failed on %s:%s\n  %s\n%s\n' "$1" "$2" "$3" "$output" >&2
+    exit 1
+  fi
+}
+# The rows of a reset query (one statement per line).
+reset_rows() { # host port query [psql options...]
+  local host=$1 port=$2 query=$3
+  shift 3
+  psql -h "$host" -p "$port" -U "$PGUSER" -d postgres -X -A -t -q \
+    -v ON_ERROR_STOP=1 "$@" -c "$query" || {
+    printf 'FAIL: reset query failed on %s:%s\n  %s\n' "$host" "$port" "$query" >&2
+    exit 1
+  }
+}
 reset_user_extensions() { # host port
-  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -c "SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname DESC" |
+  local extension rows
+  rows=$(reset_rows "$1" "$2" "SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname DESC") || exit 1
   while IFS= read -r extension; do
     [[ -z "$extension" ]] && continue
     extension=${extension//\"/\"\"}
-    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
-      -c "DROP EXTENSION \"$extension\" CASCADE" >/dev/null 2>&1
-  done
+    reset_exec "$1" "$2" "DROP EXTENSION IF EXISTS \"$extension\" CASCADE"
+  done <<<"$rows"
 }
 reset_user_routines() { # host port
-  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -F $'\t' \
-    -c "SELECT p.oid::regprocedure, p.prokind FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')" |
+  local routine kind drop rows
+  rows=$(reset_rows "$1" "$2" "SELECT CASE WHEN p.prokind = 'a' AND p.pronargs = 0 THEN left(p.oid::regprocedure::text, -2) || '(*)' ELSE p.oid::regprocedure::text END, p.prokind FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')" -F $'\t') || exit 1
   while IFS=$'\t' read -r routine kind; do
     [[ -z "$routine" ]] && continue
     case "$kind" in
@@ -1671,14 +1711,12 @@ reset_user_routines() { # host port
     p) drop='DROP PROCEDURE' ;;
     *) drop='DROP FUNCTION' ;;
     esac
-    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
-      -c "$drop $routine CASCADE" >/dev/null 2>&1
-  done
+    reset_exec "$1" "$2" "$drop IF EXISTS $routine CASCADE"
+  done <<<"$rows"
 }
 reset_user_relations() { # host port
-  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -F $'\t' \
-    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S', 'f')" |
+  local schema relation relkind drop rows
+  rows=$(reset_rows "$1" "$2" "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S', 'f') AND NOT (c.relkind = 'S' AND EXISTS (SELECT 1 FROM pg_depend AS d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')))" -F $'\t') || exit 1
   while IFS=$'\t' read -r schema relation relkind; do
     [[ -z "$relation" ]] && continue
     schema=${schema//\"/\"\"}
@@ -1690,13 +1728,12 @@ reset_user_relations() { # host port
     S) drop='DROP SEQUENCE' ;;
     f) drop='DROP FOREIGN TABLE' ;;
     *)
-      printf 'FAIL: unexpected reset relation kind %q\n' "$relkind"
-      return 1
+      printf 'FAIL: unexpected reset relation kind %q\n' "$relkind" >&2
+      exit 1
       ;;
     esac
-    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
-      -c "$drop \"$schema\".\"$relation\" CASCADE" >/dev/null 2>&1
-  done
+    reset_exec "$1" "$2" "$drop IF EXISTS \"$schema\".\"$relation\" CASCADE"
+  done <<<"$rows"
 }
 # Schemas, standalone types, public collations, foreign-data wrappers and
 # roles a fixture leaves behind would otherwise collide with a later fixture's
@@ -1705,12 +1742,12 @@ reset_user_relations() { # host port
 # dropped, so roles that predate the run on a shared reference server survive;
 # pos3ql servers are disposable, so every role it did not bootstrap is dropped.
 reset_user_objects() { # host port role-baseline
-  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -c "SELECT 'DROP FOREIGN DATA WRAPPER ' || quote_ident(fdwname) || ' CASCADE' FROM pg_foreign_data_wrapper UNION ALL SELECT 'DROP SCHEMA ' || quote_ident(nspname) || ' CASCADE' FROM pg_namespace WHERE nspname NOT IN ('public', 'information_schema') AND nspname NOT LIKE 'pg\\_%' UNION ALL SELECT 'DROP TYPE ' || quote_ident(n.nspname) || '.' || quote_ident(t.typname) || ' CASCADE' FROM pg_type AS t JOIN pg_namespace AS n ON n.oid = t.typnamespace WHERE n.nspname = 'public' AND t.typtype IN ('c', 'd', 'e', 'r') AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_class AS c WHERE c.oid = t.typrelid) = 'c') UNION ALL SELECT 'DROP COLLATION ' || quote_ident(n.nspname) || '.' || quote_ident(c.collname) || ' CASCADE' FROM pg_collation AS c JOIN pg_namespace AS n ON n.oid = c.collnamespace WHERE n.nspname = 'public' UNION ALL SELECT 'DROP OWNED BY ' || quote_ident(rolname) || ' CASCADE; DROP ROLE ' || quote_ident(rolname) FROM pg_roles WHERE oid > $3 AND rolname <> current_user" |
+  local statement rows
+  rows=$(reset_rows "$1" "$2" "SELECT 'DROP FOREIGN DATA WRAPPER IF EXISTS ' || quote_ident(fdwname) || ' CASCADE' FROM pg_foreign_data_wrapper UNION ALL SELECT 'DROP SCHEMA IF EXISTS ' || quote_ident(nspname) || ' CASCADE' FROM pg_namespace WHERE nspname NOT IN ('public', 'information_schema') AND nspname NOT LIKE 'pg\\_%' UNION ALL SELECT 'DROP TYPE IF EXISTS ' || quote_ident(n.nspname) || '.' || quote_ident(t.typname) || ' CASCADE' FROM pg_type AS t JOIN pg_namespace AS n ON n.oid = t.typnamespace WHERE n.nspname = 'public' AND t.typtype IN ('c', 'd', 'e', 'r') AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_class AS c WHERE c.oid = t.typrelid) = 'c') UNION ALL SELECT 'DROP COLLATION IF EXISTS ' || quote_ident(n.nspname) || '.' || quote_ident(c.collname) || ' CASCADE' FROM pg_collation AS c JOIN pg_namespace AS n ON n.oid = c.collnamespace WHERE n.nspname = 'public' UNION ALL SELECT 'DROP OWNED BY ' || quote_ident(rolname) || ' CASCADE; DROP ROLE IF EXISTS ' || quote_ident(rolname) FROM pg_roles WHERE oid > $3 AND rolname <> current_user") || exit 1
   while IFS= read -r statement; do
     [[ -z "$statement" ]] && continue
-    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q -c "$statement" >/dev/null 2>&1
-  done
+    reset_exec "$1" "$2" "$statement"
+  done <<<"$rows"
 }
 role_baseline() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q -c "SELECT max(oid) FROM pg_roles"

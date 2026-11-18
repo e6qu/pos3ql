@@ -1103,11 +1103,19 @@ pub(crate) fn inline_call<'a>(
         return Ok(Inlining::Kept);
     }
     let function_oid = crate::storage::routine_oid(&declared);
-    let Some(routine) =
+    let Some(mut routine) =
         storage.function_for_captured_call(function_oid, argument_names, oids, *variadic, txid)
     else {
         return Ok(Inlining::Kept);
     };
+    // A polymorphic input or result takes the type the call's arguments
+    // give it, as the body is analysed with the resolved types.
+    if storage
+        .bind_routine_call_inputs(&mut routine, argument_names, oids, *variadic, txid)
+        .is_none()
+    {
+        return Ok(Inlining::Kept);
+    }
     if !declaration(
         &routine,
         routine.argument_count,
@@ -1138,18 +1146,64 @@ pub(crate) fn inline_call<'a>(
                 count += 1;
             }
         }
+        let packs = matches!(
+            parameter.mode,
+            crate::storage::RoutineParameterMode::Variadic { .. }
+        ) && !*variadic;
         *slot_value = match supplied {
-            Some(argument)
-                if count == 1
-                    && !(matches!(
-                        parameter.mode,
-                        crate::storage::RoutineParameterMode::Variadic { .. }
-                    ) && !*variadic) =>
-            {
-                argument
+            Some(argument) if count == 1 && !packs => argument,
+            // The elements a non-VARIADIC call gives a variadic input pack
+            // into an array (`expand_function_arguments`).
+            Some(_) => {
+                // Each element is converted to the array's element type.
+                let array_oid = storage
+                    .routine_type_oid(
+                        routine.arguments()[input].ctype,
+                        routine.arguments()[input].user_type,
+                        txid,
+                    )
+                    .ok_or_else(missing_contract)?;
+                let Some(element_oid) = crate::sql::assignment_path::element_type_oid(array_oid)
+                else {
+                    return Ok(Inlining::Unmodeled);
+                };
+                let element_name =
+                    crate::sql::catalog::format_type_name(storage, txid, element_oid)?;
+                let element_name = arena
+                    .alloc_str(element_name.as_str())
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                let mut elements = crate::mem::arena::ArenaList::new(arena);
+                for (at, mapped) in mapping[..args.len()].iter().enumerate() {
+                    if usize::from(*mapped) != input {
+                        continue;
+                    }
+                    let argument = args[at];
+                    let converted = if oids[at] == element_oid {
+                        argument
+                    } else {
+                        &*arena
+                            .alloc(Expr::Cast {
+                                source_position: ast::SourcePosition::UNKNOWN,
+                                operand: argument,
+                                type_name: element_name,
+                                type_mod: -1,
+                                binding: CastBinding::Resolve,
+                                context: ast::CastContext::Implicit,
+                            })
+                            .map_err(|_| crate::sql::eval::arena_full())?
+                    };
+                    elements
+                        .push(converted)
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                }
+                &*arena
+                    .alloc(Expr::Array(elements.as_slice()))
+                    .map_err(|_| crate::sql::eval::arena_full())?
             }
-            // Packed variadic elements.
-            Some(_) => return Ok(Inlining::Unmodeled),
+            // No element for a variadic input: an empty array, not modelled.
+            None if packs && parameter.mode.default().is_none() => {
+                return Ok(Inlining::Unmodeled);
+            }
             None => {
                 let source = parameter.mode.default().ok_or_else(missing_contract)?;
                 let parameter_index = routine
@@ -1475,7 +1529,7 @@ pub(crate) fn inline_set_returning_call<'a>(
     if !storage_names_sql_function(storage, txid, name) {
         return Ok(SetInlining::Kept);
     }
-    let empty = crate::sql::exec::CatalogCols {
+    let own = crate::sql::exec::CatalogCols {
         remote_ctid: false,
         definition: None,
         alias: None,
@@ -1484,12 +1538,13 @@ pub(crate) fn inline_set_returning_call<'a>(
         txid,
         arena,
     };
+    let empty: &dyn ColTypeResolver = &own;
     let mut oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
     if args.len() > oids.len() {
         return Ok(SetInlining::Kept);
     }
     for (oid, expression) in oids.iter_mut().zip(args) {
-        *oid = match infer_routine_argument_oid(expression, &empty) {
+        *oid = match infer_routine_argument_oid(expression, empty) {
             Ok(oid) => oid,
             // An argument reading another FROM item (`LATERAL`).
             Err(error)
@@ -1517,7 +1572,7 @@ pub(crate) fn inline_set_returning_call<'a>(
         return Ok(SetInlining::Kept);
     }
     let function_oid = crate::storage::routine_oid(&declared);
-    let Some(routine) = storage.function_for_captured_call(
+    let Some(mut routine) = storage.function_for_captured_call(
         function_oid,
         item.func_argument_names,
         oids,
@@ -1526,6 +1581,19 @@ pub(crate) fn inline_set_returning_call<'a>(
     ) else {
         return Ok(SetInlining::Kept);
     };
+    // A polymorphic input or result takes the type the arguments give it.
+    if storage
+        .bind_routine_call_inputs(
+            &mut routine,
+            item.func_argument_names,
+            oids,
+            item.func_variadic,
+            txid,
+        )
+        .is_none()
+    {
+        return Ok(SetInlining::Kept);
+    }
     if routine.attributes.strict
         || routine.attributes.volatility == RoutineVolatility::Volatile
         || routine.attributes.security_definer
@@ -1565,10 +1633,60 @@ pub(crate) fn inline_set_returning_call<'a>(
                 txid,
             )
             .ok_or_else(missing_contract)?;
-        // `expand_function_arguments`: an omitted input takes its default;
-        // a packed variadic or a polymorphic input is not modeled.
+        // `expand_function_arguments`: an omitted input takes its default,
+        // and a non-VARIADIC call packs a variadic input's elements.
+        let packs = routine.parameter_for_input(input).is_some_and(|parameter| {
+            matches!(
+                parameter.mode,
+                crate::storage::RoutineParameterMode::Variadic { .. }
+            ) && !item.func_variadic
+        });
         let argument = match (supplied, count) {
-            (Some(argument), 1) => argument,
+            (Some(argument), 1) if !packs => argument,
+            (Some(_), _) if packs => {
+                let array_oid = storage
+                    .routine_type_oid(
+                        routine.arguments()[input].ctype,
+                        routine.arguments()[input].user_type,
+                        txid,
+                    )
+                    .ok_or_else(missing_contract)?;
+                let Some(element_oid) = crate::sql::assignment_path::element_type_oid(array_oid)
+                else {
+                    return Ok(SetInlining::Unmodeled);
+                };
+                let element_name =
+                    crate::sql::catalog::format_type_name(storage, txid, element_oid)?;
+                let element_name = arena
+                    .alloc_str(element_name.as_str())
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                let mut elements = crate::mem::arena::ArenaList::new(arena);
+                for (at, mapped) in mapping[..args.len()].iter().enumerate() {
+                    if usize::from(*mapped) != input {
+                        continue;
+                    }
+                    let element = if oids[at] == element_oid {
+                        args[at]
+                    } else {
+                        &*arena
+                            .alloc(Expr::Cast {
+                                source_position: ast::SourcePosition::UNKNOWN,
+                                operand: args[at],
+                                type_name: element_name,
+                                type_mod: -1,
+                                binding: CastBinding::Resolve,
+                                context: ast::CastContext::Implicit,
+                            })
+                            .map_err(|_| crate::sql::eval::arena_full())?
+                    };
+                    elements
+                        .push(element)
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                }
+                &*arena
+                    .alloc(Expr::Array(elements.as_slice()))
+                    .map_err(|_| crate::sql::eval::arena_full())?
+            }
             (None, 0) => {
                 let parameter = routine
                     .parameter_for_input(input)
@@ -1594,22 +1712,15 @@ pub(crate) fn inline_set_returning_call<'a>(
             }
             _ => return Ok(SetInlining::Unmodeled),
         };
-        if crate::sql::catalog::is_polymorphic_pseudo_type(target)
-            || routine.parameter_for_input(input).is_some_and(|parameter| {
-                matches!(
-                    parameter.mode,
-                    crate::storage::RoutineParameterMode::Variadic { .. }
-                ) && !item.func_variadic
-            })
-        {
+        if crate::sql::catalog::is_polymorphic_pseudo_type(target) {
             return Ok(SetInlining::Unmodeled);
         }
         // Volatile arguments or sub-selects keep the call.
-        let facts = argument_facts(&[argument], &empty, storage, txid, arena)?[0];
+        let facts = argument_facts(&[argument], empty, storage, txid, arena)?[0];
         if !facts.properties.known || facts.properties.volatility >= 2 || facts.properties.subplan {
             return Ok(SetInlining::Kept);
         }
-        *value = if infer_routine_argument_oid(argument, &empty)? == target {
+        *value = if infer_routine_argument_oid(argument, empty)? == target {
             argument
         } else {
             let type_name = crate::sql::catalog::format_type_name(storage, txid, target)?;
@@ -1684,16 +1795,50 @@ pub(crate) fn inline_set_returning_call<'a>(
     let output = crate::sql::query::describe_derived_definition(
         storage, &select, "", None, txid, arena, None,
     )?;
-    // `check_sql_fn_retval` would coerce a column of another type, which
-    // the plan prints as the bare column; the model does not print that.
-    if output.n_columns != declared.n_columns
-        || output
-            .columns()
-            .iter()
-            .zip(declared.columns())
-            .any(|(body, column)| body.ctype != column.ctype)
-    {
+    if output.n_columns != declared.n_columns {
         return Ok(SetInlining::Unmodeled);
+    }
+    // `check_sql_fn_retval` coerces a column of another type to the declared
+    // one at the top of the target list, where the plan does not print it.
+    let mut select = select;
+    if output
+        .columns()
+        .iter()
+        .zip(declared.columns())
+        .any(|(body, column)| body.ctype != column.ctype)
+    {
+        if select.items.len() != declared.n_columns || select.set_body.is_some() {
+            return Ok(SetInlining::Unmodeled);
+        }
+        let items = arena
+            .alloc_slice_copy(select.items)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        for ((item, body), column) in items
+            .iter_mut()
+            .zip(output.columns())
+            .zip(declared.columns())
+        {
+            if body.ctype == column.ctype {
+                continue;
+            }
+            let SelectItem::Expr { expression, .. } = item else {
+                return Ok(SetInlining::Unmodeled);
+            };
+            if column.user_type.is_some() {
+                return Ok(SetInlining::Unmodeled);
+            }
+            *expression = arena
+                .alloc(Expr::Cast {
+                    source_position: ast::SourcePosition::UNKNOWN,
+                    operand: expression,
+                    type_name: column.ctype.name(),
+                    type_mod: -1,
+                    binding: CastBinding::Resolve,
+                    context: ast::CastContext::Assignment,
+                })
+                .map_err(|_| crate::sql::eval::arena_full())?;
+        }
+        select.items = items;
     }
     let names: &'a mut [&'a str] = arena
         .alloc_slice_with(declared.n_columns, |_| "")
@@ -1766,11 +1911,14 @@ fn substitute_select<'a>(
             }
             copy.with = ctes;
         }
-        // A window above the inlined subquery is not costed by the model.
-        if !select.windows.is_empty() {
-            return Err(Failure::Uncovered);
-        }
         let expression = |value: &'a Expr<'a>| expression(value, inputs, arena);
+        if !select.windows.is_empty() {
+            let windows = arena.alloc_slice_copy(select.windows)?;
+            for window in windows.iter_mut() {
+                *window = arena.alloc(window_spec(window, inputs, arena)?)?;
+            }
+            copy.windows = windows;
+        }
         let items = arena.alloc_slice_copy(select.items)?;
         for item in items.iter_mut() {
             match item {
@@ -1828,6 +1976,36 @@ fn substitute_select<'a>(
         }
         if let Some(tree) = select.set_body {
             copy.set_body = Some(arena.alloc(set_tree(tree, inputs, arena)?)?);
+        }
+        Ok(copy)
+    }
+    fn window_spec<'a>(
+        spec: &ast::WindowSpec<'a>,
+        inputs: &[&'a Expr<'a>],
+        arena: &'a Arena,
+    ) -> Result<ast::WindowSpec<'a>, Failure> {
+        let mut copy = *spec;
+        let partition = arena.alloc_slice_copy(spec.partition_by)?;
+        for value in partition.iter_mut() {
+            *value = expression(value, inputs, arena)?;
+        }
+        copy.partition_by = partition;
+        let order = arena.alloc_slice_copy(spec.order_by)?;
+        for key in order.iter_mut() {
+            key.expression = expression(key.expression, inputs, arena)?;
+        }
+        copy.order_by = order;
+        if let Some(frame) = &mut copy.frame {
+            for bound in [&mut frame.start, &mut frame.end] {
+                match bound {
+                    ast::FrameBound::Preceding(offset) | ast::FrameBound::Following(offset) => {
+                        *offset = expression(offset, inputs, arena)?;
+                    }
+                    ast::FrameBound::UnboundedPreceding
+                    | ast::FrameBound::CurrentRow
+                    | ast::FrameBound::UnboundedFollowing => {}
+                }
+            }
         }
         Ok(copy)
     }
@@ -1909,7 +2087,36 @@ fn substitute_select<'a>(
                     select: nested(select)?,
                     all: *all,
                 })?),
-                Expr::Call { over: Some(_), .. } => return Err(Failure::Uncovered),
+                // A window call's own arguments, filter, ordering and window.
+                Expr::Call {
+                    over: Some(window), ..
+                } => {
+                    let mut call = *node;
+                    if let Expr::Call {
+                        args,
+                        order_by,
+                        filter,
+                        over,
+                        ..
+                    } = &mut call
+                    {
+                        let rewritten = arena.alloc_slice_copy(args)?;
+                        for value in rewritten.iter_mut() {
+                            *value = expression(value, inputs, arena)?;
+                        }
+                        *args = rewritten;
+                        let keys = arena.alloc_slice_copy(order_by)?;
+                        for key in keys.iter_mut() {
+                            key.expression = expression(key.expression, inputs, arena)?;
+                        }
+                        *order_by = keys;
+                        *filter = filter
+                            .map(|value| expression(value, inputs, arena))
+                            .transpose()?;
+                        *over = Some(arena.alloc(window_spec(window, inputs, arena)?)?);
+                    }
+                    Some(&*arena.alloc(call)?)
+                }
                 _ => None,
             })
         })

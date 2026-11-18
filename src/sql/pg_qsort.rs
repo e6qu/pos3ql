@@ -114,6 +114,11 @@ pub(crate) fn pg_qsort(
 /// than twice the bound arrive (`make_bounded_heap`, `tuplesort_heap_*`
 /// with the sort reversed) and returns them sorted (`sort_bounded_heap`);
 /// otherwise `pg_qsort`. Returns how many leading elements are the sorted
+/// What [`pg_incremental_sort`] tells of each batch it sorts: whether it is
+/// a presorted-prefix batch, its rows, and the bound it sorts under.
+pub(crate) type SortedBatch<'f> =
+    dyn FnMut(bool, &[u32], Option<usize>) -> Result<(), SqlError> + 'f;
+
 /// result.
 pub(crate) fn pg_tuplesort(
     data: &mut [u32],
@@ -181,7 +186,10 @@ enum Incremental {
 /// a limit above stops it once it returned that many rows and bounds its
 /// sorts as `tuplesort_set_bound` does. Writes the rows it returns to
 /// `out`, using `scratch` of twice the input's length, and returns how
-/// many.
+/// many and how many input rows it read. `sorted` sees each batch before
+/// it is sorted: whether it is a
+/// presorted prefix group's, its rows in arrival order and its sort's
+/// bound (`instrumentSortedGroup`).
 pub(crate) fn pg_incremental_sort(
     input: &[u32],
     scratch: &mut [u32],
@@ -189,7 +197,8 @@ pub(crate) fn pg_incremental_sort(
     bound: Option<usize>,
     same_group: &mut dyn FnMut(u32, u32) -> Result<bool, SqlError>,
     compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
-) -> Result<usize, SqlError> {
+    sorted: &mut SortedBatch<'_>,
+) -> Result<(usize, usize), SqlError> {
     const MIN_GROUP: usize = 32;
     const MAX_FULL_SORT_GROUP: usize = 2 * MIN_GROUP;
     let (full, prefix) = scratch.split_at_mut(input.len());
@@ -218,7 +227,8 @@ pub(crate) fn pg_incremental_sort(
                 break;
             }
             if state.remaining > 0 {
-                prefix_kept = state.switch_to_prefix(full, prefix, bound, same_group, compare)?;
+                prefix_kept =
+                    state.switch_to_prefix(full, prefix, bound, same_group, compare, sorted)?;
             } else {
                 state.status = Incremental::LoadFull;
             }
@@ -240,6 +250,7 @@ pub(crate) fn pg_incremental_sort(
             loop {
                 let Some(&slot) = input.get(position) else {
                     outer_done = true;
+                    sorted(false, &full[..full_len], sort_bound)?;
                     full_kept = pg_tuplesort(&mut full[..full_len], sort_bound, compare)?;
                     state.status = Incremental::ReadFull;
                     break;
@@ -261,12 +272,14 @@ pub(crate) fn pg_incremental_sort(
                     if let Some(bound) = bound {
                         state.bound_done = bound.min(state.bound_done + tuples);
                     }
+                    sorted(false, &full[..full_len], sort_bound)?;
                     full_kept = pg_tuplesort(&mut full[..full_len], sort_bound, compare)?;
                     state.status = Incremental::ReadFull;
                     break;
                 }
                 if tuples > MAX_FULL_SORT_GROUP {
                     state.pivot = None;
+                    sorted(false, &full[..full_len], sort_bound)?;
                     full_kept = pg_tuplesort(&mut full[..full_len], sort_bound, compare)?;
                     if let (Some(sort_bound), Some(current)) = (sort_bound, current)
                         && full_len > sort_bound * 2
@@ -275,7 +288,7 @@ pub(crate) fn pg_incremental_sort(
                     }
                     state.remaining = tuples;
                     prefix_kept =
-                        state.switch_to_prefix(full, prefix, bound, same_group, compare)?;
+                        state.switch_to_prefix(full, prefix, bound, same_group, compare, sorted)?;
                     break;
                 }
             }
@@ -296,6 +309,7 @@ pub(crate) fn pg_incremental_sort(
                     break;
                 }
             }
+            sorted(true, &prefix[..state.prefix_len], state.prefix_bound)?;
             prefix_kept =
                 pg_tuplesort(&mut prefix[..state.prefix_len], state.prefix_bound, compare)?;
             state.status = Incremental::ReadPrefix;
@@ -316,7 +330,7 @@ pub(crate) fn pg_incremental_sort(
             emitted += 1;
         }
     }
-    Ok(emitted)
+    Ok((emitted, position))
 }
 
 /// The incremental sort's state between its batches.
@@ -346,6 +360,7 @@ impl IncrementalState {
         bound: Option<usize>,
         same_group: &mut dyn FnMut(u32, u32) -> Result<bool, SqlError>,
         compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+        sorted: &mut SortedBatch<'_>,
     ) -> Result<usize, SqlError> {
         self.prefix_len = 0;
         self.prefix_bound = bound.map(|bound| bound - self.bound_done);
@@ -378,6 +393,7 @@ impl IncrementalState {
             self.status = Incremental::LoadPrefix;
             Ok(0)
         } else {
+            sorted(true, &prefix[..self.prefix_len], self.prefix_bound)?;
             let kept = pg_tuplesort(&mut prefix[..self.prefix_len], self.prefix_bound, compare)?;
             if let Some(bound) = bound {
                 self.bound_done = bound.min(self.bound_done + tuples);
@@ -497,15 +513,23 @@ mod tests {
         let input: Vec<u32> = (0..grouped.len() as u32).collect();
         let mut scratch = vec![0u32; grouped.len() * 2];
         let mut out = vec![0u32; grouped.len()];
-        let returned = pg_incremental_sort(
+        let mut batches = Vec::new();
+        let (returned, _) = pg_incremental_sort(
             &input,
             &mut scratch,
             &mut out,
             None,
             &mut |a, b| Ok(grouped[a as usize] / 100 == grouped[b as usize] / 100),
             &mut |a, b| Ok(grouped[a as usize].cmp(&grouped[b as usize])),
+            &mut |prefix, rows, _| {
+                batches.push((prefix, rows.len()));
+                Ok(())
+            },
         )
         .unwrap();
+        // Groups of 40, 40 and 20 rows: two full sorts of one group each,
+        // the second extended past 32 rows to its group's end.
+        assert_eq!(batches, [(false, 40), (false, 40), (false, 20)]);
         let sorted: Vec<i64> = out[..returned]
             .iter()
             .map(|&at| grouped[at as usize])

@@ -15018,6 +15018,16 @@ fn session_zone_at(utc_micros: i64) -> i32 {
 /// bpchar-to-text cast strips the blank padding, and every function or
 /// operator without a bpchar-specific form receives the value through that
 /// cast. Other datums pass through untouched.
+/// A grouping key's stored value: a `regtype` groups by its name. A
+/// `bpchar` keeps its padding, which its comparison ignores, so a group
+/// returns its first row's value as PostgreSQL's grouping does.
+pub(crate) fn group_key_view(d: Datum<'_>) -> Datum<'_> {
+    match d {
+        Datum::Regtype { name, .. } => Datum::Text(name),
+        other => other,
+    }
+}
+
 pub(crate) fn text_view(d: Datum<'_>) -> Datum<'_> {
     match d {
         Datum::Bpchar(s) => Datum::Text(s.trim_end_matches(' ')),

@@ -942,7 +942,8 @@ merged_cold=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
   -c "SELECT count(*), (SELECT pad FROM spilly WHERE id = 650) FROM spilly" 2>&1)
 [[ "$merged_cold" == "24550|cycle-7" ]] && ok "merged SST lists survive a cold start" \
   || bad "merged-list cold start (got: $merged_cold)"
-"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q -c "DROP TABLE spilly" >/dev/null 2>&1
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q -v ON_ERROR_STOP=1 \
+  -c "DROP TABLE spilly" >/dev/null || bad "DROP TABLE spilly failed"
 
 fi # ingest
 

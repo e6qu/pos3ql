@@ -807,6 +807,7 @@ statistics objects without `0A000`, and pg_stats_ext_exprs shows an
 expression key's null fraction, distinct values and width, not its MCV
 list or histogram.
 An index key or predicate may call a PL/pgSQL function
+A `DROP TABLE ... CASCADE` drops every foreign key that references the table in one statement and changes each referencing relation once (`differential_exact/898`); a transaction that changes one relation in more than `max_catalog_versions_per_object` statements fails with that named capacity error.
 (`differential_exact/755`): a utility statement that evaluates outside a
 query (`CREATE INDEX`, `REINDEX`, `CLUSTER`, `VACUUM`, `ANALYZE`,
 `ALTER TABLE`, `CREATE TABLE AS`, materialized view population) runs such a
@@ -829,17 +830,24 @@ another order. An index whose expression no longer resolves after
 its hint, without a cursor (`differential_exact/863`). Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
 methods, expression indexes whose keys still call a user-defined routine or read
-a user-defined type after inlining, a call of a SQL function PostgreSQL
-inlines whose arguments read an enclosing query's columns, are packed
-into a variadic array or are polymorphic,
-in a `MERGE` or an `INSERT`'s `RETURNING`, a set-returning SQL function in
-`FROM` PostgreSQL inlines with a packed variadic, polymorphic or
-lateral argument or a body with windows or a coerced column (bodies in
-`BEGIN ATOMIC`, defaults and `WITH` queries inline, `differential_exact/835`), a
-function scan of a built-in whose support function estimates its rows
-other than `generate_series` over integers, `numeric` and timestamps
-(`differential_exact/813`) and `unnest`, or whose bound or step is a stable
-expression the support function would evaluate (`now()`), a regular
+a user-defined type after inlining, a set-returning SQL function in `FROM`
+PostgreSQL inlines with a `LATERAL` argument (the inlined subquery would join
+parameterized, a plan of the join planner), and a window `PARTITION BY` over
+an expression, whose `WindowAgg` target list prints names where PostgreSQL
+prints expressions. A call of a SQL function PostgreSQL inlines packs a
+variadic input's elements into an array (zero elements do not exist), resolves
+a polymorphic input or result from its arguments, and inlines in a `MERGE` or
+an `INSERT`'s `RETURNING`, with a user-type literal and, in a subquery,
+reading the enclosing query's columns: the folding preprocesses each
+sublink with the enclosing levels' columns in reach, so an `EXISTS` over such
+a call joins as PostgreSQL's plan does (`differential_exact/890`, `891`,
+`892`, `893`). A set-returning function in `FROM` inlines with a window
+body, a column coerced to the declared type (not printed at the top of a
+target entry), and polymorphic or variadic arguments (`894`); its rows come
+from `generate_series` and `unnest` support functions over stable arguments
+too (`895`). Remaining: the `VERBOSE` target list of a subplan reading
+the enclosing query's columns (`Output: ?column?` where PostgreSQL prints
+`(t.a + 1)`), a regular
 expression with embedded options or a director (`(?i)`, `***=`),
 conditions on an expression key of a statistics object (an `OR` through
 an MCV list is estimated with `is_or`, `differential_exact/836`), conditions a
@@ -989,24 +997,88 @@ columns the aggregates read (`differential_exact/871`). Such a join's
 `Sort` sorts as `tuplesort` does in memory (quicksort, or past twice a
 limit's rows a bounded heap), and its `Incremental Sort` sorts batches of
 its input's groups as `ExecIncrementalSort` does, so rows with equal keys
-come back in PostgreSQL's order; `EXPLAIN ANALYZE` of such an incremental
-sort, whose group figures are not modeled, fails with `0A000`. Remaining
-for that search: a merge join ordered descending or with NULLs first (a
-descending `ORDER BY` of a merge join's class), `ORDER BY` expressions,
-grouping, `DISTINCT`, window functions and a `LIMIT` above an aggregate,
-which keep pos3ql's join order, join conditions of expressions or of two types
-(`a.int4col = b.int8col`, which PostgreSQL also merges into a class), an
-`OR` whose arm is an `AND` (`extract_restriction_or_clauses`) or that a
-semi or anti join or an indexed relation's parameterized scan evaluates, a
-class holding two columns of one relation
-(`ON a.k = b.k AND a.v = b.k`), a merge join over a partly sorted outer
-input (`Incremental Sort`), parenthesized joins (pulled up as
-`pull_up_subqueries` flattens them), self-join removal
+come back in PostgreSQL's order; `EXPLAIN ANALYZE` prints its full-sort
+and presorted groups' counts, methods and average and peak memory
+(`instrumentSortedGroup`), and under a limit the join below it stops once
+the sort has read the rows it returns (`differential_exact/875`). A
+semi join's inner relation made unique by an index derives its class
+clauses from the outer relation to the inner one, as
+`reduce_unique_semijoins` orients them (`differential_exact/873`). Merge
+joins also run descending or with NULLs first, as a descending `ORDER BY`
+asks of their class (`MJCompare`, `mergejoinscansel` with the direction,
+`differential_exact/874`). A class equating two constants inside an outer
+join's domain empties only that domain's relations, apart from lower left
+joins' nullable sides (`get_join_domain_min_rels`): one relation becomes a
+dummy `Result` whose columns print unqualified, several make their join
+dummy (`populate_joinrel_with_paths`, `differential_exact/876`). A class
+may hold two columns of one relation, which becomes a restriction
+comparing them (`generate_base_implied_equalities_no_const`,
+`differential_exact/877`). The join's rows are grouped as `add_paths_to_grouping_rel` plans it: a
+`HashAggregate` over the cheapest path, returning its groups in the order
+`ExecAgg` walks its `simplehash` table (each key hashed by its type's
+default hash function: `hash_numeric`, `hashfloat8`, `timestamp_hash`,
+`uuid_hash`, `hashbpchar`, `interval_hash`, `hashinet` and the others,
+`differential_exact/881`), or a `GroupAggregate` over the join sorted
+(fully or incrementally) by the grouping keys, which take the `ORDER BY`'s
+leading keys' order and directions (`preprocess_groupclause`,
+`group_keys_reorder_by_pathkeys`), sized by `estimate_num_groups`, with
+the sort and limit over the groups (`differential_exact/878`). The
+grouping keys and the select list may be expressions of the grouped
+columns, `HAVING` filters the groups (costed by `cost_qual_eval`), `ORDER
+BY` may name expressions and aggregates, a plain aggregate may carry a
+`LIMIT`, and a sorted grouping feeds order-dependent aggregates
+(`string_agg`, `array_agg`) its sorted rows (`differential_exact/879`).
+`DISTINCT` over a join is a `Unique` over sorted rows or a
+`HashAggregate` (`create_final_distinct_paths`, `differential_exact/880`).
+Join keys of `int2`, `int4` and `int8`, or of `real` and `double
+precision`, compare across types in one class
+(`differential_exact/882`). An `OR` whose arms are `AND`s restricts each
+relation by the `OR` of its own conditions
+(`extract_restriction_or_clauses`), dividing the join clause's
+selectivity by the restriction's, and a semi or anti join's `OR` of
+one-relation conditions is estimated as an inner join's
+(`differential_exact/883`); a
+parenthesized join that `deconstruct_jointree` reads into the same
+problem plans as one join search (`differential_exact/884`). Window
+functions over one relation, a join or a join's groups are planned as
+`create_window_paths` plans them: a window path over the cheapest path and
+over each path sorted by a prefix of the first window's pathkeys (which
+are the query's pathkeys, so an index ordered by them is a candidate),
+each window clause in `select_active_windows` order sorting its input
+fully or incrementally only when it is not already ordered, costed by
+`cost_windowagg` with `get_windowclause_startup_tuples` (the frame's end,
+the partitions' and peers' group estimates), each lower window's rows
+widened by its functions' results, then the query's sort and limit
+(`differential_exact/886`). Aggregates with `DISTINCT` or `ORDER BY`
+inputs extend the grouping's pathkeys by the keys most of them share
+(`adjust_group_pathkeys_for_groupagg`), so the `GroupAggregate` or plain
+`Aggregate` reads rows sorted by them, and the grouping never hashes
+(`differential_exact/887`); a query of one relation is planned through the
+same search for either. An `EXPLAIN` showing costs of a scan, aggregate or
+window whose estimates the planner model did not produce fails with
+`0A000` rather than print pos3ql's own figures. Remaining for windows:
+partition or order keys that are expressions, window functions inside
+expressions or the `ORDER BY`, windows over one relation's groups, the
+merging of window clauses equal once `optimize_window_clauses` frees their
+frames, run conditions (`find_window_run_conditions`, which needs the
+subquery scan below), and `EXPLAIN ANALYZE` of windows over an index scan,
+under a limit directly above them or over a join's groups (`0A000`:
+execution reads the input by its own scan); for presorted aggregates:
+`ORDER BY` or `DISTINCT` inputs that are expressions, and `EXPLAIN
+ANALYZE` of their sort (`0A000`: its tuples' memory is not modeled).
+Remaining for that search: join conditions of
+expressions (`a.k + 1 = b.k`) and conditions over several relations
+other than comparisons of columns (`COALESCE(a.id, 0) < b.id`), an `OR`
+of join conditions that a semi or anti join evaluates
+(`clauselist_selectivity_or` under `eqjoinsel_semi`), an `OR` join clause
+that an indexed relation's parameterized scan evaluates (as a filter, or
+as a `BitmapOr` of parameterized index scans), a merge join over a partly sorted outer input (`Incremental
+Sort`), a right-nested outer join (`a LEFT JOIN (b JOIN c) ON ...`) and
+derived tables kept as subqueries (`SubqueryScan`), self-join removal
 (`remove_useless_self_joins`), a constant equated with a full join's
 compared column (`reconsider_full_join_clause`) or with an outer join's
-column another outer join nulls, a class with two constants inside an
-outer join (a dummy inner relation), derived tables, `UPDATE ...
-FROM` and `DELETE ... USING` through the same search, more relations than
+column another outer join nulls, `UPDATE ... FROM` and `DELETE ...
+USING` through the same search, more relations than
 `join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,
 not ported; such queries keep pos3ql's join order and refuse cost output
 with `0A000`). A parameterized index scan's cost reads its index's pages:
@@ -1553,10 +1625,11 @@ custom collation a domain uses is a `pg_depend` dependency of the domain and
 its array: `DROP COLLATION` refuses it, and with `CASCADE` drops the domain
 and the columns of its type (`differential_exact/864`). `DROP TYPE` drops a
 domain as `DROP DOMAIN` does, freeing its slot (`differential_exact/865`).
-Remaining: `ALTER
-COLUMN ... TYPE` to a type that is not built in (a domain, enum or
-composite) fails with `0A000` where PostgreSQL rewrites the column through
-the type's checks. Target and expression count errors of an `INSERT`, also with subscripted
+`ALTER COLUMN ... TYPE` to a domain, enum or composite rewrites the
+column through the type: a domain's checks and `NOT NULL` apply to each row, an
+enum or composite needs `USING` unless the column has the type already (`42804`
+with PostgreSQL's hint), and a default that cannot convert is refused
+(`differential_exact/866`). Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

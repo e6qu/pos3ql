@@ -9074,6 +9074,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }
 
+    fn domain_collation(&self, type_oid: i32) -> Option<super::ast::Collation> {
+        self.storage.domain_collation_for_oid(type_oid, self.txid)
+    }
+
     fn compatible_element_oid(&self, inputs: &[(bool, i32)]) -> Option<i32> {
         self.storage.compatible_element_oid(inputs, self.txid)
     }

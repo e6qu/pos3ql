@@ -395,6 +395,18 @@ pub(crate) fn for_each_dependency(
                 "n",
             )?;
         }
+        // `GenerateTypeDependencies` records the collation of the domain and
+        // of its array type.
+        for type_oid in [
+            domain_oid(storage, domain_slot, txid),
+            crate::sql::types::oid::domain_array_oid(domain.creation()),
+        ] {
+            collation_edge(
+                ObjectAddress::new(PG_TYPE_OID, type_oid, 0),
+                domain.collation,
+                visit,
+            )?;
+        }
     }
 
     for (_, cast) in storage.casts_visible_to(txid) {

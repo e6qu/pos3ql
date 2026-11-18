@@ -168,7 +168,8 @@ Other payload rules:
   tag, invalid UTF-8, a span past the record or more than 256 bytes of
   expression text in one constraint is rejected. The definition ends with its
   [expression dependencies](#expression-dependencies).
-- **Domain payload** uses marker 251; earlier layouts are rejected. A mandatory
+- **Domain payload** uses marker 250; earlier layouts are rejected. Its collation
+  code (`pg_type.typcollation`) follows the base type modifier. A mandatory
   checked-default input section follows the constraint identities (an empty
   section is explicit).
 - **Table statistics** use V7 marker 249 and a declared record count of at
@@ -238,7 +239,7 @@ inserts a missing writer.
 | `constraint_identity POSITION CREATED_AT` | Table constraint identities in the [canonical order](#constraints-and-keys). |
 | `ukey` | Starts with the unique-key mode tag. |
 | `excl4` | Timing, method and element count, then per element `c COLUMN` or `e HEX_EXPRESSION` followed by the operator OID and the journal's fifteen key-option bytes in hex, then the hexadecimal name and predicate (`-` for none). Other element tags, over-long expression text and the earlier `excl3` record are rejected. |
-| `dom7`, `enm3`, `cmp2` | Domain, enum and composite types; written before the required `types_end`. Later type records or a missing/duplicate `types_end` are rejected. |
+| `dom8`, `enm3`, `cmp2` | Domain, enum and composite types; written before the required `types_end`. Later type records or a missing/duplicate `types_end` are rejected. |
 | `nsp` | Creation stamp, database-owner flag (`0`/`1`), hexadecimal name. Stamp zero is an initial public schema. |
 | `pub` | Creation stamp after the owner, before the flags. |
 | `pacl` | Parameter permissions; an empty row differs from removal. |
@@ -421,13 +422,13 @@ detached partition CHECKs, and domain CHECK and NOT NULL constraints each have a
 creation identity. Renames preserve it; replacing a backing index changes
 `conindid` but not the constraint identifier, comments or dependencies.
 
-Table payload v21 and domain marker 251 append one four-byte little-endian
+Table payload v21 and domain marker 250 append one four-byte little-endian
 identity per constraint and column default. Table order: CHECKs, foreign keys,
 live attributes by stable attribute number (NOT NULL, then the default or
 generation expression, each when present), detached partition CHECK, named
 primary and unique keys, exclusions, inline keys by attribute number. A column
 default's identity selects its `pg_attrdef` OID. Domain order:
-CHECKs, then NOT NULL. `dom7` appends domain identities. Positions describe the
+CHECKs, then NOT NULL. `dom8` appends domain identities and the typcollation code after the modifier. Positions describe the
 layout only. Recovery also rejects identities created before their owner, above
 the saved counter, or shared by distinct tables or domains in one database.
 

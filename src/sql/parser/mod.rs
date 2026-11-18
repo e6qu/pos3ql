@@ -425,6 +425,11 @@ pub struct Parser<'a> {
     /// expression parser needs this narrow bit of grammar context to leave the
     /// column constraint for its caller.
     stop_default_at_not_null: bool,
+    /// Brackets and `CASE` blocks open at the token before the peeked one, and
+    /// their count where the column/domain DEFAULT began: a `COLLATE` at that
+    /// count ends the DEFAULT, as PostgreSQL's `b_expr` has no `COLLATE`.
+    nesting: i32,
+    default_nesting: i32,
     /// Where the latest parenthesized primary expression (or scalar
     /// subquery) began: one of the forms PostgreSQL lets take a subscript.
     parenthesized_primary: Option<usize>,
@@ -1280,6 +1285,8 @@ impl<'a> Parser<'a> {
             allow_into: false,
             into_clause: None,
             stop_default_at_not_null: false,
+            nesting: 0,
+            default_nesting: 0,
             parenthesized_primary: None,
             routine_parameters: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
             routine_name: None,
@@ -1670,10 +1677,11 @@ impl<'a> Parser<'a> {
     }
 
     fn column_default_expression(&mut self) -> Result<&'a Expr<'a>, ParseError> {
-        let prior = self.stop_default_at_not_null;
+        let prior = (self.stop_default_at_not_null, self.default_nesting);
         self.stop_default_at_not_null = true;
+        self.default_nesting = self.nesting;
         let parsed = self.expression(0);
-        self.stop_default_at_not_null = prior;
+        (self.stop_default_at_not_null, self.default_nesting) = prior;
         parsed
     }
 
@@ -7930,19 +7938,27 @@ impl<'a> Parser<'a> {
             };
             let collation_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
             let collation = if self.eat_ident("collate")? {
-                self.collation_name()?
+                Some(self.collation_name()?)
             } else {
-                crate::sql::ast::ParsedCollation::DEFAULT
+                None
             };
-            let clauses = self.column_clauses(name, table, false, column_constraints)?;
+            let clauses = self.column_clauses(
+                name,
+                table,
+                false,
+                column_constraints,
+                collation.map(|written| (written, collation_position)),
+            )?;
             Ok(AlterAction::AddColumn {
                 definition: ColumnDef {
                     source_position: constraint_at,
                     name,
                     type_name,
                     type_mod,
-                    collation,
-                    collation_position,
+                    collation: clauses.collation.map(|(written, _)| written),
+                    collation_position: clauses
+                        .collation
+                        .map_or(crate::sql::ast::SourcePosition::UNKNOWN, |(_, at)| at),
                     foreign_options,
                     storage,
                     compression,
@@ -10702,6 +10718,11 @@ impl<'a> Parser<'a> {
     }
 
     fn advance(&mut self) -> Result<(), ParseError> {
+        match self.peeked {
+            Tok::Op("(" | "[") | Tok::Ident("case") => self.nesting += 1,
+            Tok::Op(")" | "]") | Tok::Ident("end") => self.nesting -= 1,
+            _ => {}
+        }
         self.previous_token = Some((self.peeked, self.peek_at, self.lexer.token_end()));
         self.peeked = self
             .lexer

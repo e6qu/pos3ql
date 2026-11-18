@@ -4190,7 +4190,9 @@ fn grouped_scan_path<'a>(
     )
     .selected_columns(0)
     .map(|set| set.union(group_mask));
-    let shape = QueryShape {
+    // The grouping sorts by its columns (`group_pathkeys`), which the scan
+    // may return ordered.
+    let mut shape = QueryShape {
         only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
         output,
         grouping: Some(GroupingShape {
@@ -4202,8 +4204,17 @@ fn grouped_scan_path<'a>(
             having,
         }),
         limit,
+        order_len: count,
         ..QueryShape::default()
     };
+    for at in 0..count {
+        let (descending, nulls_first) = directions[at].unwrap_or((false, false));
+        shape.order[at] = query::index_paths::OrderKey::Column {
+            column: columns_in_order[at],
+            descending,
+            nulls_first,
+        };
+    }
     let planned = query::index_paths::scan_path(
         storage,
         scope,
@@ -4230,16 +4241,22 @@ fn grouped_scan_path<'a>(
             .find(|key| column_of(key) == Some(column))
             .expect("a grouping column has its entry")
     };
+    let keys = path.grouped.map_or(columns_in_order, |grouped| grouped.keys);
+    let direction = |column: usize| {
+        columns_in_order[..count]
+            .iter()
+            .position(|&other| other == column)
+            .and_then(|at| directions[at])
+            .unwrap_or((false, false))
+    };
+    let count = path.grouped.map_or(count, |grouped| grouped.key_count);
     let sort_keys = arena
         .alloc_slice_with(count, |at| {
-            (
-                entry(columns_in_order[at]),
-                Some(directions[at].unwrap_or((false, false))),
-            )
+            (entry(keys[at]), Some(direction(keys[at])))
         })
         .map_err(|_| arena_full())?;
     let group_keys = arena
-        .alloc_slice_with(count, |at| (entry(columns_in_order[at]), None))
+        .alloc_slice_with(count, |at| (entry(keys[at]), None))
         .map_err(|_| arena_full())?;
     Ok(Some(GroupedScan {
         path,
@@ -7227,31 +7244,48 @@ fn plan_pulled_select<'a>(
         if let Some(grouped) = grouped
             && let Some(path) = grouped.path.grouped
         {
-            if let Some((startup, total)) = path.input_sort {
-                add_stage(
-                    &mut stages,
-                    &mut stage_count,
-                    PlanNode {
-                        name: StackStr::from_str("Sort"),
-                        keys: plan_keys(
-                            storage,
-                            txid,
-                            scope.as_ref(),
-                            statement,
-                            KeyLabel::Sort,
-                            grouped.sort_keys,
-                            arena,
-                        )?,
-                        startup_cost: startup,
-                        total_cost: total,
-                        rows: grouped.path.rows as u64,
-                        width: grouped.path.width,
-                        object_requests,
-                        cache_blocks,
-                        key: Some(NodeKey::new(aggregated_block, Role::GroupSort)),
-                        ..PlanNode::EMPTY
-                    },
-                )?;
+            if let Some((startup, total, presorted)) = path.input_sort {
+                let mut node = PlanNode {
+                    name: StackStr::from_str(if presorted == 0 {
+                        "Sort"
+                    } else {
+                        "Incremental Sort"
+                    }),
+                    keys: plan_keys(
+                        storage,
+                        txid,
+                        scope.as_ref(),
+                        statement,
+                        KeyLabel::Sort,
+                        grouped.sort_keys,
+                        arena,
+                    )?,
+                    startup_cost: startup,
+                    total_cost: total,
+                    rows: grouped.path.rows as u64,
+                    width: grouped.path.width,
+                    object_requests,
+                    cache_blocks,
+                    key: Some(NodeKey::new(aggregated_block, Role::GroupSort)),
+                    ..PlanNode::EMPTY
+                };
+                if presorted > 0 {
+                    let prefix = plan_keys(
+                        storage,
+                        txid,
+                        scope.as_ref(),
+                        statement,
+                        KeyLabel::Sort,
+                        &grouped.sort_keys[..usize::from(presorted)],
+                        arena,
+                    )?;
+                    node = node
+                        .with_qual(QualLabel::PresortedKey, presorted_text(&prefix, false))
+                        .with_verbose_qual(QualLabel::PresortedKey, presorted_text(&prefix, true));
+                }
+                add_stage(&mut stages, &mut stage_count, node)?;
+            }
+            if !path.hashed {
                 aggregate_name = "GroupAggregate";
             }
             planned_partitions = path.planned_partitions;
@@ -7941,7 +7975,7 @@ fn plan_pulled_select<'a>(
             )?;
             // A chosen bitmap heap scan rechecks its conditions as written;
             // its bitmap index scan prints them with the indexed side first.
-            if chosen_path.is_some_and(|path| path.kind == query::index_paths::ScanKind::Bitmap)
+            if chosen_scan.is_some_and(|path| path.kind == query::index_paths::ScanKind::Bitmap)
                 && let Some(index) = scan_indexes[0]
             {
                 let written = index.written();
@@ -7973,7 +8007,7 @@ fn plan_pulled_select<'a>(
                 .0;
                 bitmap_recheck = Some((plain, verbose));
                 // A tree's bitmap index scans print their own conditions.
-                if let Some(path) = chosen_path.filter(|path| path.bitmap.len() > 1) {
+                if let Some(path) = chosen_scan.filter(|path| path.bitmap.len() > 1) {
                     let quals = arena
                         .alloc_slice_with(path.bitmap.len(), |_| (None, None))
                         .map_err(|_| arena_full())?;

@@ -837,7 +837,7 @@ pub(crate) enum WalExtendedStatisticsData<'a> {
 
 /// Leads the extended-statistics image of the current format; journals of
 /// earlier formats are rejected.
-const EXTENDED_STATISTICS_MAGIC: &[u8; 4] = b"XST3";
+const EXTENDED_STATISTICS_MAGIC: &[u8; 4] = b"XST4";
 
 impl WalExtendedStatisticsData<'_> {
     fn encoded_len(self) -> usize {
@@ -852,7 +852,12 @@ impl WalExtendedStatisticsData<'_> {
                     + 1
                     + 2
                     + usize::from(data.dependencies_built) * data.dependency_degree_bits.len() * 8
-                    + data.expression_statistics.len() * (1 + 4 + 8 + 4 + 4)
+                    + data.expression_statistics.len() * (1 + 4 + 8 + 4 + 4 + 2)
+                    + data
+                        .expression_distributions
+                        .iter()
+                        .map(|distribution| distribution.as_bytes().len())
+                        .sum::<usize>()
                     + 2
                     + data.mcv[..usize::from(data.n_mcv)]
                         .iter()
@@ -884,12 +889,18 @@ impl WalExtendedStatisticsData<'_> {
                         ok &= buffer.append(&bits.to_le_bytes());
                     }
                 }
-                for column in data.expression_statistics {
+                for (column, distribution) in data
+                    .expression_statistics
+                    .into_iter()
+                    .zip(&data.expression_distributions)
+                {
                     ok &= buffer.append(&[u8::from(column.valid)])
                         && buffer.append(&column.null_fraction.to_bits().to_le_bytes())
                         && buffer.append(&column.distinct_values.to_le_bytes())
                         && buffer.append(&column.distinct_fraction.to_bits().to_le_bytes())
-                        && buffer.append(&column.average_width.to_le_bytes());
+                        && buffer.append(&column.average_width.to_le_bytes())
+                        && buffer.append(&(distribution.as_bytes().len() as u16).to_le_bytes())
+                        && buffer.append(distribution.as_bytes());
                 }
                 ok &= buffer.append(&data.n_mcv.to_le_bytes());
                 for entry in &data.mcv[..usize::from(data.n_mcv)] {
@@ -7749,7 +7760,11 @@ fn decode_extended_statistics_data(payload: &[u8]) -> Option<ExtendedStatisticsD
             }
         }
     }
-    for column in &mut data.expression_statistics {
+    for (column, distribution) in data
+        .expression_statistics
+        .iter_mut()
+        .zip(&mut data.expression_distributions)
+    {
         let column_valid = take_bool(&mut at)?;
         let null_fraction = f32::from_bits(u32::from_le_bytes(
             payload.get(at..at + 4)?.try_into().ok()?,
@@ -7772,6 +7787,13 @@ fn decode_extended_statistics_data(payload: &[u8]) -> Option<ExtendedStatisticsD
         if !column.fractions_valid() {
             return None;
         }
+        let length = usize::from(take_u16(&mut at)?);
+        let encoded = payload.get(at..at + length)?;
+        at += length;
+        if length != 0 {
+            crate::storage::statistics::distribution::ColumnDistribution::parse(encoded)?;
+        }
+        *distribution = crate::storage::ExpressionDistribution::new(encoded)?;
     }
     let n_mcv = take_u16(&mut at)?;
     if n_mcv > crate::storage::MAX_EXTENDED_STATISTICS_MCV {

@@ -5338,6 +5338,47 @@ pub(crate) fn extended_statistics_dependency_order(keys: usize, visit: &mut dyn 
     }
 }
 
+/// The bytes one statistics expression's distribution (most common values,
+/// histogram and correlation, as a table column's) may occupy. ANALYZE of a
+/// larger one fails with a named error naming the statistics target.
+pub(crate) const EXPRESSION_DISTRIBUTION_MAX_BYTES: usize = 16 * 1024;
+
+/// A statistics expression's encoded distribution
+/// (`statistics::distribution`), empty when ANALYZE stored none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpressionDistribution {
+    len: u16,
+    bytes: [u8; EXPRESSION_DISTRIBUTION_MAX_BYTES],
+}
+
+impl ExpressionDistribution {
+    pub(crate) const EMPTY: Self = Self {
+        len: 0,
+        bytes: [0; EXPRESSION_DISTRIBUTION_MAX_BYTES],
+    };
+
+    /// The distribution `encoded`; `None` when it exceeds the capacity.
+    pub(crate) fn new(encoded: &[u8]) -> Option<Self> {
+        let mut stored = Self::EMPTY;
+        stored
+            .bytes
+            .get_mut(..encoded.len())?
+            .copy_from_slice(encoded);
+        stored.len = u16::try_from(encoded.len()).ok()?;
+        Some(stored)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    pub(crate) fn distribution(&self) -> Option<statistics::distribution::ColumnDistribution<'_>> {
+        (self.len != 0)
+            .then(|| statistics::distribution::ColumnDistribution::parse(self.as_bytes()))
+            .flatten()
+    }
+}
+
 /// What ANALYZE computed for one statistics object, as `statext_store`
 /// keeps it: the sample it read, each kind the object builds and the
 /// statistics of its expressions.
@@ -5359,6 +5400,9 @@ pub(crate) struct ExtendedStatisticsData {
     pub(crate) dependencies_built: bool,
     pub(crate) dependency_degree_bits: [u64; MAX_EXTENDED_STATISTICS_DEPENDENCIES],
     pub(crate) expression_statistics: [ColumnStatistics; MAX_EXTENDED_STATISTICS_KEYS],
+    /// Each expression's distribution (`stxdexpr` rows' MCV, histogram and
+    /// correlation).
+    pub(crate) expression_distributions: [ExpressionDistribution; MAX_EXTENDED_STATISTICS_KEYS],
     pub(crate) mcv: [ExtendedStatisticsMcv; MAX_EXTENDED_STATISTICS_MCV],
     pub(crate) n_mcv: u16,
 }
@@ -5374,6 +5418,7 @@ impl ExtendedStatisticsData {
         dependencies_built: false,
         dependency_degree_bits: [0; MAX_EXTENDED_STATISTICS_DEPENDENCIES],
         expression_statistics: [ColumnStatistics::EMPTY; MAX_EXTENDED_STATISTICS_KEYS],
+        expression_distributions: [ExpressionDistribution::EMPTY; MAX_EXTENDED_STATISTICS_KEYS],
         mcv: [ExtendedStatisticsMcv::EMPTY; MAX_EXTENDED_STATISTICS_MCV],
         n_mcv: 0,
     };

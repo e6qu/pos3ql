@@ -1608,8 +1608,7 @@ impl<'a> OrderedIndexAccessPlan<'a> {
                 available.insert(usize::from(column));
             }
         }
-        self.covering_ready
-            && demanded.is_subset_of(available)
+        self.covering_ready && demanded.is_subset_of(available)
     }
 }
 

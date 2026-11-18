@@ -7787,7 +7787,7 @@ fn decode_extended_statistics_data(payload: &[u8]) -> Option<ExtendedStatisticsD
         if !column.fractions_valid() {
             return None;
         }
-        let length = usize::from(take_u16(&mut at)?);
+        let length = take_u16(&mut at)?;
         let encoded = payload.get(at..at + length)?;
         at += length;
         if length != 0 {

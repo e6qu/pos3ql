@@ -4599,7 +4599,6 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     crate::sql::error_position::full_message_error(
                         sqlstate::UNDEFINED_FUNCTION,
                         |text| {
-                            use core::fmt::Write as _;
                             let _ = write!(text, "function {}(", declared.name.as_str());
                             for (index, oid) in input_type_oids[..input_count].iter().enumerate() {
                                 if index != 0 {

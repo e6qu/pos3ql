@@ -1991,9 +1991,9 @@ impl Prep<'_> {
             }
         }
         member.reads = relids & !(1 << var.0);
-        for rel in 0..MAX_JOIN_RELS {
+        for (rel, nulled) in nulling.iter().enumerate().take(MAX_JOIN_RELS) {
             if relids & 1 << rel != 0 {
-                member.nulling |= nulling[rel];
+                member.nulling |= nulled;
             }
         }
         member

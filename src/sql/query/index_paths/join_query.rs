@@ -575,9 +575,9 @@ fn nonnullable(
             filter: None,
             distinct: false,
             star: false,
-            order_by,
+            order_by: [],
             ..
-        } if order_by.is_empty() => match strict_call(expression)? {
+        } => match strict_call(expression)? {
             true => {
                 let mut all = VarList::default();
                 for argument in *args {
@@ -834,6 +834,9 @@ impl<'a> Expressions<'a> {
     }
 }
 
+/// Two relations' columns, `(relation, column)` each.
+type ColumnPair = ((usize, usize), (usize, usize));
+
 /// A condition as the preparation reads it, or `None` when it is outside
 /// the model.
 fn analyze_qual<'a>(
@@ -841,7 +844,7 @@ fn analyze_qual<'a>(
     expression: &'a Expr<'a>,
     constants: &mut Constants<'a>,
     expressions: &mut Expressions<'a>,
-    full_merged: &dyn Fn(usize) -> Option<((usize, usize), (usize, usize))>,
+    full_merged: &dyn Fn(usize) -> Option<ColumnPair>,
 ) -> Result<Option<Qual>, SqlError> {
     // `COALESCE(left, right) = constant` of a full join's merged column or
     // a written `COALESCE` of two relations' columns.
@@ -852,7 +855,7 @@ fn analyze_qual<'a>(
         ..
     } = expression
     {
-        let coalesced = |side: &Expr<'_>| -> Option<((usize, usize), (usize, usize))> {
+        let coalesced = |side: &Expr<'_>| -> Option<ColumnPair> {
             match side {
                 Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
                     Ok(ResolvedColumn::Merged(merged)) => full_merged(merged),
@@ -1897,8 +1900,13 @@ pub(crate) fn modeled_join<'a>(
             quals[usize::from(id)] = conjunct;
         }
     }
-    for id in 0..expressions.count {
-        tree.expression_vars[id] = expressions.get(id).vars;
+    for (id, vars) in tree
+        .expression_vars
+        .iter_mut()
+        .enumerate()
+        .take(expressions.count)
+    {
+        *vars = expressions.get(id).vars;
     }
     let Ok(mut prepared) = join_tree::prepare(&tree) else {
         return Ok(None);

@@ -2562,15 +2562,12 @@ pub(crate) fn scan_path<'a>(
         }
         if predicate_unread[position] {
             // Only a query reading its columns could prove the predicate.
-            if restrictions
-                .iter()
-                .any(|restriction| {
-                    restriction
-                        .clause
-                        .column_set()
-                        .intersects(index_columns_mask(&index))
-                })
-                || !restrictions.is_empty()
+            if restrictions.iter().any(|restriction| {
+                restriction
+                    .clause
+                    .column_set()
+                    .intersects(index_columns_mask(&index))
+            }) || !restrictions.is_empty()
             {
                 return Ok(Planned::Outside(
                     "a partial index whose predicate the model does not read",
@@ -2665,9 +2662,11 @@ pub(crate) fn scan_path<'a>(
                 index_columns.insert(usize::from(column));
             }
         }
-        let restricted = restrictions.iter().fold(ColumnSet::EMPTY, |set, restriction| {
-            set.union(restriction.clause.column_set())
-        });
+        let restricted = restrictions
+            .iter()
+            .fold(ColumnSet::EMPTY, |set, restriction| {
+                set.union(restriction.clause.column_set())
+            });
         // A GiST or SP-GiST index may return the columns it holds.
         let mut covered = index_columns;
         for &column in &catalog_index.include_columns[..catalog_index.n_include_cols] {
@@ -2815,9 +2814,11 @@ pub(crate) fn scan_path<'a>(
     // Conditions on an expression a statistics object's expression key may
     // be are estimated from it by `statext_clauselist_selectivity`, which
     // the model leaves out, as it does statistics objects it cannot read.
-    let restricted = restrictions.iter().fold(ColumnSet::EMPTY, |set, restriction| {
-        set.union(restriction.clause.column_set())
-    });
+    let restricted = restrictions
+        .iter()
+        .fold(ColumnSet::EMPTY, |set, restriction| {
+            set.union(restriction.clause.column_set())
+        });
     let compares_expression = restrictions
         .iter()
         .any(|restriction| restriction.clause.compares_expression());

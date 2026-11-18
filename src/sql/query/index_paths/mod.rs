@@ -20,7 +20,9 @@ use crate::sql::ast::{BinaryOp, Collation, Expr, IndexAccessMethod};
 use crate::sql::catalog::PlannerIndex;
 use crate::sql::eval::SqlError;
 use crate::sql::types::{ColType, Datum};
-use crate::storage::{ColumnDistribution, ColumnSet, MAX_COLUMNS, Storage, TableDef, TableStatistics};
+use crate::storage::{
+    ColumnDistribution, ColumnSet, MAX_COLUMNS, Storage, TableDef, TableStatistics,
+};
 
 use super::scope::{QueryScope, ResolvedColumn};
 
@@ -162,7 +164,11 @@ fn write_projection<'a>(
                     scope.find_column(*qualifier, name) =>
             {
                 (
-                    output_width(definition, &statistics, Some(ColumnSet::from_column(column))),
+                    output_width(
+                        definition,
+                        &statistics,
+                        Some(ColumnSet::from_column(column)),
+                    ),
                     0.0,
                     Some(column),
                 )

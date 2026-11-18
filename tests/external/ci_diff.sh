@@ -1703,7 +1703,7 @@ reset_user_extensions() { # host port
 }
 reset_user_routines() { # host port
   local routine kind drop rows
-  rows=$(reset_rows "$1" "$2" "SELECT p.oid::regprocedure, p.prokind FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')" -F $'\t') || exit 1
+  rows=$(reset_rows "$1" "$2" "SELECT CASE WHEN p.prokind = 'a' AND p.pronargs = 0 THEN left(p.oid::regprocedure::text, -2) || '(*)' ELSE p.oid::regprocedure::text END, p.prokind FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')" -F $'\t') || exit 1
   while IFS=$'\t' read -r routine kind; do
     [[ -z "$routine" ]] && continue
     case "$kind" in

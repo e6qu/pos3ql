@@ -122,6 +122,8 @@ pub(super) struct BlockTargets<'a> {
 /// or function's alias (`q.x`), a pulled-up `VALUES` list's
 /// `"*VALUES*".column1`.
 fn relations<'a>(
+    storage: &Storage,
+    txid: u32,
     scope: &'a QueryScope<'_>,
     statement: &Select<'_>,
     nameless: &[bool],
@@ -175,8 +177,44 @@ fn relations<'a>(
             ..Joined::rule_columns(scope.names[table], Columns::Derived(columns))
         });
     }
+    // The enclosing queries' relations, which a correlated expression
+    // names after the block's own.
+    let (outer, outer_count) = super::OUTER_RELATIONS.with(|outer| *outer.borrow());
+    let outer = &outer[..outer_count];
+    let total = scope.n + outer.len();
+    let mut outer_joined = [None::<Joined<'a>>; 8];
+    for (held, (name, table)) in outer_joined.iter_mut().zip(outer) {
+        let definition = storage.table_def(*table, txid);
+        let name = arena.alloc_str(name.as_str()).map_err(|_| arena_full())?;
+        let columns = arena
+            .alloc_slice_with(definition.n_columns, |_| Column {
+                name: "",
+                type_oid: None,
+                merged: None,
+            })
+            .map_err(|_| arena_full())?;
+        // The names live in the definition the guard holds: copy them.
+        for (column, meta) in columns.iter_mut().zip(definition.columns()) {
+            column.name = arena
+                .alloc_str(meta.name.as_str())
+                .map_err(|_| arena_full())?;
+            column.type_oid = storage.routine_type_oid(meta.ctype, meta.user_type, txid);
+        }
+        *held = Some(Joined {
+            unqualified: true,
+            printed: crate::sql::catalog::deparse::printed_name(name),
+            level: 1,
+            ..Joined::rule_columns(name, Columns::Derived(columns))
+        });
+    }
     Ok(&*arena
-        .alloc_slice_with(scope.n, |table| joined[table].expect("set above"))
+        .alloc_slice_with(total, |at| {
+            if at < scope.n {
+                joined[at].expect("set above")
+            } else {
+                outer_joined[at - scope.n].expect("set above")
+            }
+        })
         .map_err(|_| arena_full())?)
 }
 
@@ -270,7 +308,7 @@ impl<'a> BlockTargets<'a> {
         arena: &'a Arena,
     ) -> Result<Self, Fail> {
         let joined = match scope {
-            Some(scope) => relations(scope, statement, nameless, arena)?,
+            Some(scope) => relations(storage, txid, scope, statement, nameless, arena)?,
             None => &[],
         };
         let relation_count = scope.map_or(0, |scope| scope.n);
@@ -581,11 +619,13 @@ impl<'a> BlockTargets<'a> {
             let active = window_calls
                 .iter()
                 .any(|call| matches!(call, Expr::Call { over: Some(used), .. } if **used == *spec));
+            // `transformWindowDefinitions` adds the `ORDER BY` keys the list
+            // lacks before the `PARTITION BY` ones.
             for key in spec
-                .partition_by
+                .order_by
                 .iter()
-                .copied()
-                .chain(spec.order_by.iter().map(|order| order.expression))
+                .map(|order| order.expression)
+                .chain(spec.partition_by.iter().copied())
             {
                 let at = keyed(&mut targets, key, false)?;
                 mark(&mut targets, at, &|target| {
@@ -1014,6 +1054,11 @@ impl<'a> BlockTargets<'a> {
             let _ = output.write_str(entry.text);
         }
         checked(output)
+    }
+
+    /// `table`'s physical columns, `None` when its scan must project.
+    pub(super) fn physical(&self, table: usize) -> Option<Result<Output, SqlError>> {
+        self.physical[table].map(render)
     }
 
     /// The values `table`'s scan returns under a `Hash` (`CP_SMALL_TLIST`),

@@ -43,10 +43,20 @@ unit-suite = []
 [profile.release]
 panic = "abort"
 
+# macOS defaults the dev profile to split-debuginfo = "unpacked", which keeps
+# every codegen unit's object file (`*.rcgu.o`) next to the build outputs for
+# the debugger; each rebuild writes fresh names and nothing removes the old
+# ones (tens of GiB). Debug info stays in the binary instead.
+[profile.dev]
+split-debuginfo = "off"
+
 # Native CI needs source-line backtraces, without full variable/type debug data
 # for the large library test executable. Keep development assertions and checks.
 [profile.native-ci]
 inherits = "dev"
+# CI runners are discarded after each job, so the unpacked object files cost
+# nothing there; keep the platform's split-debuginfo setting for link time.
+split-debuginfo = "unpacked"
 opt-level = 0
 debug = "line-tables-only"
 debug-assertions = true

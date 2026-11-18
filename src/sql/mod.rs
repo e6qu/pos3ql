@@ -22840,7 +22840,53 @@ impl Engine {
             let txid = txn.txid;
             guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
         }
-        result
+        match result {
+            Ok(Err(error)) if crate::storage::is_memtable_full(&error) => {
+                Ok(Err(self.wait_for_memtable_room(txn, error)))
+            }
+            result => result,
+        }
+    }
+
+    /// A write found the memtable full. PostgreSQL has no such limit, so a
+    /// statement does not fail while a checkpoint can spill committed rows:
+    /// it rolls back, waits for one the reactor drives, and runs again. Once
+    /// a checkpoint has published and the statement still does not fit, only
+    /// uncommitted rows fill the memtable and the error stands.
+    fn wait_for_memtable_room(&mut self, txn: &mut TxnState, full: SqlError) -> SqlError {
+        if self.commit_progress != CommitProgressMode::Reactor {
+            return full;
+        }
+        let Some(checkpointer) = self.ckpt.as_mut() else {
+            return full;
+        };
+        let request = match txn.memtable_wait() {
+            Some(request) => request,
+            None => match checkpointer.request_checkpoint() {
+                Ok(request) => {
+                    txn.set_memtable_wait(Some(request));
+                    request
+                }
+                Err(error) => return error,
+            },
+        };
+        if let Some((epoch, error)) = &self.checkpoint_failure
+            && *epoch >= request.epoch()
+        {
+            txn.set_memtable_wait(None);
+            return SqlError {
+                sqlstate: error.sqlstate,
+                message: error.message.clone(),
+            };
+        }
+        if checkpointer.checkpoint_request_satisfied(request) {
+            txn.set_memtable_wait(None);
+            return full;
+        }
+        sql_err!(
+            sqlstate::INTERNAL_IO_WAIT,
+            "checkpoint publication is pending"
+        )
     }
 
     /// Whether the current role may set the superuser-only parameter `name`.
@@ -24037,6 +24083,10 @@ impl Engine {
                             } else {
                                 eval::with_generic_plan_parameters(prepared_params, plan)
                             }
+                        });
+                        let plan = plan.and_then(|plan| {
+                            explain::refuse_parallel_candidates(&plan, &self.storage, txn.txid)
+                                .map(|()| plan)
                         });
                         match plan {
                             Ok(plan) => Some(plan),
@@ -29734,6 +29784,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "lock_timeout",
     "max_connections",
     "max_locks_per_transaction",
+    "max_parallel_workers_per_gather",
     "max_prepared_transactions",
     "min_parallel_index_scan_size",
     "min_parallel_table_scan_size",

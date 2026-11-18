@@ -5014,7 +5014,7 @@ impl Checkpointer {
                     }
                     statistics.data.dependency_degree_bits[index] = bits;
                 }
-                Some("estatexpr") => {
+                Some("estatexpr2") => {
                     let created_at: u64 = parse_field(words.next(), "estatexpr identity")?;
                     let key: usize = parse_field(words.next(), "estatexpr key")?;
                     let statistics = extended_statistics
@@ -5045,6 +5045,51 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("invalid estatexpr"));
                     }
                     statistics.data.expression_statistics[key] = column;
+                }
+                Some("estatexprd") => {
+                    let created_at: u64 = parse_field(words.next(), "estatexprd identity")?;
+                    let key: usize = parse_field(words.next(), "estatexprd key")?;
+                    let encoded = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("estatexprd bytes missing"))?;
+                    let statistics = extended_statistics
+                        .iter_mut()
+                        .find(|statistics| {
+                            statistics.database == storage.current_database_oid()
+                                && statistics.created_at == created_at
+                        })
+                        .ok_or(CheckpointSetupError::Corrupt("estatexprd precedes estat"))?;
+                    if key >= usize::from(statistics.n_keys)
+                        || !statistics.data.expression_statistics[key].valid
+                        || statistics.data.expression_distributions[key]
+                            != crate::storage::ExpressionDistribution::EMPTY
+                        || words.next().is_some()
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid estatexprd"));
+                    }
+                    let mut bytes = [0u8; crate::storage::EXPRESSION_DISTRIBUTION_MAX_BYTES];
+                    let length = encoded.len() / 2;
+                    if encoded.len() % 2 != 0 || length > bytes.len() {
+                        return Err(CheckpointSetupError::Corrupt("invalid estatexprd"));
+                    }
+                    for (byte, pair) in bytes.iter_mut().zip(encoded.as_bytes().chunks(2)) {
+                        *byte = u8::from_str_radix(
+                            core::str::from_utf8(pair)
+                                .map_err(|_| CheckpointSetupError::Corrupt("invalid estatexprd"))?,
+                            16,
+                        )
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid estatexprd"))?;
+                    }
+                    if crate::storage::statistics::distribution::ColumnDistribution::parse(
+                        &bytes[..length],
+                    )
+                    .is_none()
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid estatexprd"));
+                    }
+                    statistics.data.expression_distributions[key] =
+                        crate::storage::ExpressionDistribution::new(&bytes[..length])
+                            .ok_or(CheckpointSetupError::Corrupt("invalid estatexprd"))?;
                 }
                 Some("estatmcv3") => {
                     let created_at: u64 = parse_field(words.next(), "estatmcv identity")?;
@@ -11745,7 +11790,7 @@ impl Checkpointer {
                     write_manifest(
                         &mut self.manifest_output,
                         format_args!(
-                            "estatexpr {} {key} {} {} {} {}",
+                            "estatexpr2 {} {key} {} {} {} {}",
                             statistics.created_at,
                             column.null_fraction.to_bits(),
                             column.distinct_values,
@@ -11754,6 +11799,24 @@ impl Checkpointer {
                         ),
                     )?;
                 }
+            }
+            for (key, distribution) in data.expression_distributions.iter().enumerate() {
+                if distribution.as_bytes().is_empty() {
+                    continue;
+                }
+                let mut hex =
+                    StackStr::<{ 2 * crate::storage::EXPRESSION_DISTRIBUTION_MAX_BYTES }>::new();
+                for byte in distribution.as_bytes() {
+                    let _ = write!(hex, "{byte:02x}");
+                }
+                write_manifest(
+                    &mut self.manifest_output,
+                    format_args!(
+                        "estatexprd {} {key} {}",
+                        statistics.created_at,
+                        hex.as_str()
+                    ),
+                )?;
             }
             for entry in &data.mcv[..usize::from(data.n_mcv)] {
                 let mut value_hex =

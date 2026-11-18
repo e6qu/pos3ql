@@ -12,10 +12,10 @@ use crate::sql::ast::{BinaryOp, Expr, IndexAccessMethod, SourcePosition};
 use crate::sql::catalog::PlannerIndex;
 use crate::sql::eval::SqlError;
 use crate::sql::types::{ColType, Datum};
-use crate::storage::Storage;
+use crate::storage::{ColumnSet, Storage};
 
 use super::super::scope::QueryScope;
-use super::clauses::{self, Analyzer, Clause, QualCost, Restriction, column_bit};
+use super::clauses::{self, Analyzer, Clause, QualCost, Restriction, narrow_mask};
 use super::predicate::{self, Prop};
 use super::{
     BitmapPlanKind, BitmapPlanNode, Comparison, Costs, IndexCondition, IndexInfo, IndexKeyOrder,
@@ -212,8 +212,8 @@ struct Paths<'p, 's, 'a> {
     /// The query's pathkeys.
     order: &'p [OrderKey],
     /// Columns an equality with a constant fixes.
-    fixed: u64,
-    needed: Option<u64>,
+    fixed: ColumnSet,
+    needed: Option<ColumnSet>,
     rows: f64,
     all_cost: QualCost,
     index_paths: Pool<'a, IndexPath<'a>>,
@@ -443,14 +443,27 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
                 }
             }
         }
-        // An `OR` turned into an array condition is no clause the
-        // statistics objects read.
-        const ARRAY_OF_OR: Clause<'static> = Clause::Other {
-            columns: 0,
-            shape: "an OR as an array",
-            indexable: false,
-            pattern_only: false,
-        };
+        // An `OR` the index applies as `column op ANY (array)` is that
+        // array condition to the statistics objects, as the planner's
+        // `ScalarArrayOpExpr` index qualification is.
+        let shown = arena
+            .alloc_slice_with(clauses.len(), |at| {
+                let clause = &clauses[at];
+                match (clause.or_array, clause.restriction.clause) {
+                    (Some(array), Clause::Or(arms)) => match arms[0][0].clause {
+                        Clause::Compare { column, .. } => Clause::Array {
+                            column,
+                            comparison: array.comparison,
+                            any: true,
+                            elements: Some(array.elements),
+                            length: array.elements.len() as f64,
+                        },
+                        other => other,
+                    },
+                    (_, other) => other,
+                }
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
         let conditions = arena
             .alloc_slice_with(extra_count + clauses.len(), |at| {
                 if at < extra_count {
@@ -463,11 +476,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
                 } else {
                     let clause = &clauses[at - extra_count];
                     super::extended::Condition {
-                        clause: if clause.or_array.is_some() {
-                            &ARRAY_OF_OR
-                        } else {
-                            &clause.restriction.clause
-                        },
+                        clause: &shown[at - extra_count],
                         range: clause.range(),
                         selectivity: clause.selectivity,
                     }
@@ -752,7 +761,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             let ordered = self.order.iter().any(
                 |key| matches!(key, OrderKey::Column { column: other, .. } if *other == column),
             );
-            let fixed = self.fixed & column_bit(column) != 0;
+            let fixed = self.fixed.contains(column);
             // A column in no equivalence class ends the index's pathkeys.
             if !ordered && !fixed {
                 break;
@@ -794,14 +803,13 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         let info = &self.index(index).catalog;
         let mut keys = Keys::NONE;
         for position in 0..info.n_cols {
-            if info.pattern_keys[position]
-                || !info.column_collation[position]
-                || info.expression_keys[position]
-            {
+            if info.pattern_keys[position] || !info.column_collation[position] {
                 break;
             }
+            // An expression key's variable has a class when an expression
+            // member of the join is the key.
             let column = usize::from(info.columns[position]);
-            if self.fixed & column_bit(column) != 0 {
+            if self.fixed.contains(column) {
                 continue;
             }
             let class = if column < 64 {
@@ -860,26 +868,25 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             return false;
         };
         let info = &self.index(index).catalog;
-        let mut covered = 0u64;
+        let mut covered = ColumnSet::EMPTY;
         for (position, &column) in info.columns[..info.n_cols]
             .iter()
             .chain(&info.include_columns[..info.n_include_cols])
             .enumerate()
         {
             // An expression key returns no column (`check_index_only`).
-            if usize::from(column) < 64
-                && (position >= info.n_cols || !info.expression_keys[position])
-            {
-                covered |= 1u64 << column;
+            if position >= info.n_cols || !info.expression_keys[position] {
+                covered.insert(usize::from(column));
             }
         }
-        needed & !covered == 0
+        needed.is_subset_of(covered)
     }
 
     /// `btcostestimate`: startup and total cost, selectivity, correlation.
     /// The cost of evaluating the operands an index's conditions compare
     /// its keys with: a constant or an InitPlan's output costs nothing, a
-    /// stable expression its functions.
+    /// stable expression or an expression of a join's outer row its
+    /// operators and functions.
     fn operand_cost(&self, clauses: &[IndexClause<'a>]) -> f64 {
         let planner = self.planner;
         let columns = crate::sql::exec::AliasedDefCols {
@@ -893,8 +900,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             .filter_map(|clause| match clause.restriction.clause {
                 Clause::Compare { operand, .. }
                     if !operand.is_constant(false)
-                        && !matches!(operand, Expr::Param(_) | Expr::Subquery(_))
-                        && self.param_of(clause.restriction).is_none() =>
+                        && !matches!(operand, Expr::Param(_) | Expr::Subquery(_)) =>
                 {
                     Some(
                         super::super::plan::qual_cost(
@@ -1927,7 +1933,7 @@ impl<'a> Paths<'_, '_, 'a> {
                     pattern_only,
                     ..
                 } = restriction.clause
-                    && columns & column_bit(usize::from(info.columns[position])) != 0
+                    && columns.contains(usize::from(info.columns[position]))
                     && (!pattern_only || info.pattern_keys[position])
                 {
                     return Ok(Ok(true));
@@ -2245,7 +2251,7 @@ pub(crate) fn scan_path<'a>(
     scope: &QueryScope<'_>,
     txid: u32,
     condition: Option<&'a Expr<'a>>,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
     params: &[Datum<'a>],
     arena: &'a Arena,
     shape: QueryShape,
@@ -2322,7 +2328,7 @@ pub(crate) fn scan_path<'a>(
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
     let (extended, unreadable) =
-        match super::extended::table_objects(storage, txid, slot, definition, arena)? {
+        match super::extended::table_objects(storage, txid, slot, definition, &variables, arena)? {
             Ok(objects) => (objects, None),
             Err(shape) => (&[][..], Some(shape)),
         };
@@ -2407,10 +2413,17 @@ pub(crate) fn scan_path<'a>(
         {
             return Ok(Planned::Outside("a join clause other than a comparison"));
         }
+        // The relation's side: a column, or an expression of its columns
+        // (an index on the expression may apply it).
         let own = |side: &Expr<'_>| {
-            matches!(side, Expr::Column { qualifier, name }
-                if matches!(scope.find_column(*qualifier, name),
-                    Ok(super::super::scope::ResolvedColumn::Table(0, _))))
+            let (mut read, mut foreign) = (false, false);
+            side.for_each_column_reference(&mut |qualifier, name| match scope
+                .find_column(qualifier, name)
+            {
+                Ok(super::super::scope::ResolvedColumn::Table(0, _)) => read = true,
+                _ => foreign = true,
+            });
+            read && !foreign
         };
         outer_operands[at] = match (own(left), own(right)) {
             (true, false) => right,
@@ -2549,10 +2562,12 @@ pub(crate) fn scan_path<'a>(
         }
         if predicate_unread[position] {
             // Only a query reading its columns could prove the predicate.
-            if restrictions
-                .iter()
-                .any(|restriction| restriction.clause.columns() & index_columns_mask(&index) != 0)
-                || !restrictions.is_empty()
+            if restrictions.iter().any(|restriction| {
+                restriction
+                    .clause
+                    .column_set()
+                    .intersects(index_columns_mask(&index))
+            }) || !restrictions.is_empty()
             {
                 return Ok(Planned::Outside(
                     "a partial index whose predicate the model does not read",
@@ -2602,17 +2617,17 @@ pub(crate) fn scan_path<'a>(
         .map_err(|_| crate::sql::eval::arena_full())?;
     planner.indexes = indexes;
     // Constant equalities fix their columns' order.
-    let mut fixed = 0u64;
+    let mut fixed = ColumnSet::EMPTY;
     for restriction in restrictions {
         if let Some(column) = restriction.clause.constant_equality() {
-            fixed |= column_bit(column);
+            fixed.insert(column);
         }
     }
     let mut order = [OrderKey::Expression; super::MAX_ORDER_KEYS];
     let mut order_count = 0;
     for key in shape.order() {
         if let OrderKey::Column { column, .. } = *key
-            && fixed & column_bit(column) != 0
+            && fixed.contains(column)
         {
             continue;
         }
@@ -2630,7 +2645,7 @@ pub(crate) fn scan_path<'a>(
             continue;
         }
         let catalog_index = &index.catalog;
-        let mut index_columns = 0u64;
+        let mut index_columns = ColumnSet::EMPTY;
         // An expression key the model reads is the variable it was
         // renumbered to.
         let read_expression = |position: usize| {
@@ -2644,21 +2659,23 @@ pub(crate) fn scan_path<'a>(
             .enumerate()
         {
             if !catalog_index.expression_keys[position] || read_expression(position) {
-                index_columns |= column_bit(usize::from(column));
+                index_columns.insert(usize::from(column));
             }
         }
-        let restricted = restrictions.iter().fold(0u64, |mask, restriction| {
-            mask | restriction.clause.columns()
-        });
+        let restricted = restrictions
+            .iter()
+            .fold(ColumnSet::EMPTY, |set, restriction| {
+                set.union(restriction.clause.column_set())
+            });
         // A GiST or SP-GiST index may return the columns it holds.
         let mut covered = index_columns;
         for &column in &catalog_index.include_columns[..catalog_index.n_include_cols] {
-            covered |= column_bit(usize::from(column));
+            covered.insert(usize::from(column));
         }
         let returns = matches!(
             catalog_index.method,
             IndexAccessMethod::Gist | IndexAccessMethod::SpGist
-        ) && needed.is_some_and(|needed| needed & !covered == 0);
+        ) && needed.is_some_and(|needed| needed.is_subset_of(covered));
         // A partial btree whose predicate the model does not read serves no
         // query without conditions.
         let unread_partial = catalog_index.partial
@@ -2684,23 +2701,22 @@ pub(crate) fn scan_path<'a>(
         ) && order.contains(&OrderKey::Expression);
         // A join's base relation: a join clause may use any index on its
         // column.
-        let join_columns = join_scan.map_or(0, |scan| {
-            (0..64).fold(0u64, |mask, column| {
-                if scan.classes[column] == super::NO_CLASS {
-                    mask
-                } else {
-                    mask | 1 << column
+        let join_columns = join_scan.map_or(ColumnSet::EMPTY, |scan| {
+            (0..64).fold(ColumnSet::EMPTY, |mut set, column| {
+                if scan.classes[column] != super::NO_CLASS {
+                    set.insert(column);
                 }
+                set
             })
         });
         let relevant = expression_served
-            || index_columns & join_columns != 0
+            || index_columns.intersects(join_columns)
             || unread_partial
             || returns
             || orders_by_distance
-            || index_columns & restricted != 0
+            || index_columns.intersects(restricted)
             || order.iter().any(|key| {
-                matches!(key, OrderKey::Column { column, .. } if index_columns & column_bit(*column) != 0)
+                matches!(key, OrderKey::Column { column, .. } if index_columns.contains(*column))
             });
         if relevant {
             return Ok(Planned::Outside(match catalog_index.method {
@@ -2798,9 +2814,11 @@ pub(crate) fn scan_path<'a>(
     // Conditions on an expression a statistics object's expression key may
     // be are estimated from it by `statext_clauselist_selectivity`, which
     // the model leaves out, as it does statistics objects it cannot read.
-    let restricted = restrictions.iter().fold(0u64, |mask, restriction| {
-        mask | restriction.clause.columns()
-    });
+    let restricted = restrictions
+        .iter()
+        .fold(ColumnSet::EMPTY, |set, restriction| {
+            set.union(restriction.clause.column_set())
+        });
     let compares_expression = restrictions
         .iter()
         .any(|restriction| restriction.clause.compares_expression());
@@ -2809,20 +2827,34 @@ pub(crate) fn scan_path<'a>(
         .any(|(_, statistics)| {
             let mut covered = 0;
             let mut expressions = false;
+            // A key expression the model reads no variable for.
+            let mut unread_expression = false;
             for key in statistics.keys_for(txid) {
                 match key {
                     crate::storage::ExtendedStatisticsKey::Column(name) => {
                         if definition
                             .column_index(name.as_str())
-                            .is_some_and(|column| restricted & column_bit(column) != 0)
+                            .is_some_and(|column| restricted.contains(column))
                         {
                             covered += 1;
                         }
                     }
-                    crate::storage::ExtendedStatisticsKey::Expression(_) => expressions = true,
+                    crate::storage::ExtendedStatisticsKey::Expression(text) => {
+                        expressions = true;
+                        match planner
+                            .variables
+                            .find_text(definition, text.as_str(), arena)
+                            .ok()
+                            .flatten()
+                        {
+                            Some(_) => {}
+                            None => unread_expression = true,
+                        }
+                    }
                 }
             }
-            (covered >= 2 && unreadable.is_some()) || (expressions && compares_expression)
+            (covered >= 2 && unreadable.is_some())
+                || (expressions && unread_expression && compares_expression)
         })
         .then_some(unreadable.unwrap_or("conditions on an expression a statistics object holds"));
     if let Some(shape) = extended {
@@ -2835,17 +2867,19 @@ pub(crate) fn scan_path<'a>(
             Err(shape) => Planned::Outside(shape),
         });
     }
-    // A statistics object would estimate a join clause with the
-    // restrictions it covers (`statext_clauselist_selectivity`).
-    if join_count > 0
-        && storage
-            .extended_statistics_for_table(slot, txid)
-            .next()
-            .is_some()
-    {
-        return Ok(Planned::Outside("a statistics object on a join's relation"));
-    }
-    let rows = clamp_row_est(planner.size.tuples * planner.selectivity(restrictions)?);
+    // A parameterized scan's conditions include join clauses, which read
+    // another relation: `clauselist_selectivity` finds no single relation
+    // for them (`find_single_rel_for_clauses`) and applies no statistics
+    // object (`get_parameterized_baserel_size`).
+    let estimating = Planner {
+        extended: if join_count > 0 {
+            &[]
+        } else {
+            planner.extended
+        },
+        ..planner
+    };
+    let rows = clamp_row_est(planner.size.tuples * estimating.selectivity(restrictions)?);
     paths.rows = rows;
     match build(
         &mut paths,
@@ -2934,10 +2968,12 @@ fn partial_predicate<'a>(
     ))
 }
 
-fn index_columns_mask(index: &PlannerIndex) -> u64 {
-    index.columns[..index.n_cols]
-        .iter()
-        .fold(0u64, |mask, &column| mask | column_bit(usize::from(column)))
+fn index_columns_mask(index: &PlannerIndex) -> ColumnSet {
+    let mut set = ColumnSet::EMPTY;
+    for &column in &index.columns[..index.n_cols] {
+        set.insert(usize::from(column));
+    }
+    set
 }
 
 /// The same scope, borrowed for the analyzer's lifetime.
@@ -2984,7 +3020,7 @@ fn build<'a>(
     all: &'a [&'a Restriction<'a>],
     shape: QueryShape,
     definition: &crate::storage::TableDef,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
     rows: f64,
 ) -> Built<Planned<'a>> {
     let planner = paths.planner;
@@ -3068,7 +3104,7 @@ fn grouped<'a>(
     shape: QueryShape,
     grouping: super::GroupingShape,
     definition: &crate::storage::TableDef,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
     rows: f64,
     width: f64,
 ) -> Built<Planned<'a>> {
@@ -3259,7 +3295,7 @@ pub(crate) struct RelPaths<'a> {
     pub(super) width: f64,
     /// The columns a condition fixes to a constant, whose sort keys the
     /// paths leave out.
-    pub(super) fixed: u64,
+    pub(super) fixed: ColumnSet,
     pub(super) kept: &'a [Candidate],
 }
 
@@ -3432,7 +3468,7 @@ fn join_build<'a>(
     all: &'a [&'a Restriction<'a>],
     shape: QueryShape,
     definition: &crate::storage::TableDef,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
     rows: f64,
     scan: super::JoinScan,
 ) -> Built<Planned<'a>> {
@@ -3451,7 +3487,7 @@ fn join_build<'a>(
                 .arena
                 .alloc_slice_copy(paths.planner.indexes)
                 .map_err(|_| crate::sql::eval::arena_full())?,
-            fixed: paths.fixed,
+            fixed: narrow_mask(paths.fixed),
         })));
     };
     let Some(held) = candidates.iter().find(|held| held.describe == chosen) else {
@@ -4036,7 +4072,7 @@ fn describe<'a>(
     scan: &Candidate,
     shape: QueryShape,
     definition: &crate::storage::TableDef,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
     rows: f64,
 ) -> Built<ScanPath<'a>> {
     let planner = paths.planner;

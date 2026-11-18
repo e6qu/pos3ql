@@ -1001,8 +1001,28 @@ impl Context<'_> {
                 Some((_, result)) => Some(result),
                 None if is_conditional(name) => {
                     let mut found: Option<i32> = None;
+                    let mut same = true;
+                    let mut first: Option<i32> = None;
+                    for argument in *args {
+                        let Some(argument) = self.type_of(argument)? else {
+                            continue;
+                        };
+                        same &= *first.get_or_insert(argument) == argument;
+                    }
                     for argument in *args {
                         if let Some(argument) = self.type_of(argument)? {
+                            // `select_common_type` keeps the type all its
+                            // inputs share and reduces a domain among
+                            // different ones to its base type, to which the
+                            // argument is relabeled.
+                            let argument = if same {
+                                argument
+                            } else {
+                                self.storage
+                                    .domain_base_type_for_oid(argument, self.txid)
+                                    .and_then(|base| base.try_oid())
+                                    .unwrap_or(argument)
+                            };
                             found = Some(match found {
                                 None => argument,
                                 Some(current) => common_type(current, argument),

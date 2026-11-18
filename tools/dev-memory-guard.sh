@@ -14,7 +14,9 @@
 # that list; browsers, editors and VMs are never touched. Each stop sends
 # SIGTERM, then SIGKILL after GUARD_KILL_GRACE seconds, and is logged with
 # the process's command line. Free disk below GUARD_MIN_DISK_GIB is logged
-# as a warning, because swap needs that space.
+# as a warning, because swap needs that space, and the guard then deletes this
+# checkout's stale codegen object files (`*.rcgu.o` under target/ older than
+# GUARD_STALE_OBJECT_HOURS), logging what it removed.
 #
 # Usage: tools/dev-memory-guard.sh [--once]
 #   Run it in the background for the whole development session:
@@ -22,7 +24,7 @@
 #   --once performs a single check and exits (used by its self-test).
 # Settings (environment, with defaults):
 #   GUARD_CLIENT_RSS_MIB=3072 GUARD_SERVER_RSS_MIB=10240
-#   GUARD_MIN_AVAILABLE_PCT=12 GUARD_MIN_DISK_GIB=20
+#   GUARD_MIN_AVAILABLE_PCT=12 GUARD_MIN_DISK_GIB=25 GUARD_STALE_OBJECT_HOURS=12
 #   GUARD_INTERVAL=2 GUARD_KILL_GRACE=3
 #   GUARD_LOG=$HOME/.cache/pos3ql/dev-memory-guard.log
 set -u -o pipefail
@@ -30,7 +32,9 @@ set -u -o pipefail
 client_rss_mib=${GUARD_CLIENT_RSS_MIB:-3072}
 server_rss_mib=${GUARD_SERVER_RSS_MIB:-10240}
 min_available_pct=${GUARD_MIN_AVAILABLE_PCT:-12}
-min_disk_gib=${GUARD_MIN_DISK_GIB:-20}
+min_disk_gib=${GUARD_MIN_DISK_GIB:-25}
+stale_object_hours=${GUARD_STALE_OBJECT_HOURS:-12}
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
 interval=${GUARD_INTERVAL:-2}
 kill_grace=${GUARD_KILL_GRACE:-3}
 log=${GUARD_LOG:-$HOME/.cache/pos3ql/dev-memory-guard.log}
@@ -97,6 +101,17 @@ stop_process() {
     fi
 }
 
+# Deletes the codegen object files split-debuginfo leaves behind in
+# target/, once they are older than the builds that can still use them.
+prune_stale_objects() {
+    [[ -d "$repo_root/target" ]] || return 0
+    local before after
+    before=$(du -sk "$repo_root/target" 2>/dev/null | awk '{print $1}')
+    find "$repo_root/target" -name '*.rcgu.o' -mmin "+$((stale_object_hours * 60))" -delete 2>/dev/null
+    after=$(du -sk "$repo_root/target" 2>/dev/null | awk '{print $1}')
+    note "PRUNE removed $(( (before - after) / 1024 ))MiB of *.rcgu.o older than ${stale_object_hours}h under $repo_root/target"
+}
+
 check() {
     local pid rss comm command class rss_mib
     local largest_pid="" largest_rss=0
@@ -138,6 +153,7 @@ check() {
     disk_gib=$(df -Pk / | awk 'NR==2{print int($4/1048576)}')
     if (( disk_gib < min_disk_gib )); then
         note "WARN free disk ${disk_gib}GiB below ${min_disk_gib}GiB; swap may run out"
+        prune_stale_objects
     fi
 }
 

@@ -34,6 +34,7 @@ const COST: &str = "Query Tuning / Planner Cost Constants";
 const GEQO: &str = "Query Tuning / Genetic Query Optimizer";
 const OTHER: &str = "Query Tuning / Other Planner Options";
 const MEMORY: &str = "Resource Usage / Memory";
+const WORKERS: &str = "Resource Usage / Worker Processes";
 
 const fn method(name: &'static str, default: bool, description: &'static str) -> PlannerSettingDef {
     PlannerSettingDef {
@@ -85,7 +86,7 @@ const fn int(
     }
 }
 
-pub(super) const PLANNER_SETTING_COUNT: usize = 53;
+pub(super) const PLANNER_SETTING_COUNT: usize = 54;
 
 /// Ordered by name, as `SHOW ALL` lists them.
 pub(super) const PLANNER_SETTINGS: [PlannerSettingDef; PLANNER_SETTING_COUNT] = [
@@ -378,6 +379,15 @@ pub(super) const PLANNER_SETTINGS: [PlannerSettingDef; PLANNER_SETTING_COUNT] = 
         i32::MAX,
         OTHER,
         "Sets the FROM-list size beyond which JOIN constructs are not flattened.",
+    ),
+    int(
+        "max_parallel_workers_per_gather",
+        SettingUnit::None,
+        2,
+        0,
+        1024,
+        WORKERS,
+        "Sets the maximum number of parallel processes per executor node.",
     ),
     int(
         "min_parallel_index_scan_size",

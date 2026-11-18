@@ -123,6 +123,10 @@ pub(super) fn join_plan<'a>(
     Ok(plan)
 }
 
+/// The target lists of a sort's input and of the sort, each `None` when
+/// unprintable.
+type SortLists = (Option<Output>, Option<Output>);
+
 /// A node that does not project (`Hash`, `Sort`, `Materialize`,
 /// `Memoize`) returns its input's target list: the node at `at` takes the
 /// list of the node pushed after it.
@@ -646,7 +650,7 @@ impl Writer<'_, '_, '_, '_> {
         at: usize,
         keys: &Keys,
         relids: Relids,
-    ) -> Result<Option<(Option<Output>, Option<Output>)>, SqlError> {
+    ) -> Result<Option<SortLists>, SqlError> {
         use query::index_paths::joins::KEY_CLASS;
         let base = plan.nodes[at + 1];
         let (mut input, mut sort) = (base.output, base.output);

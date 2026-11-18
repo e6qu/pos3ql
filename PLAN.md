@@ -1551,7 +1551,9 @@ domain with a non-default collation derives it, a `CREATE TABLE AS` column
 keeps the collation its query derives, and `pg_collation_for` reports it. A
 custom collation a domain uses is a `pg_depend` dependency of the domain and
 its array: `DROP COLLATION` refuses it, and with `CASCADE` drops the domain
-and the columns of its type (`differential_exact/864`). Remaining: `ALTER
+and the columns of its type (`differential_exact/864`). `DROP TYPE` drops a
+domain as `DROP DOMAIN` does, freeing its slot (`differential_exact/865`).
+Remaining: `ALTER
 COLUMN ... TYPE` to a type that is not built in (a domain, enum or
 composite) fails with `0A000` where PostgreSQL rewrites the column through
 the type's checks. Target and expression count errors of an `INSERT`, also with subscripted

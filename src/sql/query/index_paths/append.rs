@@ -12,7 +12,7 @@ use crate::mem::arena::Arena;
 use crate::sql::ast::Expr;
 use crate::sql::eval::SqlError;
 use crate::sql::types::Datum;
-use crate::storage::{PartitionBound, PartitionStrategy, Storage, TableDef};
+use crate::storage::{ColumnSet, PartitionBound, PartitionStrategy, Storage, TableDef};
 
 use super::super::scope::QueryScope;
 use super::paths::{self, Candidate, RelPaths};
@@ -114,7 +114,7 @@ struct Live<'a> {
     /// Each tree column's position in the member, `usize::MAX` when absent.
     columns: &'a [usize],
     shape: QueryShape,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
     /// The width of its paths' rows above it.
     width: f64,
     cheapest_total: Candidate,
@@ -230,7 +230,7 @@ fn partition_order(
     definition: &TableDef,
     leaves: &[usize],
     order: &[OrderKey],
-    fixed: u64,
+    fixed: ColumnSet,
 ) -> Result<Option<PartitionOrder>, SqlError> {
     let Some(scheme) = definition.partition.scheme else {
         return Ok(None);
@@ -262,7 +262,7 @@ fn partition_order(
     let mut partial = false;
     for &key in &scheme.keys[..usize::from(scheme.n_keys)] {
         let column = usize::from(key);
-        if column < 64 && fixed & (1 << column) != 0 {
+        if fixed.contains(column) {
             continue;
         }
         if !order.iter().any(
@@ -466,7 +466,7 @@ pub(super) fn tree_path<'a>(
     scope: &QueryScope<'_>,
     txid: u32,
     condition: Option<&'a Expr<'a>>,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
     params: &[Datum<'a>],
     arena: &'a Arena,
     shape: QueryShape,
@@ -609,10 +609,10 @@ pub(super) fn tree_path<'a>(
     // The query's sort keys without those a constant fixes, which every
     // member's paths are ordered against.
     let first = live[0].expect("a live member");
-    let mut fixed = 0u64;
-    for (column, &at) in first.columns.iter().enumerate().take(64) {
-        if at < 64 && first.paths.fixed & (1 << at) != 0 {
-            fixed |= 1 << column;
+    let mut fixed = ColumnSet::EMPTY;
+    for (column, &at) in first.columns.iter().enumerate() {
+        if at != usize::MAX && first.paths.fixed.contains(at) {
+            fixed.insert(column);
         }
     }
     let mut kept_order = [OrderKey::Expression; super::MAX_ORDER_KEYS];
@@ -620,7 +620,7 @@ pub(super) fn tree_path<'a>(
     for key in shape.order() {
         if let OrderKey::Column { column, .. } = *key
             && column < 64
-            && fixed & (1 << column) != 0
+            && fixed.contains(column)
         {
             continue;
         }
@@ -1044,7 +1044,7 @@ fn tree_size(
                 f64::from(super::output_width(
                     &member_definition,
                     &statistics,
-                    Some(1u64 << at.min(63)),
+                    Some(ColumnSet::from_column(at)),
                 ))
             };
             size.column_widths[column] += width * rows;
@@ -1067,9 +1067,9 @@ fn member_inputs<'a>(
     definition: &TableDef,
     leaf: usize,
     shape: QueryShape,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
     arena: &'a Arena,
-) -> Result<(&'a [usize], Option<u64>, QueryShape), SqlError> {
+) -> Result<(&'a [usize], Option<ColumnSet>, QueryShape), SqlError> {
     let member = storage.table_def(leaf, txid);
     let columns = &*arena
         .alloc_slice_with(definition.n_columns, |column| {
@@ -1079,11 +1079,11 @@ fn member_inputs<'a>(
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
     drop(member);
-    let map = |mask: u64| {
-        let mut mapped = 0u64;
+    let map = |set: ColumnSet| {
+        let mut mapped = ColumnSet::EMPTY;
         for (column, &at) in columns.iter().enumerate() {
-            if column < 64 && mask & (1 << column) != 0 {
-                mapped |= if at < 64 { 1 << at } else { 1 << 63 };
+            if set.contains(column) && at != usize::MAX {
+                mapped.insert(at);
             }
         }
         mapped
@@ -1104,11 +1104,7 @@ fn member_inputs<'a>(
         };
     }
     // A member returns the tree's columns, not its own.
-    let all = if definition.n_columns >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << definition.n_columns) - 1
-    };
+    let all = ColumnSet::all(definition.n_columns);
     // A partitioned table's members compute the query's target list
     // themselves when it is not the members' own columns.
     let projection = shape
@@ -1217,7 +1213,7 @@ fn probe_members<'a>(
     txid: u32,
     scope: &QueryScope<'_>,
     condition: Option<&'a Expr<'a>>,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
     params: &[Datum<'a>],
     arena: &'a Arena,
     shape: QueryShape,
@@ -1233,16 +1229,15 @@ fn probe_members<'a>(
             continue;
         }
         let member_needed = needed.map(|needed| {
-            let mut mask = 0u64;
+            let mut set = ColumnSet::EMPTY;
             for (column, meta) in definition.columns().iter().enumerate() {
-                if column < 64 && needed & (1 << column) != 0 {
-                    match member.column_index(meta.name.as_str()) {
-                        Some(at) if at < 64 => mask |= 1 << at,
-                        _ => mask |= 1 << 63,
-                    }
+                if needed.contains(column)
+                    && let Some(at) = member.column_index(meta.name.as_str())
+                {
+                    set.insert(at);
                 }
             }
-            mask
+            set
         });
         drop(member);
         let member_scope = member_scope(storage, txid, leaf, exposed, arena)?;

@@ -1136,7 +1136,7 @@ impl<'a> IndexedCandidates<'a> {
         self.rowids
     }
 
-    fn covers(&self, demanded: u64) -> bool {
+    fn covers(&self, demanded: ColumnSet) -> bool {
         let mut available = self.include_mask;
         for (position, &column) in self.columns[..self.n_columns].iter().enumerate() {
             if self.expression_mask & (1 << position) == 0 {
@@ -1145,9 +1145,7 @@ impl<'a> IndexedCandidates<'a> {
         }
         self.keys.is_some()
             && self.include_mask.difference(self.payload_mask).is_empty()
-            && ColumnSet::from_low_word(demanded)
-                .difference(available)
-                .is_empty()
+            && demanded.is_subset_of(available)
     }
 }
 
@@ -1219,6 +1217,20 @@ impl PaxReadDemand {
         match self.0 {
             PaxReadMode::FullRow { .. } => None,
             PaxReadMode::Selected(columns) => Some(columns.mask(table)),
+        }
+    }
+
+    /// The columns this scan reads, when the query walker proved the
+    /// complete set; a wide column still needs a full physical row but its
+    /// demand is exact.
+    pub(crate) fn selected_columns(self, table: usize) -> Option<ColumnSet> {
+        match self.0 {
+            PaxReadMode::Selected(columns)
+            | PaxReadMode::FullRow {
+                reason: PaxFullRowReason::WideColumn,
+                columns,
+            } => Some(columns.referenced(table)),
+            PaxReadMode::FullRow { .. } => None,
         }
     }
 
@@ -1586,7 +1598,7 @@ impl<'a> OrderedIndexAccessPlan<'a> {
         self.index_name
     }
 
-    pub(crate) fn covers(&self, demanded: u64) -> bool {
+    pub(crate) fn covers(&self, demanded: ColumnSet) -> bool {
         let mut available = self.include_mask;
         for (position, &column) in self.access.columns[..self.access.n_columns]
             .iter()
@@ -1597,9 +1609,7 @@ impl<'a> OrderedIndexAccessPlan<'a> {
             }
         }
         self.covering_ready
-            && ColumnSet::from_low_word(demanded)
-                .difference(available)
-                .is_empty()
+            && demanded.is_subset_of(available)
     }
 }
 
@@ -11401,7 +11411,7 @@ fn scan_source_mode<'a>(
                 if let Some(access) = access.filter(|access| {
                     access.preserves_order
                         && pax_demand
-                            .selected_mask(order[depth])
+                            .selected_columns(order[depth])
                             .is_some_and(|demanded| access.covers(demanded))
                 }) {
                     let definition = scope.defs.get(order[depth]).expect("resolved");

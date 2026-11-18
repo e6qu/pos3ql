@@ -2807,7 +2807,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         let _context = super::index_paths::enter_query(
             slot,
             scan.condition,
-            Some(scan.read),
+            Some(crate::storage::ColumnSet::from_low_word(scan.read)),
             Some(scan.shape),
         );
         let mut keep = true;

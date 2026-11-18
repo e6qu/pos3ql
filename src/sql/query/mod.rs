@@ -14711,7 +14711,7 @@ fn enter_scan_context<'a>(
                         None,
                         statement.order_by,
                     )
-                    .selected_mask(0),
+                    .selected_columns(0),
                     ..shape
                 })
             };
@@ -14725,7 +14725,7 @@ fn enter_scan_context<'a>(
                     statement.where_clause,
                     statement.order_by,
                 )
-                .selected_mask(0),
+                .selected_columns(0),
                 shape,
             ))
         } else {

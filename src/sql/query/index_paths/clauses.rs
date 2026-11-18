@@ -6,6 +6,7 @@ use crate::mem::arena::Arena;
 use crate::sql::ast::{BinaryOp, Expr};
 use crate::sql::eval::SqlError;
 use crate::sql::types::{ColType, Datum};
+use crate::storage::ColumnSet;
 
 use super::super::scope::{QueryScope, ResolvedColumn};
 use super::{Comparison, Planner};
@@ -109,8 +110,8 @@ pub(super) enum Clause<'a> {
     /// `DEFAULT_NUM_DISTINCT`, `DEFAULT_INEQ_SEL`, `DEFAULT_UNK_SEL`, a
     /// function's 1/3).
     Expression {
-        /// The columns it reads, as a mask.
-        columns: u64,
+        /// The columns it reads.
+        columns: ColumnSet,
         /// Equal expressions share a key past every column's number, by
         /// which `addRangeClause` pairs their bounds; `Some(lower)` for a
         /// bound.
@@ -118,10 +119,9 @@ pub(super) enum Clause<'a> {
         selectivity: f64,
     },
     /// A condition the model has no form for, reading the columns of the
-    /// mask (columns past 63 set bit 63); `indexable` when an index on one
-    /// of them might apply it.
+    /// set; `indexable` when an index on one of them might apply it.
     Other {
-        columns: u64,
+        columns: ColumnSet,
         shape: &'static str,
         indexable: bool,
         /// Only a pattern class could serve it (`~<~` and its kin).
@@ -141,18 +141,19 @@ impl Clause<'_> {
         }
     }
 
-    /// The columns the clause reads, as a mask (columns past 63 set bit
-    /// 63).
-    pub(super) fn columns(&self) -> u64 {
+    /// The columns the clause reads.
+    pub(super) fn column_set(&self) -> ColumnSet {
         match *self {
             Self::Compare { column, .. }
             | Self::NullTest { column, .. }
             | Self::Array { column, .. }
-            | Self::Like { column, .. } => column_bit(column),
+            | Self::Like { column, .. } => ColumnSet::from_column(column),
             Self::Or(arms) => arms
                 .iter()
                 .flat_map(|arm| arm.iter())
-                .fold(0, |mask, restriction| mask | restriction.clause.columns()),
+                .fold(ColumnSet::EMPTY, |set, restriction| {
+                    set.union(restriction.clause.column_set())
+                }),
             Self::Other { columns, .. } | Self::Expression { columns, .. } => columns,
         }
     }
@@ -200,6 +201,12 @@ impl Clause<'_> {
 
 pub(super) fn column_bit(column: usize) -> u64 {
     1u64 << column.min(63)
+}
+
+/// A column set as the planner's 64-bit mask, the 64th bit standing for
+/// every column past the 63rd.
+pub(super) fn narrow_mask(set: ColumnSet) -> u64 {
+    set.iter().fold(0, |mask, column| mask | column_bit(column))
 }
 
 /// The value of a constant `expression` compared with a column or key
@@ -318,7 +325,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
     /// Whether `expression` is one PostgreSQL estimates by its defaults: it
     /// reads the table, calls nothing volatile and reads no subquery.
     fn estimated_expression(&self, expression: &'a Expr<'a>) -> bool {
-        self.columns_of(expression) != 0
+        !self.columns_of(expression).is_empty()
             && expression.contains_volatile_function().is_none()
             && !expression.contains_subquery()
     }
@@ -346,7 +353,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 return Ok(None);
             };
             return Ok(Some(Clause::Expression {
-                columns: self.columns_of(left) | self.columns_of(right),
+                columns: self.columns_of(left).union(self.columns_of(right)),
                 bound: None,
                 selectivity: match comparison {
                     Comparison::Eq => super::DEFAULT_EQ_SEL,
@@ -449,7 +456,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
         // A plain constant the model does not read stays unread: only a
         // call has a value that planning folds for estimation.
         if (expression.is_constant(false) && !expression.calls_routine())
-            || self.columns_of(expression) != 0
+            || !self.columns_of(expression).is_empty()
             || expression.contains_subquery()
             || expression.contains_volatile_function().is_some()
         {
@@ -475,11 +482,11 @@ impl<'a> Analyzer<'_, '_, 'a> {
     }
 
     /// The columns of the table `expression` reads.
-    fn columns_of(&self, expression: &Expr<'_>) -> u64 {
-        let mut mask = 0;
+    fn columns_of(&self, expression: &Expr<'_>) -> ColumnSet {
+        let mut mask = ColumnSet::EMPTY;
         expression.for_each_column_reference(&mut |qualifier, name| {
             if let Ok(ResolvedColumn::Table(0, column)) = self.scope.find_column(qualifier, name) {
-                mask |= column_bit(column);
+                mask.insert(column);
             }
         });
         mask

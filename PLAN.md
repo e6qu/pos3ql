@@ -390,6 +390,11 @@ long report keeps its selected versions until it finishes.
 **Done today:** row metadata, foreground row work, table definitions, index
 bindings, analyzed columns and procedural execution state share explicit pools.
 [Architecture](docs/architecture.md#memory-and-physical-size) lists them.
+With object storage on, a write that finds the memtable full no longer fails
+while committed rows can spill: the statement rolls back, waits for a
+checkpoint the reactor drives, and runs again. Only a statement (with its
+transaction) whose own uncommitted rows exceed `memtable_bytes` fails, with
+`54000`.
 
 **Remaining:**
 

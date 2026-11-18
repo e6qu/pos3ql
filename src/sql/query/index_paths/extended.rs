@@ -56,6 +56,7 @@ pub(super) fn table_objects<'a>(
     txid: u32,
     slot: usize,
     definition: &crate::storage::TableDef,
+    variables: &super::expressions::ExpressionVariables<'a>,
     arena: &'a Arena,
 ) -> Result<Result<&'a [ExtendedObject<'a>], &'static str>, SqlError> {
     let mut objects = crate::mem::arena::ArenaList::new(arena);
@@ -69,12 +70,18 @@ pub(super) fn table_objects<'a>(
         let n_keys = usize::from(statistics.n_keys);
         let mut columns = [usize::MAX; MAX_EXTENDED_STATISTICS_KEYS];
         for (column, &position) in columns.iter_mut().zip(&order.positions[..n_keys]) {
-            if let crate::storage::ExtendedStatisticsKey::Column(name) =
-                &keys[usize::from(position)]
-            {
-                *column = definition
-                    .column_index(name.as_str())
-                    .expect("a statistics column remains in its table");
+            match &keys[usize::from(position)] {
+                crate::storage::ExtendedStatisticsKey::Column(name) => {
+                    *column = definition
+                        .column_index(name.as_str())
+                        .expect("a statistics column remains in its table");
+                }
+                // An expression key is the variable its conditions compare.
+                crate::storage::ExtendedStatisticsKey::Expression(text) => {
+                    if let Some(number) = variables.find_text(definition, text.as_str(), arena)? {
+                        *column = number;
+                    }
+                }
             }
         }
         // An object with expression keys estimates conditions on those
@@ -101,7 +108,10 @@ pub(super) fn table_objects<'a>(
                 mcv_values[item * n_keys + key] = if value.is_null() || column == usize::MAX {
                     value
                 } else {
-                    let ctype = definition.columns()[column].ctype;
+                    let ctype = match variables.get(column) {
+                        Some(variable) => variable.ctype,
+                        None => definition.columns()[column].ctype,
+                    };
                     if !matches!(
                         ctype,
                         ColType::Int2

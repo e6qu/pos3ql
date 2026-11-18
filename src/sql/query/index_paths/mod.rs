@@ -965,7 +965,7 @@ pub(super) struct Planner<'s, 'a> {
     pub(super) arena: &'a Arena,
 }
 
-impl<'s, 'a> Planner<'s, 'a> {
+impl<'s, 'a: 's> Planner<'s, 'a> {
     /// The type of column or key expression `column`.
     pub(super) fn column_type(&self, column: usize) -> ColType {
         match self.variables.get(column) {
@@ -986,7 +986,8 @@ impl<'s, 'a> Planner<'s, 'a> {
         if let Some(variable) = self.variables.get(column) {
             let analyzed = variable
                 .statistics
-                .and_then(|(index, key)| self.statistics.index_column(index, key));
+                .and_then(|(index, key)| self.statistics.index_column(index, key))
+                .or_else(|| variable.extended.map(|extended| extended.column));
             return VariableStatistics {
                 analyzed: analyzed.is_some(),
                 null_fraction: analyzed.map_or(0.0, |column| f64::from(column.null_fraction)),
@@ -999,7 +1000,12 @@ impl<'s, 'a> Planner<'s, 'a> {
                 }),
                 distribution: variable
                     .statistics
-                    .and_then(|(index, key)| self.statistics.index_distribution(index, key)),
+                    .and_then(|(index, key)| self.statistics.index_distribution(index, key))
+                    .or_else(|| {
+                        variable
+                            .extended
+                            .and_then(|extended| extended.distribution.distribution())
+                    }),
                 ctype: variable.ctype,
                 collation: variable.collation,
                 unique: variable.unique,

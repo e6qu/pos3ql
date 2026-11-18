@@ -19,7 +19,7 @@ use super::super::scope::{QueryScope, ResolvedColumn};
 
 /// The most distinct key expressions the model reads on one table; an index
 /// with more is outside it.
-pub(super) const MAX_EXPRESSION_VARIABLES: usize = 32;
+pub(super) const MAX_EXPRESSION_VARIABLES: usize = 64;
 
 /// One index key expression.
 #[derive(Clone, Copy)]
@@ -33,10 +33,21 @@ pub(crate) struct ExpressionVariable<'a> {
     pub(crate) collation: Collation,
     /// The index and key position whose statistics describe it.
     pub(super) statistics: Option<(u64, u16)>,
+    /// The statistics of a statistics object's expression, read when no
+    /// index holds statistics of it (`examine_variable` tries the indexes
+    /// first).
+    pub(super) extended: Option<ExtendedExpression<'a>>,
     /// A unique whole-table index has it as its only key.
     pub(super) unique: bool,
     /// A whole-table btree leads with it.
     pub(super) indexed: bool,
+}
+
+/// One statistics object's expression statistics.
+#[derive(Clone, Copy)]
+pub(crate) struct ExtendedExpression<'a> {
+    pub(super) column: crate::storage::ColumnStatistics,
+    pub(super) distribution: &'a crate::storage::ExpressionDistribution,
 }
 
 /// The table's key expressions, in variable order.
@@ -53,6 +64,34 @@ impl<'a> ExpressionVariables<'a> {
         column
             .checked_sub(self.first)
             .and_then(|at| self.variables.get(at))
+    }
+
+    /// The variable the statistics expression `text` of `definition`'s table
+    /// is.
+    pub(crate) fn find_text(
+        &self,
+        definition: &TableDef,
+        text: &str,
+        arena: &'a Arena,
+    ) -> Result<Option<usize>, SqlError> {
+        let source = arena
+            .alloc_str(text)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let parsed = crate::sql::parser::parse_expr(source, arena)?;
+        let resolve = |qualifier: Option<&str>, name: &str| {
+            qualifier
+                .is_none()
+                .then(|| definition.column_index(name))
+                .flatten()
+        };
+        let Some(canonical) = canonical(parsed, &resolve, definition, arena)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .variables
+            .iter()
+            .position(|variable| *variable.canonical == *canonical)
+            .map(|at| self.first + at))
     }
 
     /// The variable `expression` (a query's, read in `scope`) is.
@@ -216,6 +255,83 @@ pub(crate) fn table_expressions<'a>(
             }
         }
     }
+    // The expressions of the table's statistics objects: the statistics of
+    // one no index holds are read from the object.
+    for (statistics_slot, object) in storage.extended_statistics_for_table(slot, txid) {
+        let data = storage.extended_statistics_data(statistics_slot, txid);
+        if !data.valid || data.inherited {
+            continue;
+        }
+        let keys = object.keys_for(txid);
+        for (key, definition_key) in keys.iter().enumerate() {
+            let crate::storage::ExtendedStatisticsKey::Expression(text) = definition_key else {
+                continue;
+            };
+            let column = data.expression_statistics[key];
+            if !column.valid {
+                continue;
+            }
+            let source = arena
+                .alloc_str(text.as_str())
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            let parsed = crate::sql::parser::parse_expr(source, arena)?;
+            let resolve = |qualifier: Option<&str>, name: &str| {
+                qualifier
+                    .is_none()
+                    .then(|| definition.column_index(name))
+                    .flatten()
+            };
+            let Some(canonical) = canonical(parsed, &resolve, definition, arena)? else {
+                continue;
+            };
+            let found = held[..count]
+                .iter()
+                .flatten()
+                .position(|other| *other.canonical == *canonical);
+            let distribution = arena
+                .alloc(data.expression_distributions[key])
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            let extended = ExtendedExpression {
+                column,
+                distribution: &*distribution,
+            };
+            match found {
+                Some(number) => {
+                    let variable = held[number].as_mut().expect("held variable");
+                    if variable.statistics.is_none() && variable.extended.is_none() {
+                        variable.extended = Some(extended);
+                    }
+                }
+                None if count == MAX_EXPRESSION_VARIABLES => {
+                    return Err(crate::sql_err!(
+                        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "table has more than {} distinct index and statistics expressions",
+                        MAX_EXPRESSION_VARIABLES
+                    ));
+                }
+                None => {
+                    let (ctype, collation) = crate::sql::exec::statistics_expression_type(
+                        storage,
+                        txid,
+                        definition,
+                        text.as_str(),
+                        arena,
+                    )?;
+                    held[count] = Some(ExpressionVariable {
+                        canonical,
+                        bound: parsed,
+                        ctype,
+                        collation,
+                        statistics: None,
+                        extended: Some(extended),
+                        unique: false,
+                        indexed: false,
+                    });
+                    count += 1;
+                }
+            }
+        }
+    }
     let variables = arena
         .alloc_slice_with(count, |at| held[at].expect("dense variables"))
         .map_err(|_| crate::sql::eval::arena_full())?;
@@ -274,6 +390,7 @@ pub(crate) fn key_variable<'a>(
         ctype,
         collation: index.collations[position],
         statistics: None,
+        extended: None,
         unique: false,
         indexed: false,
     }))

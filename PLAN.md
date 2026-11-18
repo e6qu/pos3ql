@@ -1069,8 +1069,9 @@ query. `max_parallel_workers_per_gather` is PostgreSQL's setting (default 2,
 0 to 1024, shown by `EXPLAIN (SETTINGS)`): a relation below
 `min_parallel_table_scan_size` gets no parallel workers in PostgreSQL
 (`compute_parallel_worker`), so its plans match at any value, and with the
-setting above 0 an `EXPLAIN` scanning a relation at least that large fails
-with `0A000`, since PostgreSQL may choose a `Gather` there; at 0 every plan
+setting above 0 an `EXPLAIN` of a query scanning a relation at least that
+large fails with `0A000`, since PostgreSQL may choose a `Gather` there (a
+write or a row lock is never parallel, so its plan prints); at 0 every plan
 is exact (`differential_exact/931`). A join condition whose
 side is an expression of one relation's columns (`a.k + 1 = b.k`,
 `lower(a.t) = lower(b.t)`) makes the expression a member of its

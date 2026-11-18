@@ -10718,9 +10718,22 @@ pub(super) fn refuse_parallel_candidates(
     if crate::sql::guc::planner_value("max_parallel_workers_per_gather") == 0.0 {
         return Ok(());
     }
+    let nodes = &plan.nodes[..plan.count];
+    // A write or a row lock is never planned in parallel
+    // (`standard_planner`'s `parallelModeOK`, `max_parallel_hazard`).
+    if nodes.iter().any(|node| {
+        let name = node.name.as_str();
+        name == "LockRows"
+            || ["Insert", "Update", "Delete", "Merge"]
+                .iter()
+                .any(|write| name == *write)
+    }) {
+        return Ok(());
+    }
     let threshold = crate::sql::guc::planner_value("min_parallel_table_scan_size");
-    for node in &plan.nodes[..plan.count] {
-        if node.relation.is_empty() {
+    for node in nodes {
+        // Only a relation's own scan gets partial paths.
+        if node.relation.is_empty() || !node.name.as_str().ends_with("Scan") {
             continue;
         }
         let schema = (!node.schema.is_empty()).then_some(node.schema.as_str());

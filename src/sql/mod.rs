@@ -24085,7 +24085,7 @@ impl Engine {
                     // The plan counts what each of its nodes does as the
                     // statement runs.
                     let execution = match (plan.as_mut(), rewritten.as_mut()) {
-                        (Some(plan), _) => plan.analyze(arena, options.timing, run),
+                        (Some(plan), _) => plan.analyze(arena, *options, run),
                         (None, Some(queries)) => {
                             explain::analyze_rewritten(queries, arena, options.timing, run)
                         }

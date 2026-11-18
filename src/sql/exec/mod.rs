@@ -37643,7 +37643,7 @@ fn execute_plpgsql_dynamic_explain(
                 )
             };
             let execution = match (plan.as_mut(), rewritten.as_mut()) {
-                (Some(plan), _) => plan.analyze(arena, options.timing, run),
+                (Some(plan), _) => plan.analyze(arena, options, run),
                 (None, Some(queries)) => {
                     super::explain::analyze_rewritten(queries, arena, options.timing, run)
                 }

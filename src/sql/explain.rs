@@ -582,13 +582,16 @@ impl<'a> Plan<'a> {
     }
 
     /// Runs `execute`, the statement this plan explains, counting the work
-    /// of each node that has a key; `timing` also measures its time.
+    /// of each node that has a key; `TIMING` also measures its time. A plan
+    /// [`printable`] rejects is rejected before the statement runs.
     pub(super) fn analyze<R>(
         &mut self,
         arena: &'a Arena,
-        timing: bool,
+        options: ExplainOptions,
         execute: impl FnOnce() -> R,
     ) -> Result<R, SqlError> {
+        let timing = options.timing;
+        shared_buffers_printable(self, options)?;
         // PostgreSQL's per-scan pruning by a subplan's value runs the subplan
         // first and skips the members it rules out; execution here reads
         // them all, so the counts would differ.
@@ -6394,6 +6397,15 @@ fn plan_pulled_select<'a>(
         )?,
         _ => None,
     };
+    // Windows over a join the join search does not plan would print
+    // pos3ql's own join order and sorts.
+    if modeled.is_none() && scope.as_ref().is_some_and(|scope| scope.n > 1) && has_window(statement)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of window functions over a join PostgreSQL's join search does not plan here is not supported"
+        ));
+    }
     let (modeled, windowed_scan) = match modeled {
         Some(model)
             if !model.windows.is_empty() && scope.as_ref().is_some_and(|scope| scope.n == 1) =>
@@ -6638,6 +6650,12 @@ fn plan_pulled_select<'a>(
                     upper_nodes[upper_count].analyze_unsupported = Some(
                         "EXPLAIN ANALYZE of window functions over a join's groups is not supported",
                     );
+                }
+                // A limit directly above the windows stops them early; their
+                // execution computes every row first.
+                if model.plan.upper.limit.is_some() && model.plan.upper.sort.is_none() {
+                    upper_nodes[upper_count].analyze_unsupported =
+                        Some("EXPLAIN ANALYZE of window functions under a limit is not supported");
                 }
                 upper_count += 1;
             }
@@ -15949,10 +15967,30 @@ fn render_document<'a>(
     document.finish()
 }
 
+/// Rejects `BUFFERS` (on by default under `ANALYZE`) of a plan reading or
+/// writing a relation: PostgreSQL counts each node's shared buffer hits and
+/// reads, and the planning's catalog reads, which depend on its buffer and
+/// catalog caches and which pos3ql does not model. A plan reading no
+/// relation counts none, as PostgreSQL's does.
+fn shared_buffers_printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), SqlError> {
+    match plan.nodes[..plan.count]
+        .iter()
+        .find(|node| !node.relation.is_empty())
+    {
+        Some(node) if options.buffers => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN cannot print the shared buffer counts of node \"{}\"",
+            node.name.as_str()
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Rejects a plan showing costs pos3ql does not model as PostgreSQL does,
 /// and a `VERBOSE` plan holding a target list outside the deparser's
 /// coverage, rather than print wrong estimates or a wrong `Output:`.
 fn printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), SqlError> {
+    shared_buffers_printable(plan, options)?;
     if options.costs
         && let Some(node) = plan.nodes[..plan.count]
             .iter()

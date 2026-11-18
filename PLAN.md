@@ -1072,7 +1072,17 @@ query. `max_parallel_workers_per_gather` is PostgreSQL's setting (default 2,
 setting above 0 an `EXPLAIN` of a query scanning a relation at least that
 large fails with `0A000`, since PostgreSQL may choose a `Gather` there (a
 write or a row lock is never parallel, so its plan prints); at 0 every plan
-is exact (`differential_exact/931`). A join condition whose
+is exact (`differential_exact/931`). `BUFFERS` is on by default under
+`ANALYZE`, as in PostgreSQL 18, and accepted without it; a plan reading or
+writing a relation fails with `0A000` there, since PostgreSQL's per-node
+shared buffer counts and planning catalog reads depend on its buffer and
+catalog caches, which pos3ql does not model; a plan reading no relation
+counts none. Windows over a join the search plans read its plan's rows,
+so `EXPLAIN ANALYZE` counts its nodes (`differential_exact/935`); windows
+over a join it does not plan (a window function in the `ORDER BY`) fail
+`EXPLAIN` with `0A000` rather than print pos3ql's join order, and
+`EXPLAIN ANALYZE` of windows under a limit directly above them fails with
+`0A000`, since their execution computes every row first. A join condition whose
 side is an expression of one relation's columns (`a.k + 1 = b.k`,
 `lower(a.t) = lower(b.t)`) makes the expression a member of its
 equivalence class (`process_equivalence`), computed by its relation's scan:
@@ -1604,8 +1614,8 @@ use `DEFAULT`, a defaulted identity, serial or generated column,
 an `INSERT ... SELECT`'s `RETURNING` list and an `INSERT` into a view, a
 `(record).*` item, a sort below a postponed select list (whose input PostgreSQL
 computes without the postponed expressions), and an `EXISTS` subplan's
-list (the output columns' names are printed there), per-node `Buffers`
-and `WAL` (reported on the top node only), trigger time lines, an index-only
+list (the output columns' names are printed there), per-node `WAL`
+(reported on the top node only), trigger time lines, an index-only
 scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. `EXPLAIN
 ANALYZE` of a joined `UPDATE` or `DELETE` counts the scans (each member's
 under an `Append`), the `Hash` with its table's size or the `Materialize`

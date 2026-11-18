@@ -73328,7 +73328,6 @@ pub(crate) fn analyze_extended_statistics(
         let mut types = [ColType::Bool; MAX_EXTENDED_STATISTICS_KEYS];
         let mut collations = [crate::sql::ast::Collation::None; MAX_EXTENDED_STATISTICS_KEYS];
         let mut column_target = -1i32;
-        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
         for (index, &position) in order.positions[..n_keys].iter().enumerate() {
             match &keys[usize::from(position)] {
                 ExtendedStatisticsKey::Column(column) => {
@@ -73344,29 +73343,12 @@ pub(crate) fn analyze_extended_statistics(
                     });
                 }
                 ExtendedStatisticsKey::Expression(expression) => {
-                    let text = arena
-                        .alloc_str(expression.as_str())
-                        .map_err(|_| arena_full())?;
-                    let parsed = super::parser::parse_expr(text, arena)?;
-                    let (type_oid, _) = infer_type_catalog(
-                        parsed,
-                        Some(&table_definition),
+                    (types[index], collations[index]) = statistics_expression_type(
                         storage,
                         txn.txid,
+                        &table_definition,
+                        expression.as_str(),
                         arena,
-                    )?;
-                    types[index] = catalog_column_type(storage, txn.txid, type_oid)
-                        .map_or(ColType::Text, |(ctype, _)| ctype);
-                    let row = RowCtx {
-                        def: crate::storage::RelationDefinition::from_definition(&table_definition),
-                        values: &[],
-                        alias: None,
-                        table_oid: None,
-                    };
-                    collations[index] = crate::sql::eval::resolved_expression_collation(
-                        parsed,
-                        &row,
-                        Some(&catalog),
                     )?;
                 }
             }
@@ -73521,7 +73503,7 @@ pub(crate) fn analyze_extended_statistics(
             ) {
                 continue;
             }
-            let (column, _) = storage.analyzed_values(
+            let (column, distribution) = storage.analyzed_values(
                 txn.txid,
                 types[index],
                 collations[index],
@@ -73533,6 +73515,14 @@ pub(crate) fn analyze_extended_statistics(
                 arena,
             )?;
             data.expression_statistics[usize::from(position)] = column;
+            data.expression_distributions[usize::from(position)] =
+                crate::storage::ExpressionDistribution::new(distribution).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "statistics expression distribution exceeds {} bytes; lower the statistics target",
+                        crate::storage::EXPRESSION_DISTRIBUTION_MAX_BYTES
+                    )
+                })?;
         }
         storage.write_extended_statistics_data(slot, txn.txid, data)?;
         if let Err(error) = txn.record_extended_statistics(slot as u32) {
@@ -73541,6 +73531,31 @@ pub(crate) fn analyze_extended_statistics(
         }
     }
     Ok(())
+}
+
+/// The type and collation of the statistics expression `expression` over
+/// `table_definition`, as ANALYZE sorts its values.
+pub(crate) fn statistics_expression_type(
+    storage: &Storage,
+    txid: u32,
+    table_definition: &crate::storage::TableDef,
+    expression: &str,
+    arena: &Arena,
+) -> Result<(ColType, crate::sql::ast::Collation), SqlError> {
+    let text = arena.alloc_str(expression).map_err(|_| arena_full())?;
+    let parsed = super::parser::parse_expr(text, arena)?;
+    let (type_oid, _) = infer_type_catalog(parsed, Some(table_definition), storage, txid, arena)?;
+    let ctype =
+        catalog_column_type(storage, txid, type_oid).map_or(ColType::Text, |(ctype, _)| ctype);
+    let row = RowCtx {
+        def: crate::storage::RelationDefinition::from_definition(table_definition),
+        values: &[],
+        alias: None,
+        table_oid: None,
+    };
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let collation = crate::sql::eval::resolved_expression_collation(parsed, &row, Some(&catalog))?;
+    Ok((ctype, collation))
 }
 
 #[derive(Clone, Copy)]

@@ -2328,7 +2328,7 @@ pub(crate) fn scan_path<'a>(
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
     let (extended, unreadable) =
-        match super::extended::table_objects(storage, txid, slot, definition, arena)? {
+        match super::extended::table_objects(storage, txid, slot, definition, &variables, arena)? {
             Ok(objects) => (objects, None),
             Err(shape) => (&[][..], Some(shape)),
         };
@@ -2827,6 +2827,8 @@ pub(crate) fn scan_path<'a>(
         .any(|(_, statistics)| {
             let mut covered = 0;
             let mut expressions = false;
+            // A key expression the model reads no variable for.
+            let mut unread_expression = false;
             for key in statistics.keys_for(txid) {
                 match key {
                     crate::storage::ExtendedStatisticsKey::Column(name) => {
@@ -2837,10 +2839,22 @@ pub(crate) fn scan_path<'a>(
                             covered += 1;
                         }
                     }
-                    crate::storage::ExtendedStatisticsKey::Expression(_) => expressions = true,
+                    crate::storage::ExtendedStatisticsKey::Expression(text) => {
+                        expressions = true;
+                        match planner
+                            .variables
+                            .find_text(definition, text.as_str(), arena)
+                            .ok()
+                            .flatten()
+                        {
+                            Some(_) => {}
+                            None => unread_expression = true,
+                        }
+                    }
                 }
             }
-            (covered >= 2 && unreadable.is_some()) || (expressions && compares_expression)
+            (covered >= 2 && unreadable.is_some())
+                || (expressions && unread_expression && compares_expression)
         })
         .then_some(unreadable.unwrap_or("conditions on an expression a statistics object holds"));
     if let Some(shape) = extended {

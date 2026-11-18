@@ -9601,6 +9601,39 @@ pub(crate) fn extended_statistics_definition_by_oid<'a>(
         .map_err(|_| arena_full())
 }
 
+/// A statistics expression as `pg_get_statisticsobjdef_expressions` prints
+/// it: PostgreSQL's deparse of the bound expression.
+fn deparsed_statistics_expression<'a>(
+    storage: &Storage,
+    txid: u32,
+    table: &crate::storage::TableDef,
+    expression: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let deparsed = deparse::deparse(
+        &deparse::Context {
+            storage,
+            txid,
+            arena,
+            dependencies: None,
+            table: Some(table),
+            parameters: &[],
+            joined: &[],
+            pretty: false,
+            qualify: false,
+            domain_value: None,
+            sublinks: None,
+            references: None,
+            folded: false,
+            bare: None,
+        },
+        expression,
+        deparse::Destination::Value,
+        arena,
+    )?;
+    Ok(deparsed.unwrap_or(expression))
+}
+
 pub(crate) fn extended_statistics_expressions_by_oid<'a>(
     storage: &Storage,
     txid: u32,
@@ -9618,28 +9651,10 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
     for key in statistics.keys_for(txid) {
         if let crate::storage::ExtendedStatisticsKey::Expression(expression) = key {
             let table = storage.table_def(usize::from(statistics.table), txid);
-            let deparsed = deparse::deparse(
-                &deparse::Context {
-                    storage,
-                    txid,
-                    arena,
-                    dependencies: None,
-                    table: Some(&table),
-                    parameters: &[],
-                    joined: &[],
-                    pretty: false,
-                    qualify: false,
-                    domain_value: None,
-                    sublinks: None,
-                    references: None,
-                    folded: false,
-                    bare: None,
-                },
-                expression.as_str(),
-                deparse::Destination::Value,
+            values[count] = text(
+                deparsed_statistics_expression(storage, txid, &table, expression.as_str(), arena)?,
                 arena,
             )?;
-            values[count] = text(deparsed.unwrap_or(expression.as_str()), arena)?;
             count += 1;
         }
     }
@@ -19490,6 +19505,31 @@ fn pg_stats_ext_exprs<'a>(
             } else {
                 column.distinct_values as f32
             };
+            let (most_common, frequencies, histogram, correlation) =
+                match data.expression_distributions[key].distribution() {
+                    Some(distribution) => {
+                        let (ctype, _) = super::exec::statistics_expression_type(
+                            storage,
+                            txid,
+                            &table,
+                            expression.as_str(),
+                            arena,
+                        )?;
+                        let element = match ctype {
+                            ColType::Array(inner) => super::types::ArrElem::nested(inner),
+                            scalar => super::types::ArrElem::from_coltype(scalar),
+                        }
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "statistics of type {} cannot be shown",
+                                ctype.name()
+                            )
+                        })?;
+                        statistics_slots(distribution, ctype, element, arena)?
+                    }
+                    None => (Datum::Null, Datum::Null, Datum::Null, Datum::Null),
+                };
             rows[count] = row(
                 &[
                     text(table.schema.as_str(), arena)?,
@@ -19497,15 +19537,24 @@ fn pg_stats_ext_exprs<'a>(
                     text(mutable.schema.as_str(), arena)?,
                     text(mutable.name.as_str(), arena)?,
                     text(owner.as_str(), arena)?,
-                    text(expression.as_str(), arena)?,
+                    text(
+                        deparsed_statistics_expression(
+                            storage,
+                            txid,
+                            &table,
+                            expression.as_str(),
+                            arena,
+                        )?,
+                        arena,
+                    )?,
                     Datum::Bool(data.inherited),
                     Datum::Float4(column.null_fraction),
                     Datum::Int4(column.average_width.min(i32::MAX as u32) as i32),
                     Datum::Float4(distinct),
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Null,
+                    most_common,
+                    frequencies,
+                    histogram,
+                    correlation,
                     Datum::Null,
                     Datum::Null,
                     Datum::Null,

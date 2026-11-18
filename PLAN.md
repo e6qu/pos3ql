@@ -806,9 +806,15 @@ index condition derived from an `OR` is the array condition PostgreSQL
 qualifies the index with, so its MCV matching reads it
 (`differential_exact/897`). Remaining: the estimates of joins and of plans
 outside the single-table planner (the general `GROUP BY` costing among
-them) ignore the statistics objects without `0A000`, and pg_stats_ext_exprs shows an
-expression key's null fraction, distinct values and width, not its MCV
-list or histogram.
+them) ignore the statistics objects without `0A000`. A statistics object
+keeps each expression's distribution (most common values, histogram and
+correlation as a table column's, at most 16 KiB each; a larger one fails
+ANALYZE with a named error), pg_stats_ext_exprs shows it, and a condition on
+an expression the object holds is estimated from it as `examine_variable`
+does, alone or with the object's other keys through its MCV list and
+dependencies (`differential_exact/899`, `900`, `901`). pg_stats_ext_exprs
+leaves the array-element columns (`most_common_elems` and the two after it)
+NULL.
 An index key or predicate may call a PL/pgSQL function
 A `DROP TABLE ... CASCADE` drops every foreign key that references the table in one statement and changes each referencing relation once (`differential_exact/898`); a transaction that changes one relation in more than `max_catalog_versions_per_object` statements fails with that named capacity error.
 (`differential_exact/755`): a utility statement that evaluates outside a

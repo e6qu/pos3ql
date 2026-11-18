@@ -273,7 +273,6 @@ data_dir = ${WORK}/p3data
 object_store = off
 log_format = text
 max_tables = 64
-max_domains = 64
 max_indexes = 64
 max_extended_statistics = 512
 max_views = 64

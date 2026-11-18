@@ -6411,6 +6411,12 @@ fn plan_pulled_select<'a>(
             let Some((table, column)) = shown else {
                 continue;
             };
+            if let Some(id) =
+                query::index_paths::joins::Member::plain(0, column as u16).expression_id()
+            {
+                key.0 = model.expressions[id].expression;
+                continue;
+            }
             let Some(definition) = scope.defs.stored(table) else {
                 continue;
             };
@@ -9527,6 +9533,9 @@ fn windowed_scan_path<'a>(
         .scan(storage, txid, path, &[], arena)?
         .path;
     let upper = model.plan.upper;
+    // The scan computes the windows' input (`make_window_input_target`).
+    scan.width = model.output_width as u32;
+    scan.total_cost = upper.top_total;
     scan.sort = match upper.sort {
         None => query::index_paths::SortKind::None,
         Some((_, _, 0)) => query::index_paths::SortKind::Full,

@@ -235,7 +235,7 @@ impl Writer<'_, '_, '_, '_> {
                     self.operand(
                         (usize::from(member.rel), usize::from(member.column)),
                         &mut text,
-                    );
+                    )?;
                     for held in [&mut shown.plain, &mut shown.verbose] {
                         if !held.is_empty() {
                             let _ = write!(held, "{}", super::KEY_SEPARATOR);
@@ -285,7 +285,7 @@ impl Writer<'_, '_, '_, '_> {
                     self.operand(
                         (usize::from(member.rel), usize::from(member.column)),
                         &mut text,
-                    );
+                    )?;
                     for held in [&mut shown.plain, &mut shown.verbose] {
                         if !held.is_empty() {
                             let _ = write!(held, "{}", super::KEY_SEPARATOR);
@@ -312,7 +312,7 @@ impl Writer<'_, '_, '_, '_> {
                     self.column(
                         (usize::from(member.rel), usize::from(member.column)),
                         &mut key,
-                    );
+                    )?;
                 }
                 let node = self
                     .node("Memoize", &path, depth)
@@ -339,8 +339,14 @@ impl Writer<'_, '_, '_, '_> {
                     self.split(&clauses, path.relids, jointype, &ClauseList::EMPTY);
                 let node = self
                     .node(join_name("Nested Loop", jointype).as_str(), &path, depth)
-                    .with_qual(QualLabel::JoinFilter, self.conditions(&join_filter, None)?)
-                    .with_qual(QualLabel::Filter, self.conditions(&filter, None)?);
+                    .with_qual(
+                        QualLabel::JoinFilter,
+                        self.conditions(&join_filter, None, (false, false))?,
+                    )
+                    .with_qual(
+                        QualLabel::Filter,
+                        self.conditions(&filter, None, (false, false))?,
+                    );
                 plan.push(self.keyed(node, query::instrument::Role::Join, id))?;
                 self.path(plan, outer, depth + 1)?;
                 self.path(plan, inner, depth + 1)
@@ -359,10 +365,16 @@ impl Writer<'_, '_, '_, '_> {
                     .node(join_name("Hash", jointype).as_str(), &path, depth)
                     .with_qual(
                         QualLabel::HashCond,
-                        self.conditions(&hash, Some(outer_relids))?,
+                        self.conditions(&hash, Some(outer_relids), (false, false))?,
                     )
-                    .with_qual(QualLabel::JoinFilter, self.conditions(&join_filter, None)?)
-                    .with_qual(QualLabel::Filter, self.conditions(&filter, None)?);
+                    .with_qual(
+                        QualLabel::JoinFilter,
+                        self.conditions(&join_filter, None, (false, false))?,
+                    )
+                    .with_qual(
+                        QualLabel::Filter,
+                        self.conditions(&filter, None, (false, false))?,
+                    );
                 plan.push(self.keyed(node, query::instrument::Role::Join, id))?;
                 self.path(plan, outer, depth + 1)?;
                 let inner_path = *self.model.plan.path(inner);
@@ -390,10 +402,23 @@ impl Writer<'_, '_, '_, '_> {
                     .node(join_name("Merge", jointype).as_str(), &path, depth)
                     .with_qual(
                         QualLabel::MergeCond,
-                        self.conditions(&merge, Some(outer_relids))?,
+                        self.conditions(
+                            &merge,
+                            Some(outer_relids),
+                            (
+                                !outer_sort.as_slice().is_empty(),
+                                !inner_sort.as_slice().is_empty(),
+                            ),
+                        )?,
                     )
-                    .with_qual(QualLabel::JoinFilter, self.conditions(&join_filter, None)?)
-                    .with_qual(QualLabel::Filter, self.conditions(&filter, None)?);
+                    .with_qual(
+                        QualLabel::JoinFilter,
+                        self.conditions(&join_filter, None, (false, false))?,
+                    )
+                    .with_qual(
+                        QualLabel::Filter,
+                        self.conditions(&filter, None, (false, false))?,
+                    );
                 plan.push(self.keyed(node, query::instrument::Role::Join, id))?;
                 self.sorted(plan, id, outer, outer_sort, false, 0, depth + 1)?;
                 self.sorted(plan, id, inner, inner_sort, materialize_inner, 1, depth + 1)
@@ -464,7 +489,7 @@ impl Writer<'_, '_, '_, '_> {
         }
         if let Some(sorted) = sorted {
             let mut node = self.node("Sort", &sorted, depth);
-            node.keys = self.sort_keys(&keys, input.relids);
+            node.keys = self.sort_keys(&keys, input.relids)?;
             plan.push(self.keyed(
                 node,
                 |number| query::instrument::Role::MergeSort(number, side),
@@ -562,8 +587,25 @@ impl Writer<'_, '_, '_, '_> {
         super::push_scan(plan, node)
     }
 
-    /// `relation.column`, as the join prints a column.
-    fn column(&self, (table, column): (usize, usize), text: &mut StackStr<512>) {
+    /// `relation.column`, as the join prints a column; an expression
+    /// member as `ruleutils.c` prints the expression.
+    fn column(
+        &self,
+        (table, column): (usize, usize),
+        text: &mut StackStr<512>,
+    ) -> Result<(), SqlError> {
+        if let Some(id) = query::index_paths::joins::Member::plain(0, column as u16).expression_id()
+        {
+            let Some(printed) = self.deparse_as(self.model.expressions[id].expression, false)?
+            else {
+                return Err(crate::sql_err!(
+                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN of this join key expression is not supported"
+                ));
+            };
+            let _ = write!(text, "{}", printed.as_str());
+            return Ok(());
+        }
         let definition = self.scope.defs.stored(table).expect("a plain table");
         // A plan scanning nothing names every relation (`set_rtable_names`
         // with no relations used).
@@ -575,7 +617,7 @@ impl Writer<'_, '_, '_, '_> {
                     definition.columns()[column].name.as_str()
                 )
             );
-            return;
+            return Ok(());
         }
         let _ = write!(
             text,
@@ -583,34 +625,54 @@ impl Writer<'_, '_, '_, '_> {
             crate::sql::catalog::deparse::printed_name(self.scope.names[table]),
             crate::sql::catalog::deparse::printed_name(definition.columns()[column].name.as_str())
         );
+        Ok(())
     }
 
     /// A column as an equality's operand: a type without its own equality
     /// operator prints relabeled to the type whose operator compares it
     /// (`varchar` as `text`, `cidr` as `inet`).
-    fn operand(&self, (table, column): (usize, usize), text: &mut StackStr<512>) {
-        let definition = self.scope.defs.stored(table).expect("a plain table");
-        let relabeled = match definition.columns()[column].ctype {
+    fn operand(
+        &self,
+        (table, column): (usize, usize),
+        text: &mut StackStr<512>,
+    ) -> Result<(), SqlError> {
+        let ctype = match query::index_paths::joins::Member::plain(0, column as u16).expression_id()
+        {
+            Some(id) => self.model.expressions[id].ctype,
+            None => {
+                self.scope
+                    .defs
+                    .stored(table)
+                    .expect("a plain table")
+                    .columns()[column]
+                    .ctype
+            }
+        };
+        let relabeled = match ctype {
             crate::sql::types::ColType::Varchar => Some("text"),
             crate::sql::types::ColType::Cidr => Some("inet"),
             _ => None,
         };
         let Some(relabeled) = relabeled else {
-            self.column((table, column), text);
-            return;
+            return self.column((table, column), text);
         };
         let _ = write!(text, "(");
-        self.column((table, column), text);
+        self.column((table, column), text)?;
         let _ = write!(text, ")::{relabeled}");
+        Ok(())
     }
 
     /// The conditions of `clauses` ANDed, an equality with the column of
     /// `outer` first when given (`get_switched_clauses`), as written
     /// otherwise.
+    /// A merge join's side its own `Sort` orders (`sorted`, outer side
+    /// first) reads an expression key from the sort's target list, which
+    /// prints parenthesized (`get_variable`).
     fn conditions(
         &self,
         clauses: &ClauseList,
         outer: Option<Relids>,
+        sorted: (bool, bool),
     ) -> Result<Option<StackStr<512>>, SqlError> {
         // The constant `true` an outer join clause gave way to
         // (`reconsider_outer_join_clauses`) prints as nothing.
@@ -655,10 +717,24 @@ impl Writer<'_, '_, '_, '_> {
             {
                 core::mem::swap(&mut left, &mut right);
             }
+            let sorted_operand = |side: (usize, usize), sorted: bool, text: &mut StackStr<512>| {
+                let computed = sorted
+                    && query::index_paths::joins::Member::plain(0, side.1 as u16)
+                        .expression_id()
+                        .is_some();
+                if computed {
+                    let _ = write!(text, "(");
+                }
+                self.operand(side, text)?;
+                if computed {
+                    let _ = write!(text, ")");
+                }
+                Ok::<_, SqlError>(())
+            };
             let _ = write!(text, "(");
-            self.operand(left, &mut text);
+            sorted_operand(left, sorted.0, &mut text)?;
             let _ = write!(text, " = ");
-            self.operand(right, &mut text);
+            sorted_operand(right, sorted.1, &mut text)?;
             let _ = write!(text, ")");
         }
         if ids.len() > 1 {
@@ -672,6 +748,16 @@ impl Writer<'_, '_, '_, '_> {
     fn deparse(
         &self,
         expression: &crate::sql::ast::Expr<'_>,
+    ) -> Result<Option<StackStr<512>>, SqlError> {
+        self.deparse_as(expression, true)
+    }
+
+    /// A condition (`qual`), or a value of its own type, as `ruleutils.c`
+    /// prints it in the join, its columns qualified by their relations.
+    fn deparse_as(
+        &self,
+        expression: &crate::sql::ast::Expr<'_>,
+        qual: bool,
     ) -> Result<Option<StackStr<512>>, SqlError> {
         let joined = self
             .arena
@@ -703,11 +789,29 @@ impl Writer<'_, '_, '_, '_> {
             folded: true,
             bare: None,
         };
-        super::deparse_qual(&context, &[expression], self.arena)
+        if qual {
+            return super::deparse_qual(&context, &[expression], self.arena);
+        }
+        let mark = self.arena.mark();
+        let printed = crate::sql::catalog::deparse::deparse_expression(
+            &context,
+            expression,
+            crate::sql::catalog::deparse::Destination::Value,
+            self.arena,
+        )
+        .map(|part| {
+            part.and_then(|part| {
+                let text = StackStr::<512>::from_str(part);
+                (!text.is_truncated()).then_some(text)
+            })
+        });
+        // SAFETY: the text was copied out of the arena.
+        unsafe { self.arena.rewind_to(mark) };
+        printed
     }
 
     /// A sort's keys: each class's first member among `relids`.
-    fn sort_keys(&self, keys: &Keys, relids: Relids) -> PlanKeys {
+    fn sort_keys(&self, keys: &Keys, relids: Relids) -> Result<PlanKeys, SqlError> {
         let mut shown = PlanKeys {
             label: KeyLabel::Sort,
             ..PlanKeys::NONE
@@ -715,15 +819,23 @@ impl Writer<'_, '_, '_, '_> {
         use query::index_paths::joins::{KEY_CLASS, KEY_DESCENDING, KEY_NULLS_FIRST};
         for &key in keys.as_slice() {
             let class = key & KEY_CLASS;
-            let members = self.model.plan.classes[usize::from(class)].members();
-            let Some(at) = members
-                .iter()
-                .position(|member| relids & 1 << member.rel != 0)
-            else {
+            let Some(at) = self.model.plan.classes[usize::from(class)].sort_member(relids) else {
                 continue;
             };
             let mut text = StackStr::<512>::new();
-            self.column(self.model.member(class, at as u8), &mut text);
+            let member = self.model.member(class, at as u8);
+            // An expression a sort computes is its input's target list
+            // entry, which prints parenthesized (`get_variable`).
+            let expression = query::index_paths::joins::Member::plain(0, member.1 as u16)
+                .expression_id()
+                .is_some();
+            if expression {
+                let _ = write!(text, "(");
+            }
+            self.column(member, &mut text)?;
+            if expression {
+                let _ = write!(text, ")");
+            }
             // `show_sortorder_options`.
             let descending = key & KEY_DESCENDING != 0;
             let nulls_first = key & KEY_NULLS_FIRST != 0;
@@ -742,7 +854,7 @@ impl Writer<'_, '_, '_, '_> {
                 let _ = write!(held, "{}", text.as_str());
             }
         }
-        shown
+        Ok(shown)
     }
 }
 

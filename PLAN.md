@@ -1055,27 +1055,40 @@ inputs extend the grouping's pathkeys by the keys most of them share
 (`differential_exact/887`); a query of one relation is planned through the
 same search for either. An `EXPLAIN` showing costs of a scan, aggregate or
 window whose estimates the planner model did not produce fails with
-`0A000` rather than print pos3ql's own figures. Remaining for windows:
-partition or order keys that are expressions, window functions inside
+`0A000` rather than print pos3ql's own figures. A join condition whose
+side is an expression of one relation's columns (`a.k + 1 = b.k`,
+`lower(a.t) = lower(b.t)`) makes the expression a member of its
+equivalence class (`process_equivalence`), computed by its relation's scan:
+it hashes, merges (its sort's key and the `Merge Cond` reading it from the
+sort parenthesized), keys a `Memoize` cache (`(b.w * 2)`), parameterizes an
+index scan of the other side and, through an index on the expression, of
+its own (`match_index_to_operand`, the index's statistics read by
+`examine_variable`), estimated without statistics otherwise
+(`get_variable_numdistinct`, `estimate_num_groups` reading its columns);
+an `ORDER BY`, window partition or order key or ordered aggregate input
+of such an expression sorts by its class, a window's input computing it
+(`make_window_input_target`). A full join's merged `USING` column, or a
+`COALESCE` of its compared columns, equated with a constant equates each
+side with the constant instead (`reconsider_full_join_clause`,
+`differential_exact/888`). Remaining for windows: window functions inside
 expressions or the `ORDER BY`, windows over one relation's groups, the
 merging of window clauses equal once `optimize_window_clauses` frees their
 frames, run conditions (`find_window_run_conditions`, which needs the
 subquery scan below), and `EXPLAIN ANALYZE` of windows over an index scan,
 under a limit directly above them or over a join's groups (`0A000`:
 execution reads the input by its own scan); for presorted aggregates:
-`ORDER BY` or `DISTINCT` inputs that are expressions, and `EXPLAIN
-ANALYZE` of their sort (`0A000`: its tuples' memory is not modeled).
-Remaining for that search: join conditions of
-expressions (`a.k + 1 = b.k`) and conditions over several relations
-other than comparisons of columns (`COALESCE(a.id, 0) < b.id`), an `OR`
+`EXPLAIN ANALYZE` of their sort (`0A000`: its tuples' memory is not modeled).
+Remaining for that search: an equality whose side reads several
+relations (`a.x + b.y = c.z`) and other conditions over several relations
+than comparisons of columns (`COALESCE(a.id, 0) < b.id`, a `COALESCE` no
+full join clause matches), an `OR`
 of join conditions that a semi or anti join evaluates
 (`clauselist_selectivity_or` under `eqjoinsel_semi`), an `OR` join clause
 that an indexed relation's parameterized scan evaluates (as a filter, or
 as a `BitmapOr` of parameterized index scans), a merge join over a partly sorted outer input (`Incremental
 Sort`), a right-nested outer join (`a LEFT JOIN (b JOIN c) ON ...`) and
 derived tables kept as subqueries (`SubqueryScan`), self-join removal
-(`remove_useless_self_joins`), a constant equated with a full join's
-compared column (`reconsider_full_join_clause`) or with an outer join's
+(`remove_useless_self_joins`), a constant equated with an outer join's
 column another outer join nulls, `UPDATE ... FROM` and `DELETE ...
 USING` through the same search, more relations than
 `join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,

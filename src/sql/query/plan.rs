@@ -1140,6 +1140,57 @@ fn routine_cost(e: &Expr, columns: &dyn ColTypeResolver, storage: &Storage, txid
     }
 }
 
+/// Whether the routine a function call runs is strict (`func_strict`):
+/// `None` when the call names no catalog routine.
+pub(crate) fn routine_strict(
+    e: &Expr,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+) -> Option<bool> {
+    let Expr::Call {
+        name,
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        ..
+    } = e
+    else {
+        return None;
+    };
+    let builtin = |oid: i32| {
+        if let Some(slot) = storage.routine_slot_by_oid(oid, txid) {
+            return Some(storage.routine_for(slot, txid).attributes.strict);
+        }
+        crate::sql::catalog::builtin_planner_procedure(oid).map(|routine| routine.strict)
+    };
+    if let Some(oid) = bound_oid {
+        return builtin(*oid);
+    }
+    let mut types = [0; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    if args.len() > types.len() {
+        return None;
+    }
+    for (slot, argument) in types.iter_mut().zip(*args) {
+        *slot = crate::sql::exec::infer_routine_argument_oid(argument, columns).ok()?;
+    }
+    match storage.select_routine_call(
+        name,
+        argument_names,
+        &types[..args.len()],
+        *variadic,
+        txid,
+        crate::storage::RoutineCallKind::Function,
+    ) {
+        crate::storage::RoutineCallSelection::Stored(slot) => {
+            Some(storage.routine_for(slot, txid).attributes.strict)
+        }
+        crate::storage::RoutineCallSelection::Builtin { oid, .. } => builtin(oid),
+        _ => None,
+    }
+}
+
 /// The argument types of the built-in function a call runs, when it runs
 /// one.
 fn builtin_arguments(

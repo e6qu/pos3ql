@@ -189,6 +189,18 @@ pub(crate) fn aggregate_costs<'a>(
         for argument in *args {
             result.transition_per_tuple += charge(argument);
         }
+        // The `ORDER BY` items are the call's arguments too, those no
+        // argument already is as entries of their own
+        // (`transformSortClause` into the `Aggref`'s target list).
+        for (at, order) in order_by.iter().enumerate() {
+            if !args.iter().any(|argument| **argument == *order.expression)
+                && !order_by[..at]
+                    .iter()
+                    .any(|earlier| *earlier.expression == *order.expression)
+            {
+                result.transition_per_tuple += charge(order.expression);
+            }
+        }
         if let Some(filter) = filter {
             result.transition_per_tuple += charge(filter);
         }

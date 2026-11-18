@@ -21,7 +21,12 @@ pub(super) fn join_plan<'a>(
     txid: u32,
     scope: &QueryScope<'_>,
     model: &ModeledJoin<'_>,
-    (sort_keys, presorted, aggregate): (PlanKeys, Option<PlanKeys>, Option<PlanNode>),
+    (sort_keys, presorted, aggregate, group): (
+        PlanKeys,
+        Option<PlanKeys>,
+        Option<PlanNode>,
+        &[PlanNode],
+    ),
     block: query::instrument::BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
@@ -35,13 +40,19 @@ pub(super) fn join_plan<'a>(
         arena,
         top_depth: u8::from(model.plan.upper.limit.is_some())
             + u8::from(model.plan.upper.sort.is_some())
-            + u8::from(aggregate.is_some()),
+            + u8::from(aggregate.is_some())
+            + group.len() as u8,
+        scanned: scanned_rels(&model.plan, model.plan.top),
     };
     // The query's `Limit` and `Sort` above the join, with the target
     // list's width.
     let upper = model.plan.upper;
     let top = model.plan.path(model.plan.top);
-    let width = model.output_width as u32;
+    // Above a grouping the nodes return its groups.
+    let (rows, width) = match upper.group {
+        Some(chosen) => (chosen.rows, chosen.width as u32),
+        None => (top.rows, model.output_width as u32),
+    };
     let mut depth = 0;
     if let Some(node) = aggregate {
         plan.push(PlanNode { depth, ..node })?;
@@ -78,16 +89,13 @@ pub(super) fn join_plan<'a>(
             depth,
             startup_cost: startup,
             total_cost: total,
-            rows: top.rows as u64,
+            rows: rows as u64,
             width,
             keys: sort_keys,
             output_unprintable: true,
             ..PlanNode::EMPTY
         };
         if let Some(prefix) = presorted {
-            // Its groups' sort methods and memory are not modeled.
-            node.analyze_unsupported =
-                Some("EXPLAIN ANALYZE of an incremental sort of a join's rows is not supported");
             node = node
                 .with_qual(
                     QualLabel::PresortedKey,
@@ -99,6 +107,10 @@ pub(super) fn join_plan<'a>(
                 );
         }
         plan.push(node)?;
+        depth += 1;
+    }
+    for node in group {
+        plan.push(PlanNode { depth, ..*node })?;
         depth += 1;
     }
     writer.path(&mut plan, model.plan.top, depth)?;
@@ -114,6 +126,26 @@ struct Writer<'w, 'm, 's, 'a> {
     arena: &'a Arena,
     /// The depth of the join's top node, below the query's own.
     top_depth: u8,
+    /// The relations some node scans: when there are any, a column of
+    /// another (a dummy relation's) prints without its relation's name, as
+    /// EXPLAIN names only the range table entries the plan scans.
+    scanned: Relids,
+}
+
+/// The base relations the plan under path `id` scans.
+pub(super) fn scanned_rels(plan: &query::index_paths::joins::JoinPlan<'_>, id: u32) -> Relids {
+    match plan.path(id).kind {
+        PathKind::Dummy => 0,
+        PathKind::Scan { rel, .. } => 1 << rel,
+        PathKind::Material { input }
+        | PathKind::Unique { input, .. }
+        | PathKind::Memoize { input, .. } => scanned_rels(plan, input),
+        PathKind::NestLoop { outer, inner, .. }
+        | PathKind::HashJoin { outer, inner, .. }
+        | PathKind::MergeJoin { outer, inner, .. } => {
+            scanned_rels(plan, outer) | scanned_rels(plan, inner)
+        }
+    }
 }
 
 impl Writer<'_, '_, '_, '_> {
@@ -538,6 +570,18 @@ impl Writer<'_, '_, '_, '_> {
     /// `relation.column`, as the join prints a column.
     fn column(&self, (table, column): (usize, usize), text: &mut StackStr<512>) {
         let definition = self.scope.defs.stored(table).expect("a plain table");
+        // A plan scanning nothing names every relation (`set_rtable_names`
+        // with no relations used).
+        if self.scanned != 0 && self.scanned & 1 << table == 0 {
+            let _ = write!(
+                text,
+                "{}",
+                crate::sql::catalog::deparse::printed_name(
+                    definition.columns()[column].name.as_str()
+                )
+            );
+            return;
+        }
         let _ = write!(
             text,
             "{}.{}",
@@ -618,10 +662,15 @@ impl Writer<'_, '_, '_, '_> {
         let joined = self
             .arena
             .alloc_slice_with(self.scope.n, |table| {
-                crate::sql::catalog::deparse::Joined::new(
+                let mut joined = crate::sql::catalog::deparse::Joined::new(
                     self.scope.names[table],
                     self.scope.defs.stored(table).expect("a plain table"),
-                )
+                );
+                // A relation no node scans prints its columns unqualified.
+                if self.scanned != 0 && self.scanned & 1 << table == 0 {
+                    joined.printed = "";
+                }
+                joined
             })
             .map_err(|_| crate::sql::eval::arena_full())?;
         let context = crate::sql::catalog::deparse::Context {
@@ -649,7 +698,9 @@ impl Writer<'_, '_, '_, '_> {
             label: KeyLabel::Sort,
             ..PlanKeys::NONE
         };
-        for &class in keys.as_slice() {
+        use query::index_paths::joins::{KEY_CLASS, KEY_DESCENDING, KEY_NULLS_FIRST};
+        for &key in keys.as_slice() {
+            let class = key & KEY_CLASS;
             let members = self.model.plan.classes[usize::from(class)].members();
             let Some(at) = members
                 .iter()
@@ -659,6 +710,17 @@ impl Writer<'_, '_, '_, '_> {
             };
             let mut text = StackStr::<512>::new();
             self.column(self.model.member(class, at as u8), &mut text);
+            // `show_sortorder_options`.
+            let descending = key & KEY_DESCENDING != 0;
+            let nulls_first = key & KEY_NULLS_FIRST != 0;
+            if descending {
+                let _ = write!(text, " DESC");
+            }
+            if nulls_first && !descending {
+                let _ = write!(text, " NULLS FIRST");
+            } else if !nulls_first && descending {
+                let _ = write!(text, " NULLS LAST");
+            }
             for held in [&mut shown.plain, &mut shown.verbose] {
                 if !held.is_empty() {
                     let _ = write!(held, "{}", super::KEY_SEPARATOR);

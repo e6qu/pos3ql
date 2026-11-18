@@ -42,6 +42,7 @@ pub(crate) use retained::{
 mod routine_contract_tests;
 
 mod setops;
+mod simplehash;
 pub(crate) use cte::{RecursiveChunk, RecursiveCteQuery};
 pub(crate) use setops::describe_set_body;
 pub use setops::set_query;

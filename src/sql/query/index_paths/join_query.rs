@@ -241,9 +241,24 @@ pub(crate) struct ModeledJoin<'a> {
     pub(crate) sort_items: &'a [u8],
     /// The query aggregates the joined rows into one row.
     pub(crate) aggregated: bool,
+    /// The query's `GROUP BY` above the join.
+    pub(crate) group: Option<ModeledGroup<'a>>,
     /// The column each sort key shows: its class's first member the
     /// target list holds.
     pub(crate) sort_shown: &'a [(usize, usize)],
+}
+
+/// How the plan groups the joined rows.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ModeledGroup<'a> {
+    /// A `HashAggregate`, whose groups come back in its hash table's
+    /// order, rather than a `GroupAggregate`.
+    pub(crate) hashed: bool,
+    /// The grouping columns in its `Group Key` order, by their position
+    /// in the `GROUP BY`, each with the direction its sort orders it.
+    pub(crate) keys: &'a [(usize, u8)],
+    /// The buckets the hash table starts with (`build_hash_table`).
+    pub(crate) buckets: usize,
 }
 
 impl<'a> ModeledJoin<'a> {
@@ -709,7 +724,6 @@ pub(crate) fn modeled_join<'a>(
         || !statement.with.is_empty()
         || statement.distinct
         || !statement.distinct_on.is_empty()
-        || !statement.group_by.is_empty()
         || !statement.grouping_sets.is_empty()
         || statement.having.is_some()
         || statement.with_ties
@@ -788,6 +802,7 @@ pub(crate) fn modeled_join<'a>(
     let mut target_cost = 0.0;
     let mut aggregated = false;
     let mut unaggregated = false;
+    let mut computed = false;
     for item in statement.items {
         match item {
             SelectItem::Wildcard(_) if !scope.merged_output().is_empty() => {
@@ -865,6 +880,7 @@ pub(crate) fn modeled_join<'a>(
                         expression_width += entry_width;
                         target_cost += cost;
                         unaggregated = true;
+                        computed = true;
                     }
                     for &(table, column) in vars.as_slice() {
                         output[usize::from(table)] |= 1 << column;
@@ -875,8 +891,55 @@ pub(crate) fn modeled_join<'a>(
             SelectItem::RecordStar(_) => return Ok(None),
         }
     }
+    // The `GROUP BY` columns, once each, which the joined rows return.
+    let grouped = !statement.group_by.is_empty();
+    // A `HAVING` filters the groups by a qualification the grouping's
+    // estimate does not model here.
+    if grouped && statement.having.is_some() {
+        return Ok(None);
+    }
+    let mut group_columns = [(0usize, 0usize); super::joins::MAX_KEYS];
+    let mut group_count = 0;
+    for &expression in statement.group_by {
+        let Some((table, column)) = column_of(scope, expression) else {
+            return Ok(None);
+        };
+        let ctype = scope
+            .defs
+            .stored(table)
+            .map(|def| def.columns()[column].ctype);
+        if column >= 64 || !ctype.is_some_and(joinable) {
+            return Ok(None);
+        }
+        if group_columns[..group_count].contains(&(table, column)) {
+            continue;
+        }
+        if group_count == group_columns.len() {
+            return Ok(None);
+        }
+        group_columns[group_count] = (table, column);
+        group_count += 1;
+        output[table] |= 1 << column;
+        note(table, column);
+    }
+    let group_columns = &group_columns[..group_count];
+    // A grouped query's select list is its grouping columns and
+    // aggregates, and it orders by its grouping columns.
+    if grouped
+        && statement.items.iter().any(|item| match item {
+            SelectItem::Expr { expression, .. } => match column_of(scope, expression) {
+                Some(column) => !group_columns.contains(&column),
+                None => !matches!(expression, Expr::Call { .. }),
+            },
+            _ => true,
+        })
+        || (grouped && computed)
+    {
+        return Ok(None);
+    }
     // A plain aggregate's query returns one row of aggregates.
     if aggregated
+        && !grouped
         && (unaggregated
             || statement
                 .items
@@ -903,7 +966,9 @@ pub(crate) fn modeled_join<'a>(
             txid,
             None,
         )?;
-        let Some((table, column)) = column_of(scope, target) else {
+        let Some((table, column)) =
+            column_of(scope, target).filter(|column| !grouped || group_columns.contains(column))
+        else {
             return Ok(None);
         };
         let ctype = scope
@@ -1150,6 +1215,9 @@ pub(crate) fn modeled_join<'a>(
                     equals_constant(scope, member, value, arena)?,
                 )
             }
+            Placed::Equated { left, right } => {
+                (usize::from(left.rel), equality(scope, left, right, arena)?)
+            }
             Placed::Join(_) => continue,
         };
         restrictions[table] = Some(match restrictions[table] {
@@ -1235,6 +1303,81 @@ pub(crate) fn modeled_join<'a>(
     }; join_tree::MAX_CLASSES];
     extended[..class_count].copy_from_slice(classes);
     let mut class_count = class_count;
+    // `group_pathkeys` (`preprocess_groupclause`,
+    // `make_pathkeys_for_sortclauses`): the grouping columns the `ORDER BY`
+    // leads with, in its order, then the others, each sorted as the first
+    // `ORDER BY` item naming it sorts; a column of a class with a constant
+    // or of an earlier key's class is redundant and leaves the grouping.
+    let mut group_keys = Keys::NONE;
+    let mut group_members = [Member::plain(0, 0); super::joins::MAX_KEYS];
+    let mut group_shown = [((0usize, 0usize), 0u8); super::joins::MAX_KEYS];
+    if grouped {
+        let mut ordered = [((0usize, 0usize), 0u8); super::joins::MAX_KEYS];
+        let mut ordered_count = 0;
+        for &(table, column, flags, _) in &sort_columns[..sort_count] {
+            if !group_columns.contains(&(table, column)) {
+                break;
+            }
+            if !ordered[..ordered_count]
+                .iter()
+                .any(|&(held, _)| held == (table, column))
+            {
+                ordered[ordered_count] = ((table, column), flags);
+                ordered_count += 1;
+            }
+        }
+        for &grouping in group_columns {
+            if ordered[..ordered_count]
+                .iter()
+                .any(|&(held, _)| held == grouping)
+            {
+                continue;
+            }
+            let flags = sort_columns[..sort_count]
+                .iter()
+                .find(|&&(table, column, ..)| (table, column) == grouping)
+                .map_or(0, |&(_, _, flags, _)| flags);
+            ordered[ordered_count] = (grouping, flags);
+            ordered_count += 1;
+        }
+        for &((table, column), flags) in &ordered[..ordered_count] {
+            let member = Member {
+                rel: table as u8,
+                column: column as u16,
+                nulling: nulling_relids[table] & !BASE_RELIDS,
+            };
+            let class = match extended[..class_count]
+                .iter()
+                .position(|class| class.members().contains(&member))
+            {
+                Some(class) => class,
+                None => {
+                    if class_count == extended.len() {
+                        return Ok(None);
+                    }
+                    extended[class_count].members[0] = member;
+                    extended[class_count].count = 1;
+                    class_count += 1;
+                    class_count - 1
+                }
+            };
+            if extended[class].has_const
+                || group_keys
+                    .as_slice()
+                    .iter()
+                    .any(|&key| usize::from(key & KEY_CLASS) == class)
+            {
+                continue;
+            }
+            let at = group_keys.as_slice().len();
+            group_members[at] = member;
+            group_shown[at] = ((table, column), class as u8);
+            let _ = group_keys.push_class(class as u8 | flags);
+        }
+        if group_keys.as_slice().is_empty() {
+            return Ok(None);
+        }
+    }
     let mut sort_keys = Keys::NONE;
     let mut sort_items = [0u8; super::joins::MAX_KEYS];
     let mut sort_shown = [(0usize, 0usize); super::joins::MAX_KEYS];
@@ -1622,7 +1765,11 @@ pub(crate) fn modeled_join<'a>(
                 needed[needed_count] = NeededColumn {
                     rel: table as u8,
                     column: column as u16,
-                    width: f64::from(super::column_width(storage, txid, slot, column)),
+                    width: if prepared.false_relids == 1 << table {
+                        0.0
+                    } else {
+                        f64::from(super::column_width(storage, txid, slot, column))
+                    },
                     needed_by: prepared.needed_by((table as u8, column as u16)) & !(1 << table),
                     output: output[table] & 1 << column != 0,
                 };
@@ -1672,6 +1819,47 @@ pub(crate) fn modeled_join<'a>(
         clause_count += 1;
         Some(clause_count as u8 - 1)
     };
+    // `reduce_unique_semijoins` runs before the base relations' paths: for
+    // a semi join to one relation with a unique index
+    // (`rel_supports_distinctness`), it derives each class's clause from
+    // the first member of the join's left side to the first of the inner
+    // relation, so those clauses take that orientation.
+    for special in &prepared.specials[..prepared.special_count] {
+        let inner = special.min_right;
+        if special.kind != super::joins::SpecialKind::Semi
+            || inner.count_ones() != 1
+            || inner & !BASE_RELIDS != 0
+        {
+            continue;
+        }
+        let Some(paths) = planned_paths[inner.trailing_zeros() as usize] else {
+            continue;
+        };
+        if !paths
+            .indexes
+            .iter()
+            .any(|index| index.catalog.unique && index.catalog.immediate && !index.catalog.partial)
+        {
+            continue;
+        }
+        let joined = special.min_left | inner;
+        for class in 0..class_count as u8 {
+            let held = &classes[usize::from(class)];
+            if held.has_const || held.count <= 1 {
+                continue;
+            }
+            let first = |side: Relids| {
+                held.members().iter().position(|member| {
+                    member.relids() & !joined == 0 && member.relids() & !side == 0
+                })
+            };
+            if let (Some(outer), Some(within)) = (first(special.min_left), first(inner))
+                && derive(class, outer as u8, within as u8).is_none()
+            {
+                return Ok(None);
+            }
+        }
+    }
     let mut base_paths = [&[][..]; MAX_JOIN_RELS];
     let mut base = [BaseRel {
         rows: 0.0,
@@ -1683,11 +1871,32 @@ pub(crate) fn modeled_join<'a>(
     for table in 0..n {
         let rel = rels[table].expect("planned");
         let paths = planned_paths[table].expect("planned");
-        let member_of = |class: u8| {
-            classes[usize::from(class)]
-                .members()
-                .iter()
-                .position(|member| member.relids() == 1 << table)
+        // A dummy relation has no paths and derives no clauses.
+        if prepared.false_relids == 1 << table {
+            base[table] = BaseRel {
+                rows: 0.0,
+                width: 0.0,
+                paths: &[],
+                unique: &[],
+                fixed: paths.fixed,
+            };
+            continue;
+        }
+        // The relation's member of a class: the one of `column`, else its
+        // first.
+        let member_of = |class: u8, column: Option<usize>| {
+            let members = classes[usize::from(class)].members();
+            column
+                .and_then(|column| {
+                    members.iter().position(|member| {
+                        member.relids() == 1 << table && usize::from(member.column) == column
+                    })
+                })
+                .or_else(|| {
+                    members
+                        .iter()
+                        .position(|member| member.relids() == 1 << table)
+                })
         };
         // The clauses a path parameterized by `param` moves into the scan:
         // the outer joins' movable clauses, then one per class.
@@ -1706,7 +1915,7 @@ pub(crate) fn modeled_join<'a>(
                 if held.has_const || held.count <= 1 {
                     continue;
                 }
-                let Some(own) = member_of(class) else {
+                let Some(own) = member_of(class, None) else {
                     continue;
                 };
                 let Some(outer) = held
@@ -1742,7 +1951,7 @@ pub(crate) fn modeled_join<'a>(
                 if held.has_const || held.count <= 1 {
                     continue;
                 }
-                let own = member_of(class).expect("a class of the relation") as u8;
+                let own = member_of(class, Some(column)).expect("a class of the relation") as u8;
                 for (other, member) in held.members().iter().enumerate() {
                     if usize::from(member.rel) != table && derive(class, own, other as u8).is_none()
                     {
@@ -2066,7 +2275,11 @@ pub(crate) fn modeled_join<'a>(
     }
     // The output's width (`apply_scanjoin_target_to_paths`): each output
     // column's, a full join's merged column at its type's.
+    // A dummy relation's columns were never sized (`attr_widths`).
     let column_width = |(table, column): (usize, usize)| {
+        if prepared.false_relids == 1 << table {
+            return 0.0;
+        }
         f64::from(super::column_width(
             storage,
             txid,
@@ -2120,8 +2333,25 @@ pub(crate) fn modeled_join<'a>(
         output_width += column_width(junk);
     }
     output_width += expression_width;
-    // An aggregate's input is each column its arguments read, once.
-    if aggregated {
+    // The groups' width: their grouping columns' and aggregates'.
+    let mut grouped_width = 0.0;
+    if grouped {
+        for item in statement.items {
+            let SelectItem::Expr { expression, .. } = item else {
+                return Ok(None);
+            };
+            grouped_width += match column_of(scope, expression) {
+                Some(column) => column_width(column),
+                None => match target_entry(storage, txid, scope, expression, arena) {
+                    Some((entry_width, _)) => entry_width,
+                    None => return Ok(None),
+                },
+            };
+        }
+    }
+    // An aggregate's input is each column its arguments and the grouping
+    // read, once.
+    if aggregated || grouped {
         output_width = 0.0;
         for (table, &mask) in output.iter().enumerate().take(n) {
             for column in (0..64).filter(|column| mask & 1 << column != 0) {
@@ -2129,6 +2359,41 @@ pub(crate) fn modeled_join<'a>(
             }
         }
     }
+    // The aggregates' costs (`get_agg_clause_costs`).
+    let mut problem_group_aggregates = None;
+    let group = if grouped {
+        let expressions = arena
+            .alloc_slice_with(statement.items.len(), |at| match statement.items[at] {
+                SelectItem::Expr { expression, .. } => expression,
+                _ => &Expr::Null,
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let columns = crate::sql::query::CatalogScopeCols {
+            scope,
+            outer: None,
+            storage,
+            txid,
+            arena,
+        };
+        let Some(aggregates) = super::aggregate_costs(expressions, storage, txid, &columns, arena)?
+        else {
+            return Ok(None);
+        };
+        problem_group_aggregates = Some(aggregates);
+        Some(super::joins::GroupProblem {
+            keys: group_keys,
+            sort: sort_keys,
+            members: group_members,
+            aggregates,
+            input_width: output_width,
+            output_width: grouped_width,
+            hashable: true,
+            hashagg: value("enable_hashagg") != 0.0,
+            group_by_reordering: value("enable_group_by_reordering") != 0.0,
+        })
+    } else {
+        None
+    };
     let reader = RelStatistics {
         planners: &planners,
         rels: &base,
@@ -2144,12 +2409,14 @@ pub(crate) fn modeled_join<'a>(
         foreign_keys: &foreign_keys[..foreign_count],
         removed,
         upper: super::joins::UpperProblem {
-            sort: sort_keys,
+            sort: if grouped { group_keys } else { sort_keys },
             limit,
             width: output_width,
             target_cost,
+            group,
         },
         dummy: prepared.contradictory,
+        false_relids: prepared.false_relids,
         settings: JoinSettings {
             costs,
             work_mem_bytes: f64::from(crate::sql::guc::work_mem_kilobytes()) * 1024.0,
@@ -2229,6 +2496,60 @@ pub(crate) fn modeled_join<'a>(
             return Ok(None);
         }
     }
+    // The grouping the plan chose: its keys as the `GROUP BY` names them.
+    let modeled_group = match plan.upper.group {
+        Some(chosen) => {
+            let keys = arena
+                .alloc_slice_with(chosen.keys.as_slice().len(), |at| {
+                    let key = chosen.keys.as_slice()[at];
+                    let (column, _) = group_shown
+                        .iter()
+                        .find(|&&(_, class)| class == key & KEY_CLASS)
+                        .copied()
+                        .expect("a grouping key's column");
+                    let position = statement
+                        .group_by
+                        .iter()
+                        .position(|&expression| column_of(scope, expression) == Some(column))
+                        .expect("a grouping column");
+                    (position, key & !KEY_CLASS)
+                })
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            let type_of = |(table, column): (usize, usize)| {
+                scope.defs.stored(table).expect("plain table").columns()[column].ctype
+            };
+            if chosen.hashed {
+                // A hash table's order needs its keys' hash values, which
+                // only some key types have here.
+                if group_shown[..keys.len()].iter().any(|&(column, _)| {
+                    !matches!(
+                        type_of(column),
+                        ColType::Int2
+                            | ColType::Int4
+                            | ColType::Int8
+                            | ColType::Date
+                            | ColType::Bool
+                            | ColType::Text
+                    )
+                }) {
+                    return Ok(None);
+                }
+            } else if !order_insensitive_aggregates(scope, statement) {
+                // A sorted grouping feeds each group's rows in its sort's
+                // order, which pos3ql's grouping does not reproduce.
+                return Ok(None);
+            }
+            let buckets = problem_group_aggregates.map_or(0, |aggregates| {
+                super::aggregate::hash_agg_buckets(&aggregates, chosen.rows, output_width)
+            });
+            Some(ModeledGroup {
+                hashed: chosen.hashed,
+                keys,
+                buckets,
+            })
+        }
+        None => None,
+    };
     let rels = arena
         .alloc_slice_with(n, |table| rels[table].expect("planned"))
         .map_err(|_| crate::sql::eval::arena_full())?;
@@ -2250,7 +2571,8 @@ pub(crate) fn modeled_join<'a>(
         columns,
         quals,
         output_width,
-        aggregated,
+        aggregated: aggregated && !grouped,
+        group: modeled_group,
         sort_items: arena
             .alloc_slice_copy(&sort_items[..sort_keys.as_slice().len()])
             .map_err(|_| crate::sql::eval::arena_full())?,
@@ -2258,6 +2580,39 @@ pub(crate) fn modeled_join<'a>(
             .alloc_slice_copy(&sort_shown[..sort_keys.as_slice().len()])
             .map_err(|_| crate::sql::eval::arena_full())?,
     }))
+}
+
+/// Whether each aggregate of the select list returns the same result
+/// whatever order its group's rows arrive in: counts, extremes, boolean
+/// aggregates and sums and averages of exact numbers.
+fn order_insensitive_aggregates(scope: &QueryScope<'_>, statement: &Select<'_>) -> bool {
+    for item in statement.items {
+        let SelectItem::Expr {
+            expression: Expr::Call { name, args, .. },
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let insensitive = match *name {
+            "count" | "min" | "max" | "bool_and" | "bool_or" | "every" => true,
+            "sum" | "avg" => args.iter().all(|argument| {
+                column_of(scope, argument).is_some_and(|(table, column)| {
+                    scope.defs.stored(table).is_some_and(|definition| {
+                        matches!(
+                            definition.columns()[column].ctype,
+                            ColType::Int2 | ColType::Int4 | ColType::Int8 | ColType::Numeric
+                        )
+                    })
+                })
+            }),
+            _ => false,
+        };
+        if !insensitive {
+            return false;
+        }
+    }
+    true
 }
 
 /// A select-list expression's average width and its cost per row
@@ -2685,6 +3040,30 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
         Ok(groups.ceil().min(calls).max(1.0))
     }
 
+    fn num_groups(&self, members: &[Member], rows: f64) -> Result<f64, SqlError> {
+        let mut groups = 1.0;
+        let mut done = 0u32;
+        for member in members {
+            if done & 1 << member.rel != 0 {
+                continue;
+            }
+            done |= 1 << member.rel;
+            let mut columns = [0usize; super::joins::MAX_KEYS];
+            let mut count = 0;
+            for other in members.iter().filter(|other| other.rel == member.rel) {
+                columns[count] = usize::from(other.column);
+                count += 1;
+            }
+            groups *= super::paths::relation_groups(
+                self.planner(*member),
+                &columns[..count],
+                self.rels[usize::from(member.rel)].rows,
+            )
+            .0;
+        }
+        Ok(groups.ceil().min(super::clamp_row_est(rows)).max(1.0))
+    }
+
     fn bucket(&self, member: Member, buckets: f64) -> Result<(f64, f64), SqlError> {
         let planner = self.planner(member);
         let variable = planner.variable(usize::from(member.column));
@@ -2718,24 +3097,51 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
         Ok((mcv_frequency, fraction.clamp(1.0e-6, 1.0)))
     }
 
-    fn merge_range(&self, left: Member, right: Member) -> Result<Option<[f64; 4]>, SqlError> {
+    fn merge_range(
+        &self,
+        left: Member,
+        right: Member,
+        descending: bool,
+        nulls_first: bool,
+    ) -> Result<Option<[f64; 4]>, SqlError> {
         let (first, second) = (self.planner(left), self.planner(right));
         let (left_column, right_column) = (usize::from(left.column), usize::from(right.column));
         let mut range = [0.0, 1.0, 0.0, 1.0];
-        let (Some((left_min, left_max)), Some((right_min, right_max))) = (
+        let (Some((left_low, left_high)), Some((right_low, right_high))) = (
             self.range(first, left_column)?,
             self.range(second, right_column)?,
         ) else {
             return Ok(Some(range));
         };
+        // Merged descending, each side starts at its maximum: the ranges
+        // swap ends and the comparisons turn to `>=` and `>`.
+        let (left_min, left_max, right_min, right_max, end_op, start_op) = if descending {
+            (
+                left_high,
+                left_low,
+                right_high,
+                right_low,
+                Comparison::Ge,
+                Comparison::Gt,
+            )
+        } else {
+            (
+                left_low,
+                left_high,
+                right_low,
+                right_high,
+                Comparison::Le,
+                Comparison::Lt,
+            )
+        };
         let default = super::DEFAULT_INEQ_SEL;
         let selectivity = |planner: &Planner<'_, '_>, column, comparison, value| {
             planner.inequality_selectivity(column, comparison, value)
         };
-        let Ok(left_end) = selectivity(first, left_column, Comparison::Le, right_max)? else {
+        let Ok(left_end) = selectivity(first, left_column, end_op, right_max)? else {
             return Ok(None);
         };
-        let Ok(right_end) = selectivity(second, right_column, Comparison::Le, left_max)? else {
+        let Ok(right_end) = selectivity(second, right_column, end_op, left_max)? else {
             return Ok(None);
         };
         if left_end != default {
@@ -2752,10 +3158,10 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
             range[1] = 1.0;
             range[3] = 1.0;
         }
-        let Ok(left_start) = selectivity(first, left_column, Comparison::Lt, right_min)? else {
+        let Ok(left_start) = selectivity(first, left_column, start_op, right_min)? else {
             return Ok(None);
         };
-        let Ok(right_start) = selectivity(second, right_column, Comparison::Lt, left_min)? else {
+        let Ok(right_start) = selectivity(second, right_column, start_op, left_min)? else {
             return Ok(None);
         };
         if left_start != default {
@@ -2771,6 +3177,14 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
         } else {
             range[0] = 0.0;
             range[2] = 0.0;
+        }
+        // NULLs sorted first come before every value.
+        if nulls_first {
+            for (planner, column, at) in [(first, left_column, 0), (second, right_column, 2)] {
+                let nulls = planner.variable(column).null_fraction;
+                range[at] = (range[at] + nulls).clamp(0.0, 1.0);
+                range[at + 1] = (range[at + 1] + nulls).clamp(0.0, 1.0);
+            }
         }
         if range[0] >= range[1] {
             range[0] = 0.0;

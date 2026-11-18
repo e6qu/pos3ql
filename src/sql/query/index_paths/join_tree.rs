@@ -244,6 +244,9 @@ pub(crate) enum Placed {
     /// `member = constant` of a class with a constant
     /// (`generate_base_implied_equalities_const`).
     Implied { member: Member, class: u8 },
+    /// `left = right` of two columns of one relation a class equates
+    /// (`generate_base_implied_equalities_no_const`).
+    Equated { left: Member, right: Member },
     /// A join clause.
     Join(JoinQual),
 }
@@ -284,6 +287,11 @@ pub(crate) struct Prepared {
     /// A class equates two different constants in the query's join
     /// domain: the query returns no rows.
     pub(crate) contradictory: bool,
+    /// The base relations a class equating two different constants
+    /// inside an outer join empties (`get_join_domain_min_rels`): one
+    /// relation is dummy, several make the join of them dummy; 0 when no
+    /// class does.
+    pub(crate) false_relids: Relids,
 }
 
 impl Prepared {
@@ -316,6 +324,7 @@ impl Prepared {
             let keep = match &mut entry {
                 Placed::Restriction { rel, .. } => 1 << *rel & info.min_right == 0,
                 Placed::Implied { member, .. } => member.relids() & gone == 0,
+                Placed::Equated { left, .. } => left.relids() & gone == 0,
                 Placed::Join(join) if join.required & gone == 0 && join.relids & gone == 0 => true,
                 Placed::Join(join) => {
                     if join.relids & info.min_right != 0
@@ -459,12 +468,17 @@ struct Prep<'t> {
     /// Each node's join domain (`JoinDomain`): the query's is 0.
     domain: [u8; MAX_NODES],
     domain_count: u8,
+    /// The node each join domain holds the relations of (`jd_relids`):
+    /// a left or anti join's nullable side, a full join's side; `None`
+    /// for the query's and a full join's quals' domain.
+    domain_root: [Option<u8>; MAX_NODES],
     /// The join lists: each list's elements, a negative entry naming a
     /// nested list by `-(index + 1)`.
     lists: [[i8; MAX_JOIN_RELS]; MAX_NODES],
     list_len: [u8; MAX_NODES],
     list_count: usize,
     contradictory: bool,
+    false_relids: Relids,
 }
 
 const FULL: Outside = "a query beyond the join preparation's capacity";
@@ -530,10 +544,12 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         full_count: 0,
         domain: [0; MAX_NODES],
         domain_count: 1,
+        domain_root: [None; MAX_NODES],
         lists: [[0; MAX_JOIN_RELS]; MAX_NODES],
         list_len: [0; MAX_NODES],
         list_count: 0,
         contradictory: false,
+        false_relids: 0,
     };
     for (at, node) in tree.nodes[..tree.node_count].iter().enumerate() {
         if let TreeNode::Join {
@@ -595,7 +611,7 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
                     *right = canonical(&prep, *right);
                 }
             }
-            Placed::Restriction { .. } => {}
+            Placed::Restriction { .. } | Placed::Equated { .. } => {}
         }
     }
     Ok(Prepared {
@@ -611,6 +627,7 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         needed: prep.needed,
         needed_count: prep.needed_count,
         contradictory: prep.contradictory,
+        false_relids: prep.false_relids,
     })
 }
 
@@ -761,6 +778,7 @@ impl Prep<'_> {
                 match self.kinds[at] {
                     Some(TreeJoin::Left | TreeJoin::Anti) => {
                         let child = self.next_domain();
+                        self.domain_root[usize::from(child)] = Some(right);
                         self.domain[at] = child;
                         self.assign_domains(left, domain);
                         self.assign_domains(right, child);
@@ -768,8 +786,10 @@ impl Prep<'_> {
                     Some(TreeJoin::Full) => {
                         self.domain[at] = self.next_domain();
                         let left_domain = self.next_domain();
+                        self.domain_root[usize::from(left_domain)] = Some(left);
                         self.assign_domains(left, left_domain);
                         let right_domain = self.next_domain();
+                        self.domain_root[usize::from(right_domain)] = Some(right);
                         self.assign_domains(right, right_domain);
                     }
                     _ => {
@@ -1687,13 +1707,49 @@ impl Prep<'_> {
     /// A class equating two different constants: their constant false
     /// equality (`generate_base_implied_equalities_const`) empties the
     /// query when it holds in the query's own join domain, whose join
-    /// then is a dummy relation.
+    /// then is a dummy relation. Inside an outer join it is a gating
+    /// condition of the domain's relations apart from the nullable sides
+    /// of the left joins within (`get_join_domain_min_rels`).
     fn contradiction(&mut self, domain: u8) -> Result<(), Outside> {
-        if domain != 0 {
-            return Err("an equivalence class of two constants inside an outer join");
+        if domain == 0 {
+            self.contradictory = true;
+            return Ok(());
         }
-        self.contradictory = true;
+        let Some(root) = self.domain_root[usize::from(domain)] else {
+            return Err("an equivalence class of two constants in a full join's condition");
+        };
+        let relids = self.min_rels(root)?;
+        if relids == 0 || (self.false_relids != 0 && self.false_relids != relids) {
+            return Err("equivalence classes of two constants inside different outer joins");
+        }
+        self.false_relids = relids;
         Ok(())
+    }
+
+    /// The base relations under `node` apart from the nullable sides of
+    /// the left joins there.
+    fn min_rels(&self, node: u8) -> Result<Relids, Outside> {
+        let at = usize::from(node);
+        match self.tree.nodes[at] {
+            TreeNode::Rel(table) => Ok(1 << table),
+            TreeNode::From { first, count } => {
+                let mut relids = 0;
+                for position in 0..usize::from(count) {
+                    relids |= self.min_rels(self.tree.children[usize::from(first) + position])?;
+                }
+                Ok(relids)
+            }
+            TreeNode::Join { .. } => {
+                let (left, right) = self.sides[at];
+                match self.kinds[at] {
+                    Some(TreeJoin::Left) => self.min_rels(left),
+                    Some(TreeJoin::Inner) | None => {
+                        Ok(self.min_rels(left)? | self.min_rels(right)?)
+                    }
+                    _ => Err("an equivalence class of two constants above a full or anti join"),
+                }
+            }
+        }
     }
 
     /// `initialize_mergeclause_eclasses`: each side's class, a new
@@ -1864,12 +1920,20 @@ impl Prep<'_> {
             if members.len() <= 1 {
                 continue;
             }
-            if members.iter().enumerate().any(|(position, member)| {
-                members[..position]
-                    .iter()
-                    .any(|other| other.rel == member.rel)
-            }) {
-                return Err("an equivalence class of two columns of one relation");
+            // Each plain member equated with the relation's previous one.
+            let mut previous = [None::<Member>; MAX_JOIN_RELS];
+            for &member in members {
+                if member.nulling != 0 {
+                    continue;
+                }
+                let rel = usize::from(member.rel);
+                if let Some(left) = previous[rel] {
+                    self.place(Placed::Equated {
+                        left,
+                        right: member,
+                    })?;
+                }
+                previous[rel] = Some(member);
             }
             let relids = held.class.relids();
             for &member in members {

@@ -989,23 +989,43 @@ columns the aggregates read (`differential_exact/871`). Such a join's
 `Sort` sorts as `tuplesort` does in memory (quicksort, or past twice a
 limit's rows a bounded heap), and its `Incremental Sort` sorts batches of
 its input's groups as `ExecIncrementalSort` does, so rows with equal keys
-come back in PostgreSQL's order; `EXPLAIN ANALYZE` of such an incremental
-sort, whose group figures are not modeled, fails with `0A000`. Remaining
-for that search: a merge join ordered descending or with NULLs first (a
-descending `ORDER BY` of a merge join's class), `ORDER BY` expressions,
-grouping, `DISTINCT`, window functions and a `LIMIT` above an aggregate,
-which keep pos3ql's join order, join conditions of expressions or of two types
+come back in PostgreSQL's order; `EXPLAIN ANALYZE` prints its full-sort
+and presorted groups' counts, methods and average and peak memory
+(`instrumentSortedGroup`), and under a limit the join below it stops once
+the sort has read the rows it returns (`differential_exact/875`). A
+semi join's inner relation made unique by an index derives its class
+clauses from the outer relation to the inner one, as
+`reduce_unique_semijoins` orients them (`differential_exact/873`). Merge
+joins also run descending or with NULLs first, as a descending `ORDER BY`
+asks of their class (`MJCompare`, `mergejoinscansel` with the direction,
+`differential_exact/874`). A class equating two constants inside an outer
+join's domain empties only that domain's relations, apart from lower left
+joins' nullable sides (`get_join_domain_min_rels`): one relation becomes a
+dummy `Result` whose columns print unqualified, several make their join
+dummy (`populate_joinrel_with_paths`, `differential_exact/876`). A class
+may hold two columns of one relation, which becomes a restriction
+comparing them (`generate_base_implied_equalities_no_const`,
+`differential_exact/877`). A `GROUP BY` of plain columns without `HAVING`
+groups the join's rows as `add_paths_to_grouping_rel` plans it: a
+`HashAggregate` over the cheapest path, returning its groups in the order
+`ExecAgg` walks its `simplehash` table, or a `GroupAggregate` over the
+join sorted (fully or incrementally) by the grouping keys, which take the
+`ORDER BY`'s leading keys' order and directions (`preprocess_groupclause`,
+`group_keys_reorder_by_pathkeys`), sized by `estimate_num_groups`, with
+the sort and limit over the groups (`differential_exact/878`); a sorted
+grouping's aggregates whose result depends on their input order, and
+hashing keys of types other than integers, `date`, `bool` and `text`,
+keep pos3ql's join order. Remaining for that search: `ORDER BY`
+expressions, `HAVING`, `DISTINCT`, window functions and a `LIMIT` above
+a plain aggregate, which keep pos3ql's join order, join conditions of expressions or of two types
 (`a.int4col = b.int8col`, which PostgreSQL also merges into a class), an
 `OR` whose arm is an `AND` (`extract_restriction_or_clauses`) or that a
-semi or anti join or an indexed relation's parameterized scan evaluates, a
-class holding two columns of one relation
-(`ON a.k = b.k AND a.v = b.k`), a merge join over a partly sorted outer
+semi or anti join or an indexed relation's parameterized scan evaluates, a merge join over a partly sorted outer
 input (`Incremental Sort`), parenthesized joins (pulled up as
 `pull_up_subqueries` flattens them), self-join removal
 (`remove_useless_self_joins`), a constant equated with a full join's
 compared column (`reconsider_full_join_clause`) or with an outer join's
-column another outer join nulls, a class with two constants inside an
-outer join (a dummy inner relation), derived tables, `UPDATE ...
+column another outer join nulls, derived tables, `UPDATE ...
 FROM` and `DELETE ... USING` through the same search, more relations than
 `join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,
 not ported; such queries keep pos3ql's join order and refuse cost output

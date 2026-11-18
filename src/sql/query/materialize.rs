@@ -3350,9 +3350,6 @@ pub(crate) fn materialized_stages(limited: bool) -> instrument::Stages {
     stages
 }
 
-/// DISTINCT / ORDER BY execution to the wire: materialize the rows, then page
-/// with LIMIT/OFFSET and emit.
-#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 /// Whether the ordered query reads a join PostgreSQL's join search plans,
 /// whose rows the in-memory path orders as PostgreSQL's tuplesort does
 /// (`pg_tuplesort`, `pg_incremental_sort`): a spilling sort's order of
@@ -3375,6 +3372,9 @@ pub(crate) fn sorts_modeled_join<'a>(
         .is_some())
 }
 
+/// DISTINCT / ORDER BY execution to the wire: materialize the rows, then page
+/// with LIMIT/OFFSET and emit.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(crate) fn materialized_select<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,

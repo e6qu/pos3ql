@@ -18558,6 +18558,16 @@ fn pg_stats<'a>(
                 )?,
                 None => (Datum::Null, Datum::Null, Datum::Null, Datum::Null),
             };
+            let (common_elements, element_frequencies, element_counts) = match table_definition
+                .attributes
+                .number(column)
+                .and_then(|attribute| statistics.index_distribution(key, attribute))
+            {
+                Some(distribution) => {
+                    statistics_element_slots(distribution, metadata.ctype, arena)?
+                }
+                None => (Datum::Null, Datum::Null, Datum::Null),
+            };
             rows[count] = row(
                 &[
                     text(table_definition.schema.as_str(), arena)?,
@@ -18571,9 +18581,9 @@ fn pg_stats<'a>(
                     frequencies,
                     histogram,
                     correlation,
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Null,
+                    common_elements,
+                    element_frequencies,
+                    element_counts,
                     Datum::Null,
                     Datum::Null,
                     Datum::Null,
@@ -18767,6 +18777,52 @@ fn statistics_slots<'a>(
         .correlation()
         .map_or(Datum::Null, Datum::Float4);
     Ok((most_common, frequencies, histogram, correlation))
+}
+
+/// `pg_stats`' `most_common_elems`, `most_common_elem_freqs` and
+/// `elem_count_histogram` of an array column's `distribution`
+/// (`STATISTIC_KIND_MCELEM` and `STATISTIC_KIND_DECHIST`).
+fn statistics_element_slots<'a>(
+    distribution: crate::storage::ColumnDistribution<'_>,
+    ctype: ColType,
+    arena: &'a Arena,
+) -> Result<(Datum<'a>, Datum<'a>, Datum<'a>), SqlError> {
+    use super::types::ArrElem;
+    let ColType::Array(element) = ctype else {
+        return Ok((Datum::Null, Datum::Null, Datum::Null));
+    };
+    let numbers = |count: usize, at: &dyn Fn(usize) -> f32| -> Result<Datum<'a>, SqlError> {
+        if count == 0 {
+            return Ok(Datum::Null);
+        }
+        let values = arena
+            .alloc_slice_with(count, |index| Datum::Float4(at(index)))
+            .map_err(|_| arena_full())?;
+        Ok(Datum::Array {
+            element: ArrElem::Float4,
+            raw: super::array::build(values, arena)?,
+        })
+    };
+    let mut elements = Datum::Null;
+    if distribution.element_len() != 0 {
+        let values = arena
+            .alloc_slice_with(distribution.element_len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (index, value) in values.iter_mut().enumerate() {
+            *value = distribution.element_value(index, element.to_coltype())?;
+        }
+        elements = Datum::Array {
+            element,
+            raw: super::array::build(values, arena)?,
+        };
+    }
+    let frequencies = numbers(distribution.element_numbers_len(), &|index| {
+        distribution.element_frequency(index)
+    })?;
+    let counts = numbers(distribution.element_counts_len(), &|index| {
+        distribution.element_count_number(index)
+    })?;
+    Ok((elements, frequencies, counts))
 }
 
 fn policy_command_name(command: PolicyCommandKind) -> &'static str {
@@ -19505,6 +19561,7 @@ fn pg_stats_ext_exprs<'a>(
             } else {
                 column.distinct_values as f32
             };
+            let mut element_slots = (Datum::Null, Datum::Null, Datum::Null);
             let (most_common, frequencies, histogram, correlation) =
                 match data.expression_distributions[key].distribution() {
                     Some(distribution) => {
@@ -19526,10 +19583,12 @@ fn pg_stats_ext_exprs<'a>(
                                 ctype.name()
                             )
                         })?;
+                        element_slots = statistics_element_slots(distribution, ctype, arena)?;
                         statistics_slots(distribution, ctype, element, arena)?
                     }
                     None => (Datum::Null, Datum::Null, Datum::Null, Datum::Null),
                 };
+            let (common_elements, element_frequencies, element_counts) = element_slots;
             rows[count] = row(
                 &[
                     text(table.schema.as_str(), arena)?,
@@ -19555,9 +19614,9 @@ fn pg_stats_ext_exprs<'a>(
                     frequencies,
                     histogram,
                     correlation,
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Null,
+                    common_elements,
+                    element_frequencies,
+                    element_counts,
                 ],
                 arena,
             )?;

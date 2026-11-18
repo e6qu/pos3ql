@@ -329,10 +329,48 @@ pub(crate) fn raw_value_length(value: &Datum<'_>) -> usize {
                 (if short { 2 } else { 4 }) + 2 * number.ndigits()
             }
         }
+        Datum::Array { element, raw } => array_data_length(*element, raw),
         other => {
             crate::storage::rowenc::encoded_len(core::slice::from_ref(other)).saturating_sub(3)
         }
     }
+}
+
+/// The bytes of a PostgreSQL array after its four-byte varlena header
+/// (`ARR_OVERHEAD_*`: the type, flags, dimensions and lower bounds, a null
+/// bitmap when an element is NULL, then each non-NULL element at its type's
+/// alignment, a varlena with its four-byte header).
+fn array_data_length(element: crate::sql::types::ArrElem, raw: &[u8]) -> usize {
+    let ctype = element.to_coltype();
+    let layout = ctype.physical_layout();
+    let align = match layout.alignment {
+        b'd' => 8,
+        b'i' => 4,
+        b's' => 2,
+        _ => 1,
+    };
+    let count = crate::sql::array::len(raw);
+    let dimensions = crate::sql::array::shape(raw).map_or(1, |shape| shape.dimension_count());
+    let mut nulls = false;
+    let mut data = 0usize;
+    for index in 0..count {
+        let value = crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null);
+        if value.is_null() {
+            nulls = true;
+            continue;
+        }
+        data = data.next_multiple_of(align)
+            + if layout.length > 0 {
+                layout.length as usize
+            } else {
+                raw_value_length(&value) + 4
+            };
+        data = data.next_multiple_of(align);
+    }
+    // The 16-byte header counts the varlena header, which `raw` excludes.
+    let header =
+        (16 + 8 * dimensions + if nulls { count.div_ceil(8) } else { 0 }).next_multiple_of(8) - 4;
+    header + data
 }
 
 /// `VARSIZE_ANY` of a stored value of `raw` data bytes: a one-byte header

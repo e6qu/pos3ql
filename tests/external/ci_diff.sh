@@ -273,7 +273,6 @@ data_dir = ${WORK}/p3data
 object_store = off
 log_format = text
 max_tables = 64
-max_domains = 64
 max_indexes = 64
 max_extended_statistics = 512
 max_views = 64
@@ -1651,20 +1650,40 @@ run_corpus() { # host port outfile file diagnostics
     --stderr "$3.stderr" --input-diagnostics verbose --diagnostics "$diagnostics" \
     > "$3" || return 1
 }
+# One reset statement. Dropping what an earlier CASCADE already removed is
+# not an error (every statement is IF EXISTS); any other failure aborts the
+# run, naming the statement, so a server that cannot drop an object cannot
+# leak it into later fixtures unnoticed.
+reset_exec() { # host port statement
+  local output
+  if ! output=$(psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
+    -v ON_ERROR_STOP=1 -c "$3" 2>&1 >/dev/null); then
+    printf 'FAIL: reset statement failed on %s:%s\n  %s\n%s\n' "$1" "$2" "$3" "$output" >&2
+    exit 1
+  fi
+}
+# The rows of a reset query (one statement per line).
+reset_rows() { # host port query [psql options...]
+  local host=$1 port=$2 query=$3
+  shift 3
+  psql -h "$host" -p "$port" -U "$PGUSER" -d postgres -X -A -t -q \
+    -v ON_ERROR_STOP=1 "$@" -c "$query" || {
+    printf 'FAIL: reset query failed on %s:%s\n  %s\n' "$host" "$port" "$query" >&2
+    exit 1
+  }
+}
 reset_user_extensions() { # host port
-  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -c "SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname DESC" |
+  local extension rows
+  rows=$(reset_rows "$1" "$2" "SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname DESC") || exit 1
   while IFS= read -r extension; do
     [[ -z "$extension" ]] && continue
     extension=${extension//\"/\"\"}
-    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
-      -c "DROP EXTENSION \"$extension\" CASCADE" >/dev/null 2>&1
-  done
+    reset_exec "$1" "$2" "DROP EXTENSION IF EXISTS \"$extension\" CASCADE"
+  done <<<"$rows"
 }
 reset_user_routines() { # host port
-  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -F $'\t' \
-    -c "SELECT p.oid::regprocedure, p.prokind FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')" |
+  local routine kind drop rows
+  rows=$(reset_rows "$1" "$2" "SELECT p.oid::regprocedure, p.prokind FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')" -F $'\t') || exit 1
   while IFS=$'\t' read -r routine kind; do
     [[ -z "$routine" ]] && continue
     case "$kind" in
@@ -1672,14 +1691,12 @@ reset_user_routines() { # host port
     p) drop='DROP PROCEDURE' ;;
     *) drop='DROP FUNCTION' ;;
     esac
-    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
-      -c "$drop $routine CASCADE" >/dev/null 2>&1
-  done
+    reset_exec "$1" "$2" "$drop IF EXISTS $routine CASCADE"
+  done <<<"$rows"
 }
 reset_user_relations() { # host port
-  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -F $'\t' \
-    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S', 'f')" |
+  local schema relation relkind drop rows
+  rows=$(reset_rows "$1" "$2" "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S', 'f') AND NOT (c.relkind = 'S' AND EXISTS (SELECT 1 FROM pg_depend AS d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')))" -F $'\t') || exit 1
   while IFS=$'\t' read -r schema relation relkind; do
     [[ -z "$relation" ]] && continue
     schema=${schema//\"/\"\"}
@@ -1691,13 +1708,12 @@ reset_user_relations() { # host port
     S) drop='DROP SEQUENCE' ;;
     f) drop='DROP FOREIGN TABLE' ;;
     *)
-      printf 'FAIL: unexpected reset relation kind %q\n' "$relkind"
-      return 1
+      printf 'FAIL: unexpected reset relation kind %q\n' "$relkind" >&2
+      exit 1
       ;;
     esac
-    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
-      -c "$drop \"$schema\".\"$relation\" CASCADE" >/dev/null 2>&1
-  done
+    reset_exec "$1" "$2" "$drop IF EXISTS \"$schema\".\"$relation\" CASCADE"
+  done <<<"$rows"
 }
 # Schemas, standalone types, public collations, foreign-data wrappers and
 # roles a fixture leaves behind would otherwise collide with a later fixture's
@@ -1706,12 +1722,12 @@ reset_user_relations() { # host port
 # dropped, so roles that predate the run on a shared reference server survive;
 # pos3ql servers are disposable, so every role it did not bootstrap is dropped.
 reset_user_objects() { # host port role-baseline
-  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -c "SELECT 'DROP FOREIGN DATA WRAPPER ' || quote_ident(fdwname) || ' CASCADE' FROM pg_foreign_data_wrapper UNION ALL SELECT 'DROP SCHEMA ' || quote_ident(nspname) || ' CASCADE' FROM pg_namespace WHERE nspname NOT IN ('public', 'information_schema') AND nspname NOT LIKE 'pg\\_%' UNION ALL SELECT 'DROP TYPE ' || quote_ident(n.nspname) || '.' || quote_ident(t.typname) || ' CASCADE' FROM pg_type AS t JOIN pg_namespace AS n ON n.oid = t.typnamespace WHERE n.nspname = 'public' AND t.typtype IN ('c', 'd', 'e', 'r') AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_class AS c WHERE c.oid = t.typrelid) = 'c') UNION ALL SELECT 'DROP COLLATION ' || quote_ident(n.nspname) || '.' || quote_ident(c.collname) || ' CASCADE' FROM pg_collation AS c JOIN pg_namespace AS n ON n.oid = c.collnamespace WHERE n.nspname = 'public' UNION ALL SELECT 'DROP OWNED BY ' || quote_ident(rolname) || ' CASCADE; DROP ROLE ' || quote_ident(rolname) FROM pg_roles WHERE oid > $3 AND rolname <> current_user" |
+  local statement rows
+  rows=$(reset_rows "$1" "$2" "SELECT 'DROP FOREIGN DATA WRAPPER IF EXISTS ' || quote_ident(fdwname) || ' CASCADE' FROM pg_foreign_data_wrapper UNION ALL SELECT 'DROP SCHEMA IF EXISTS ' || quote_ident(nspname) || ' CASCADE' FROM pg_namespace WHERE nspname NOT IN ('public', 'information_schema') AND nspname NOT LIKE 'pg\\_%' UNION ALL SELECT 'DROP TYPE IF EXISTS ' || quote_ident(n.nspname) || '.' || quote_ident(t.typname) || ' CASCADE' FROM pg_type AS t JOIN pg_namespace AS n ON n.oid = t.typnamespace WHERE n.nspname = 'public' AND t.typtype IN ('c', 'd', 'e', 'r') AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_class AS c WHERE c.oid = t.typrelid) = 'c') UNION ALL SELECT 'DROP COLLATION IF EXISTS ' || quote_ident(n.nspname) || '.' || quote_ident(c.collname) || ' CASCADE' FROM pg_collation AS c JOIN pg_namespace AS n ON n.oid = c.collnamespace WHERE n.nspname = 'public' UNION ALL SELECT 'DROP OWNED BY ' || quote_ident(rolname) || ' CASCADE; DROP ROLE IF EXISTS ' || quote_ident(rolname) FROM pg_roles WHERE oid > $3 AND rolname <> current_user") || exit 1
   while IFS= read -r statement; do
     [[ -z "$statement" ]] && continue
-    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q -c "$statement" >/dev/null 2>&1
-  done
+    reset_exec "$1" "$2" "$statement"
+  done <<<"$rows"
 }
 role_baseline() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q -c "SELECT max(oid) FROM pg_roles"

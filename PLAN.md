@@ -978,8 +978,11 @@ useful for it (`truncate_useless_pathkeys`, `right_merge_direction`,
 `select_outer_pathkeys_for_merge`), a limit makes every relation weigh
 startup cost (`consider_startup`), and the joined relation's paths are
 kept presorted, sorted or incrementally sorted (`create_ordered_paths`)
-under a `Limit` (`create_limit_path`), the cheapest of those running
-(`differential_exact/870`). The select list's expressions cost each joined
+under a `Limit` (`create_limit_path`), the cheapest of those running,
+each sort key shown as its class's first member the target list holds
+(`prepare_sort_from_pathkeys`, `differential_exact/870`). A one-table
+query's `Sort Key` drops a key of a column an earlier key orders, as its
+redundant pathkey. The select list's expressions cost each joined
 row (`create_projection_path`), and a select list of plain aggregates
 runs an `Aggregate` over the join's cheapest path, the join returning the
 columns the aggregates read (`differential_exact/871`). Such a join's

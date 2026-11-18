@@ -6445,6 +6445,25 @@ fn plan_pulled_select<'a>(
                 order[usize::from(model.sort_items[at])]
             })
             .map_err(|_| arena_full())?;
+        // Each key shows its class's first member the target list holds.
+        for (key, &(table, column)) in sorted.iter_mut().zip(model.sort_shown) {
+            let Some(definition) = scope.defs.stored(table) else {
+                continue;
+            };
+            let name = arena
+                .alloc_str_display(format_args!(
+                    "{}",
+                    definition.columns()[column].name.as_str()
+                ))
+                .map_err(|_| arena_full())?;
+            key.0 = arena
+                .alloc(Expr::Column {
+                    qualifier: Some(scope.names[table]),
+                    name,
+                })
+                .map_err(|_| arena_full())?;
+        }
+        let sorted: &[KeyItem<'_>] = sorted;
         let sort_keys = plan_keys(
             storage,
             txid,
@@ -7288,7 +7307,28 @@ fn plan_pulled_select<'a>(
             .map_err(|_| arena_full())?;
         let mut count = 0;
         for key in keys {
-            if !constant_fixed_key(statement, key.0, storage, txid, arena)? {
+            // A key of a column an earlier key orders is redundant too.
+            let repeated = kept[..count].iter().flatten().any(|earlier: &KeyItem<'_>| {
+                *earlier.0 == *key.0
+                    || match (earlier.0, key.0, scope.as_ref()) {
+                        (
+                            Expr::Column {
+                                qualifier: one,
+                                name: first,
+                            },
+                            Expr::Column {
+                                qualifier: two,
+                                name: second,
+                            },
+                            Some(scope),
+                        ) => matches!(
+                            (scope.find_column(*one, first), scope.find_column(*two, second)),
+                            (Ok(left), Ok(right)) if left == right
+                        ),
+                        _ => false,
+                    }
+            });
+            if !repeated && !constant_fixed_key(statement, key.0, storage, txid, arena)? {
                 kept[count] = Some(*key);
                 count += 1;
             }

@@ -241,6 +241,9 @@ pub(crate) struct ModeledJoin<'a> {
     pub(crate) sort_items: &'a [u8],
     /// The query aggregates the joined rows into one row.
     pub(crate) aggregated: bool,
+    /// The column each sort key shows: its class's first member the
+    /// target list holds.
+    pub(crate) sort_shown: &'a [(usize, usize)],
 }
 
 impl<'a> ModeledJoin<'a> {
@@ -1234,6 +1237,7 @@ pub(crate) fn modeled_join<'a>(
     let mut class_count = class_count;
     let mut sort_keys = Keys::NONE;
     let mut sort_items = [0u8; super::joins::MAX_KEYS];
+    let mut sort_shown = [(0usize, 0usize); super::joins::MAX_KEYS];
     for &(table, column, flags, item) in &sort_columns[..sort_count] {
         let member = Member {
             rel: table as u8,
@@ -1263,6 +1267,60 @@ pub(crate) fn modeled_join<'a>(
         {
             continue;
         }
+        // The sort shows the first target list entry its class holds
+        // (`prepare_sort_from_pathkeys`).
+        let in_class = |(table, column): (usize, usize)| {
+            extended[class].members().iter().any(|held| {
+                (usize::from(held.rel), usize::from(held.column)) == (table, column)
+                    && held.nulling == nulling_relids[table] & !BASE_RELIDS
+            })
+        };
+        let mut shown_member = None;
+        for item in statement.items {
+            let found = match item {
+                SelectItem::Wildcard(_) if !scope.merged_output().is_empty() => {
+                    scope.merged_output().iter().find_map(|&entry| match entry {
+                        ResolvedColumn::Table(table, column) => {
+                            Some((table, column)).filter(|&entry| in_class(entry))
+                        }
+                        ResolvedColumn::Merged(merged) => match merged_parts(merged) {
+                            &[part] => Some(part).filter(|&part| in_class(part)),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                }
+                SelectItem::Wildcard(_) => (0..n).find_map(|table| {
+                    (0..width(table))
+                        .map(|column| (table, column))
+                        .find(|&entry| in_class(entry))
+                }),
+                SelectItem::TableWildcard(qualifier) => (0..n)
+                    .filter(|&table| scope.names[table] == *qualifier)
+                    .find_map(|table| {
+                        (0..width(table))
+                            .map(|column| (table, column))
+                            .find(|&entry| in_class(entry))
+                    }),
+                SelectItem::Expr { expression, .. } => {
+                    column_of(scope, expression).filter(|&entry| in_class(entry))
+                }
+                SelectItem::RecordStar(_) => None,
+            };
+            if found.is_some() {
+                shown_member = found;
+                break;
+            }
+        }
+        let shown_member = shown_member
+            .or_else(|| {
+                junk_columns[..junk_count]
+                    .iter()
+                    .copied()
+                    .find(|&entry| in_class(entry))
+            })
+            .unwrap_or((table, column));
+        sort_shown[sort_keys.as_slice().len()] = shown_member;
         sort_items[sort_keys.as_slice().len()] = item;
         let _ = sort_keys.push_class(class as u8 | flags);
     }
@@ -2195,6 +2253,9 @@ pub(crate) fn modeled_join<'a>(
         aggregated,
         sort_items: arena
             .alloc_slice_copy(&sort_items[..sort_keys.as_slice().len()])
+            .map_err(|_| crate::sql::eval::arena_full())?,
+        sort_shown: arena
+            .alloc_slice_copy(&sort_shown[..sort_keys.as_slice().len()])
             .map_err(|_| crate::sql::eval::arena_full())?,
     }))
 }

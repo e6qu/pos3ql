@@ -3870,6 +3870,10 @@ pub trait CatalogAccess {
     fn domain_base_type(&self, _type_oid: i32) -> Option<ColType> {
         None
     }
+    /// `typcollation` of a visible domain (or its array type).
+    fn domain_collation(&self, _type_oid: i32) -> Option<Collation> {
+        None
+    }
     /// The common element type of one call's `anycompatible` inputs, each
     /// `(is_array, type_oid)`, or `None` when PostgreSQL finds none.
     fn compatible_element_oid(&self, inputs: &[(bool, i32)]) -> Option<i32> {
@@ -10287,6 +10291,48 @@ pub(crate) fn collation_not_found(schema: Option<&str>, name: &str) -> SqlError 
     }
 }
 
+/// `collations are not supported by type T` for `operand`, which has none; a
+/// domain is named as written, not by its base type.
+fn collation_unsupported<'a>(
+    operand: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> SqlError {
+    let declared = match operand {
+        Expr::Column { qualifier, name } => row.column_user_type(*qualifier, name),
+        _ => None,
+    };
+    let domain = match declared {
+        Some(user) => Some(StackStr::<260>::from_str(user.name.as_str())),
+        None => super::exec::infer_type_res(operand, &RuntimeColumnTypes { row, catalog })
+            .ok()
+            .and_then(|(oid, _)| catalog?.type_name_fixed(oid).ok().flatten()),
+    };
+    sql_err!(
+        sqlstate::DATATYPE_MISMATCH,
+        "collations are not supported by type {}",
+        domain.as_ref().map_or_else(
+            || static_type(operand, row)
+                .expect("known noncollatable type")
+                .name(),
+            |name| name.as_str()
+        )
+    )
+}
+
+/// `pg_collation_for`'s collation of `operand`: none for an indeterminate
+/// derivation, an error for a type without collation.
+pub(crate) fn collation_of_argument<'a>(
+    operand: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Result<Collation, SqlError> {
+    if static_type(operand, row).is_some_and(|ctype| !ctype.is_collatable()) {
+        return Err(collation_unsupported(operand, row, catalog));
+    }
+    resolved_expression_collation(operand, row, catalog)
+}
+
 fn expression_collation<'a>(
     expression: &Expr<'a>,
     row: &impl ColumnLookup<'a>,
@@ -10302,29 +10348,7 @@ fn expression_collation<'a>(
                 |error| crate::sql::error_position::at_source_position(error, *source_position);
             let collatable = static_type(operand, row).is_none_or(ColType::is_collatable);
             if !collatable {
-                // A domain is named as written, not by its base type.
-                let declared = match operand {
-                    Expr::Column { qualifier, name } => row.column_user_type(*qualifier, name),
-                    _ => None,
-                };
-                let domain = match declared {
-                    Some(user) => Some(StackStr::<260>::from_str(user.name.as_str())),
-                    None => {
-                        super::exec::infer_type_res(operand, &RuntimeColumnTypes { row, catalog })
-                            .ok()
-                            .and_then(|(oid, _)| catalog?.type_name_fixed(oid).ok().flatten())
-                    }
-                };
-                return Err(located(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "collations are not supported by type {}",
-                    domain.as_ref().map_or_else(
-                        || static_type(operand, row)
-                            .expect("known noncollatable type")
-                            .name(),
-                        |name| name.as_str()
-                    )
-                )));
+                return Err(located(collation_unsupported(operand, row, catalog)));
             }
             let value = match *collation {
                 crate::sql::ast::ParsedCollation::Builtin(value) => value,
@@ -10409,7 +10433,50 @@ fn expression_collation<'a>(
         } => match ColType::from_sql_name(type_name) {
             Some(ctype) if ctype.is_collatable() => expression_collation(operand, row, catalog),
             Some(_) => Ok(None),
-            None => expression_collation(operand, row, catalog),
+            // A cast to a domain gives its collation to a value of another
+            // type: its own when it is not the default one, else the
+            // operand's, or the default one for a value with none. A value
+            // already of the domain's type keeps its own.
+            None => {
+                let resolver = |catalog| RuntimeColumnTypes {
+                    row,
+                    catalog: Some(catalog),
+                };
+                let target = catalog.and_then(|catalog| {
+                    super::exec::ColTypeResolver::named_type_oid(&resolver(catalog), type_name)
+                });
+                let operand_type = match operand {
+                    Expr::Column { qualifier, name } => super::exec::ColTypeResolver::column_meta(
+                        &RuntimeColumnTypes { row, catalog },
+                        *qualifier,
+                        name,
+                    )
+                    .map(|meta| meta.type_oid),
+                    _ => super::exec::infer_type_res(operand, &RuntimeColumnTypes { row, catalog })
+                        .ok()
+                        .map(|(oid, _)| oid),
+                };
+                if target.is_some() && target == operand_type {
+                    return expression_collation(operand, row, catalog);
+                }
+                let domain = catalog
+                    .zip(target)
+                    .and_then(|(catalog, oid)| catalog.domain_collation(oid));
+                match domain {
+                    Some(Collation::None) | None => expression_collation(operand, row, catalog),
+                    // A value with no collation of its own takes the
+                    // domain's, the default one included.
+                    Some(Collation::Default) => Ok(expression_collation(operand, row, catalog)?
+                        .or_else(|| DerivedCollation::implicit(Collation::Default, true))),
+                    Some(collation) => {
+                        let inner = expression_collation(operand, row, catalog)?;
+                        if inner.is_some_and(|inner| inner.explicit) {
+                            return Ok(inner);
+                        }
+                        Ok(DerivedCollation::implicit(collation, true))
+                    }
+                }
+            }
         },
         Expr::Column { qualifier, name } => {
             if row.column_type_oid(*qualifier, name).is_some() {

@@ -483,31 +483,19 @@ pub(super) fn build_column(
         None => (false, false),
     };
     let auto_increment = serial || is_identity;
-    let collatable = ctype.is_collatable();
-    let collation = resolve_parsed_collation(storage, txid, c.collation).map_err(|error| {
-        crate::sql::error_position::at_source_position(error, c.collation_position)
-    })?;
-    if !collatable && collation != crate::sql::ast::Collation::Default {
-        return Err(crate::sql::error_position::at_source_position(
-            sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "collations are not supported by type {}",
-                ctype.name()
-            ),
-            c.collation_position,
-        ));
-    }
+    let collation = assigned_collation(
+        storage,
+        txid,
+        (ctype, user_type),
+        c.collation.map(|written| (written, c.collation_position)),
+    )?;
     let column_storage = c.storage.unwrap_or_else(|| default_column_storage(ctype));
     validate_column_storage(ctype, column_storage, c.compression)?;
     Ok(ColumnMeta {
         name: SqlName::parse(c.name)?,
         ctype,
         type_mod,
-        collation: if collatable {
-            collation
-        } else {
-            crate::sql::ast::Collation::None
-        },
+        collation,
         storage: column_storage,
         compression: c.compression,
         not_null: crate::storage::NotNullOrigin::local(c.not_null || auto_increment),
@@ -555,6 +543,60 @@ pub(super) fn validate_column_storage(
         ));
     }
     Ok(())
+}
+
+/// `pg_type.typcollation` of the type `ctype` (a domain's when `user_type`
+/// names one): a domain's own, else the default collation of a collatable
+/// type, else none.
+pub(super) fn type_collation(
+    storage: &Storage,
+    txid: u32,
+    (ctype, user_type): (ColType, Option<crate::storage::UserTypeName>),
+) -> crate::sql::ast::Collation {
+    if let Some(identity) = user_type
+        && let Some(slot) =
+            storage.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+    {
+        return storage.domain_for(slot, txid).collation;
+    }
+    if ctype.is_collatable() {
+        crate::sql::ast::Collation::Default
+    } else {
+        crate::sql::ast::Collation::None
+    }
+}
+
+/// `GetColumnDefCollation`: the collation of a column, attribute or ALTER
+/// target of the given type. A written `COLLATE` is looked up first and then
+/// refused on a type without collation, both at its keyword; without one the
+/// type's own collation applies.
+pub(super) fn assigned_collation(
+    storage: &Storage,
+    txid: u32,
+    (ctype, user_type): (ColType, Option<crate::storage::UserTypeName>),
+    written: Option<(
+        crate::sql::ast::ParsedCollation<'_>,
+        crate::sql::ast::SourcePosition,
+    )>,
+) -> Result<crate::sql::ast::Collation, SqlError> {
+    let own = type_collation(storage, txid, (ctype, user_type));
+    let Some((parsed, at)) = written else {
+        return Ok(own);
+    };
+    let located = |error| crate::sql::error_position::at_source_position(error, at);
+    let chosen = resolve_parsed_collation(storage, txid, parsed).map_err(located)?;
+    if own == crate::sql::ast::Collation::None {
+        let type_name = match user_type {
+            Some(identity) => crate::util::StackStr::<260>::from_str(identity.name.as_str()),
+            None => crate::util::StackStr::from_str(ctype.name()),
+        };
+        return Err(located(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "collations are not supported by type {}",
+            type_name.as_str()
+        )));
+    }
+    Ok(chosen)
 }
 
 pub(super) fn resolve_parsed_collation(

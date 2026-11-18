@@ -1468,9 +1468,23 @@ collation (`42704`, naming the schema-qualified name and the encoding, or
 (`42804`) fail at the clause, with its cursor, whether or not a row reaches
 it (`differential_exact/860`), also in an index key, an `ALTER COLUMN ...
 TYPE`, an attribute of `ALTER TYPE` and a domain-typed value or column, which
-the message names by the domain (`differential_exact/861`). Remaining:
-`CREATE DOMAIN ... COLLATE` is a syntax error where PostgreSQL gives the
-domain a collation its columns inherit. Target and expression count errors of an `INSERT`, also with subscripted
+the message names by the domain (`differential_exact/861`). A domain has a
+collation (`pg_type.typcollation`, also of its array type and
+`information_schema.domains`): the one `COLLATE` gives it, anywhere among its
+constraints, else its parent's or its base type's, and a base type without
+collation refuses one at the type name. Columns, attributes, `ALTER TYPE
+... ADD ATTRIBUTE` and `ALTER COLUMN ... TYPE` targets of the domain take it
+unless they write their own `COLLATE` (a column's `COLLATE` may also follow
+its other constraints, but not a `DEFAULT` expression's own); `ALTER COLUMN
+... TYPE` takes the new type's collation, not the old column's. A cast to a
+domain with a non-default collation derives it, a `CREATE TABLE AS` column
+keeps the collation its query derives, and `pg_collation_for` reports it. A
+custom collation a domain uses is a `pg_depend` dependency of the domain and
+its array: `DROP COLLATION` refuses it, and with `CASCADE` drops the domain
+and the columns of its type (`differential_exact/864`). Remaining: `ALTER
+COLUMN ... TYPE` to a type that is not built in (a domain, enum or
+composite) fails with `0A000` where PostgreSQL rewrites the column through
+the type's checks. Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

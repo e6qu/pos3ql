@@ -7231,7 +7231,7 @@ fn infer_type_unpositioned(
                 of(ColType::Array(crate::sql::types::ArrElem::Text))
             }
             "format" | "regexp_replace" | "similar_to_escape" | "normalize" | "unicode_version"
-            | "unistr" | "casefold" | "to_ascii" => of(ColType::Text),
+            | "unistr" | "casefold" | "to_ascii" | "pg_collation_for" => of(ColType::Text),
             "overlay" | "substr" | "substring" | "reverse" | "btrim" | "ltrim" | "rtrim" => {
                 match args
                     .first()

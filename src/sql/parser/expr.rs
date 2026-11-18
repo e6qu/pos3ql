@@ -306,6 +306,9 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.peeked == Tok::Ident("collate") {
+                if self.stop_default_at_not_null && self.nesting == self.default_nesting {
+                    return Ok(left);
+                }
                 self.advance()?;
                 let collation = self.collation_name()?;
                 left = self.arena_expr(Expr::Collate {

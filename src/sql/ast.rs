@@ -1778,7 +1778,8 @@ pub struct CompositeField<'a> {
     pub name: &'a str,
     pub type_name: &'a str,
     pub type_mod: i32,
-    pub collation: ParsedCollation<'a>,
+    /// The collation `COLLATE` selected; without one the type's own applies.
+    pub collation: Option<ParsedCollation<'a>>,
     /// The `COLLATE` keyword's location where PostgreSQL positions a
     /// collation error (`ALTER TYPE`); unknown in `CREATE TYPE`.
     pub collation_position: SourcePosition,
@@ -4647,6 +4648,11 @@ pub struct CreateDomain<'a> {
     pub nullability: DomainNullability<'a>,
     pub default_text: Option<&'a str>,
     pub checks: &'a [DomainCheck<'a>],
+    /// The collation `COLLATE` selected; without one the base type's applies.
+    pub collation: Option<ParsedCollation<'a>>,
+    /// Where the base type is written, which positions a collation the base
+    /// type cannot have.
+    pub base_type_position: SourcePosition,
 }
 
 /// An input-capable routine parameter either requires a call argument or owns
@@ -5098,7 +5104,7 @@ pub enum AlterTypeAction<'a> {
         name: &'a str,
         type_name: &'a str,
         type_mod: i32,
-        collation: ParsedCollation<'a>,
+        collation: Option<ParsedCollation<'a>>,
         collation_position: SourcePosition,
         cascade: bool,
     },
@@ -5133,8 +5139,8 @@ pub struct ColumnDef<'a> {
     /// PostgreSQL atttypmod for the declared type: -1 when no `(...)` modifier.
     /// varchar(n)/char(n) encode `n + 4`; numeric(p,s) encodes `((p<<16)|s)+4`.
     pub type_mod: i32,
-    /// The collation selected by `COLLATE` or the database default.
-    pub collation: ParsedCollation<'a>,
+    /// The collation `COLLATE` selected; without one the type's own applies.
+    pub collation: Option<ParsedCollation<'a>>,
     /// The `COLLATE` keyword's location, which positions a collation error.
     pub collation_position: SourcePosition,
     /// Foreign-column options are parsed only by CREATE FOREIGN TABLE. An

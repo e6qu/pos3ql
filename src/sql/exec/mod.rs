@@ -51191,6 +51191,19 @@ fn drop_collation_slot(
         ));
     }
     if !cascade {
+        for domain_slot in 0..storage.domain_count() {
+            if storage.domain_slot_visible_to(domain_slot, txn.txid)
+                && storage.domain_for(domain_slot, txn.txid).collation == identity
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop collation {}.{} because type {} depends on it",
+                    definition.schema.as_str(),
+                    definition.name.as_str(),
+                    storage.domain_for(domain_slot, txn.txid).name.as_str()
+                ));
+            }
+        }
         for table_slot in 0..storage.table_count() {
             if !storage.table_slot_visible_to(table_slot, txn.txid) {
                 continue;
@@ -51240,6 +51253,31 @@ fn drop_collation_slot(
             }
         }
     } else {
+        // A domain with the collation goes first, with the columns of its type.
+        let domains = match arena.alloc_slice_with(storage.domain_count(), |slot| {
+            storage.domain_slot_visible_to(slot, txn.txid)
+                && storage.domain_for(slot, txn.txid).collation == identity
+        }) {
+            Ok(domains) => domains,
+            Err(_) => return sql_fail(arena_full()),
+        };
+        if domains.iter().any(|selected| *selected)
+            && let Err(error) = drop_domain_selection(
+                storage,
+                wal,
+                txn,
+                scratch,
+                domains,
+                None,
+                true,
+                0,
+                arena,
+                seq_session,
+                responder,
+            )
+        {
+            return sql_fail(error);
+        }
         for table_slot in 0..storage.table_count() {
             if !storage.table_slot_visible_to(table_slot, txn.txid) {
                 continue;
@@ -62569,10 +62607,11 @@ pub fn create_table_as(
             name: parsed,
             ctype,
             type_mod: columns[i].type_mod,
-            collation: if ctype.is_collatable() {
-                crate::sql::ast::Collation::Default
-            } else {
-                crate::sql::ast::Collation::None
+            // The collation the query derives for the column.
+            collation: match columns[i].collation {
+                _ if !ctype.is_collatable() => crate::sql::ast::Collation::None,
+                crate::sql::ast::Collation::None => crate::sql::ast::Collation::Default,
+                derived => derived,
             },
             storage: ddl::default_column_storage(ctype),
             compression: crate::sql::ast::ColumnCompression::Default,
@@ -64786,6 +64825,8 @@ fn build_domain_spec(
     nullability: crate::sql::ast::DomainNullability<'_>,
     default_text: Option<&str>,
     ast_checks: &[crate::sql::ast::DomainCheck],
+    written_collation: Option<crate::sql::ast::ParsedCollation<'_>>,
+    base_type_position: crate::sql::ast::SourcePosition,
     arena: &Arena,
 ) -> Result<crate::storage::DomainSpec, SqlError> {
     if matches!(base_type, "record" | "record[]") {
@@ -64820,6 +64861,39 @@ fn build_domain_spec(
             )
         };
     let base = resolved.ctype;
+    // `DefineDomain`: the collation written, else the parent domain's or the
+    // base type's own, which only a collatable type has.
+    let inherited_collation = match storage.find_domain(base_type, txid) {
+        Some(parent) => parent.collation,
+        None if base.is_collatable() => crate::sql::ast::Collation::Default,
+        None => crate::sql::ast::Collation::None,
+    };
+    let collation = match written_collation {
+        None => inherited_collation,
+        Some(parsed) => {
+            // PostgreSQL gives a missing collation no cursor.
+            let chosen = ddl::resolve_parsed_collation(storage, txid, parsed)?;
+            if inherited_collation == crate::sql::ast::Collation::None {
+                return Err(crate::sql::error_position::at_source_position(
+                    sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "collations are not supported by type {}",
+                        crate::sql::catalog::format_type_oid(
+                            storage,
+                            txid,
+                            storage
+                                .routine_type_oid(resolved.ctype, resolved.user_type, txid)
+                                .unwrap_or_else(|| resolved.ctype.oid()),
+                            -1
+                        )
+                        .as_str()
+                    ),
+                    base_type_position,
+                ));
+            }
+            chosen
+        }
+    };
     let default_expr = match default_text {
         Some(t) => {
             validate_domain_expr(t, false, arena)?;
@@ -64906,6 +64980,7 @@ fn build_domain_spec(
         base_user_type,
         base,
         base_type_mod,
+        collation,
         not_null,
         not_null_name,
         not_null_identity: None,
@@ -64983,6 +65058,8 @@ pub fn create_domain(
         d.nullability,
         d.default_text,
         d.checks,
+        d.collation,
+        d.base_type_position,
         arena,
     ) {
         Ok(s) => s,
@@ -66038,6 +66115,7 @@ pub fn alter_domain(
         base_user_type: current.base_user_type,
         base: current.base,
         base_type_mod: current.base_type_mod,
+        collation: current.collation,
         not_null: current.not_null,
         not_null_name: current.not_null_name,
         not_null_identity: current.not_null_identity,
@@ -66811,28 +66889,20 @@ fn build_composite_spec(
                 field.type_name
             ));
         }
-        let collatable = ctype.is_collatable();
-        let located =
-            |error| crate::sql::error_position::at_source_position(error, field.collation_position);
-        let collation =
-            ddl::resolve_parsed_collation(storage, txid, field.collation).map_err(located)?;
-        if !collatable && collation != crate::sql::ast::Collation::Default {
-            return Err(located(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "collations are not supported by type {}",
-                ctype.name()
-            )));
-        }
+        let collation = ddl::assigned_collation(
+            storage,
+            txid,
+            (ctype, user_type),
+            field
+                .collation
+                .map(|written| (written, field.collation_position)),
+        )?;
         out[index] = crate::storage::CompositeFieldDef {
             attribute_number: (index + 1) as u16,
             name: SqlName::parse(field.name)?,
             ctype,
             type_mod: field.type_mod,
-            collation: if collatable {
-                collation
-            } else {
-                crate::sql::ast::Collation::None
-            },
+            collation,
             user_type,
             dropped: false,
             not_null: false,
@@ -71389,6 +71459,7 @@ fn rewrite_composite_dependent_domains(
             base_user_type: current.base_user_type,
             base: current.base,
             base_type_mod: current.base_type_mod,
+            collation: current.collation,
             not_null: current.not_null,
             not_null_name: current.not_null_name,
             not_null_identity: current.not_null_identity,
@@ -104063,6 +104134,18 @@ fn alter_table_relation(
                     invalidated_statistics.insert(usize::from(attribute - 1));
                 }
                 let Some(target) = ColType::from_sql_name(type_name) else {
+                    // A type that exists but is not built in: rewriting the
+                    // column through its checks is not modelled.
+                    if resolve_routine_type(storage, txn.txid, type_name).is_ok() {
+                        return sql_fail(crate::sql::error_position::at_subject(
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "ALTER COLUMN TYPE to the user-defined type \"{}\" is not supported",
+                                type_name
+                            ),
+                            type_name,
+                        ));
+                    }
                     return sql_fail(crate::sql::error_position::at_subject(
                         crate::sql::type_name_miss::TypeNameMiss::in_storage(
                             storage, txn.txid, type_name,
@@ -104082,35 +104165,17 @@ fn alter_table_relation(
                         target.name()
                     ));
                 }
-                let source_type = new_def.columns[i].ctype;
-                let source_collation = new_def.columns[i].collation;
-                let located = |error| {
-                    crate::sql::error_position::at_source_position(error, *collation_position)
-                };
-                let target_collation = match (*collation, target.is_collatable()) {
-                    (Some(collation), true) => {
-                        match ddl::resolve_parsed_collation(storage, txn.txid, collation) {
-                            Ok(collation) => collation,
-                            Err(error) => return sql_fail(located(error)),
-                        }
-                    }
-                    // `GetColumnDefCollation` looks the name up before it
-                    // rejects the type.
-                    (Some(collation), false) => {
-                        if let Err(error) =
-                            ddl::resolve_parsed_collation(storage, txn.txid, collation)
-                        {
-                            return sql_fail(located(error));
-                        }
-                        return sql_fail(located(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "collations are not supported by type {}",
-                            target.name()
-                        )));
-                    }
-                    (None, true) if source_type.is_collatable() => source_collation,
-                    (None, true) => crate::sql::ast::Collation::Default,
-                    (None, false) => crate::sql::ast::Collation::None,
+                // The column takes the new type's collation unless `COLLATE`
+                // gives one, as `GetColumnDefCollation` does, whatever its old
+                // collation was.
+                let target_collation = match ddl::assigned_collation(
+                    storage,
+                    txn.txid,
+                    (target, None),
+                    collation.map(|written| (written, *collation_position)),
+                ) {
+                    Ok(collation) => collation,
+                    Err(error) => return sql_fail(error),
                 };
                 // Compose with whatever already produces this column: a kept or
                 // cast original column becomes a (re)cast of its original index;

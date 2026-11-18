@@ -4599,7 +4599,6 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     crate::sql::error_position::full_message_error(
                         sqlstate::UNDEFINED_FUNCTION,
                         |text| {
-                            use core::fmt::Write as _;
                             let _ = write!(text, "function {}(", declared.name.as_str());
                             for (index, oid) in input_type_oids[..input_count].iter().enumerate() {
                                 if index != 0 {
@@ -9073,6 +9072,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
+    }
+
+    fn domain_collation(&self, type_oid: i32) -> Option<super::ast::Collation> {
+        self.storage.domain_collation_for_oid(type_oid, self.txid)
     }
 
     fn compatible_element_oid(&self, inputs: &[(bool, i32)]) -> Option<i32> {

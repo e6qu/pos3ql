@@ -370,6 +370,7 @@ mod tests {
                         base_user_type: None,
                         base: ColType::Int4,
                         base_type_mod: -1,
+                        collation: crate::sql::ast::Collation::None,
                         not_null: false,
                         not_null_name: None,
                         not_null_identity: None,

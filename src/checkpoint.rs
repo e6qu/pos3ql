@@ -365,7 +365,7 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                 types_finished = true;
                 true
             }
-            Some("dom7" | "enm3" | "cmp2") if types_finished => {
+            Some("dom8" | "enm3" | "cmp2") if types_finished => {
                 return Err("type source follows its catalog boundary");
             }
             Some("end") => {
@@ -8274,7 +8274,7 @@ impl Checkpointer {
                         log_count,
                     );
                 }
-                Some("dom7") => {
+                Some("dom8") => {
                     let source_slot: usize = parse_field(words.next(), "domain source slot")?;
                     if source_slot >= storage.domain_count() {
                         return Err(CheckpointSetupError::Corrupt(
@@ -8300,6 +8300,11 @@ impl Checkpointer {
                     };
                     let base_code: u8 = parse_field(words.next(), "dom base")?;
                     let base_type_mod: i32 = parse_field(words.next(), "dom typmod")?;
+                    let collation = crate::sql::ast::Collation::from_code(parse_field::<u32>(
+                        words.next(),
+                        "dom collation",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("unknown domain collation"))?;
                     let not_null: u8 = parse_field(words.next(), "dom notnull")?;
                     if not_null > 1 {
                         return Err(CheckpointSetupError::Corrupt(
@@ -8425,6 +8430,7 @@ impl Checkpointer {
                         base_user_type,
                         base,
                         base_type_mod,
+                        collation,
                         not_null: not_null != 0,
                         not_null_name,
                         not_null_identity,
@@ -10814,11 +10820,12 @@ impl Checkpointer {
             use core::fmt::Write;
             write!(
                 &mut self.manifest_output,
-                "dom7 {} {} {} {} {} {}",
+                "dom8 {} {} {} {} {} {} {}",
                 slot,
                 d.created_at,
                 d.base.code(),
                 d.base_type_mod,
+                d.collation.code(),
                 u8::from(d.not_null),
                 d.n_checks
             )

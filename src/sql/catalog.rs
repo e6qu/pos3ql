@@ -29524,12 +29524,7 @@ fn pg_type<'a>(
         let base_oid = domain_base_oid(storage, &d, txid);
         let array_oid =
             crate::sql::types::oid::domain_array_oid(storage.domain_for(slot, txid).creation());
-        // A domain and its array take the base type's default collation.
-        let collation = if d.base.is_collatable() {
-            crate::sql::ast::Collation::Default.oid()
-        } else {
-            0
-        };
+        let collation = d.collation.oid();
         out[n] = row(
             &[
                 Datum::Int4(domain_oid(storage, slot, txid)),
@@ -31439,6 +31434,29 @@ fn info_domains<'a>(
             )?,
             None => Datum::Null,
         };
+        // Every collation but `pg_catalog.default` is named.
+        let collation_names = match domain.collation {
+            crate::sql::ast::Collation::None | crate::sql::ast::Collation::Default => None,
+            crate::sql::ast::Collation::Catalog(selected) => {
+                let definition = storage.collation_definition(selected, txid)?;
+                Some((
+                    StackStr::<64>::from_str(definition.schema.as_str()),
+                    StackStr::<64>::from_str(definition.name.as_str()),
+                ))
+            }
+            builtin => Some((
+                StackStr::<64>::from_str("pg_catalog"),
+                StackStr::<64>::from_str(builtin.name()),
+            )),
+        };
+        let collation_columns = match &collation_names {
+            Some((schema, name)) => [
+                text("postgres", arena)?,
+                text(schema.as_str(), arena)?,
+                text(name.as_str(), arena)?,
+            ],
+            None => [Datum::Null; 3],
+        };
         output[count] = row(
             &[
                 text("postgres", arena)?,
@@ -31450,9 +31468,9 @@ fn info_domains<'a>(
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
-                Datum::Null,
-                Datum::Null,
-                Datum::Null,
+                collation_columns[0],
+                collation_columns[1],
+                collation_columns[2],
                 scalar.precision.map_or(Datum::Null, Datum::Int4),
                 scalar.radix.map_or(Datum::Null, Datum::Int4),
                 scalar.scale.map_or(Datum::Null, Datum::Int4),

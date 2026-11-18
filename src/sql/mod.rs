@@ -33332,6 +33332,7 @@ fn apply_wal_op(
                 base_user_type: def.base_user_type,
                 base: def.base,
                 base_type_mod: def.base_type_mod,
+                collation: def.collation,
                 not_null: def.not_null,
                 not_null_name: def.not_null_name,
                 not_null_identity: def.not_null_identity,

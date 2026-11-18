@@ -4569,6 +4569,12 @@ pub(crate) fn planner_setting_metadata(name: &str) -> Option<PlannerSettingMetad
 
 /// The active session's `work_mem` in kilobytes; PostgreSQL's default
 /// outside a session.
+/// `get_hash_memory_limit`: `work_mem` times `hash_mem_multiplier`, in
+/// bytes.
+pub(crate) fn hash_memory_bytes() -> f64 {
+    f64::from(work_mem_kilobytes()) * 1024.0 * planner_value("hash_mem_multiplier")
+}
+
 pub(crate) fn work_mem_kilobytes() -> i32 {
     ACTIVE_GUC.with(|active| {
         let pointer = active.get();

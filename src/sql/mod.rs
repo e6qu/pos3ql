@@ -29720,6 +29720,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "geqo_seed",
     "geqo_selection_bias",
     "geqo_threshold",
+    "hash_mem_multiplier",
     "idle_in_transaction_session_timeout",
     "integer_datetimes",
     "IntervalStyle",

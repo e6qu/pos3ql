@@ -515,6 +515,10 @@ impl<'a> BatchTable<'a> {
                     .map_err(|_| arena_full())?;
             }
         }
+        // Only batch 0 has skew buckets.
+        if self.current != 0 {
+            return Ok(());
+        }
         let skew_rows = self.skew_rows.borrowed_slice();
         for (bucket, slot) in self.skew.borrowed_slice().iter().enumerate() {
             if slot.removed {
@@ -873,8 +877,14 @@ fn run<'a>(
     let mut bound: Bound<'a> = [None; MAX_JOIN_RELS];
     runner.exec(model.plan.top, &mut bound, &mut |bound| {
         for table in 0..n {
-            let row = bound[table].expect("the top join binds every relation");
             let start = offsets[table];
+            // A removed join's relation reads as NULLs, which nothing reads.
+            if model.plan.removed & 1 << table != 0 {
+                values[start..start + nulls[table].len()].copy_from_slice(nulls[table]);
+                rowids[table] = None;
+                continue;
+            }
+            let row = bound[table].expect("the top join binds every relation");
             values[start..start + row.values.len()].copy_from_slice(row.values);
             rowids[table] = row.rowid;
         }
@@ -934,11 +944,12 @@ impl<'r, 'a> Runner<'r, 'a> {
                 keys,
                 key_count,
                 single_row,
+                binary,
             } => self.memoize(
                 id,
                 input,
                 &keys[..usize::from(key_count)],
-                single_row,
+                (single_row, binary),
                 bound,
                 sink,
             ),
@@ -1110,6 +1121,13 @@ impl<'r, 'a> Runner<'r, 'a> {
                 buckets,
                 batches,
             } => {
+                // An inner input reading the values of an outer row above
+                // changes at each rescan, which builds the table again
+                // (`ExecReScanHashJoin` with the inner plan's `chgParam`).
+                if self.model.plan.path(inner).param != 0 {
+                    self.built[id as usize].set(None);
+                    self.frozen[id as usize].set(None);
+                }
                 let outer_relids = self.model.plan.path(outer).relids;
                 let inner_relids = self.model.plan.path(inner).relids;
                 let keys = self.sides(&hash, outer_relids);
@@ -1764,7 +1782,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         id: u32,
         input: u32,
         keys: &[super::index_paths::joins::Member],
-        single_row: bool,
+        (single_row, binary): (bool, bool),
         bound: &mut Bound<'a>,
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
@@ -1784,7 +1802,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         });
         let mut found = None;
         for (at, entry) in cache.entries.borrowed_slice().iter().enumerate() {
-            if self.same_key(&entry.key[..keys.len()], key, keys)? {
+            if self.same_key(&entry.key[..keys.len()], key, keys, binary)? {
                 found = Some(at);
                 break;
             }
@@ -1892,6 +1910,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         held: &[Datum<'a>],
         key: &[Datum<'a>],
         members: &[super::index_paths::joins::Member],
+        binary: bool,
     ) -> Result<bool, SqlError> {
         for ((left, right), member) in held.iter().zip(key).zip(members) {
             match (left.is_null(), right.is_null()) {
@@ -1907,6 +1926,14 @@ impl<'r, 'a> Runner<'r, 'a> {
                 left,
                 right,
             )? != Ordering::Equal
+            {
+                return Ok(false);
+            }
+            // Binary mode tells apart equal numerics of different scales,
+            // which the other modeled types' bytes never do.
+            if binary
+                && let (Datum::Numeric(one), Datum::Numeric(two)) = (left, right)
+                && one.dscale != two.dscale
             {
                 return Ok(false);
             }
@@ -2038,12 +2065,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         let Some(mut table) = table else {
             return Ok(true);
         };
-        if fill_inner && table.batches > 1 {
-            return Err(crate::sql_err!(
-                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                "a hash join returning unmatched inner rows over several batches is not supported"
-            ));
-        }
         if table.batches == 1 {
             self.frozen[id as usize].set(Some(table.frozen()));
             if fill_inner && !ended {
@@ -2052,6 +2073,15 @@ impl<'r, 'a> Runner<'r, 'a> {
                 return self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink);
             }
             return Ok(true);
+        }
+        // Each batch returns its unmatched inner rows once its outer rows
+        // are done (`HJ_FILL_INNER_TUPLES`), batch 0's skew buckets too.
+        if fill_inner && !ended {
+            let mut rows = ArenaList::new(self.arena);
+            table.unmatched(&mut rows)?;
+            if !self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink)? {
+                return Ok(false);
+            }
         }
         // `ExecHashJoinNewBatch`.
         table.skew_enabled = false;
@@ -2131,6 +2161,13 @@ impl<'r, 'a> Runner<'r, 'a> {
                     continue;
                 }
                 if !self.probe_batch(table.frozen(), None, hash, &probe, &mut row, sink)? {
+                    return Ok(false);
+                }
+            }
+            if fill_inner {
+                let mut rows = ArenaList::new(self.arena);
+                table.unmatched(&mut rows)?;
+                if !self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink)? {
                     return Ok(false);
                 }
             }

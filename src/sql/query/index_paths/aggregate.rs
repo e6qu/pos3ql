@@ -260,10 +260,9 @@ pub(crate) fn hash_agg_entry_size(
     ENTRY + tuple + per_group + transition
 }
 
-/// `get_hash_memory_limit`: work_mem times the default
-/// `hash_mem_multiplier` of 2, which pos3ql does not let a session change.
+/// `get_hash_memory_limit`.
 fn hash_memory_limit() -> f64 {
-    f64::from(crate::sql::guc::work_mem_kilobytes()) * 1024.0 * 2.0
+    crate::sql::guc::hash_memory_bytes()
 }
 
 /// `BLCKSZ`, the size of the buffers of a hash aggregate's spill files.

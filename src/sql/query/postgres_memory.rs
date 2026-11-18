@@ -489,7 +489,7 @@ impl HashAggSizing {
         let most = ((memory / entry_size) as i64) >> 1;
         let buckets = (groups as i64).min(most).max(1);
         let entry = (TUPLE_HASH_ENTRY + maxalign(transitions * PER_GROUP_STATE)) as i64;
-        let limit = (work_mem_bytes() * 2) / entry;
+        let limit = crate::sql::guc::hash_memory_bytes().min(i64::MAX as f64) as i64 / entry;
         usize::try_from(buckets.min(limit)).unwrap_or(1)
     }
 }

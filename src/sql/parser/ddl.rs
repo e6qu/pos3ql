@@ -174,6 +174,9 @@ pub(super) struct ColumnClauses<'a> {
     pub(super) generated_text: Option<&'a str>,
     pub(super) generated_kind: crate::storage::Generation,
     pub(super) identity: Option<crate::sql::ast::IdentitySpec<'a>>,
+    /// The column's `COLLATE` and its keyword's location, written anywhere
+    /// among the column's qualifiers (`SplitColQualList`).
+    pub(super) collation: Option<(crate::sql::ast::ParsedCollation<'a>, SourcePosition)>,
 }
 
 fn rule_action_statement(statement: &Stmt<'_>) -> bool {
@@ -4934,10 +4937,12 @@ impl<'a> Parser<'a> {
     fn create_domain(&mut self) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("domain name")?;
         let _ = self.eat_ident("as")?;
+        let base_type_position = SourcePosition::new(Some(self.peek_at));
         let (base_type, base_type_mod) = self.type_name_mod()?;
         use crate::sql::ast::DomainNullability;
         let mut nullability = DomainNullability::Unspecified;
         let mut default_text = None;
+        let mut collation = None;
         let mut checks = ArenaList::new(self.arena);
         loop {
             let constraint_at = self.peek_at;
@@ -4946,6 +4951,16 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            if cname.is_none() && self.eat_ident("collate")? {
+                if collation.is_some() {
+                    return Err(ParseError {
+                        cursor: Some(constraint_at),
+                        ..self.err_here("multiple COLLATE clauses not allowed")
+                    });
+                }
+                collation = Some(self.collation_name()?);
+                continue;
+            }
             if self.eat_ident("not")? {
                 self.expect_ident("null")?;
                 match nullability {
@@ -5035,6 +5050,8 @@ impl<'a> Parser<'a> {
             nullability,
             default_text,
             checks,
+            collation,
+            base_type_position,
         }))
     }
 
@@ -5180,9 +5197,9 @@ impl<'a> Parser<'a> {
                 let field_name = self.any_ident("composite field name")?;
                 let (type_name, type_mod) = self.type_name_mod()?;
                 let collation = if self.eat_ident("collate")? {
-                    self.collation_name()?
+                    Some(self.collation_name()?)
                 } else {
-                    crate::sql::ast::ParsedCollation::DEFAULT
+                    None
                 };
                 self.push(
                     &mut fields,
@@ -5191,6 +5208,7 @@ impl<'a> Parser<'a> {
                         type_name,
                         type_mod,
                         collation,
+                        collation_position: SourcePosition::UNKNOWN,
                     },
                 )?;
                 if !self.eat_op(",")? {
@@ -5215,16 +5233,18 @@ impl<'a> Parser<'a> {
             if self.eat_ident("attribute")? {
                 let field_name = self.any_ident("composite field name")?;
                 let (type_name, type_mod) = self.type_name_mod()?;
+                let collation_position = SourcePosition::new(Some(self.peek_at));
                 let collation = if self.eat_ident("collate")? {
-                    self.collation_name()?
+                    Some(self.collation_name()?)
                 } else {
-                    crate::sql::ast::ParsedCollation::DEFAULT
+                    None
                 };
                 AlterTypeAction::AddAttribute(crate::sql::ast::CompositeField {
                     name: field_name,
                     type_name,
                     type_mod,
                     collation,
+                    collation_position,
                 })
             } else {
                 self.expect_ident("value")?;
@@ -5289,10 +5309,11 @@ impl<'a> Parser<'a> {
                 self.expect_ident("data")?;
                 self.expect_ident("type")?;
                 let (type_name, type_mod) = self.type_name_mod()?;
+                let collation_position = SourcePosition::new(Some(self.peek_at));
                 let collation = if self.eat_ident("collate")? {
-                    self.collation_name()?
+                    Some(self.collation_name()?)
                 } else {
-                    crate::sql::ast::ParsedCollation::DEFAULT
+                    None
                 };
                 let cascade = if self.eat_ident("cascade")? {
                     true
@@ -5305,14 +5326,16 @@ impl<'a> Parser<'a> {
                     type_name,
                     type_mod,
                     collation,
+                    collation_position,
                     cascade,
                 }
             } else if self.eat_ident("type")? {
                 let (type_name, type_mod) = self.type_name_mod()?;
+                let collation_position = SourcePosition::new(Some(self.peek_at));
                 let collation = if self.eat_ident("collate")? {
-                    self.collation_name()?
+                    Some(self.collation_name()?)
                 } else {
-                    crate::sql::ast::ParsedCollation::DEFAULT
+                    None
                 };
                 let cascade = if self.eat_ident("cascade")? {
                     true
@@ -5325,6 +5348,7 @@ impl<'a> Parser<'a> {
                     type_name,
                     type_mod,
                     collation,
+                    collation_position,
                     cascade,
                 }
             } else {
@@ -8411,7 +8435,7 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("with")? {
                     self.expect_ident("options")?;
                 }
-                let clauses = self.column_clauses(column, table, !foreign, &mut cons)?;
+                let clauses = self.column_clauses(column, table, !foreign, &mut cons, None)?;
                 self.push(
                     &mut columns,
                     ColumnDef {
@@ -8419,8 +8443,10 @@ impl<'a> Parser<'a> {
                         name: column,
                         type_name: "",
                         type_mod: -1,
-                        collation: crate::sql::ast::ParsedCollation::DEFAULT,
-                        collation_position: SourcePosition::UNKNOWN,
+                        collation: clauses.collation.map(|(written, _)| written),
+                        collation_position: clauses
+                            .collation
+                            .map_or(SourcePosition::UNKNOWN, |(_, at)| at),
                         foreign_options: &[],
                         storage: None,
                         compression: crate::sql::ast::ColumnCompression::Default,
@@ -8738,9 +8764,9 @@ impl<'a> Parser<'a> {
             };
             let collation_position = SourcePosition::new(Some(self.peek_at));
             let collation = if self.eat_ident("collate")? {
-                self.collation_name()?
+                Some(self.collation_name()?)
             } else {
-                crate::sql::ast::ParsedCollation::DEFAULT
+                None
             };
             // PostgreSQL resolves a column definition's type twice, so a
             // precision-clamp warning is reported twice per column here where
@@ -8749,7 +8775,13 @@ impl<'a> Parser<'a> {
                 let again = self.warnings.as_slice()[w];
                 self.notice(again)?;
             }
-            let clauses = self.column_clauses(col_name, name.name, !foreign, &mut cons)?;
+            let clauses = self.column_clauses(
+                col_name,
+                name.name,
+                !foreign,
+                &mut cons,
+                collation.map(|written| (written, collation_position)),
+            )?;
             self.push(
                 &mut columns,
                 ColumnDef {
@@ -8757,8 +8789,10 @@ impl<'a> Parser<'a> {
                     name: col_name,
                     type_name,
                     type_mod,
-                    collation,
-                    collation_position,
+                    collation: clauses.collation.map(|(written, _)| written),
+                    collation_position: clauses
+                        .collation
+                        .map_or(SourcePosition::UNKNOWN, |(_, at)| at),
                     foreign_options,
                     storage,
                     compression,
@@ -9122,8 +9156,10 @@ impl<'a> Parser<'a> {
         table: &str,
         compact_keys: bool,
         constraints: &mut ArenaList<'a, TableConstraint<'a>>,
+        collation: Option<(crate::sql::ast::ParsedCollation<'a>, SourcePosition)>,
     ) -> Result<ColumnClauses<'a>, ParseError> {
         let mut clauses = ColumnClauses {
+            collation,
             not_null: false,
             not_null_name: None,
             not_null_inheritable: true,
@@ -9147,6 +9183,16 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            if name.is_none() && self.eat_ident("collate")? {
+                if clauses.collation.is_some() {
+                    return Err(ParseError {
+                        cursor: Some(constraint_at),
+                        ..self.err_here("multiple COLLATE clauses not allowed")
+                    });
+                }
+                clauses.collation = Some((self.collation_name()?, source_position));
+                continue;
+            }
             if self.eat_ident("not")? {
                 self.expect_ident("null")?;
                 if null_clause == Some(false) {

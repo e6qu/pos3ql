@@ -242,6 +242,7 @@ fn same_domain(image: &DomainDef, source: &DomainDef, transaction: u32) -> bool 
         && same_type_name(image.base_user_type, source.base_user_type)
         && image.base == source.base
         && image.base_type_mod == source.base_type_mod
+        && image.collation == source.collation
         && image.not_null == source.not_null
         && image.not_null_name == source.not_null_name
         && image.not_null_identity == source.not_null_identity
@@ -753,6 +754,7 @@ mod tests {
                         base_user_type: None,
                         base: ColType::Int4,
                         base_type_mod: -1,
+                        collation: crate::sql::ast::Collation::None,
                         not_null: true,
                         not_null_name: None,
                         not_null_identity: None,
@@ -1419,6 +1421,7 @@ mod tests {
                     )),
                     base: ColType::Enum(Some(storage.enum_for(0, 0).creation())),
                     base_type_mod: -1,
+                    collation: crate::sql::ast::Collation::None,
                     not_null: false,
                     not_null_name: None,
                     not_null_identity: None,
@@ -1512,6 +1515,7 @@ mod tests {
             base_user_type: None,
             base: ColType::Int4,
             base_type_mod: -1,
+            collation: crate::sql::ast::Collation::None,
             not_null: false,
             not_null_name: None,
             not_null_identity: None,
@@ -1657,6 +1661,7 @@ mod tests {
                                 base_user_type: None,
                                 base: ColType::Int4,
                                 base_type_mod: -1,
+                                collation: crate::sql::ast::Collation::None,
                                 not_null: false,
                                 not_null_name: None,
                                 not_null_identity: None,
@@ -1915,6 +1920,7 @@ mod tests {
                                     base_user_type: None,
                                     base: ColType::Int8,
                                     base_type_mod: -1,
+                                    collation: crate::sql::ast::Collation::None,
                                     not_null: false,
                                     not_null_name: None,
                                     not_null_identity: None,
@@ -2113,6 +2119,7 @@ mod tests {
                         base_user_type: None,
                         base: ColType::Int4,
                         base_type_mod: -1,
+                        collation: crate::sql::ast::Collation::None,
                         not_null: false,
                         not_null_name: None,
                         not_null_identity: None,

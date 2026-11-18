@@ -167,13 +167,16 @@ impl Checker<'_> {
                 let located =
                     |error| crate::sql::error_position::at_source_position(error, *source_position);
                 // A type without collation fails before the name is looked up.
-                if let Some(ctype) = self.operand_type(operand)
+                if let Some((ctype, oid)) = self.operand_type(operand)
                     && !ctype.is_collatable()
                 {
+                    // A domain is named as written, not by its base type.
+                    let domain =
+                        crate::sql::catalog::user_type_name_fixed(self.storage, self.txid, oid)?;
                     return Err(located(sql_err!(
                         sqlstate::DATATYPE_MISMATCH,
                         "collations are not supported by type {}",
-                        ctype.name()
+                        domain.as_ref().map_or(ctype.name(), |name| name.as_str())
                     )));
                 }
                 let value = match *collation {
@@ -343,12 +346,28 @@ impl Checker<'_> {
 
     /// The built-in type of `expression`, when this analysis can infer it. An
     /// untyped literal is text, as `transformCollateClause` coerces it.
-    fn operand_type(&self, expression: &Expr<'_>) -> Option<ColType> {
-        let (oid, _) = crate::sql::error_position::preserving_pending(|| {
-            crate::sql::exec::infer_type_res(expression, self.columns)
-        })
-        .ok()?;
+    fn operand_type(&self, expression: &Expr<'_>) -> Option<(ColType, i32)> {
+        // A column keeps its declared type, a domain's own.
+        let declared = match expression {
+            Expr::Column { qualifier, name } => self
+                .columns
+                .column_meta(*qualifier, name)
+                .map(|meta| meta.type_oid),
+            _ => None,
+        };
+        let oid = match declared {
+            Some(oid) => oid,
+            None => {
+                crate::sql::error_position::preserving_pending(|| {
+                    crate::sql::exec::infer_type_res(expression, self.columns)
+                })
+                .ok()?
+                .0
+            }
+        };
         ColType::from_oid(oid)
+            .or_else(|| self.catalog.domain_base_type(oid))
+            .map(|ctype| (ctype, oid))
     }
 
     /// What a node passes up: its inputs' explicit collation when its own

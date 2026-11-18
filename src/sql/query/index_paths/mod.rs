@@ -371,66 +371,132 @@ pub(crate) struct BtreeSize {
     pub(crate) height: u32,
 }
 
+/// `nulls` of `entries` hold a NULL in a single key column: they sort last
+/// as their own run, which a deduplicating build merges like equal keys, in
+/// tuples of a header and a null bitmap; `distinct` counts the other keys.
 pub(crate) fn btree_size(
     entries: f64,
     key_width: f64,
     distinct: f64,
     deduplicate: bool,
+    nulls: f64,
 ) -> BtreeSize {
     let key = (key_width.ceil() as usize).next_multiple_of(8);
     let tuple = 8 + key;
-    // The leaf tuples: a posting tuple per run of equal keys, whose
-    // posting list (padding included) a page's fill test discounts as
-    // truncatable (`truncextra`), else one tuple per entry.
+    // The leaf tuples in key order: the keys', then the NULL keys' last
+    // (one header and null bitmap each). A posting tuple holds a run of
+    // equal keys, whose posting list (padding included) a page's fill test
+    // discounts as truncatable (`truncextra`).
     let entries = entries.max(0.0);
-    let (leaf_tuples, leaf_size, truncatable) =
-        if deduplicate && distinct >= 1.0 && entries / distinct >= 2.0 {
-            let per_key = entries / distinct;
+    let nulls = nulls.clamp(0.0, entries).round_ties_even();
+    let keyed = entries - nulls;
+    let postings = |count: f64, keys: f64, tuple: usize| -> Run {
+        if deduplicate && keys >= 1.0 && count / keys >= 2.0 {
+            let per_key = count / keys;
             let per_posting = ((812 - tuple) / 6).max(1) as f64;
             let postings = (per_key / per_posting).ceil();
             let posting =
                 ((tuple as f64 + 6.0 * per_key / postings).ceil() as usize).next_multiple_of(8);
-            (distinct * postings, posting, posting - tuple)
+            Run {
+                tuples: keys * postings,
+                size: posting,
+                truncatable: posting - tuple,
+            }
         } else {
-            (entries, tuple, 0)
-        };
-    let leaves = level_pages(leaf_tuples, leaf_size, truncatable, 819, true);
+            Run {
+                tuples: count,
+                size: tuple,
+                truncatable: 0,
+            }
+        }
+    };
+    let leaf_runs = [
+        postings(keyed, distinct, tuple),
+        postings(nulls, if nulls >= 1.0 { 1.0 } else { 0.0 }, 16),
+    ];
+    let leaves = level_pages(&leaf_runs, 819, true);
     // Inner levels hold one pivot per page below, filled to 70%.
     let mut level = leaves;
     let mut pages = 1.0 + leaves;
     let mut height = 0;
     while level > 1.0 {
-        level = level_pages(level, tuple, 0, 2457, false);
+        level = level_pages(
+            &[Run {
+                tuples: level,
+                size: tuple,
+                truncatable: 0,
+            }],
+            2457,
+            false,
+        );
         pages += level;
         height += 1;
     }
     BtreeSize { pages, height }
 }
 
-/// The pages `_bt_buildadd` fills with `tuples` tuples of `size` bytes:
-/// a page closes when a tuple arrives and its free space
-/// (`PageGetFreeSpace`), with the last tuple's `truncatable` bytes, is under
-/// `reserve` (or a leaf's has no room for the tuple and a heap TID), and
-/// its last tuple moves to the next page.
-fn level_pages(tuples: f64, size: usize, truncatable: usize, reserve: usize, leaf: bool) -> f64 {
+/// Consecutive index tuples of one size.
+#[derive(Clone, Copy)]
+struct Run {
+    tuples: f64,
+    size: usize,
+    truncatable: usize,
+}
+
+/// The pages `_bt_buildadd` fills with `runs` of tuples in order: a page
+/// closes when a tuple arrives and the page's free space
+/// (`PageGetFreeSpace`), with its last tuple's truncatable bytes, is under
+/// `reserve` while it holds two tuples (or a leaf has no room for the tuple
+/// and a heap TID), and its last tuple moves to the next page.
+fn level_pages(runs: &[Run], reserve: usize, leaf: bool) -> f64 {
     // `BLCKSZ` less the page header, the special space and the high key's
     // line pointer `_bt_blnewpage` reserves, less one line pointer.
     const FREE: usize = 8192 - 24 - 16 - 4 - 4;
-    let line = size + 4;
-    let room = size + if leaf { 8 } else { 0 };
-    // The tuples on a page when the next one arrives and closes it.
-    let mut full = 2usize;
-    loop {
-        let free = FREE.saturating_sub(full * line);
-        if free < room || free + truncatable < reserve {
-            break;
+    let mut pages = 1.0f64;
+    // The tuples on the open page, their line pointers' bytes included,
+    // and its last tuple.
+    let mut held = 0usize;
+    let mut used = 0usize;
+    let mut last: Option<(usize, usize)> = None;
+    let closes = |used: usize, held: usize, last: Option<(usize, usize)>, size: usize| {
+        let free = FREE.saturating_sub(used);
+        let room = size + if leaf { 8 } else { 0 };
+        free < room
+            || (held >= 2 && free + last.map_or(0, |(_, truncatable)| truncatable) < reserve)
+    };
+    for run in runs {
+        let line = run.size + 4;
+        let mut remaining = run.tuples.max(0.0);
+        while remaining > 0.0 {
+            if held == 1 && last == Some((run.size, run.truncatable)) {
+                // A page opened by this run's moved tuple: each later page
+                // takes the same tuples, so whole pages are counted.
+                let mut full = 1usize;
+                while !closes(full * line, full, last, run.size) {
+                    full += 1;
+                }
+                let per_page = (full - 1) as f64;
+                let closed = ((remaining - per_page) / per_page).ceil().max(0.0);
+                pages += closed;
+                remaining -= closed * per_page;
+                held = 1 + remaining.ceil() as usize;
+                used = held * line;
+                break;
+            }
+            if held > 1 && closes(used, held, last, run.size) {
+                pages += 1.0;
+                let (moved, _) = last.expect("a closed page holds tuples");
+                held = 1;
+                used = moved + 4;
+                continue;
+            }
+            held += 1;
+            used += line;
+            last = Some((run.size, run.truncatable));
+            remaining -= 1.0;
         }
-        full += 1;
     }
-    if tuples <= full as f64 {
-        return 1.0;
-    }
-    1.0 + ((tuples - full as f64) / (full - 1) as f64).ceil()
+    pages
 }
 
 /// Whether a btree on `ctype` deduplicates equal keys (its operator class
@@ -571,7 +637,16 @@ fn btree_layout(planner: &Planner<'_, '_>, info: &IndexInfo, entries: f64) -> (f
         (product * doubled).ceil().max(1.0)
     };
     let distinct = distinct.min(entries.max(1.0));
-    let size = btree_size(entries, width, distinct, deduplicate);
+    // A single key column's NULL keys sort last in their own run.
+    let nulls = if index.n_cols == 1 && !index.expression_keys[0] {
+        entries
+            * planner
+                .variable(usize::from(index.columns[0]))
+                .null_fraction
+    } else {
+        0.0
+    };
+    let size = btree_size(entries, width, distinct, deduplicate, nulls);
     (size.pages, size.height, deduplicate)
 }
 
@@ -829,7 +904,7 @@ impl<'a> Planned<'a> {
 pub(super) struct VariableStatistics<'s> {
     /// Whether ANALYZE recorded the column (`statsTuple`).
     pub(super) analyzed: bool,
-    null_fraction: f64,
+    pub(super) null_fraction: f64,
     distinct: f64,
     pub(super) distribution: Option<ColumnDistribution<'s>>,
     ctype: ColType,
@@ -2104,6 +2179,13 @@ pub(crate) struct JoinScan {
     /// each class's in the order of its members.
     pub(crate) params: [(u8, u8); MAX_JOIN_PARAMS],
     pub(crate) param_count: u8,
+    /// The parameters, by bit, that are join clauses of the relation's
+    /// `joininfo` (`match_join_clauses_to_index`), each applied on its own,
+    /// rather than equalities a class implies, of which a scan applies one.
+    pub(crate) clause_params: u16,
+    /// The outer joins that null each parameter's other side, which a
+    /// path applying it is parameterized by too.
+    pub(crate) param_nulling: [u32; MAX_JOIN_PARAMS],
     /// Each column's equivalence class when it has a member in another
     /// relation (`eclass_useful_for_merging`), else [`NO_CLASS`].
     pub(crate) classes: [u8; 64],
@@ -2123,7 +2205,7 @@ pub(crate) struct JoinDescribe {
     pub(crate) kind: ScanKind,
     pub(crate) index: u16,
     pub(crate) backward: bool,
-    pub(crate) param: u8,
+    pub(crate) param: u32,
 }
 
 /// No equivalence class in [`JoinScan::classes`].

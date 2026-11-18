@@ -4593,9 +4593,31 @@ impl StorageCatalog<'_, '_, '_, '_> {
         self.storage
             .bind_routine_call(declared, &input_type_oids[..input_count], self.txid)
             .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "routine input types do not match its captured signature"
+                // The call no longer resolves, as when the stored expression
+                // is parsed again after a column's type changed.
+                crate::sql::error_position::missing_function(
+                    crate::sql::error_position::full_message_error(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        |text| {
+                            let _ = write!(text, "function {}(", declared.name.as_str());
+                            for (index, oid) in input_type_oids[..input_count].iter().enumerate() {
+                                if index != 0 {
+                                    let _ = text.write_str(", ");
+                                }
+                                let _ = text.write_str(
+                                    crate::sql::catalog::format_type_oid(
+                                        self.storage,
+                                        self.txid,
+                                        *oid,
+                                        -1,
+                                    )
+                                    .as_str(),
+                                );
+                            }
+                            let _ = text.write_str(") does not exist");
+                            Ok(())
+                        },
+                    ),
                 )
             })?;
         self.storage
@@ -9050,6 +9072,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
+    }
+
+    fn domain_collation(&self, type_oid: i32) -> Option<super::ast::Collation> {
+        self.storage.domain_collation_for_oid(type_oid, self.txid)
     }
 
     fn compatible_element_oid(&self, inputs: &[(bool, i32)]) -> Option<i32> {

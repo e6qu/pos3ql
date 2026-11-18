@@ -209,6 +209,7 @@ pub(crate) fn dispatch<'a>(
             | "unistr"
             | "casefold"
             | "to_ascii"
+            | "pg_collation_for"
     ) {
         return None;
     }
@@ -258,6 +259,23 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 unicode::unistr(input, arena).map(Datum::Text)
+            }
+            "pg_collation_for" => {
+                arity(1)?;
+                match crate::sql::eval::collation_of_argument(args[0], row, hooks.catalog)? {
+                    Collation::None => Ok(Datum::Null),
+                    collation => {
+                        let Some(rendered) = hooks
+                            .catalog
+                            .map(|catalog| catalog.collation_name(collation.oid(), arena))
+                            .transpose()?
+                            .flatten()
+                        else {
+                            return Ok(Datum::Null);
+                        };
+                        Ok(Datum::Text(rendered))
+                    }
+                }
             }
             "casefold" => {
                 arity(1)?;

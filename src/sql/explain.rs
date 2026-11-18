@@ -13657,11 +13657,8 @@ impl PostgresHashTable {
     fn of(node: &PlanNode, table: query::instrument::HashTable) -> Self {
         /// `MaxAllocSize / sizeof(HashJoinTuple)`.
         const MAX_ALLOC_POINTERS: u64 = 0x3fff_ffff / 8;
-        // `get_hash_memory_limit`: work_mem times the default
-        // hash_mem_multiplier of 2, which pos3ql does not let a session change.
-        let memory_limit = u64::try_from(crate::sql::guc::work_mem_kilobytes())
-            .unwrap_or(0)
-            .saturating_mul(1024 * 2);
+        // `get_hash_memory_limit`.
+        let memory_limit = crate::sql::guc::hash_memory_bytes().min(u64::MAX as f64) as u64;
         let pointers = (memory_limit / 8).clamp(1, MAX_ALLOC_POINTERS);
         let max_pointers = (1u64 << pointers.ilog2()).min(i32::MAX as u64 / 2 + 1);
         let estimated = if node.rows == 0 { 1000 } else { node.rows };

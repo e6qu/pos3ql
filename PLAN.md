@@ -824,10 +824,9 @@ restarts once per row, to keep their order; `REINDEX INDEX`, a write and a
 table rewrite (`ALTER TABLE ... TYPE`, `CLUSTER`) rebuild the table's value
 caches, which evaluates the other indexes' keys again and repeats their
 notices; a partial unique index's predicate and key calls interleave in
-another order; and an index whose expression no longer resolves after
-`ALTER COLUMN ... TYPE` fails with `routine input types do not match its
-captured signature` where PostgreSQL reports `function rw(bigint) does not
-exist`. Remaining, which `EXPLAIN` rejects with `0A000` naming the
+another order. An index whose expression no longer resolves after
+`ALTER COLUMN ... TYPE` fails with `function rw(bigint) does not exist` and
+its hint, without a cursor (`differential_exact/863`). Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
 methods, expression indexes whose keys still call a user-defined routine or read
 a user-defined type after inlining, a call of a SQL function PostgreSQL
@@ -916,7 +915,36 @@ pulled-up subquery's relation's columns bare, as PostgreSQL prints them.
 `SELECT *` reading a merged column's left column (a right join's right
 one, a full join's both), and the top join's width is the query output's
 (`apply_scanjoin_target_to_paths`), each listed column counted
-(`differential_exact/848`).
+(`differential_exact/848`). A parameterized index scan also filters by
+every other join clause its parameterization moves into it
+(`get_baserel_parampathinfo`): an outer join's equalities and column
+comparisons no index applies, several clauses of one key column (each
+applied, a class's equality once), and a clause reading a column an outer
+join nulls, whose path then waits for that join; a `Memoize` over such a
+scan keys by the moved clauses' outer columns, in binary mode when one is
+not a hash equality (`differential_exact/849`). Nested loops, hash joins
+and merge joins may themselves be parameterized where an outer join
+allows it (`param_source_rels`), each evaluating the join clauses its
+parameterization moves into it (`get_joinrel_parampathinfo`, its own
+`joininfo` clauses included) and sized by its `ppi_rows`; a hash join
+whose hashed input reads an outer row's values builds its table again at
+each rescan (`differential_exact/850`). A left join to one relation no row
+above reads, which a unique index's keys (each equated with the join's
+left side or a constant) make match at most one row, is removed with its
+conditions (`remove_useless_joins`); a column only the removed join read
+stays in its relation's scan width, and a query left with one relation
+scans it with the query's output width (`differential_exact/851`). Join
+conditions may also be inequalities of two relations' columns
+(`neqjoinsel`, for a semi or anti join the outer column's non-NULL
+fraction) and `OR`s of comparisons, equalities and one relation's
+conditions (`clauselist_selectivity_or`), evaluated as join filters
+(`differential_exact/852`). A constant equated with a left or right
+join's outer column equates its inner column too, inside the join's inner
+side, the join clause giving way to a constant `true` that `EXPLAIN` does
+not print (`reconsider_outer_join_clause`, `differential_exact/853`). A
+single-column btree's NULL keys are laid out as a run of their own at the
+end of the index, in tuples of a header and a null bitmap that share
+posting lists when it deduplicates (`differential_exact/862`).
 Hash joins build
 their table on the first outer row and return each outer row's matches in
 their bucket chain's order (re-chained as `ExecHashIncreaseNumBuckets` does
@@ -929,20 +957,27 @@ times `hash_mem_multiplier` runs in batches as PostgreSQL's does
 skew buckets from `ExecHashBuildSkewHash` and `ExecHashJoinNewBatch`), its
 rows assigned by `hashint2`/`hashint4`/`hashint8`/`hashtext`/`hashchar`
 values, so rows, `Batches` and `Memory Usage` match
-(`differential_exact/843`); keys of other types (`numeric`) keep the
+(`differential_exact/843`), a right or full join returning each batch's
+unmatched inner rows once its outer rows are probed, batch 0's skew
+buckets after its main buckets (`differential_exact/854`); a session sets
+`hash_mem_multiplier`, which hash joins and hash aggregates read; keys of other types (`numeric`) keep the
 planner out of such joins, and fail with `0A000` should their one-batch
 table outgrow its memory while running. `EXPLAIN ANALYZE` counts these nodes, a hash's
 `Buckets` and memory and a `Materialize` store included, except a merge
 join over an input in index order that is not a plain index scan without
-a filter (`0A000`). Remaining for that search: a parameterized path of a
-relation with an index that would also filter by another join clause
-movable into it (`get_baserel_parampathinfo`), output expressions other
-than columns, join conditions other than column
-equalities and comparisons, join removal, a constant equated with an
-outer join's compared column (`reconsider_outer_join_clause`), a
-parameterized hash or merge join (`get_joinrel_parampathinfo` of an outer
-join's clauses), several batches of a hash join returning unmatched inner
-rows, a class with two constants, output expressions, upper
+a filter (`0A000`). Remaining for that search: output expressions other
+than columns, join conditions of expressions or of two types
+(`a.int4col = b.int8col`, which PostgreSQL also merges into a class), an
+`OR` whose arm is an `AND` (`extract_restriction_or_clauses`) or that a
+semi or anti join or an indexed relation's parameterized scan evaluates, a
+class holding two columns of one relation
+(`ON a.k = b.k AND a.v = b.k`), a merge join over a partly sorted outer
+input (`Incremental Sort`), parenthesized joins (pulled up as
+`pull_up_subqueries` flattens them), self-join removal
+(`remove_useless_self_joins`), a constant equated with a full join's
+compared column (`reconsider_full_join_clause`) or with an outer join's
+column another outer join nulls, a class with two constants, output
+expressions, upper
 stages (`ORDER BY`, `LIMIT`, grouping, which also bring the query's
 pathkeys and tuple fraction into the search), derived tables, `UPDATE ...
 FROM` and `DELETE ... USING` through the same search, more relations than
@@ -952,7 +987,13 @@ with `0A000`). A parameterized index scan's cost reads its index's pages:
 an index built over loaded rows is sized as `_bt_buildadd` fills its
 pages (a page closes when its free space and its last tuple's posting
 list fall under the fill factor's reserve, that tuple moving on), but one
-grown by inserts is the btree size estimate below. The local reference used to verify costs runs
+grown by inserts is the btree size estimate below. The layout is computed
+from the key columns' statistics, so equal keys share posting lists only
+when the keys repeat twice on average: a column whose keys mostly repeat
+twice but average fewer (`g % 1501` over 3000 rows) is laid out one page
+larger than PostgreSQL's real build, which needs the index's own key
+counts. An index's `pg_class` row reports no pages or tuples where
+PostgreSQL's reports its size. The local reference used to verify costs runs
 on arm64, whose compiler fuses multiply-adds, so a cost there can differ
 from x86-64's (and pos3ql's) in its last printed digit. Other queries'
 joins are not costed as PostgreSQL costs them (`final_cost_hashjoin`,
@@ -1446,7 +1487,11 @@ an operator, array constructors, `COLLATE` clauses, window names, repeated
 utility options and domain constraints, `EXECUTE` and routine arguments
 (unknown literals and row constructors converting to their parameter's type
 at analysis) and privilege checks on a written schema are positioned too
-(`differential_exact/814`). The exact-error corpus compares every error's
+(`differential_exact/814`). Remaining: an unknown table named in a
+query's select list over a derived table whose `EXISTS` subquery reads the
+same name (`SELECT sum(a.id) FROM (SELECT a.id FROM a WHERE EXISTS (SELECT
+1 FROM b WHERE b.k = a.id)) s`) is positioned at the subquery's reference
+rather than the select list's. The exact-error corpus compares every error's
 cursor, psql's `LINE n:` excerpt and caret. A domain's base type modifier
 follows the coercion context (`differential_exact/830`): an explicit cast
 truncates, an assignment, implicit coercion or input rejects; an input
@@ -1465,7 +1510,25 @@ coercion while the statement is planned, as an `UPDATE`'s does; an unknown
 collation (`42704`, naming the schema-qualified name and the encoding, or
 `3F000` for a missing schema) and a `COLLATE` on a type without collation
 (`42804`) fail at the clause, with its cursor, whether or not a row reaches
-it (`differential_exact/846`). Target and expression count errors of an `INSERT`, also with subscripted
+it (`differential_exact/860`), also in an index key, an `ALTER COLUMN ...
+TYPE`, an attribute of `ALTER TYPE` and a domain-typed value or column, which
+the message names by the domain (`differential_exact/861`). A domain has a
+collation (`pg_type.typcollation`, also of its array type and
+`information_schema.domains`): the one `COLLATE` gives it, anywhere among its
+constraints, else its parent's or its base type's, and a base type without
+collation refuses one at the type name. Columns, attributes, `ALTER TYPE
+... ADD ATTRIBUTE` and `ALTER COLUMN ... TYPE` targets of the domain take it
+unless they write their own `COLLATE` (a column's `COLLATE` may also follow
+its other constraints, but not a `DEFAULT` expression's own); `ALTER COLUMN
+... TYPE` takes the new type's collation, not the old column's. A cast to a
+domain with a non-default collation derives it, a `CREATE TABLE AS` column
+keeps the collation its query derives, and `pg_collation_for` reports it. A
+custom collation a domain uses is a `pg_depend` dependency of the domain and
+its array: `DROP COLLATION` refuses it, and with `CASCADE` drops the domain
+and the columns of its type (`differential_exact/864`). Remaining: `ALTER
+COLUMN ... TYPE` to a type that is not built in (a domain, enum or
+composite) fails with `0A000` where PostgreSQL rewrites the column through
+the type's checks. Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

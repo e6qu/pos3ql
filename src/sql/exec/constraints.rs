@@ -1458,6 +1458,11 @@ pub(crate) fn index_key_values<'a>(
                         },
                         &hooks,
                     )
+                })
+                // The key's text was stored by an earlier statement: its
+                // positions mean nothing in the one that evaluates it.
+                .inspect_err(|error| {
+                    crate::sql::error_position::take_position(error);
                 })?
             }
             None => row[columns[position] as usize],

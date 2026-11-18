@@ -12798,6 +12798,9 @@ pub struct DomainDef {
     /// The base type's atttypmod (e.g. `varchar(5)` → 9), applied to a value
     /// before the domain's own constraints.
     pub base_type_mod: i32,
+    /// `pg_type.typcollation`: the collation `COLLATE` gave the domain, else
+    /// its parent's or base type's; `None` for a type without collation.
+    pub collation: crate::sql::ast::Collation,
     pub not_null: bool,
     pub not_null_name: Option<SqlName>,
     pub(crate) not_null_identity: Option<ConstraintIdentity>,
@@ -12838,6 +12841,7 @@ impl DomainDef {
         base_user_type: None,
         base: ColType::Bool,
         base_type_mod: -1,
+        collation: crate::sql::ast::Collation::None,
         not_null: false,
         not_null_name: None,
         not_null_identity: None,
@@ -12872,6 +12876,7 @@ impl DomainDef {
                     base_user_type: pending.spec.base_user_type,
                     base: pending.spec.base,
                     base_type_mod: pending.spec.base_type_mod,
+                    collation: pending.spec.collation,
                     not_null: pending.spec.not_null,
                     not_null_name: pending.spec.not_null_name,
                     not_null_identity: pending.spec.not_null_identity,
@@ -12894,6 +12899,7 @@ pub(crate) struct DomainSpec {
     pub base_user_type: Option<UserTypeName>,
     pub base: ColType,
     pub base_type_mod: i32,
+    pub collation: crate::sql::ast::Collation,
     pub not_null: bool,
     pub not_null_name: Option<SqlName>,
     pub(crate) not_null_identity: Option<ConstraintIdentity>,
@@ -48372,6 +48378,7 @@ impl Storage {
             base_user_type: spec.base_user_type,
             base: spec.base,
             base_type_mod: spec.base_type_mod,
+            collation: spec.collation,
             not_null: spec.not_null,
             not_null_name: spec.not_null_name,
             not_null_identity: spec.not_null_identity,
@@ -48716,6 +48723,7 @@ impl Storage {
                 base_user_type: domain.base_user_type,
                 base: domain.base,
                 base_type_mod: domain.base_type_mod,
+                collation: domain.collation,
                 not_null: domain.not_null,
                 not_null_name: domain.not_null_name,
                 not_null_identity: domain.not_null_identity,
@@ -51604,6 +51612,22 @@ impl Storage {
         self.read_domain_definition(target, txid)
             .ok()?
             .map(|definition| definition.base)
+    }
+
+    /// `typcollation` of the user-defined domain or domain array `type_oid`.
+    pub(crate) fn domain_collation_for_oid(
+        &self,
+        type_oid: i32,
+        txid: u32,
+    ) -> Option<crate::sql::ast::Collation> {
+        let (kind, creation, _) = NamedTypeKind::from_oid(type_oid)?;
+        if kind != NamedTypeKind::Domain {
+            return None;
+        }
+        let target = TypeDefinitionTarget::by_creation(self, kind, creation).ok()?;
+        self.read_domain_definition(target, txid)
+            .ok()?
+            .map(|definition| definition.collation)
     }
 
     pub(crate) fn user_type_identity_oid(

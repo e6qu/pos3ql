@@ -281,7 +281,7 @@ wal_record_kinds! {
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
 const TABLE_DEF_PAYLOAD_VERSION: u8 = 28;
-const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
+const DOMAIN_PAYLOAD_VERSION: u8 = 250;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
 fn access_class_has_oid(class: u8) -> bool {
@@ -4536,6 +4536,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + crate::storage::TypeCreation::ENCODED_BYTES
                 + 4
+                + 4
                 + 1
                 + 2
                 + de
@@ -6511,6 +6512,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && domain_base_creation(def)
                     .is_some_and(|creation| buffer.append(&creation.to_le_bytes()))
                 && buffer.append(&def.base_type_mod.to_le_bytes())
+                && buffer.append(&def.collation.code().to_le_bytes())
                 && buffer.append(&[u8::from(def.not_null)])
                 && name_bytes(
                     buffer,
@@ -10927,6 +10929,10 @@ fn decode_op_inner<'a>(
             };
             let base_type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
             at += 4;
+            let collation = crate::sql::ast::Collation::from_code(u32::from_le_bytes(
+                payload.get(at..at + 4)?.try_into().unwrap(),
+            ))?;
+            at += 4;
             let not_null = stored_boolean(*payload.get(at)?)?;
             at += 1;
             let not_null_text = take_name(&mut at)?;
@@ -11006,6 +11012,7 @@ fn decode_op_inner<'a>(
                 base_user_type,
                 base,
                 base_type_mod,
+                collation,
                 not_null,
                 not_null_name,
                 not_null_identity,
@@ -18613,6 +18620,7 @@ mod tests {
             bytes.push(ColType::Int4.code());
             bytes.extend_from_slice(&NO_DOMAIN_BASE_CREATION.to_le_bytes());
             bytes.extend_from_slice(&(-1_i32).to_le_bytes());
+            bytes.extend_from_slice(&crate::sql::ast::Collation::None.code().to_le_bytes());
             bytes.push(not_null);
             bytes.push(not_null_name.len() as u8);
             bytes.extend_from_slice(not_null_name.as_bytes());

@@ -1016,6 +1016,11 @@ impl<'a> BlockTargets<'a> {
         checked(output)
     }
 
+    /// `table`'s physical columns, `None` when its scan must project.
+    pub(super) fn physical(&self, table: usize) -> Option<Result<Output, SqlError>> {
+        self.physical[table].map(render)
+    }
+
     /// The values `table`'s scan returns under a `Hash` (`CP_SMALL_TLIST`),
     /// in order: the columns needed above it, or its physical columns when
     /// it may return them. `None` when they exceed what a layout holds.

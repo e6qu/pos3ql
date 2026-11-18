@@ -6642,12 +6642,53 @@ fn plan_pulled_select<'a>(
             upper_nodes[upper_count] = *node;
             upper_count += 1;
         }
+        // `VERBOSE`'s target lists of a join without grouping, windows or
+        // row locks: the join computes the scan/join target, the `Sort`
+        // and `Limit` above it return it.
+        let verbose_targets = if model.plan.upper.group.is_none()
+            && model.windows.is_empty()
+            && !aggregate
+            && statement.locking.is_empty()
+        {
+            let mut stages = [targets::Stage {
+                name: "Join",
+                passthrough: false,
+            }; 3];
+            let mut count = 1;
+            for (present, name) in [
+                (model.plan.upper.sort.is_some(), "Sort"),
+                (model.plan.upper.limit.is_some(), "Limit"),
+            ] {
+                if present {
+                    stages[count].name = name;
+                    count += 1;
+                }
+            }
+            targets::BlockTargets::new(
+                storage,
+                txid,
+                statement,
+                Some(scope),
+                true,
+                &stages[..count],
+                &[],
+                &[],
+                false,
+                true,
+                &[],
+                arena,
+            )?
+            .filter(|found| (0..scope.n).all(|table| !found.reads_whole_row(table)))
+        } else {
+            None
+        };
         let mut plan = joins::join_plan(
             storage,
             txid,
             scope,
             &model,
             (sort_keys, presorted, &upper_nodes[..upper_count]),
+            verbose_targets.as_ref(),
             block,
             arena,
         )?;

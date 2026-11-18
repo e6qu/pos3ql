@@ -1073,7 +1073,17 @@ of such an expression sorts by its class, a window's input computing it
 (`make_window_input_target`). A full join's merged `USING` column, or a
 `COALESCE` of its compared columns, equated with a constant equates each
 side with the constant instead (`reconsider_full_join_clause`,
-`differential_exact/888`). Remaining for windows: window functions inside
+`differential_exact/888`). `EXPLAIN VERBOSE` of a plan that search builds
+prints each node's target list as `createplan.c` builds it: the top join
+computes the select list, a lower join its relations' columns needed above
+it in its first building pair's order (`build_joinrel_tlist`), a scan under
+a `Hash`, `Sort`, `Materialize` or `Memoize` or a batched hash join's outer
+scan only the columns needed, another scan its physical columns (an
+index-only scan its index's), a unique-ified relation's input and a merge
+join's sort the compared expressions they compute, and a join with a
+unique inner relation `Inner Unique: true` (`differential_exact/930`).
+Remaining for `VERBOSE` there: the lists of a join under grouping, windows
+or row locks, which fail with `0A000`. Remaining for windows: window functions inside
 expressions or the `ORDER BY`, windows over one relation's groups, the
 merging of window clauses equal once `optimize_window_clauses` frees their
 frames, run conditions (`find_window_run_conditions`, which needs the

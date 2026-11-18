@@ -1388,6 +1388,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 hash,
                 buckets,
                 batches,
+                ..
             } => {
                 // An inner input reading the values of an outer row above
                 // changes at each rescan, which builds the table again

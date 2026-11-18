@@ -550,6 +550,8 @@ pub(crate) enum PathKind {
         hash: ClauseList,
         buckets: u32,
         batches: u32,
+        /// The inner relation is unique for the join's clauses.
+        inner_unique: bool,
     },
     MergeJoin {
         jointype: JoinType,
@@ -4630,6 +4632,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     hash,
                     buckets: sizing.buckets,
                     batches: sizing.batches,
+                    inner_unique: inputs.inner_unique,
                 },
                 relids: joined,
                 rows: param_rows.unwrap_or(rel.rows),

@@ -1573,10 +1573,11 @@ custom collation a domain uses is a `pg_depend` dependency of the domain and
 its array: `DROP COLLATION` refuses it, and with `CASCADE` drops the domain
 and the columns of its type (`differential_exact/864`). `DROP TYPE` drops a
 domain as `DROP DOMAIN` does, freeing its slot (`differential_exact/865`).
-Remaining: `ALTER
-COLUMN ... TYPE` to a type that is not built in (a domain, enum or
-composite) fails with `0A000` where PostgreSQL rewrites the column through
-the type's checks. Target and expression count errors of an `INSERT`, also with subscripted
+`ALTER COLUMN ... TYPE` to a domain, enum or composite rewrites the
+column through the type: a domain's checks and `NOT NULL` apply to each row, an
+enum or composite needs `USING` unless the column has the type already (`42804`
+with PostgreSQL's hint), and a default that cannot convert is refused
+(`differential_exact/866`). Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

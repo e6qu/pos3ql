@@ -17,9 +17,9 @@ use crate::storage::{Storage, TableStatistics};
 
 use super::join_tree::{self, Placed, Qual, Shape, Tree, TreeJoin, TreeNode, VarList};
 use super::joins::{
-    BASE_RELIDS, BasePath, BaseRel, Clause, ClauseForm, ClauseList, ForeignKeyJoin, JoinPlan,
-    JoinProblem, JoinSettings, JoinStatistics, Keys, MAX_CLAUSES, MAX_JOIN_RELS, MAX_MEMBERS,
-    Member, NO_KEY_CLASS, NeededColumn, Relids,
+    BASE_RELIDS, BasePath, BaseRel, Clause, ClauseForm, ClauseList, EquivalenceClass,
+    ForeignKeyJoin, JoinPlan, JoinProblem, JoinSettings, JoinStatistics, KEY_CLASS, Keys,
+    MAX_CLAUSES, MAX_JOIN_RELS, MAX_MEMBERS, Member, NO_KEY_CLASS, NeededColumn, Relids,
 };
 use super::paths::JoinCandidate;
 use super::{
@@ -234,8 +234,13 @@ pub(crate) struct ModeledJoin<'a> {
     pub(crate) columns: &'a [[(usize, usize); MAX_MEMBERS]],
     /// The query's conditions, by [`Clause::source`].
     pub(crate) quals: &'a [&'a Expr<'a>],
-    /// The width of the query's output, which the top join's paths carry.
+    /// The width of the query's target list, its ordering columns
+    /// included, which the top join's paths carry.
     pub(crate) output_width: f64,
+    /// The `ORDER BY` items whose pathkeys the plan's sort sorts by.
+    pub(crate) sort_items: &'a [u8],
+    /// The query aggregates the joined rows into one row.
+    pub(crate) aggregated: bool,
 }
 
 impl<'a> ModeledJoin<'a> {
@@ -704,14 +709,15 @@ pub(crate) fn modeled_join<'a>(
         || !statement.group_by.is_empty()
         || !statement.grouping_sets.is_empty()
         || statement.having.is_some()
-        || !statement.order_by.is_empty()
-        || statement.limit.is_some()
-        || statement.offset.is_some()
+        || statement.with_ties
         || !statement.windows.is_empty()
         || !statement.locking.is_empty()
     {
         return Ok(None);
     }
+    let Some(limit) = super::constant_limit(statement.limit, statement.offset, arena)? else {
+        return Ok(None);
+    };
     let methods = crate::sql::guc::planner_methods();
     let value = crate::sql::guc::planner_value;
     // Above `geqo_threshold` PostgreSQL searches genetically, and past the
@@ -774,6 +780,11 @@ pub(crate) fn modeled_join<'a>(
             _ => &parts[..1],
         }
     };
+    // The select list's expressions' widths and their cost per row.
+    let mut expression_width = 0.0;
+    let mut target_cost = 0.0;
+    let mut aggregated = false;
+    let mut unaggregated = false;
     for item in statement.items {
         match item {
             SelectItem::Wildcard(_) if !scope.merged_output().is_empty() => {
@@ -813,11 +824,125 @@ pub(crate) fn modeled_join<'a>(
                 Some((table, column)) if column < 64 => {
                     output[table] |= 1 << column;
                     note(table, column);
+                    unaggregated = true;
                 }
-                _ => return Ok(None),
+                Some(_) => return Ok(None),
+                // An expression: the columns it reads, in the order it
+                // reads them (`pull_var_clause`), and its width and cost.
+                None => {
+                    let Some(vars) = qual_vars(scope, expression) else {
+                        return Ok(None);
+                    };
+                    let columns = crate::sql::query::CatalogScopeCols {
+                        scope,
+                        outer: None,
+                        storage,
+                        txid,
+                        arena,
+                    };
+                    if crate::sql::query::expr_has_window(expression)
+                        || crate::sql::query::has_set_returning_items(
+                            core::slice::from_ref(item),
+                            storage,
+                            txid,
+                        )
+                    {
+                        return Ok(None);
+                    }
+                    if crate::sql::query::expr_has_aggregate(expression, storage, txid, &columns)? {
+                        // A plain aggregate: the join returns the columns
+                        // its arguments read.
+                        aggregated = true;
+                    } else {
+                        let Some((entry_width, cost)) =
+                            target_entry(storage, txid, scope, expression, arena)
+                        else {
+                            return Ok(None);
+                        };
+                        expression_width += entry_width;
+                        target_cost += cost;
+                        unaggregated = true;
+                    }
+                    for &(table, column) in vars.as_slice() {
+                        output[usize::from(table)] |= 1 << column;
+                        note(usize::from(table), usize::from(column));
+                    }
+                }
             },
             SelectItem::RecordStar(_) => return Ok(None),
         }
+    }
+    // A plain aggregate's query returns one row of aggregates.
+    if aggregated
+        && (unaggregated
+            || statement
+                .items
+                .iter()
+                .any(|item| !matches!(item, SelectItem::Expr { .. }))
+            || !statement.order_by.is_empty()
+            || limit.is_some())
+    {
+        return Ok(None);
+    }
+    // The `ORDER BY` columns, which the target list holds after the
+    // output's (`resjunk` entries).
+    let mut sort_columns = [(0usize, 0usize, 0u8, 0u8); super::joins::MAX_KEYS];
+    let mut sort_count = 0;
+    let mut junk_columns = [(0usize, 0usize); super::joins::MAX_KEYS];
+    let mut junk_count = 0;
+    for (item, order) in statement.order_by.iter().enumerate() {
+        let target = crate::sql::query::resolve_order_target(
+            order.expression,
+            statement.items,
+            scope,
+            arena,
+            storage,
+            txid,
+            None,
+        )?;
+        let Some((table, column)) = column_of(scope, target) else {
+            return Ok(None);
+        };
+        let ctype = scope
+            .defs
+            .stored(table)
+            .map(|def| def.columns()[column].ctype);
+        if column >= 64 || !ctype.is_some_and(joinable) || sort_count == super::joins::MAX_KEYS {
+            return Ok(None);
+        }
+        let flags = if order.descending {
+            super::joins::KEY_DESCENDING
+        } else {
+            0
+        } | if order.nulls_first {
+            super::joins::KEY_NULLS_FIRST
+        } else {
+            0
+        };
+        sort_columns[sort_count] = (table, column, flags, item as u8);
+        sort_count += 1;
+        // `findTargetlistEntrySQL92`: an output column the key names.
+        let listed = statement.items.iter().any(|item| match item {
+            SelectItem::Wildcard(_) if !scope.merged_output().is_empty() => {
+                scope.merged_output().iter().any(|&entry| match entry {
+                    ResolvedColumn::Table(listed, at) => (listed, at) == (table, column),
+                    ResolvedColumn::Merged(merged) => merged_parts(merged) == [(table, column)],
+                    _ => false,
+                })
+            }
+            SelectItem::Wildcard(_) => true,
+            SelectItem::TableWildcard(qualifier) => scope.names[table] == *qualifier,
+            SelectItem::Expr { expression, .. } => {
+                column_of(scope, expression) == Some((table, column))
+            }
+            SelectItem::RecordStar(_) => false,
+        });
+        if !listed && !junk_columns[..junk_count].contains(&(table, column)) {
+            junk_columns[junk_count] = (table, column);
+            junk_count += 1;
+        }
+        output[table] |= 1 << column;
+        note(table, column);
     }
     // The join tree as written: each comma-separated item a chain of joins
     // (each join's range table entry numbered in written order), then the
@@ -1096,6 +1221,54 @@ pub(crate) fn modeled_join<'a>(
             }
         }
     }
+    // The query's pathkeys (`make_pathkeys_for_sortclauses`): each `ORDER
+    // BY` column's class, a new one when no class holds the column as the
+    // query's output reads it, a key of a class already ordered or of a
+    // constant's dropped as redundant.
+    let mut extended = [EquivalenceClass {
+        members: [Member::plain(0, 0); MAX_MEMBERS],
+        count: 0,
+        has_const: false,
+    }; join_tree::MAX_CLASSES];
+    extended[..class_count].copy_from_slice(classes);
+    let mut class_count = class_count;
+    let mut sort_keys = Keys::NONE;
+    let mut sort_items = [0u8; super::joins::MAX_KEYS];
+    for &(table, column, flags, item) in &sort_columns[..sort_count] {
+        let member = Member {
+            rel: table as u8,
+            column: column as u16,
+            nulling: nulling_relids[table] & !BASE_RELIDS,
+        };
+        let class = match extended[..class_count]
+            .iter()
+            .position(|class| class.members().contains(&member))
+        {
+            Some(class) => class,
+            None => {
+                if class_count == extended.len() {
+                    return Ok(None);
+                }
+                extended[class_count].members[0] = member;
+                extended[class_count].count = 1;
+                class_count += 1;
+                class_count - 1
+            }
+        };
+        if extended[class].has_const
+            || sort_keys
+                .as_slice()
+                .iter()
+                .any(|&key| usize::from(key & KEY_CLASS) == class)
+        {
+            continue;
+        }
+        sort_items[sort_keys.as_slice().len()] = item;
+        let _ = sort_keys.push_class(class as u8 | flags);
+    }
+    let classes: &[EquivalenceClass] = arena
+        .alloc_slice_copy(&extended[..class_count])
+        .map_err(|_| crate::sql::eval::arena_full())?;
     // The columns each other condition of two relations compares, each
     // nulled by the outer joins the clause reads it above.
     for clause in &mut clauses[..placed_join_count] {
@@ -1137,6 +1310,8 @@ pub(crate) fn modeled_join<'a>(
         clause_params: 0,
         param_nulling: [0; MAX_JOIN_PARAMS],
         classes: [NO_CLASS; 64],
+        merging: 0,
+        order: Keys::NONE,
         rel_rows: [0.0; 8],
         total_table_pages: 0.0,
         describe: None,
@@ -1157,6 +1332,7 @@ pub(crate) fn modeled_join<'a>(
             total_table_pages += super::relation_size(storage, scope.slots[table], txid).pages;
         }
         let scan = &mut scans[table];
+        scan.order = sort_keys;
         let relids: Relids = 1 << table;
         // `pathkeys_useful_for_merging` at the relation: a class with a
         // member elsewhere, or one a mergeable clause of its `joininfo`
@@ -1185,6 +1361,13 @@ pub(crate) fn modeled_join<'a>(
                         if usize::from(left_class) == class || usize::from(right_class) == class)
             });
             if useful_by_class || useful_by_clause {
+                *slot = class as u8;
+                scan.merging |= 1 << class;
+            } else if sort_keys
+                .as_slice()
+                .iter()
+                .any(|&key| usize::from(key & KEY_CLASS) == class)
+            {
                 *slot = class as u8;
             }
         }
@@ -1823,6 +2006,71 @@ pub(crate) fn modeled_join<'a>(
             }
         }
     }
+    // The output's width (`apply_scanjoin_target_to_paths`): each output
+    // column's, a full join's merged column at its type's.
+    let column_width = |(table, column): (usize, usize)| {
+        f64::from(super::column_width(
+            storage,
+            txid,
+            scope.slots[table],
+            column,
+        ))
+    };
+    let mut output_width = 0.0;
+    for item in statement.items {
+        match item {
+            SelectItem::Wildcard(_) if !scope.merged_output().is_empty() => {
+                for &entry in scope.merged_output() {
+                    output_width += match entry {
+                        ResolvedColumn::Table(table, column) => column_width((table, column)),
+                        ResolvedColumn::Merged(merged) => {
+                            let parts = merged_parts(merged);
+                            if parts.len() == 1 {
+                                column_width(parts[0])
+                            } else {
+                                type_width(scope.merged[merged].ctype)
+                            }
+                        }
+                        ResolvedColumn::TableOid(_) => return Ok(None),
+                    };
+                }
+            }
+            SelectItem::Wildcard(_) => {
+                for table in 0..n {
+                    for column in 0..width(table) {
+                        output_width += column_width((table, column));
+                    }
+                }
+            }
+            SelectItem::TableWildcard(qualifier) => {
+                let table = (0..n)
+                    .find(|&table| scope.names[table] == *qualifier)
+                    .expect("resolved");
+                for column in 0..width(table) {
+                    output_width += column_width((table, column));
+                }
+            }
+            SelectItem::Expr { expression, .. } => {
+                if let Some(column) = column_of(scope, expression) {
+                    output_width += column_width(column);
+                }
+            }
+            SelectItem::RecordStar(_) => return Ok(None),
+        }
+    }
+    for &junk in &junk_columns[..junk_count] {
+        output_width += column_width(junk);
+    }
+    output_width += expression_width;
+    // An aggregate's input is each column its arguments read, once.
+    if aggregated {
+        output_width = 0.0;
+        for (table, &mask) in output.iter().enumerate().take(n) {
+            for column in (0..64).filter(|column| mask & 1 << column != 0) {
+                output_width += column_width((table, column));
+            }
+        }
+    }
     let reader = RelStatistics {
         planners: &planners,
         rels: &base,
@@ -1837,6 +2085,13 @@ pub(crate) fn modeled_join<'a>(
         needed: &needed[..needed_count],
         foreign_keys: &foreign_keys[..foreign_count],
         removed,
+        upper: super::joins::UpperProblem {
+            sort: sort_keys,
+            limit,
+            width: output_width,
+            target_cost,
+        },
+        dummy: prepared.contradictory,
         settings: JoinSettings {
             costs,
             work_mem_bytes: f64::from(crate::sql::guc::work_mem_kilobytes()) * 1024.0,
@@ -1846,6 +2101,7 @@ pub(crate) fn modeled_join<'a>(
             mergejoin: value("enable_mergejoin") != 0.0,
             material: methods.material,
             sort: methods.sort,
+            incremental_sort: methods.incremental_sort,
             memoize: value("enable_memoize") != 0.0,
         },
     };
@@ -1930,63 +2186,45 @@ pub(crate) fn modeled_join<'a>(
     let quals = arena
         .alloc_slice_copy(quals)
         .map_err(|_| crate::sql::eval::arena_full())?;
-    // The output's width (`apply_scanjoin_target_to_paths`): each output
-    // column's, a full join's merged column at its type's.
-    let column_width = |(table, column): (usize, usize)| {
-        f64::from(super::column_width(
-            storage,
-            txid,
-            scope.slots[table],
-            column,
-        ))
-    };
-    let mut output_width = 0.0;
-    for item in statement.items {
-        match item {
-            SelectItem::Wildcard(_) if !scope.merged_output().is_empty() => {
-                for &entry in scope.merged_output() {
-                    output_width += match entry {
-                        ResolvedColumn::Table(table, column) => column_width((table, column)),
-                        ResolvedColumn::Merged(merged) => {
-                            let parts = merged_parts(merged);
-                            if parts.len() == 1 {
-                                column_width(parts[0])
-                            } else {
-                                type_width(scope.merged[merged].ctype)
-                            }
-                        }
-                        ResolvedColumn::TableOid(_) => return Ok(None),
-                    };
-                }
-            }
-            SelectItem::Wildcard(_) => {
-                for table in 0..n {
-                    for column in 0..width(table) {
-                        output_width += column_width((table, column));
-                    }
-                }
-            }
-            SelectItem::TableWildcard(qualifier) => {
-                let table = (0..n)
-                    .find(|&table| scope.names[table] == *qualifier)
-                    .expect("resolved");
-                for column in 0..width(table) {
-                    output_width += column_width((table, column));
-                }
-            }
-            SelectItem::Expr { expression, .. } => {
-                output_width += column_width(column_of(scope, expression).expect("a column"));
-            }
-            SelectItem::RecordStar(_) => return Ok(None),
-        }
-    }
     Ok(Some(ModeledJoin {
         plan,
         rels,
         columns,
         quals,
         output_width,
+        aggregated,
+        sort_items: arena
+            .alloc_slice_copy(&sort_items[..sort_keys.as_slice().len()])
+            .map_err(|_| crate::sql::eval::arena_full())?,
     }))
+}
+
+/// A select-list expression's average width and its cost per row
+/// (`set_pathtarget_cost_width`); `None` for a type the model does not
+/// size.
+fn target_entry<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'a>,
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Option<(f64, f64)> {
+    let columns = crate::sql::query::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    let (type_oid, type_mod) = crate::sql::exec::infer_type_res(expression, &columns).ok()?;
+    let Some((ctype, None)) = crate::sql::exec::catalog_column_type(storage, txid, type_oid) else {
+        return None;
+    };
+    Some((
+        super::type_average_width(ctype, i32::from(type_mod)),
+        super::super::plan::qual_cost(expression, &columns, storage, txid, arena) / 2.0
+            * Costs::current().cpu_operator,
+    ))
 }
 
 /// `join_is_removable` of left join `info` to relation `table`: no row
@@ -2501,7 +2739,7 @@ fn reaches_hashed_unique(plan: &JoinPlan<'_>, hashable: &dyn Fn(&Member) -> bool
                     && !keys[..usize::from(key_count)].iter().all(hashable))
                     || reaches(plan, input, hashable)
             }
-            PathKind::Scan { .. } => false,
+            PathKind::Scan { .. } | PathKind::Dummy => false,
             PathKind::Material { input } | PathKind::Memoize { input, .. } => {
                 reaches(plan, input, hashable)
             }

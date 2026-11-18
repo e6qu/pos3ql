@@ -109,6 +109,312 @@ pub(crate) fn pg_qsort(
     }
 }
 
+/// PostgreSQL's in-memory tuplesort of `data` in arrival order: a sort
+/// bounded to its `bound` least elements keeps them in a heap once more
+/// than twice the bound arrive (`make_bounded_heap`, `tuplesort_heap_*`
+/// with the sort reversed) and returns them sorted (`sort_bounded_heap`);
+/// otherwise `pg_qsort`. Returns how many leading elements are the sorted
+/// result.
+pub(crate) fn pg_tuplesort(
+    data: &mut [u32],
+    bound: Option<usize>,
+    compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+) -> Result<usize, SqlError> {
+    let Some(bound) = bound.filter(|&bound| data.len() > bound * 2) else {
+        pg_qsort(data, compare)?;
+        return Ok(data.len());
+    };
+    if bound == 0 {
+        return Ok(0);
+    }
+    // The reversed order puts the greatest element at the heap's top.
+    let mut reversed = |a: u32, b: u32| compare(b, a);
+    let mut count = 0usize;
+    for at in 0..data.len() {
+        let tuple = data[at];
+        if count < bound {
+            // `tuplesort_heap_insert`: sift up.
+            let mut j = count;
+            count += 1;
+            while j > 0 {
+                let i = (j - 1) >> 1;
+                if reversed(tuple, data[i])?.is_ge() {
+                    break;
+                }
+                data[j] = data[i];
+                j = i;
+            }
+            data[j] = tuple;
+        } else if reversed(tuple, data[0])?.is_le() {
+            // Not less than the greatest kept: discarded.
+        } else {
+            heap_replace_top(&mut data[..count], tuple, &mut reversed)?;
+        }
+    }
+    // `sort_bounded_heap`: each greatest element moves past the heap.
+    let kept = count;
+    while count > 1 {
+        let top = data[0];
+        count -= 1;
+        let last = data[count];
+        heap_replace_top(&mut data[..count], last, &mut reversed)?;
+        data[count] = top;
+    }
+    Ok(kept)
+}
+
+/// Where PostgreSQL's incremental sort is in its cycle
+/// (`IncrementalSortExecutionStatus`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Incremental {
+    LoadFull,
+    LoadPrefix,
+    ReadFull,
+    ReadPrefix,
+}
+
+/// PostgreSQL's `ExecIncrementalSort` over `input`, already sorted by the
+/// first keys, which `same_group` compares: batches of at least 32 rows
+/// (`DEFAULT_MIN_GROUP_SIZE`) extended to the end of their group are
+/// sorted by every key, and past 64 rows a large group's rest is sorted
+/// alone by the other keys (`switchToPresortedPrefixMode`). A `bound` from
+/// a limit above stops it once it returned that many rows and bounds its
+/// sorts as `tuplesort_set_bound` does. Writes the rows it returns to
+/// `out`, using `scratch` of twice the input's length, and returns how
+/// many.
+pub(crate) fn pg_incremental_sort(
+    input: &[u32],
+    scratch: &mut [u32],
+    out: &mut [u32],
+    bound: Option<usize>,
+    same_group: &mut dyn FnMut(u32, u32) -> Result<bool, SqlError>,
+    compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+) -> Result<usize, SqlError> {
+    const MIN_GROUP: usize = 32;
+    const MAX_FULL_SORT_GROUP: usize = 2 * MIN_GROUP;
+    let (full, prefix) = scratch.split_at_mut(input.len());
+    let mut state = IncrementalState {
+        status: Incremental::LoadFull,
+        pivot: None,
+        transfer: None,
+        remaining: 0,
+        bound_done: 0,
+        full_read: 0,
+        prefix_len: 0,
+        prefix_bound: None,
+    };
+    let (mut full_kept, mut prefix_kept) = (0usize, 0usize);
+    let (mut position, mut emitted, mut outer_done) = (0usize, 0usize, false);
+    loop {
+        if bound.is_some_and(|bound| emitted >= bound) {
+            break;
+        }
+        let mut tuples = 0usize;
+        if matches!(
+            state.status,
+            Incremental::ReadFull | Incremental::ReadPrefix
+        ) {
+            if outer_done {
+                break;
+            }
+            if state.remaining > 0 {
+                prefix_kept = state.switch_to_prefix(full, prefix, bound, same_group, compare)?;
+            } else {
+                state.status = Incremental::LoadFull;
+            }
+        }
+        if state.status == Incremental::LoadFull {
+            let mut full_len = 0;
+            state.full_read = 0;
+            let current = bound.map(|bound| bound - state.bound_done);
+            let sort_bound = current.filter(|&current| current < MIN_GROUP);
+            let min_group = current.map_or(MIN_GROUP, |current| current.min(MIN_GROUP));
+            if let Some(pivot) = state.pivot {
+                full[full_len] = pivot;
+                full_len += 1;
+                tuples += 1;
+                if tuples != min_group {
+                    state.pivot = None;
+                }
+            }
+            loop {
+                let Some(&slot) = input.get(position) else {
+                    outer_done = true;
+                    full_kept = pg_tuplesort(&mut full[..full_len], sort_bound, compare)?;
+                    state.status = Incremental::ReadFull;
+                    break;
+                };
+                position += 1;
+                if tuples < min_group {
+                    full[full_len] = slot;
+                    full_len += 1;
+                    tuples += 1;
+                    if tuples == min_group {
+                        state.pivot = Some(slot);
+                    }
+                } else if same_group(state.pivot.expect("a group's first row"), slot)? {
+                    full[full_len] = slot;
+                    full_len += 1;
+                    tuples += 1;
+                } else {
+                    state.pivot = Some(slot);
+                    if let Some(bound) = bound {
+                        state.bound_done = bound.min(state.bound_done + tuples);
+                    }
+                    full_kept = pg_tuplesort(&mut full[..full_len], sort_bound, compare)?;
+                    state.status = Incremental::ReadFull;
+                    break;
+                }
+                if tuples > MAX_FULL_SORT_GROUP {
+                    state.pivot = None;
+                    full_kept = pg_tuplesort(&mut full[..full_len], sort_bound, compare)?;
+                    if let (Some(sort_bound), Some(current)) = (sort_bound, current)
+                        && full_len > sort_bound * 2
+                    {
+                        tuples = tuples.min(current);
+                    }
+                    state.remaining = tuples;
+                    prefix_kept =
+                        state.switch_to_prefix(full, prefix, bound, same_group, compare)?;
+                    break;
+                }
+            }
+        }
+        if state.status == Incremental::LoadPrefix {
+            loop {
+                let Some(&slot) = input.get(position) else {
+                    outer_done = true;
+                    break;
+                };
+                position += 1;
+                if same_group(state.pivot.expect("a group's first row"), slot)? {
+                    prefix[state.prefix_len] = slot;
+                    state.prefix_len += 1;
+                    tuples += 1;
+                } else {
+                    state.pivot = Some(slot);
+                    break;
+                }
+            }
+            prefix_kept =
+                pg_tuplesort(&mut prefix[..state.prefix_len], state.prefix_bound, compare)?;
+            state.status = Incremental::ReadPrefix;
+            if let Some(bound) = bound {
+                state.bound_done = bound.min(state.bound_done + tuples);
+            }
+        }
+        let batch = if state.status == Incremental::ReadFull {
+            &full[..full_kept]
+        } else {
+            &prefix[..prefix_kept]
+        };
+        for &row in batch {
+            if bound.is_some_and(|bound| emitted >= bound) {
+                break;
+            }
+            out[emitted] = row;
+            emitted += 1;
+        }
+    }
+    Ok(emitted)
+}
+
+/// The incremental sort's state between its batches.
+struct IncrementalState {
+    status: Incremental,
+    /// The first row of the group being loaded (`group_pivot`).
+    pivot: Option<u32>,
+    /// The full sort's row that began the next group (`transfer_tuple`).
+    transfer: Option<u32>,
+    /// The full sort's rows not yet returned (`n_fullsort_remaining`).
+    remaining: usize,
+    bound_done: usize,
+    /// The full sort's rows read back.
+    full_read: usize,
+    prefix_len: usize,
+    prefix_bound: Option<usize>,
+}
+
+impl IncrementalState {
+    /// `switchToPresortedPrefixMode`: moves the sorted full batch's rows of
+    /// its first group to the prefix sort; returns the prefix sort's
+    /// sorted rows once the group ends within them.
+    fn switch_to_prefix(
+        &mut self,
+        full: &[u32],
+        prefix: &mut [u32],
+        bound: Option<usize>,
+        same_group: &mut dyn FnMut(u32, u32) -> Result<bool, SqlError>,
+        compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+    ) -> Result<usize, SqlError> {
+        self.prefix_len = 0;
+        self.prefix_bound = bound.map(|bound| bound - self.bound_done);
+        let mut tuples = 0;
+        while tuples < self.remaining {
+            if tuples == 0
+                && let Some(transfer) = self.transfer
+            {
+                prefix[self.prefix_len] = transfer;
+                self.prefix_len += 1;
+                self.pivot = Some(transfer);
+            } else {
+                let row = full[self.full_read];
+                self.full_read += 1;
+                self.transfer = Some(row);
+                let pivot = *self.pivot.get_or_insert(row);
+                if same_group(pivot, row)? {
+                    prefix[self.prefix_len] = row;
+                    self.prefix_len += 1;
+                } else {
+                    self.pivot = None;
+                    break;
+                }
+            }
+            tuples += 1;
+        }
+        self.remaining -= tuples;
+        if self.remaining == 0 {
+            self.pivot = self.transfer.take();
+            self.status = Incremental::LoadPrefix;
+            Ok(0)
+        } else {
+            let kept = pg_tuplesort(&mut prefix[..self.prefix_len], self.prefix_bound, compare)?;
+            if let Some(bound) = bound {
+                self.bound_done = bound.min(self.bound_done + tuples);
+            }
+            self.status = Incremental::ReadPrefix;
+            Ok(kept)
+        }
+    }
+}
+
+/// `tuplesort_heap_replace_top`: `tuple` replaces the heap's top and sifts
+/// down.
+fn heap_replace_top(
+    heap: &mut [u32],
+    tuple: u32,
+    reversed: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+) -> Result<(), SqlError> {
+    let n = heap.len();
+    let mut i = 0usize;
+    loop {
+        let mut j = 2 * i + 1;
+        if j >= n {
+            break;
+        }
+        if j + 1 < n && reversed(heap[j], heap[j + 1])?.is_gt() {
+            j += 1;
+        }
+        if reversed(tuple, heap[j])?.is_le() {
+            break;
+        }
+        heap[i] = heap[j];
+        i = j;
+    }
+    heap[i] = tuple;
+    Ok(())
+}
+
 fn med3(
     data: &[u32],
     a: usize,
@@ -173,5 +479,39 @@ mod tests {
         // last is compared before any partitioning.
         let (_, pairs) = trace(&[3, 1, 2, 4, 5, 6, 7, 0]);
         assert_eq!(pairs[..4], [(3, 1), (3, 5), (5, 0), (3, 0)]);
+    }
+
+    #[test]
+    fn bounded_and_incremental_sorts_return_the_least_rows_in_order() {
+        let values = [9i64, 4, 7, 1, 8, 2, 6, 3, 5, 0, 4, 1];
+        let mut compare = |a: u32, b: u32| Ok(values[a as usize].cmp(&values[b as usize]));
+        let mut order: Vec<u32> = (0..values.len() as u32).collect();
+        let kept = pg_tuplesort(&mut order, Some(3), &mut compare).unwrap();
+        let least: Vec<i64> = order[..kept]
+            .iter()
+            .map(|&at| values[at as usize])
+            .collect();
+        assert_eq!(least, [0, 1, 1]);
+        // Rows already grouped by their tens are sorted within each batch.
+        let grouped: Vec<i64> = (0..100).map(|at| (at / 40) * 100 + (99 - at) % 7).collect();
+        let input: Vec<u32> = (0..grouped.len() as u32).collect();
+        let mut scratch = vec![0u32; grouped.len() * 2];
+        let mut out = vec![0u32; grouped.len()];
+        let returned = pg_incremental_sort(
+            &input,
+            &mut scratch,
+            &mut out,
+            None,
+            &mut |a, b| Ok(grouped[a as usize] / 100 == grouped[b as usize] / 100),
+            &mut |a, b| Ok(grouped[a as usize].cmp(&grouped[b as usize])),
+        )
+        .unwrap();
+        let sorted: Vec<i64> = out[..returned]
+            .iter()
+            .map(|&at| grouped[at as usize])
+            .collect();
+        let mut expected = grouped.clone();
+        expected.sort_unstable();
+        assert_eq!(sorted, expected);
     }
 }

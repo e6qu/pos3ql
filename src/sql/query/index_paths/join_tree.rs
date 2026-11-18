@@ -281,6 +281,9 @@ pub(crate) struct Prepared {
     /// is needed only by its own relation.
     pub(crate) needed: [(Var, Relids, u8); 64],
     pub(crate) needed_count: usize,
+    /// A class equates two different constants in the query's join
+    /// domain: the query returns no rows.
+    pub(crate) contradictory: bool,
 }
 
 impl Prepared {
@@ -461,6 +464,7 @@ struct Prep<'t> {
     lists: [[i8; MAX_JOIN_RELS]; MAX_NODES],
     list_len: [u8; MAX_NODES],
     list_count: usize,
+    contradictory: bool,
 }
 
 const FULL: Outside = "a query beyond the join preparation's capacity";
@@ -529,6 +533,7 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         lists: [[0; MAX_JOIN_RELS]; MAX_NODES],
         list_len: [0; MAX_NODES],
         list_count: 0,
+        contradictory: false,
     };
     for (at, node) in tree.nodes[..tree.node_count].iter().enumerate() {
         if let TreeNode::Join {
@@ -605,6 +610,7 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         placed_count: prep.placed_count,
         needed: prep.needed,
         needed_count: prep.needed_count,
+        contradictory: prep.contradictory,
     })
 }
 
@@ -1615,10 +1621,15 @@ impl Prep<'_> {
                 for &member in moved.class.members() {
                     self.add_member(one, member)?;
                 }
-                let held = &mut self.classes[usize::from(one)];
-                if held.class.has_const && moved.class.has_const {
-                    return Err("an equivalence class of two constants");
+                let kept = self.classes[usize::from(one)];
+                if kept.class.has_const
+                    && moved.class.has_const
+                    && kept.constant.map(|(_, constant, _)| constant)
+                        != moved.constant.map(|(_, constant, _)| constant)
+                {
+                    self.contradiction(domain)?;
                 }
+                let held = &mut self.classes[usize::from(one)];
                 held.class.has_const |= moved.class.has_const;
                 if held.constant.is_none() {
                     held.constant = moved.constant;
@@ -1632,12 +1643,19 @@ impl Prep<'_> {
                 match right {
                     Some(right) => self.add_member(one, right)?,
                     None => {
-                        let held = &mut self.classes[usize::from(one)];
+                        let held = &self.classes[usize::from(one)];
                         if held.class.has_const {
-                            return Err("an equivalence class of two constants");
+                            // `generate_base_implied_equalities_const`
+                            // equates the two constants: a constant
+                            // false.
+                            if held.constant.map(|(_, held, _)| held) != constant {
+                                self.contradiction(domain)?;
+                            }
+                        } else {
+                            let held = &mut self.classes[usize::from(one)];
+                            held.class.has_const = true;
+                            held.constant = Some((qual, constant.expect("a constant"), domain));
                         }
-                        held.class.has_const = true;
-                        held.constant = Some((qual, constant.expect("a constant"), domain));
                     }
                 }
                 one
@@ -1664,6 +1682,18 @@ impl Prep<'_> {
         *self.sources.get_mut(self.source_count).ok_or(FULL)? = (qual, class);
         self.source_count += 1;
         Ok(true)
+    }
+
+    /// A class equating two different constants: their constant false
+    /// equality (`generate_base_implied_equalities_const`) empties the
+    /// query when it holds in the query's own join domain, whose join
+    /// then is a dummy relation.
+    fn contradiction(&mut self, domain: u8) -> Result<(), Outside> {
+        if domain != 0 {
+            return Err("an equivalence class of two constants inside an outer join");
+        }
+        self.contradictory = true;
+        Ok(())
     }
 
     /// `initialize_mergeclause_eclasses`: each side's class, a new

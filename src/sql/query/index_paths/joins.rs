@@ -31,7 +31,7 @@ pub(crate) const MAX_CLAUSES: usize = 64;
 pub(crate) const MAX_JOIN_CLAUSES: usize = 32;
 pub(crate) const MAX_KEYS: usize = 8;
 /// Paths kept per relation by `add_path`.
-const MAX_REL_PATHS: usize = 16;
+const MAX_REL_PATHS: usize = 32;
 
 /// A set of base relations, by bit, and of the outer joins above them
 /// (PostgreSQL's join relids), each at [`OJ_SHIFT`] past its number.
@@ -343,6 +343,7 @@ pub(crate) struct JoinSettings {
     pub(crate) mergejoin: bool,
     pub(crate) material: bool,
     pub(crate) sort: bool,
+    pub(crate) incremental_sort: bool,
     pub(crate) memoize: bool,
 }
 
@@ -379,8 +380,16 @@ impl ClauseList {
     }
 }
 
-/// A path's sort order: equivalence classes, each ascending with NULLs
-/// last, as merge joins sort.
+/// A pathkey's equivalence class bits; the others are its direction.
+pub(crate) const KEY_CLASS: u8 = 0x3f;
+/// A pathkey sorting its class descending.
+pub(crate) const KEY_DESCENDING: u8 = 0x40;
+/// A pathkey placing NULLs first.
+pub(crate) const KEY_NULLS_FIRST: u8 = 0x80;
+
+/// A path's sort order: pathkeys, each an equivalence class with
+/// [`KEY_DESCENDING`] and [`KEY_NULLS_FIRST`] flags; without flags it is
+/// ascending with NULLs last, as merge joins sort.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Keys {
     classes: [u8; MAX_KEYS],
@@ -417,7 +426,8 @@ impl Keys {
         keys
     }
 
-    fn truncated(mut self, len: usize) -> Self {
+    /// Its first `len` keys.
+    pub(crate) fn truncated(mut self, len: usize) -> Self {
         self.len = self.len.min(len as u8);
         self
     }
@@ -440,6 +450,9 @@ impl Keys {
 /// What a path does.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PathKind {
+    /// A dummy relation's path: a `Result` whose constant false
+    /// condition returns no rows (`set_dummy_rel_pathlist`).
+    Dummy,
     Scan {
         rel: u8,
         /// Its position in [`BaseRel::paths`].
@@ -557,7 +570,9 @@ pub(crate) struct JoinPlan<'a> {
     pub(crate) paths: &'a [Path],
     pub(crate) clauses: &'a [Clause],
     pub(crate) classes: &'a [EquivalenceClass],
+    /// The join's chosen path, below [`Self::upper`].
     pub(crate) top: u32,
+    pub(crate) upper: UpperPlan,
     pub(crate) settings: JoinSettings,
     /// For each join relation, by its base relations, the pair that built
     /// it.
@@ -620,6 +635,36 @@ pub(crate) struct ForeignKeyJoin {
 /// A foreign key column pair no class holds.
 pub(crate) const NO_KEY_CLASS: u8 = u8::MAX;
 
+/// What the query does with the joined rows that chooses among the
+/// join's paths (`grouping_planner` of a query without grouping).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UpperProblem {
+    /// `sort_pathkeys`, which are the query's `query_pathkeys`.
+    pub(crate) sort: Keys,
+    /// The `LIMIT`'s rows, when not `ALL` or NULL, and the `OFFSET`'s, when
+    /// either is given as a constant.
+    pub(crate) limit: Option<(Option<f64>, f64)>,
+    /// The width of the query's target list, its ordering columns
+    /// included (`apply_scanjoin_target_to_paths`).
+    pub(crate) width: f64,
+    /// The per-row cost of the target list's expressions, which the
+    /// joined relation's paths take on (`create_projection_path`).
+    pub(crate) target_cost: f64,
+}
+
+/// The query's nodes above the join, as `create_ordered_paths` and
+/// `create_limit_path` chose them.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct UpperPlan {
+    /// A `Sort` of the joined rows, or an `Incremental Sort` of rows sorted
+    /// by its first keys: its startup and total cost and those keys.
+    pub(crate) sort: Option<(f64, f64, u8)>,
+    /// A `Limit`: its startup and total cost and its rows.
+    pub(crate) limit: Option<(f64, f64, f64)>,
+    /// The join path's total cost with its target list's.
+    pub(crate) top_total: f64,
+}
+
 /// The join problem.
 pub(crate) struct JoinProblem<'p> {
     pub(crate) rels: &'p [BaseRel<'p>],
@@ -640,6 +685,10 @@ pub(crate) struct JoinProblem<'p> {
     /// The relations of removed joins (`remove_useless_joins`), which no
     /// join reads.
     pub(crate) removed: Relids,
+    pub(crate) upper: UpperProblem,
+    /// A class equates two constants in the query's join domain: the
+    /// joined relation is dummy.
+    pub(crate) dummy: bool,
 }
 
 struct Search<'p, 'a, 's> {
@@ -668,6 +717,9 @@ struct Search<'p, 'a, 's> {
     buckets: [[Option<(f64, f64)>; 2]; MAX_CLAUSES],
     /// `all_baserels`.
     all_baserels: Relids,
+    /// `consider_startup` of every relation: the query has a `LIMIT`
+    /// (`root->tuple_fraction > 0`).
+    consider_startup: bool,
 }
 
 /// Plans the join of `problem`'s relations as `make_rel_from_joinlist` and
@@ -699,6 +751,10 @@ pub(crate) fn search<'a>(
         param_rows: ArenaList::new(arena),
         buckets: [[None; 2]; MAX_CLAUSES],
         all_baserels: ((1 << n) - 1) & !problem.removed,
+        consider_startup: problem
+            .upper
+            .limit
+            .is_some_and(|(count, _)| count.is_some()),
     };
     for clause in problem.clauses {
         search.clauses.push(*clause).map_err(|_| arena_full())?;
@@ -749,7 +805,39 @@ pub(crate) fn search<'a>(
         search.set_cheapest(relids);
     }
     search.reduce_unique_semijoins()?;
-    for subproblem in problem.subproblems {
+    if problem.dummy {
+        // The final relation is the dummy one the query's constant false
+        // condition leaves.
+        let relids = search.all_baserels;
+        let id = search.push_path(Path {
+            kind: PathKind::Dummy,
+            relids,
+            rows: 0.0,
+            width: 0.0,
+            startup: 0.0,
+            total: 0.0,
+            disabled: 0,
+            keys: Keys::NONE,
+            param: 0,
+        })?;
+        let mut paths = [0; MAX_REL_PATHS];
+        paths[0] = id;
+        search.rels[relids as usize] = Some(Rel {
+            relids,
+            joininfo: ClauseList::EMPTY,
+            rows: 0.0,
+            width: 0.0,
+            paths,
+            count: 1,
+            cheapest_total: id,
+            cheapest_startup: id,
+            parameterized: paths,
+            parameterized_count: 1,
+            first: (relids, 0),
+            unique: None,
+        });
+    }
+    for subproblem in problem.subproblems.iter().filter(|_| !problem.dummy) {
         let items = &subproblem.items[..usize::from(subproblem.count)];
         if items.len() < 2 {
             continue;
@@ -778,13 +866,15 @@ pub(crate) fn search<'a>(
     let Some(top) = search.rels[all] else {
         return Ok(Err("a join the search does not reach"));
     };
+    let (top, upper) = search.upper_paths(&top)?;
     Ok(Ok(JoinPlan {
         paths: search.paths.as_slice(),
         clauses: search.clauses.as_slice(),
         classes: arena
             .alloc_slice_copy(problem.classes)
             .map_err(|_| arena_full())?,
-        top: top.cheapest_total,
+        top,
+        upper,
         settings: problem.settings,
         firsts: arena
             .alloc_slice_with(search.rels.len(), |relids| {
@@ -1809,116 +1899,181 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         self.rels[(relids & BASE_RELIDS) as usize] = Some(rel);
     }
 
-    /// `add_path` without parallel paths. A parameterized path's pathkeys
-    /// do not count, and one path dominates another only when it needs no
-    /// more of the other relations (`bms_subset_compare`).
+    /// `add_path` without parallel paths into `relids`' relation.
     fn add_path(&mut self, relids: Relids, new: Path) -> Result<(), SqlError> {
         let mut rel = self.rel(relids);
-        let mut kept = [0u32; MAX_REL_PATHS];
-        let mut kept_count = 0usize;
-        let mut accept = true;
-        let mut insert_at = 0usize;
-        let held = rel.paths;
-        let count = usize::from(rel.count);
-        let mut position = 0;
-        while position < count {
-            let old_id = held[position];
-            let old = self.path(old_id);
-            position += 1;
-            let mut remove_old = false;
-            let costs = compare_fuzzily(&new, &old, FUZZ);
-            if costs != CostOrder::Different {
-                let new_keys = if new.param != 0 { Keys::NONE } else { new.keys };
-                let old_keys = if old.param != 0 { Keys::NONE } else { old.keys };
-                let keys = compare_keys(&new_keys, &old_keys);
-                // `bms_subset_compare` of the parameterizations.
-                let outer = match (new.param & !old.param == 0, old.param & !new.param == 0) {
-                    (true, true) => Subset::Equal,
-                    (true, false) => Subset::Subset1,
-                    (false, true) => Subset::Subset2,
-                    (false, false) => Subset::Different,
-                };
-                let new_wins = matches!(outer, Subset::Equal | Subset::Subset1);
-                let old_wins = matches!(outer, Subset::Equal | Subset::Subset2);
-                if keys != KeysOrder::Different {
-                    match costs {
-                        CostOrder::Equal => match keys {
-                            KeysOrder::Better1 => remove_old = new_wins && new.rows <= old.rows,
-                            KeysOrder::Better2 => {
-                                if old_wins && new.rows >= old.rows {
-                                    accept = false;
-                                }
-                            }
-                            KeysOrder::Equal => match outer {
-                                Subset::Equal => {
-                                    if new.rows < old.rows {
-                                        remove_old = true;
-                                    } else if new.rows > old.rows {
-                                        accept = false;
-                                    } else if compare_fuzzily(&new, &old, 1.000_000_000_1)
-                                        == CostOrder::Better1
-                                    {
-                                        remove_old = true;
-                                    } else {
-                                        accept = false;
-                                    }
-                                }
-                                Subset::Subset1 => remove_old = new.rows <= old.rows,
-                                Subset::Subset2 => {
-                                    if new.rows >= old.rows {
-                                        accept = false;
-                                    }
-                                }
-                                Subset::Different => {}
-                            },
-                            KeysOrder::Different => {}
-                        },
-                        CostOrder::Better1 => {
-                            if keys != KeysOrder::Better2 && new_wins && new.rows <= old.rows {
-                                remove_old = true;
-                            }
-                        }
-                        CostOrder::Better2 => {
-                            if keys != KeysOrder::Better1 && old_wins && new.rows >= old.rows {
-                                accept = false;
-                            }
-                        }
-                        CostOrder::Different => {}
-                    }
-                }
-            }
-            if !remove_old {
-                if new.disabled > old.disabled
-                    || (new.disabled == old.disabled && new.total >= old.total)
-                {
-                    insert_at = kept_count + 1;
-                }
-                kept[kept_count] = old_id;
-                kept_count += 1;
-            }
-            if !accept {
-                // The rest stay as they were.
-                while position < count {
-                    kept[kept_count] = held[position];
-                    kept_count += 1;
-                    position += 1;
-                }
-                break;
-            }
+        let id = self.paths.len() as u32;
+        let paths = self.paths.as_slice();
+        let (count, accepted) = add_to_pathlist(
+            &mut rel.paths,
+            usize::from(rel.count),
+            (id, new),
+            &|id| paths[id as usize],
+            self.consider_startup,
+        )?;
+        if accepted {
+            self.push_path(new)?;
         }
-        if accept {
-            if kept_count == MAX_REL_PATHS {
-                return Err(too_many());
-            }
-            let id = self.push_path(new)?;
-            kept.copy_within(insert_at..kept_count, insert_at + 1);
-            kept[insert_at] = id;
-            kept_count += 1;
-        }
-        rel.paths = kept;
-        rel.count = kept_count as u8;
+        rel.count = count as u8;
         self.rels[(relids & BASE_RELIDS) as usize] = Some(rel);
         Ok(())
+    }
+
+    /// `create_ordered_paths` over the joined relation `rel`'s paths, then
+    /// `create_limit_path` over each, and the cheapest of those
+    /// (`get_cheapest_fractional_path` of a tuple fraction of zero): the
+    /// join's path under the nodes above it, and those nodes.
+    fn upper_paths(&mut self, rel: &Rel) -> Result<(u32, UpperPlan), SqlError> {
+        const MAX_UPPER: usize = 2 * MAX_REL_PATHS;
+        let upper = self.problem.upper;
+        let settings = self.problem.settings;
+        let sort = upper.sort;
+        let sort_len = usize::from(sort.len);
+        let limit_tuples = upper
+            .limit
+            .and_then(|(count, offset)| count.map(|count| count.max(1.0) + offset.max(0.0)));
+        let cheapest = rel.cheapest_total;
+        // Each upper path, the join path below it and its sort and limit.
+        let mut store = [self.path(cheapest); MAX_UPPER];
+        let mut below = [(cheapest, None::<(f64, f64, u8)>); MAX_UPPER];
+        let mut stored = 0usize;
+        let mut ordered = [0u32; MAX_REL_PATHS];
+        let mut ordered_count = 0usize;
+        for &id in &rel.paths[..usize::from(rel.count)] {
+            let mut input = self.path(id);
+            input.total += upper.target_cost * input.rows;
+            let mut path = input;
+            let mut sorted = None;
+            let presorted = sort.common_prefix(&input.keys);
+            if sort_len > 0 && presorted < sort_len {
+                let incremental = presorted > 0 && settings.incremental_sort;
+                if id != cheapest && !incremental {
+                    continue;
+                }
+                let costs = settings.costs;
+                let (startup, total) = if incremental {
+                    let input_tuples = input.rows.max(2.0);
+                    let mut members = [Member::plain(0, 0); MAX_KEYS];
+                    for (at, &key) in sort.as_slice()[..presorted].iter().enumerate() {
+                        members[at] = self.problem.classes[usize::from(key & KEY_CLASS)].members[0];
+                    }
+                    let groups = self
+                        .statistics
+                        .groups(&members[..presorted], input_tuples)?;
+                    let group_tuples = input_tuples / groups;
+                    let input_run = input.total - input.startup;
+                    let group_input_run = input_run / groups;
+                    let (group_startup, group_run) = super::paths::tuplesort_cost(
+                        group_tuples,
+                        upper.width,
+                        limit_tuples,
+                        costs,
+                    );
+                    let startup = group_startup + input.startup + group_input_run;
+                    let mut run = group_run
+                        + (group_run + group_startup) * (groups - 1.0)
+                        + group_input_run * (groups - 1.0);
+                    // `create_incremental_sort_path` passes no comparison cost.
+                    run += costs.cpu_tuple * input_tuples;
+                    run += 2.0 * costs.cpu_tuple * groups;
+                    (startup, startup + run)
+                } else {
+                    let (startup, run) =
+                        super::paths::tuplesort_cost(input.rows, upper.width, limit_tuples, costs);
+                    let startup = startup + input.total;
+                    path.disabled += u32::from(!settings.sort);
+                    (startup, startup + run)
+                };
+                path.startup = startup;
+                path.total = total;
+                path.keys = sort;
+                sorted = Some((
+                    startup,
+                    total,
+                    if incremental { presorted as u8 } else { 0 },
+                ));
+            }
+            if sort_len == 0 {
+                // Without an ordering the joined relation's paths are the
+                // final relation's.
+                ordered[ordered_count] = stored as u32;
+                ordered_count += 1;
+                store[stored] = path;
+                below[stored] = (id, None);
+                stored += 1;
+                continue;
+            }
+            store[stored] = path;
+            below[stored] = (id, sorted);
+            let (count, accepted) = add_to_pathlist(
+                &mut ordered,
+                ordered_count,
+                (stored as u32, path),
+                &|at| store[at as usize],
+                self.consider_startup,
+            )?;
+            ordered_count = count;
+            stored += usize::from(accepted);
+        }
+        // `create_limit_path` scales each path's run cost to the rows it
+        // reads.
+        let mut finals = [0u32; MAX_REL_PATHS];
+        let mut final_count = 0usize;
+        let mut limits = [None::<(f64, f64, f64)>; MAX_UPPER];
+        for &at in &ordered[..ordered_count] {
+            let mut path = store[at as usize];
+            let mut limit = None;
+            if let Some((count, offset)) = upper.limit {
+                let (startup, total, rows) = super::paths::adjust_limit_rows_costs(
+                    path.startup,
+                    path.total,
+                    path.rows,
+                    count,
+                    offset,
+                );
+                path.startup = startup;
+                path.total = total;
+                path.rows = rows;
+                limit = Some((startup, total, rows));
+            }
+            if stored == MAX_UPPER {
+                return Err(too_many());
+            }
+            store[stored] = path;
+            below[stored] = below[at as usize];
+            limits[stored] = limit;
+            let (count, accepted) = add_to_pathlist(
+                &mut finals,
+                final_count,
+                (stored as u32, path),
+                &|at| store[at as usize],
+                self.consider_startup,
+            )?;
+            final_count = count;
+            stored += usize::from(accepted);
+        }
+        // `set_cheapest`'s cheapest total path.
+        let mut chosen = finals[0];
+        for &at in &finals[1..final_count] {
+            let compared = compare_costs(&store[chosen as usize], &store[at as usize], false);
+            if compared > 0
+                || (compared == 0
+                    && compare_keys(&store[chosen as usize].keys, &store[at as usize].keys)
+                        == KeysOrder::Better2)
+            {
+                chosen = at;
+            }
+        }
+        let (top, sort) = below[chosen as usize];
+        let joined = self.path(top);
+        Ok((
+            top,
+            UpperPlan {
+                sort,
+                limit: limits[chosen as usize],
+                top_total: joined.total + upper.target_cost * joined.rows,
+            },
+        ))
     }
 
     /// `eclass_useful_for_merging`.
@@ -1947,7 +2102,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let rel = self.rel(joined);
         let eclass_joins = self.has_eclass_joins(joined);
         let mut useful = 0;
-        for &class in outer.as_slice() {
+        for &key in outer.as_slice() {
+            if !self.right_merge_direction(key) {
+                break;
+            }
+            let class = key & KEY_CLASS;
             let matched = if eclass_joins && self.useful_for_merging(class, joined) {
                 true
             } else {
@@ -1962,7 +2121,23 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 break;
             }
         }
+        // `pathkeys_useful_for_ordering`.
+        let useful = useful.max(self.problem.upper.sort.common_prefix(outer));
         outer.truncated(useful)
+    }
+
+    /// `right_merge_direction`: a pathkey is useful for merging in the
+    /// direction the query orders its class, ascending when it does not.
+    fn right_merge_direction(&self, key: u8) -> bool {
+        let wanted = self
+            .problem
+            .upper
+            .sort
+            .as_slice()
+            .iter()
+            .find(|&&query| query & KEY_CLASS == key & KEY_CLASS)
+            .map_or(0, |&query| query & KEY_DESCENDING);
+        key & KEY_DESCENDING == wanted
     }
 
     /// `select_mergejoin_clauses`: the join clauses a merge join can use,
@@ -2075,8 +2250,10 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         Ok(())
     }
 
-    /// `select_outer_pathkeys_for_merge` without query pathkeys: the merge
-    /// clauses' outer classes, most future join partners first.
+    /// `select_outer_pathkeys_for_merge`: the query's pathkeys when the
+    /// merge clauses' outer classes hold them all, or their prefix when it
+    /// is all the clauses' classes, then the other classes, most future
+    /// join partners first.
     fn outer_pathkeys_for_merge(&self, joined: Relids, inputs: &JoinInputs) -> Keys {
         let mut classes = [0u8; MAX_JOIN_CLAUSES];
         let mut scores = [0i32; MAX_JOIN_CLAUSES];
@@ -2097,6 +2274,27 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let mut all = Keys::NONE;
         if count == 0 {
             return all;
+        }
+        let query = self.problem.upper.sort;
+        if query.len > 0 {
+            let matches = query
+                .as_slice()
+                .iter()
+                .take_while(|&&key| classes[..count].contains(&(key & KEY_CLASS)))
+                .count();
+            if matches == usize::from(query.len) {
+                all = query;
+                for &key in query.as_slice() {
+                    if let Some(at) = classes[..count]
+                        .iter()
+                        .position(|&class| class == key & KEY_CLASS)
+                    {
+                        scores[at] = -1;
+                    }
+                }
+            } else if matches == usize::from(inputs.mergeable.len) {
+                return query.truncated(matches);
+            }
         }
         loop {
             let mut best = 0;
@@ -2148,7 +2346,10 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     let _ = outer_keys.push(class);
                 }
             }
-            let merge = self.mergeclauses_for_outer_keys(&outer_keys, inputs);
+            let Some(merge) = self.mergeclauses_for_outer_keys(&outer_keys, inputs) else {
+                self.outside = Some("a merge join ordered descending or with NULLs first");
+                return Ok(());
+            };
             let inner_keys = self.inner_keys_for_merge(&merge, inputs);
             let keys = self.join_keys(joined, inputs.path_jointype(), &outer_keys);
             self.try_mergejoin(
@@ -2165,13 +2366,15 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         Ok(())
     }
 
-    /// `find_mergeclauses_for_outer_pathkeys`.
-    fn mergeclauses_for_outer_keys(&self, keys: &Keys, inputs: &JoinInputs) -> ClauseList {
+    /// `find_mergeclauses_for_outer_pathkeys`; `None` for a merge in a
+    /// direction other than ascending with NULLs last, which the model
+    /// leaves out.
+    fn mergeclauses_for_outer_keys(&self, keys: &Keys, inputs: &JoinInputs) -> Option<ClauseList> {
         let mut merge = ClauseList::EMPTY;
-        for &class in keys.as_slice() {
+        for &key in keys.as_slice() {
             let mut matched = false;
             for &id in inputs.mergeable.as_slice() {
-                if self.merge_classes(id, inputs.outer, inputs.inner).0 == class {
+                if self.merge_classes(id, inputs.outer, inputs.inner).0 == key & KEY_CLASS {
                     let _ = merge.push(id);
                     matched = true;
                 }
@@ -2179,8 +2382,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             if !matched {
                 break;
             }
+            if key & !KEY_CLASS != 0 {
+                return None;
+            }
         }
-        merge
+        Some(merge)
     }
 
     /// `make_inner_pathkeys_for_merge`: each merge clause's inner class,
@@ -2568,6 +2774,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             return ClauseList::EMPTY;
         }
         match path.kind {
+            PathKind::Dummy => ClauseList::EMPTY,
             PathKind::Scan { rel, path } => {
                 self.problem.rels[usize::from(rel)].paths[usize::from(path)].enforced
             }
@@ -2739,7 +2946,10 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         use_all: bool,
     ) -> Result<(), SqlError> {
         let outer_keys = self.path(outer).keys;
-        let merge = self.mergeclauses_for_outer_keys(&outer_keys, inputs);
+        let Some(merge) = self.mergeclauses_for_outer_keys(&outer_keys, inputs) else {
+            self.outside = Some("a merge join ordered descending or with NULLs first");
+            return Ok(());
+        };
         if merge.len == 0 && inputs.jointype != JoinType::Full {
             return Ok(());
         }
@@ -3639,6 +3849,126 @@ fn prev_power_of_two(value: f64) -> f64 {
     (1u64 << value.ilog2()) as f64
 }
 
+/// `add_path` of `new`, numbered `id`, into the pathlist `held[..count]`,
+/// kept in order of total cost; returns the new count and whether `new`
+/// was kept. A parameterized path's
+/// pathkeys do not count, and one path dominates another only when it
+/// needs no more of the other relations (`bms_subset_compare`). A
+/// parameterized path never considers its startup cost.
+fn add_to_pathlist(
+    held: &mut [u32; MAX_REL_PATHS],
+    count: usize,
+    (id, new): (u32, Path),
+    path: &dyn Fn(u32) -> Path,
+    consider_startup: bool,
+) -> Result<(usize, bool), SqlError> {
+    let consider_startup = consider_startup && new.param == 0;
+    let mut kept = [0u32; MAX_REL_PATHS];
+    let mut kept_count = 0usize;
+    let mut accept = true;
+    let mut insert_at = 0usize;
+    let mut position = 0;
+    while position < count {
+        let old_id = held[position];
+        let old = path(old_id);
+        position += 1;
+        let mut remove_old = false;
+        let costs = compare_fuzzily(&new, &old, FUZZ, consider_startup);
+        if costs != CostOrder::Different {
+            let new_keys = if new.param != 0 { Keys::NONE } else { new.keys };
+            let old_keys = if old.param != 0 { Keys::NONE } else { old.keys };
+            let keys = compare_keys(&new_keys, &old_keys);
+            // `bms_subset_compare` of the parameterizations.
+            let outer = match (new.param & !old.param == 0, old.param & !new.param == 0) {
+                (true, true) => Subset::Equal,
+                (true, false) => Subset::Subset1,
+                (false, true) => Subset::Subset2,
+                (false, false) => Subset::Different,
+            };
+            let new_wins = matches!(outer, Subset::Equal | Subset::Subset1);
+            let old_wins = matches!(outer, Subset::Equal | Subset::Subset2);
+            if keys != KeysOrder::Different {
+                match costs {
+                    CostOrder::Equal => match keys {
+                        KeysOrder::Better1 => remove_old = new_wins && new.rows <= old.rows,
+                        KeysOrder::Better2 => {
+                            if old_wins && new.rows >= old.rows {
+                                accept = false;
+                            }
+                        }
+                        KeysOrder::Equal => match outer {
+                            Subset::Equal => {
+                                if new.rows < old.rows {
+                                    remove_old = true;
+                                } else if new.rows > old.rows {
+                                    accept = false;
+                                } else if compare_fuzzily(
+                                    &new,
+                                    &old,
+                                    1.000_000_000_1,
+                                    consider_startup,
+                                ) == CostOrder::Better1
+                                {
+                                    remove_old = true;
+                                } else {
+                                    accept = false;
+                                }
+                            }
+                            Subset::Subset1 => remove_old = new.rows <= old.rows,
+                            Subset::Subset2 => {
+                                if new.rows >= old.rows {
+                                    accept = false;
+                                }
+                            }
+                            Subset::Different => {}
+                        },
+                        KeysOrder::Different => {}
+                    },
+                    CostOrder::Better1 => {
+                        if keys != KeysOrder::Better2 && new_wins && new.rows <= old.rows {
+                            remove_old = true;
+                        }
+                    }
+                    CostOrder::Better2 => {
+                        if keys != KeysOrder::Better1 && old_wins && new.rows >= old.rows {
+                            accept = false;
+                        }
+                    }
+                    CostOrder::Different => {}
+                }
+            }
+        }
+        if !remove_old {
+            if new.disabled > old.disabled
+                || (new.disabled == old.disabled && new.total >= old.total)
+            {
+                insert_at = kept_count + 1;
+            }
+            kept[kept_count] = old_id;
+            kept_count += 1;
+        }
+        if !accept {
+            // The rest stay as they were.
+            while position < count {
+                kept[kept_count] = held[position];
+                kept_count += 1;
+                position += 1;
+            }
+            break;
+        }
+    }
+    if accept {
+        if kept_count == MAX_REL_PATHS {
+            return Err(too_many());
+        }
+        kept.copy_within(insert_at..kept_count, insert_at + 1);
+        kept[insert_at] = id;
+        kept_count += 1;
+    }
+    *held = kept;
+    Ok((kept_count, accept))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CostOrder {
     Better1,
@@ -3647,9 +3977,9 @@ enum CostOrder {
     Different,
 }
 
-/// `compare_path_costs_fuzzily` where no relation considers startup cost
-/// (a query without `LIMIT`).
-fn compare_fuzzily(new: &Path, old: &Path, fuzz: f64) -> CostOrder {
+/// `compare_path_costs_fuzzily`: with `consider_startup` (a query with a
+/// `LIMIT`) a path cheaper to start but dearer in total differs.
+fn compare_fuzzily(new: &Path, old: &Path, fuzz: f64, consider_startup: bool) -> CostOrder {
     if new.disabled != old.disabled {
         return if new.disabled < old.disabled {
             CostOrder::Better1
@@ -3658,9 +3988,15 @@ fn compare_fuzzily(new: &Path, old: &Path, fuzz: f64) -> CostOrder {
         };
     }
     if new.total > old.total * fuzz {
+        if consider_startup && old.startup > new.startup * fuzz {
+            return CostOrder::Different;
+        }
         return CostOrder::Better2;
     }
     if old.total > new.total * fuzz {
+        if consider_startup && new.startup > old.startup * fuzz {
+            return CostOrder::Different;
+        }
         return CostOrder::Better1;
     }
     if new.startup > old.startup * fuzz {
@@ -3749,6 +4085,7 @@ mod tests {
             mergejoin: true,
             material: true,
             sort: true,
+            incremental_sort: true,
             memoize: true,
         }
     }
@@ -3880,6 +4217,13 @@ mod tests {
             settings: settings(),
             foreign_keys: &[],
             removed: 0,
+            upper: UpperProblem {
+                sort: Keys::NONE,
+                limit: None,
+                width: 20.0,
+                target_cost: 0.0,
+            },
+            dummy: false,
         };
         let plan = search(&problem, &Uniform, &arena).unwrap().unwrap();
         let top = plan.path(plan.top);

@@ -21,10 +21,11 @@ pub(super) fn join_plan<'a>(
     txid: u32,
     scope: &QueryScope<'_>,
     model: &ModeledJoin<'_>,
+    (sort_keys, presorted, aggregate): (PlanKeys, Option<PlanKeys>, Option<PlanNode>),
     block: query::instrument::BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
-    let mut plan = Plan::new(arena, model.plan.paths.len() * 3 + 4)?;
+    let mut plan = Plan::new(arena, model.plan.paths.len() * 3 + 6)?;
     let mut writer = Writer {
         storage,
         txid,
@@ -32,8 +33,75 @@ pub(super) fn join_plan<'a>(
         model,
         block,
         arena,
+        top_depth: u8::from(model.plan.upper.limit.is_some())
+            + u8::from(model.plan.upper.sort.is_some())
+            + u8::from(aggregate.is_some()),
     };
-    writer.path(&mut plan, model.plan.top, 0)?;
+    // The query's `Limit` and `Sort` above the join, with the target
+    // list's width.
+    let upper = model.plan.upper;
+    let top = model.plan.path(model.plan.top);
+    let width = model.output_width as u32;
+    let mut depth = 0;
+    if let Some(node) = aggregate {
+        plan.push(PlanNode { depth, ..node })?;
+        depth += 1;
+    }
+    if let Some((startup, total, rows)) = upper.limit {
+        plan.push(PlanNode {
+            name: StackStr::from_str("Limit"),
+            key: Some(query::instrument::NodeKey::new(
+                block,
+                query::instrument::Role::Limit,
+            )),
+            depth,
+            startup_cost: startup,
+            total_cost: total,
+            rows: rows as u64,
+            width,
+            output_unprintable: true,
+            ..PlanNode::EMPTY
+        })?;
+        depth += 1;
+    }
+    if let Some((startup, total, presorted_count)) = upper.sort {
+        let mut node = PlanNode {
+            name: StackStr::from_str(if presorted_count == 0 {
+                "Sort"
+            } else {
+                "Incremental Sort"
+            }),
+            key: Some(query::instrument::NodeKey::new(
+                block,
+                query::instrument::Role::Sort,
+            )),
+            depth,
+            startup_cost: startup,
+            total_cost: total,
+            rows: top.rows as u64,
+            width,
+            keys: sort_keys,
+            output_unprintable: true,
+            ..PlanNode::EMPTY
+        };
+        if let Some(prefix) = presorted {
+            // Its groups' sort methods and memory are not modeled.
+            node.analyze_unsupported =
+                Some("EXPLAIN ANALYZE of an incremental sort of a join's rows is not supported");
+            node = node
+                .with_qual(
+                    QualLabel::PresortedKey,
+                    super::presorted_text(&prefix, false),
+                )
+                .with_verbose_qual(
+                    QualLabel::PresortedKey,
+                    super::presorted_text(&prefix, true),
+                );
+        }
+        plan.push(node)?;
+        depth += 1;
+    }
+    writer.path(&mut plan, model.plan.top, depth)?;
     Ok(plan)
 }
 
@@ -44,6 +112,8 @@ struct Writer<'w, 'm, 's, 'a> {
     model: &'w ModeledJoin<'m>,
     block: query::instrument::BlockId,
     arena: &'a Arena,
+    /// The depth of the join's top node, below the query's own.
+    top_depth: u8,
 }
 
 impl Writer<'_, '_, '_, '_> {
@@ -52,11 +122,17 @@ impl Writer<'_, '_, '_, '_> {
             name: StackStr::from_str(name),
             depth,
             startup_cost: path.startup,
-            total_cost: path.total,
+            // The top relation's paths compute the target list
+            // (`create_projection_path`).
+            total_cost: if depth == self.top_depth {
+                self.model.plan.upper.top_total
+            } else {
+                path.total
+            },
             rows: path.rows as u64,
             // The top relation's paths carry the query's output
             // (`apply_scanjoin_target_to_paths`).
-            width: if depth == 0 {
+            width: if depth == self.top_depth {
                 self.model.output_width as u32
             } else {
                 path.width as u32
@@ -90,6 +166,15 @@ impl Writer<'_, '_, '_, '_> {
     fn path(&mut self, plan: &mut Plan<'_>, id: u32, depth: u8) -> Result<(), SqlError> {
         let path = *self.model.plan.path(id);
         match path.kind {
+            PathKind::Dummy => {
+                let node = PlanNode {
+                    rows: 0,
+                    ..self.node("Result", &path, depth)
+                };
+                plan.push(
+                    node.with_qual(QualLabel::OneTimeFilter, Some(StackStr::from_str("false"))),
+                )
+            }
             PathKind::Scan { rel, path } => self.scan(plan, usize::from(rel), path, depth),
             PathKind::Material { input } => {
                 let node = self.node("Materialize", &path, depth);

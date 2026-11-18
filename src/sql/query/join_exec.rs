@@ -764,7 +764,7 @@ pub(super) fn scan_statement_source<'a>(
             storage, txid, statement, scope, params, arena,
         )?
     {
-        return run(storage, scope, txid, &model, arena, params, hooks, visit);
+        return run_modeled(storage, scope, txid, &model, arena, params, hooks, visit);
     }
     if recycle_rows {
         super::scan::scan_source_recycling_with_pax_columns(
@@ -800,7 +800,7 @@ pub(super) fn scan_statement_source<'a>(
 /// Runs `model`'s plan, passing each joined row to `visit` until it
 /// returns false.
 #[allow(clippy::too_many_arguments)]
-fn run<'a>(
+pub(super) fn run_modeled<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
     txid: u32,
@@ -919,6 +919,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         let _block = super::instrument::enter_block(self.block);
         let path = *self.model.plan.path(id);
         match path.kind {
+            PathKind::Dummy => Ok(true),
             PathKind::Scan { rel, path } => self.scan(id, usize::from(rel), path, bound, sink),
             PathKind::Material { input } => self.exec(input, bound, sink),
             PathKind::Unique {

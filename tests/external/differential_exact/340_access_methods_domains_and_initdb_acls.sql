@@ -25,7 +25,11 @@ drop access method am340;
 create domain d340 as int check (value > 0) check (value < 100 and value <> 5) not null;
 create domain d340_even as d340 check (value % 2 = 0);
 create domain d340_text as text check (length(value) > 1 and value like 'a%');
-\dD d340*
+-- psql's domain listing shows a domain's constraints in catalog order,
+-- which PostgreSQL's reuse of freed catalog space makes depend on the
+-- cluster's history: it lists the domains with one CHECK, and the query
+-- below orders d340's constraints.
+\dD d340_*
 select pg_get_constraintdef(oid), pg_get_constraintdef(oid, true) from pg_constraint
 where contypid in ('d340'::regtype, 'd340_even'::regtype) order by conname;
 create table t340 (c d340_even check (c % 4 = 0), v varchar check (v like 'a%'));

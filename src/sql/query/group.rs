@@ -693,19 +693,27 @@ pub(super) fn groups_for_mask<'a>(
             }
             Ok(true)
         };
+        // A plain aggregate's join PostgreSQL's join search plans runs that
+        // plan.
+        super::join_exec::scan_statement_source(
+            statement,
+            recycling_safe || hold_values,
+            storage,
+            scope,
+            from,
+            txid,
+            scan_where,
+            arena,
+            params,
+            hooks,
+            outer,
+            pax_demand,
+            &mut visit,
+        )?;
         if recycling_safe || hold_values {
-            scan_source_recycling_with_pax_columns(
-                storage, scope, from, txid, scan_where, arena, params, hooks, outer, pax_demand,
-                &mut visit,
-            )?;
             for (state, held) in states.iter_mut().zip(held.iter()) {
                 state.restore_held(held, arena)?;
             }
-        } else {
-            scan_source_with_pax_columns(
-                storage, scope, from, txid, scan_where, arena, params, hooks, outer, pax_demand,
-                &mut visit,
-            )?;
         }
         if partial_execution && partial_rows > 0 {
             for g in 0..n_groups {

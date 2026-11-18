@@ -783,16 +783,16 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             .count()
     }
 
-    /// `build_index_pathkeys` of `index` scanned `backward`, truncated to
-    /// the keys useful for merging (`pathkeys_useful_for_merging`): leading
-    /// ascending keys of columns whose equivalence class reaches another
-    /// relation, a constant's class skipped as redundant.
+    /// `build_index_pathkeys` of `index` scanned `backward`, a constant's
+    /// class skipped as redundant, truncated to the keys useful for merging
+    /// or for the query's ordering (`truncate_useless_pathkeys`).
     fn merge_keys(&self, index: usize, backward: bool) -> Result<super::joins::Keys, Shape> {
+        use super::joins::{KEY_CLASS, KEY_DESCENDING, KEY_NULLS_FIRST, Keys};
         let Some(join) = self.join else {
-            return Ok(super::joins::Keys::NONE);
+            return Ok(Keys::NONE);
         };
         let info = &self.index(index).catalog;
-        let mut keys = super::joins::Keys::NONE;
+        let mut keys = Keys::NONE;
         for position in 0..info.n_cols {
             if info.pattern_keys[position]
                 || !info.column_collation[position]
@@ -812,21 +812,43 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             if class == super::NO_CLASS {
                 break;
             }
-            if keys.as_slice().contains(&class) {
+            if keys.as_slice().iter().any(|&key| key & KEY_CLASS == class) {
                 continue;
             }
-            // `right_merge_direction`: ascending only.
+            let mut key = class;
             if info.descending[position] != backward {
-                break;
+                key |= KEY_DESCENDING;
             }
             if info.nulls_first[position] != backward {
-                return Err("an index of a join's relation ordered with NULLs first");
+                key |= KEY_NULLS_FIRST;
             }
-            if keys.push_class(class).is_none() {
+            if keys.push_class(key).is_none() {
                 break;
             }
         }
-        Ok(keys)
+        // `pathkeys_useful_for_merging`, each key in the direction the
+        // query orders its class (`right_merge_direction`), and
+        // `pathkeys_useful_for_ordering`.
+        let order = join.scan.order;
+        let mut merging = 0;
+        for &key in keys.as_slice() {
+            let wanted = order
+                .as_slice()
+                .iter()
+                .find(|&&query| query & KEY_CLASS == key & KEY_CLASS)
+                .map_or(0, |&query| query & KEY_DESCENDING);
+            if key & KEY_DESCENDING != wanted || join.scan.merging & 1 << (key & KEY_CLASS) == 0 {
+                break;
+            }
+            merging += 1;
+        }
+        let ordering = order
+            .as_slice()
+            .iter()
+            .zip(keys.as_slice())
+            .take_while(|(query, key)| query == key)
+            .count();
+        Ok(keys.truncated(merging.max(ordering)))
     }
 
     /// `check_index_only`.
@@ -2160,6 +2182,15 @@ pub(super) fn relation_groups(
     (groups, used_default)
 }
 
+/// costsize.c's `LOG2`, whose divisor is not exactly `ln 2`.
+#[expect(
+    clippy::approx_constant,
+    reason = "PostgreSQL divides by this truncated constant, not LN_2"
+)]
+fn log2(value: f64) -> f64 {
+    value.ln() / 0.693_147_180_559_945
+}
+
 /// `tuplesort_merge_order`.
 fn merge_order(memory: f64) -> f64 {
     (memory / (34.0 * 8192.0)).floor().clamp(6.0, 500.0)
@@ -2195,12 +2226,12 @@ pub(super) fn tuplesort_cost(
             1.0
         };
         let accesses = 2.0 * pages * log_runs;
-        startup = comparison * tuples * tuples.log2();
+        startup = comparison * tuples * log2(tuples);
         startup += accesses * (costs.seq_page * 0.75 + costs.random_page * 0.25);
     } else if tuples > 2.0 * output_tuples || input_bytes > memory {
-        startup = comparison * tuples * (2.0 * output_tuples).log2();
+        startup = comparison * tuples * log2(2.0 * output_tuples);
     } else {
-        startup = comparison * tuples * tuples.log2();
+        startup = comparison * tuples * log2(tuples);
     }
     (startup, costs.cpu_operator * tuples)
 }
@@ -3890,7 +3921,8 @@ pub(super) fn upper_paths(
                 let mut run = group_run
                     + (group_run + group_startup) * (groups - 1.0)
                     + group_input_run * (groups - 1.0);
-                run += (costs.cpu_tuple + 2.0 * costs.cpu_operator) * input_tuples;
+                // `create_incremental_sort_path` passes no comparison cost.
+                run += costs.cpu_tuple * input_tuples;
                 run += 2.0 * costs.cpu_tuple * groups;
                 path = Candidate {
                     startup,

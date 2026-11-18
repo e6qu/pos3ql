@@ -2187,8 +2187,13 @@ pub(crate) struct JoinScan {
     /// path applying it is parameterized by too.
     pub(crate) param_nulling: [u32; MAX_JOIN_PARAMS],
     /// Each column's equivalence class when it has a member in another
-    /// relation (`eclass_useful_for_merging`), else [`NO_CLASS`].
+    /// relation (`eclass_useful_for_merging`) or the query orders by it,
+    /// else [`NO_CLASS`].
     pub(crate) classes: [u8; 64],
+    /// The classes useful for merging, by bit.
+    pub(crate) merging: u32,
+    /// The query's pathkeys (`query_pathkeys`).
+    pub(crate) order: joins::Keys,
     /// Each relation's rows by FROM position (`get_loop_count`).
     pub(crate) rel_rows: [f64; 8],
     /// `root->total_table_pages`.

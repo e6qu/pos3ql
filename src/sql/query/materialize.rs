@@ -2019,6 +2019,18 @@ pub(crate) fn materialized_rows<'a>(
         None
     };
 
+    // A join PostgreSQL's join search plans runs that plan: rows it returns
+    // in the query's order need no sort, and its sort sorts as
+    // PostgreSQL's does.
+    let modeled = if outer.is_none() && n_order > 0 && ordered_candidates.is_none() {
+        super::index_paths::join_query::modeled_join(
+            storage, txid, statement, scope, params, arena,
+        )?
+    } else {
+        None
+    };
+    let join_sort = modeled.as_ref().map(|model| model.plan.upper.sort);
+    let join_presorted = join_sort.is_some_and(|sort| sort.is_none());
     let stored_width = width + n_keys + n_raw + n_identities;
     let mut rows = ArenaList::new_persistent(arena);
     // Rows read in scan order under a limit are locked as the scan returns
@@ -2041,8 +2053,9 @@ pub(crate) fn materialized_rows<'a>(
     // Rows an index returns in the query's order need no sort: under a
     // limit the scan stops once the limit has its rows, as PostgreSQL's
     // `Limit` stops pulling from the index scan.
-    let scan_window = rank_window
-        .filter(|_| ordered_candidates.is_some() && lock_pass.is_none() && !any_postponed);
+    let scan_window = rank_window.filter(|_| {
+        (ordered_candidates.is_some() || join_presorted) && lock_pass.is_none() && !any_postponed
+    });
     // Evaluate each projection once, in scan order. Encoded rows and their
     // references survive the scan's per-row scratch rewinds in the arena tail.
     let mut encode = |row: &JoinRow<'_, 'a, '_>| {
@@ -2106,7 +2119,18 @@ pub(crate) fn materialized_rows<'a>(
             .is_none_or(|(_, _, window)| locked < *window)
             && scan_window.is_none_or(|window| rows.len() < window))
     };
-    if let Some(indexed) = ordered_candidates.as_ref() {
+    if let Some(model) = modeled.as_ref() {
+        super::join_exec::run_modeled(
+            storage,
+            scope,
+            txid,
+            model,
+            arena,
+            params,
+            hooks,
+            &mut |row| encode(row),
+        )?;
+    } else if let Some(indexed) = ordered_candidates.as_ref() {
         scan_source_recycling_with_indexed_candidates(
             storage,
             scope,
@@ -2161,7 +2185,7 @@ pub(crate) fn materialized_rows<'a>(
     // ascending as a tiebreak — a no-op when ORDER BY already begins with them
     // (as PostgreSQL requires), but it groups equal keys when ORDER BY is
     // absent so the run dedup below works.
-    if (n_order > 0 && ordered_candidates.is_none()) || n_on > 0 {
+    if (n_order > 0 && ordered_candidates.is_none() && !join_presorted) || n_on > 0 {
         for row in rows.iter() {
             for (key, &collation) in key_collations.iter().enumerate().take(n_keys) {
                 storage.validate_text_collation(
@@ -2216,6 +2240,66 @@ pub(crate) fn materialized_rows<'a>(
             ),
         };
         match bound {
+            // A join's `Sort` is PostgreSQL's tuplesort, bounded by a limit
+            // directly over it.
+            _ if join_sort.is_some() => {
+                let order = arena
+                    .alloc_slice_with(rows.len(), |at| at as u32)
+                    .map_err(|_| arena_full())?;
+                let held: &[&[u8]] = rows;
+                let mut compare_at = |a: u32, b: u32| compare(&held[a as usize], &held[b as usize]);
+                let kept = match join_sort.flatten() {
+                    // An incremental sort's input is ordered by the keys
+                    // its first sort items order.
+                    Some((_, _, presorted)) if presorted > 0 => {
+                        let model = modeled.as_ref().expect("a modeled join");
+                        let prefix = &model.sort_items[..usize::from(presorted)];
+                        let input = arena
+                            .alloc_slice_with(held.len(), |at| at as u32)
+                            .map_err(|_| arena_full())?;
+                        let scratch = arena
+                            .alloc_slice_with(held.len() * 2, |_| 0u32)
+                            .map_err(|_| arena_full())?;
+                        crate::sql::pg_qsort::pg_incremental_sort(
+                            input,
+                            scratch,
+                            order,
+                            bounded,
+                            &mut |a, b| {
+                                for &item in prefix {
+                                    let key = usize::from(item);
+                                    let left = crate::sql::exec::ProjectedValue::column(
+                                        held[a as usize],
+                                        width + key,
+                                    );
+                                    let right = crate::sql::exec::ProjectedValue::column(
+                                        held[b as usize],
+                                        width + key,
+                                    );
+                                    if !compare_materialized_key(
+                                        storage,
+                                        txid,
+                                        key_collations[key],
+                                        left,
+                                        right,
+                                    )?
+                                    .is_eq()
+                                    {
+                                        return Ok(false);
+                                    }
+                                }
+                                Ok(true)
+                            },
+                            &mut compare_at,
+                        )?
+                    }
+                    _ => crate::sql::pg_qsort::pg_tuplesort(order, bounded, &mut compare_at)?,
+                };
+                let sorted = arena
+                    .alloc_slice_with(kept, |at| held[order[at] as usize])
+                    .map_err(|_| arena_full())?;
+                rows[..kept].copy_from_slice(sorted);
+            }
             Some(bound) => {
                 crate::mem::arena::try_stable_top_n_via(arena, rows, bound, compare, |_| {
                     arena_full()
@@ -3269,6 +3353,28 @@ pub(crate) fn materialized_stages(limited: bool) -> instrument::Stages {
 /// DISTINCT / ORDER BY execution to the wire: materialize the rows, then page
 /// with LIMIT/OFFSET and emit.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+/// Whether the ordered query reads a join PostgreSQL's join search plans,
+/// whose rows the in-memory path orders as PostgreSQL's tuplesort does
+/// (`pg_tuplesort`, `pg_incremental_sort`): a spilling sort's order of
+/// equal rows would differ.
+pub(crate) fn sorts_modeled_join<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    params: &[Datum<'a>],
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<bool, SqlError> {
+    Ok(outer.is_none()
+        && !statement.order_by.is_empty()
+        && scope.n > 1
+        && super::index_paths::join_query::modeled_join(
+            storage, txid, statement, scope, params, arena,
+        )?
+        .is_some())
+}
+
 pub(crate) fn materialized_select<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
@@ -3284,7 +3390,12 @@ pub(crate) fn materialized_select<'a>(
     offset: u64,
     responder: &mut Responder,
 ) -> Outcome {
-    if storage.spill_attached() {
+    if storage.spill_attached()
+        && !match sorts_modeled_join(storage, txid, statement, scope, params, arena, None) {
+            Ok(sorts) => sorts,
+            Err(error) => return sql_fail(error),
+        }
+    {
         return external_materialized_select(
             storage, scope, from, txid, statement, arena, params, hooks, correlated, base, limit,
             offset, responder,

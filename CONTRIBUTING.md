@@ -65,7 +65,10 @@ database servers (pos3ql, postgres) above 10 GiB. When available system memory
 falls below 12%, it stops the largest of those processes, compilers or cargo
 test binaries. It logs each stop with the command line to
 `~/.cache/pos3ql/dev-memory-guard.log`, and warns when free disk, which swap
-needs, falls below 20 GiB. The script's header lists its settings. A stopped
+needs, falls below 25 GiB and then deletes this checkout's stale codegen object
+files (`*.rcgu.o` under `target/` older than 12 hours), logging how much it
+removed. The dev profile sets `split-debuginfo = "off"` so cargo stops leaving
+those files behind in the first place. The script's header lists its settings. A stopped
 run means the workload is too large for the machine: bound it or move it to CI
 rather than raising the limits.
 

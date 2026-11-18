@@ -2148,3 +2148,5 @@ routines through the rows it built, a table's row type among them),
 `pg_policy`, `pg_statistic_ext`, `pg_partitioned_table`, `pg_rewrite` and
 `pg_sequence` still materialize every table's rows for a table change, and
 changes to views, sequences, routines and types select every table.
+
+Local builds: the dev profile sets `split-debuginfo = "off"`, because macOS's default (`unpacked`) kept every codegen unit's `*.rcgu.o` in `target/debug/build/pos3ql/*/out` and each rebuild added fresh names (46 GiB observed); `tools/dev-memory-guard.sh` also deletes such files older than 12 hours when free disk falls below 25 GiB, and logs the disk pressure and what it removed.

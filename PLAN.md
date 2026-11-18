@@ -854,12 +854,11 @@ a call joins as PostgreSQL's plan does (`differential_exact/890`, `891`,
 body, a column coerced to the declared type (not printed at the top of a
 target entry), and polymorphic or variadic arguments (`894`); its rows come
 from `generate_series` and `unnest` support functions over stable arguments
-too (`895`). Remaining: the `VERBOSE` target list of a subplan reading
-the enclosing query's columns (`Output: ?column?` where PostgreSQL prints
-`(t.a + 1)`), a regular
+too (`895`). A `VERBOSE` subplan's target list names the enclosing
+query's columns, and a `COALESCE`, `GREATEST` or `LEAST` over a domain and
+another type relabels the domain to its base type (`902`). Remaining: a regular
 expression with embedded options or a director (`(?i)`, `***=`),
-conditions on an expression key of a statistics object (an `OR` through
-an MCV list is estimated with `is_or`, `differential_exact/836`), a
+a
 statistics object with an MCV list of a type
 other than the integer, floating, numeric, character, `name`, `"char"`,
 `oid`, boolean, date, time, timestamp, interval, `bytea`, `money`, network,

@@ -11562,7 +11562,7 @@ where
     match &sel.from {
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
-            validate_static_grouping(sel, &scope, storage, txid, arena)?;
+            validate_static_grouping(sel, &scope, None, storage, txid, arena)?;
             describe_select_items(
                 sel.items,
                 Some(&scope),
@@ -11591,13 +11591,14 @@ where
 pub(crate) fn validate_static_grouping<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let columns = subquery::SubqueryColumns {
         scope: Some(scope),
-        outer: None,
+        outer,
         catalog: super::exec::CatalogCols {
             remote_ctid: false,
             definition: None,
@@ -12825,12 +12826,25 @@ fn with_level_columns<'a, R>(
     catalog: &dyn super::eval::CatalogAccess,
     run: impl FnOnce(&dyn super::exec::ColTypeResolver) -> R,
 ) -> R {
+    with_nested_level_columns(scope, None, catalog, run)
+}
+
+/// [`with_level_columns`] for a query nested in another, whose expressions
+/// may also read the enclosing queries' columns.
+fn with_nested_level_columns<'a, R>(
+    scope: Option<&QueryScope<'a>>,
+    outer: Option<&dyn ColumnLookup<'_>>,
+    catalog: &dyn super::eval::CatalogAccess,
+    run: impl FnOnce(&dyn super::exec::ColTypeResolver) -> R,
+) -> R {
     let empty = super::eval::NoColumns;
     let schema = scope.map(materialize::ScopeSchema);
-    let row: &dyn ColumnLookup<'_> = match &schema {
+    let inner: &dyn ColumnLookup<'_> = match &schema {
         Some(schema) => schema,
         None => &empty,
     };
+    let chained = Chained { inner, outer };
+    let row: &dyn ColumnLookup<'_> = if outer.is_some() { &chained } else { inner };
     let columns = super::eval::RuntimeColumnTypes {
         row,
         catalog: Some(catalog),
@@ -12852,7 +12866,218 @@ pub fn fold_select_constants<'a>(
     storage: &Storage,
     txid: u32,
 ) -> Result<&'a Select<'a>, SqlError> {
-    super::eval::finish_folding(fold_select_constants_in(statement, arena, storage, txid))
+    super::eval::finish_folding(fold_select_constants_in(
+        statement, arena, storage, txid, None,
+    ))
+}
+
+/// [`fold_select_constants`] for a query nested in an expression, which reads
+/// the enclosing queries' columns through `outer`.
+pub fn fold_select_constants_nested<'a>(
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+    outer: &dyn ColumnLookup<'_>,
+) -> Result<&'a Select<'a>, SqlError> {
+    super::eval::finish_folding(fold_select_constants_in(
+        statement,
+        arena,
+        storage,
+        txid,
+        Some(outer),
+    ))
+}
+
+/// The queries nested in `select`'s expressions (`WHERE`, select list, `HAVING`,
+/// `GROUP BY`, `ORDER BY` and join conditions), each folded with the
+/// enclosing levels' columns in reach, as the planner preprocesses a
+/// subquery's expressions (`inline_function` inside a sublink), then their
+/// own nested queries in turn.
+pub fn fold_sublinks<'a>(
+    select: &'a Select<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+    outer: Option<&dyn ColumnLookup<'_>>,
+) -> Result<&'a Select<'a>, SqlError> {
+    let level_expressions = || {
+        returning_expressions(select.items)
+            .chain(select.where_clause)
+            .chain(select.having)
+            .chain(select.group_by.iter().copied())
+            .chain(select.order_by.iter().map(|key| key.expression))
+            .chain(
+                select
+                    .from
+                    .iter()
+                    .flat_map(|from| from.joins.iter().filter_map(|join| join.on)),
+            )
+    };
+    if !level_expressions().any(has_sublink) {
+        return Ok(select);
+    }
+    let mark = arena.mark();
+    let scope = match select
+        .from
+        .as_ref()
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
+        .transpose()
+    {
+        Ok(scope) => scope,
+        Err(error) if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED => return Err(error),
+        Err(_) => {
+            // SAFETY: the failed resolution's scratch is not referenced.
+            unsafe { arena.rewind_to(mark) };
+            return Ok(select);
+        }
+    };
+    let schema = scope.as_ref().map(materialize::ScopeSchema);
+    let empty = super::eval::NoColumns;
+    let inner: &dyn ColumnLookup<'_> = match &schema {
+        Some(schema) => schema,
+        None => &empty,
+    };
+    let row = Chained { inner, outer };
+    let rewrite =
+        |expression: &'a Expr<'a>| rewrite_sublinks(expression, &row, arena, storage, txid);
+    let mut copy = *select;
+    let items = arena
+        .alloc_slice_copy(select.items)
+        .map_err(|_| arena_full())?;
+    for item in items.iter_mut() {
+        match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                *expression = rewrite(expression)?;
+            }
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
+        }
+    }
+    copy.items = items;
+    copy.where_clause = select.where_clause.map(rewrite).transpose()?;
+    copy.having = select.having.map(rewrite).transpose()?;
+    let group_by = arena
+        .alloc_slice_copy(select.group_by)
+        .map_err(|_| arena_full())?;
+    for key in group_by.iter_mut() {
+        *key = rewrite(key)?;
+    }
+    copy.group_by = group_by;
+    let order_by = arena
+        .alloc_slice_copy(select.order_by)
+        .map_err(|_| arena_full())?;
+    for key in order_by.iter_mut() {
+        key.expression = rewrite(key.expression)?;
+    }
+    copy.order_by = order_by;
+    if let Some(from) = &select.from {
+        let joins = arena
+            .alloc_slice_copy(from.joins)
+            .map_err(|_| arena_full())?;
+        for join in joins.iter_mut() {
+            join.on = join.on.map(rewrite).transpose()?;
+        }
+        copy.from = Some(FromClause {
+            base: from.base,
+            joins,
+        });
+    }
+    arena
+        .alloc(copy)
+        .map(|copy| &*copy)
+        .map_err(|_| arena_full())
+}
+
+/// Whether `expression` holds a nested query outside of any other.
+fn has_sublink(expression: &Expr<'_>) -> bool {
+    if matches!(
+        expression,
+        Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_)
+    ) {
+        return true;
+    }
+    let mut found = false;
+    let _ = walk_children(expression, &mut |child| {
+        found |= has_sublink(child);
+        Ok(())
+    });
+    found
+}
+
+/// `expression` with each nested query folded in the columns of `row`.
+fn rewrite_sublinks<'a>(
+    expression: &'a Expr<'a>,
+    row: &dyn ColumnLookup<'_>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let nested = |select: &'a Select<'a>| -> Result<&'a Select<'a>, SqlError> {
+        let folded = fold_select_constants_nested(select, arena, storage, txid, row)?;
+        fold_sublinks(folded, arena, storage, txid, Some(row))
+    };
+    enum Failed {
+        Sql(SqlError),
+        Full,
+    }
+    impl From<SqlError> for Failed {
+        fn from(error: SqlError) -> Self {
+            Self::Sql(error)
+        }
+    }
+    impl From<crate::mem::arena::ArenaFull> for Failed {
+        fn from(_: crate::mem::arena::ArenaFull) -> Self {
+            Self::Full
+        }
+    }
+    crate::sql::ast::rewrite_expression(expression, arena, &mut |node: &'a Expr<'a>| -> Result<
+        Option<&'a Expr<'a>>,
+        Failed,
+    > {
+        let replaced = match node {
+            Expr::Subquery(select) => Expr::Subquery(nested(select)?),
+            Expr::Exists(select) => Expr::Exists(nested(select)?),
+            Expr::ArraySubquery(select) => Expr::ArraySubquery(nested(select)?),
+            Expr::RowSubquery { select, arity } => Expr::RowSubquery {
+                select: nested(select)?,
+                arity: *arity,
+            },
+            Expr::InSubquery {
+                operand,
+                select,
+                negated,
+            } => Expr::InSubquery {
+                operand: rewrite_sublinks(operand, row, arena, storage, txid)?,
+                select: nested(select)?,
+                negated: *negated,
+            },
+            Expr::QuantifiedSubquery {
+                operand,
+                operator,
+                select,
+                all,
+            } => Expr::QuantifiedSubquery {
+                operand: rewrite_sublinks(operand, row, arena, storage, txid)?,
+                operator: *operator,
+                select: nested(select)?,
+                all: *all,
+            },
+            _ => return Ok(None),
+        };
+        arena
+            .alloc(replaced)
+            .map(|node| Some(&*node))
+            .map_err(|_| Failed::Full)
+    })
+    .map_err(|failed| match failed {
+        Failed::Sql(error) => error,
+        Failed::Full => arena_full(),
+    })
 }
 
 fn fold_select_constants_in<'a>(
@@ -12860,6 +13085,7 @@ fn fold_select_constants_in<'a>(
     arena: &'a Arena,
     storage: &Storage,
     txid: u32,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<&'a Select<'a>, SqlError> {
     if statement.from.is_none() {
         super::eval::probe_constants(|| {
@@ -12870,7 +13096,7 @@ fn fold_select_constants_in<'a>(
 
     let catalog = storage_catalog(storage, arena, txid);
     let Some(from) = &statement.from else {
-        return with_level_columns(None, &catalog, |columns| {
+        return with_nested_level_columns(None, outer, &catalog, |columns| {
             fold_select_level(statement, arena, storage, txid, &catalog, Some(columns))
         });
     };
@@ -12882,8 +13108,8 @@ fn fold_select_constants_in<'a>(
     // here: its calls of inlinable functions stay calls, which `EXPLAIN`
     // refuses.
     let mark = arena.mark();
-    match QueryScope::resolve_schema(storage, from, txid, arena, None) {
-        Ok(scope) => with_level_columns(Some(&scope), &catalog, |columns| {
+    match QueryScope::resolve_schema(storage, from, txid, arena, outer) {
+        Ok(scope) => with_nested_level_columns(Some(&scope), outer, &catalog, |columns| {
             fold_select_level(statement, arena, storage, txid, &catalog, Some(columns))
         }),
         Err(error) if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED => Err(error),

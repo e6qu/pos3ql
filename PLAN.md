@@ -807,6 +807,7 @@ statistics objects without `0A000`, and pg_stats_ext_exprs shows an
 expression key's null fraction, distinct values and width, not its MCV
 list or histogram.
 An index key or predicate may call a PL/pgSQL function
+A `DROP TABLE ... CASCADE` drops every foreign key that references the table in one statement and changes each referencing relation once (`differential_exact/898`); a transaction that changes one relation in more than `max_catalog_versions_per_object` statements fails with that named capacity error.
 (`differential_exact/755`): a utility statement that evaluates outside a
 query (`CREATE INDEX`, `REINDEX`, `CLUSTER`, `VACUUM`, `ANALYZE`,
 `ALTER TABLE`, `CREATE TABLE AS`, materialized view population) runs such a

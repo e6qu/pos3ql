@@ -222,7 +222,7 @@ pub(crate) use spill_generations::{
 pub(crate) use spill_generations::{StatementFileLease, StatementFileScope};
 
 pub(crate) use definition_images::TableDefinitionImages;
-pub(crate) use row_heap::{HeapRowRead, RowHeap};
+pub(crate) use row_heap::{HeapRowRead, RowHeap, is_memtable_full};
 pub(crate) use row_images::{
     OrderedRowSnapshot, RowByteRead, RowSnapshot, RowVersion, TableRowSnapshot, VisibleRowHome,
 };

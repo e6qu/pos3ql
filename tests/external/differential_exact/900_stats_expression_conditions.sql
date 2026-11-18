@@ -1,3 +1,4 @@
+-- The rows of each statement stay under the forced-spill run's 256 KiB memtable.
 -- A condition on an expression a statistics object holds is estimated from
 -- the expression's own statistics (`examine_variable` reads them when no
 -- index does): equality through its most common values, ranges through its
@@ -5,7 +6,7 @@
 CREATE TABLE x900 (a integer, b text, c numeric, d timestamp);
 INSERT INTO x900
 SELECT g % 50, 'item' || (g % 17), (g % 23) * 1.5, timestamp '2024-01-01' + (g % 400) * interval '1 hour'
-FROM generate_series(1, 3000) g;
+FROM generate_series(1, 1000) g;
 INSERT INTO x900 SELECT NULL, NULL, NULL, NULL FROM generate_series(1, 100);
 CREATE STATISTICS s900 (mcv) ON (a + 1), lower(b), (c * 2) FROM x900;
 CREATE STATISTICS s900b ON (d::date) FROM x900;

@@ -13021,30 +13021,28 @@ fn rewrite_sublinks<'a>(
         let folded = fold_select_constants_nested(select, arena, storage, txid, row)?;
         fold_sublinks(folded, arena, storage, txid, Some(row))
     };
-    enum Failed {
-        Sql(SqlError),
-        Full,
-    }
-    impl From<SqlError> for Failed {
-        fn from(error: SqlError) -> Self {
-            Self::Sql(error)
-        }
-    }
+    /// The rewrite's failure: an exhausted arena, or the error held aside.
+    struct Failed;
     impl From<crate::mem::arena::ArenaFull> for Failed {
         fn from(_: crate::mem::arena::ArenaFull) -> Self {
-            Self::Full
+            Self
         }
     }
+    let failure = core::cell::Cell::new(None);
+    let set_aside = |error: SqlError| {
+        failure.set(Some(error));
+        Failed
+    };
     crate::sql::ast::rewrite_expression(expression, arena, &mut |node: &'a Expr<'a>| -> Result<
         Option<&'a Expr<'a>>,
         Failed,
     > {
         let replaced = match node {
-            Expr::Subquery(select) => Expr::Subquery(nested(select)?),
-            Expr::Exists(select) => Expr::Exists(nested(select)?),
-            Expr::ArraySubquery(select) => Expr::ArraySubquery(nested(select)?),
+            Expr::Subquery(select) => Expr::Subquery(nested(select).map_err(&set_aside)?),
+            Expr::Exists(select) => Expr::Exists(nested(select).map_err(&set_aside)?),
+            Expr::ArraySubquery(select) => Expr::ArraySubquery(nested(select).map_err(&set_aside)?),
             Expr::RowSubquery { select, arity } => Expr::RowSubquery {
-                select: nested(select)?,
+                select: nested(select).map_err(&set_aside)?,
                 arity: *arity,
             },
             Expr::InSubquery {
@@ -13052,8 +13050,9 @@ fn rewrite_sublinks<'a>(
                 select,
                 negated,
             } => Expr::InSubquery {
-                operand: rewrite_sublinks(operand, row, arena, storage, txid)?,
-                select: nested(select)?,
+                operand: rewrite_sublinks(operand, row, arena, storage, txid)
+                    .map_err(&set_aside)?,
+                select: nested(select).map_err(&set_aside)?,
                 negated: *negated,
             },
             Expr::QuantifiedSubquery {
@@ -13062,9 +13061,10 @@ fn rewrite_sublinks<'a>(
                 select,
                 all,
             } => Expr::QuantifiedSubquery {
-                operand: rewrite_sublinks(operand, row, arena, storage, txid)?,
+                operand: rewrite_sublinks(operand, row, arena, storage, txid)
+                    .map_err(&set_aside)?,
                 operator: *operator,
-                select: nested(select)?,
+                select: nested(select).map_err(&set_aside)?,
                 all: *all,
             },
             _ => return Ok(None),
@@ -13072,12 +13072,9 @@ fn rewrite_sublinks<'a>(
         arena
             .alloc(replaced)
             .map(|node| Some(&*node))
-            .map_err(|_| Failed::Full)
+            .map_err(|_| Failed)
     })
-    .map_err(|failed| match failed {
-        Failed::Sql(error) => error,
-        Failed::Full => arena_full(),
-    })
+    .map_err(|Failed| failure.take().unwrap_or_else(arena_full))
 }
 
 fn fold_select_constants_in<'a>(

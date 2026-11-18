@@ -4241,7 +4241,9 @@ fn grouped_scan_path<'a>(
             .find(|key| column_of(key) == Some(column))
             .expect("a grouping column has its entry")
     };
-    let keys = path.grouped.map_or(columns_in_order, |grouped| grouped.keys);
+    let keys = path
+        .grouped
+        .map_or(columns_in_order, |grouped| grouped.keys);
     let direction = |column: usize| {
         columns_in_order[..count]
             .iter()
@@ -4251,9 +4253,7 @@ fn grouped_scan_path<'a>(
     };
     let count = path.grouped.map_or(count, |grouped| grouped.key_count);
     let sort_keys = arena
-        .alloc_slice_with(count, |at| {
-            (entry(keys[at]), Some(direction(keys[at])))
-        })
+        .alloc_slice_with(count, |at| (entry(keys[at]), Some(direction(keys[at]))))
         .map_err(|_| arena_full())?;
     let group_keys = arena
         .alloc_slice_with(count, |at| (entry(keys[at]), None))

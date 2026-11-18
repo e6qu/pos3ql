@@ -3349,7 +3349,9 @@ fn grouped<'a>(
     sorted_paths[sorted_count] = Some(hashed);
     let grouped_inputs = paths
         .arena
-        .alloc_slice_with(sorted_count + 1, |at| sorted_paths[at].expect("dense paths"))
+        .alloc_slice_with(sorted_count + 1, |at| {
+            sorted_paths[at].expect("dense paths")
+        })
         .map_err(|_| crate::sql::eval::arena_full())?;
     let grouped_count = add_paths(grouped_inputs, false, &mut grouped_paths);
     let grouped_paths = &grouped_paths[..grouped_count];
@@ -3446,7 +3448,9 @@ fn grouped<'a>(
         sort_input(&scan, chosen.reordered).and_then(|(_, sort)| sort)
     };
     let keys = arrangement(&scan, chosen.reordered).0;
-    let mut path = outside!(describe(paths, &chosen, &scan, shape, definition, needed, rows)?);
+    let mut path = outside!(describe(
+        paths, &chosen, &scan, shape, definition, needed, rows
+    )?);
     path.grouped = Some(super::GroupedPath {
         hashed: hashed_chosen,
         keys,
@@ -4135,9 +4139,8 @@ fn incremental_sort_cost(
     let group_input_run = input_run / groups;
     let (group_startup, group_run) = tuplesort_cost(group_tuples, width, limit_tuples, costs);
     let startup = group_startup + path.startup + group_input_run;
-    let mut run = group_run
-        + (group_run + group_startup) * (groups - 1.0)
-        + group_input_run * (groups - 1.0);
+    let mut run =
+        group_run + (group_run + group_startup) * (groups - 1.0) + group_input_run * (groups - 1.0);
     // `create_incremental_sort_path` passes no comparison cost.
     run += costs.cpu_tuple * input_tuples;
     run += 2.0 * costs.cpu_tuple * groups;

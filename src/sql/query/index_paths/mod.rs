@@ -901,7 +901,7 @@ impl<'a> Planned<'a> {
 pub(super) struct VariableStatistics<'s> {
     /// Whether ANALYZE recorded the column (`statsTuple`).
     pub(super) analyzed: bool,
-    null_fraction: f64,
+    pub(super) null_fraction: f64,
     distinct: f64,
     pub(super) distribution: Option<ColumnDistribution<'s>>,
     ctype: ColType,

@@ -493,7 +493,7 @@ fn analyze_qual<'a>(
         _ => Shape::Other,
     };
     // A condition above one relation must be one the model estimates.
-    if rels.count_ones() > 1 && shape == Shape::Other && !join_comparison(scope, expression) {
+    if rels.count_ones() > 1 && shape == Shape::Other && !join_condition(scope, expression) {
         return None;
     }
     let strict = strict?;
@@ -508,6 +508,155 @@ fn analyze_qual<'a>(
         forced_null,
         shape,
     })
+}
+
+/// A condition of several relations the model estimates: a comparison of
+/// two relations' columns, or an `OR` whose arms are such comparisons or
+/// conditions of one relation (`clauselist_selectivity_or`). An arm that
+/// is itself an `AND` would also restrict its relations' scans
+/// (`extract_restriction_or_clauses`), which the model leaves.
+fn join_condition(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
+    match expression {
+        Expr::Binary {
+            operator: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => [left, right].iter().all(|arm| {
+            let Some(vars) = qual_vars(scope, arm) else {
+                return false;
+            };
+            let rels = vars
+                .as_slice()
+                .iter()
+                .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
+            if rels.count_ones() <= 1 {
+                return !matches!(
+                    arm,
+                    Expr::Binary {
+                        operator: BinaryOp::And,
+                        ..
+                    }
+                );
+            }
+            join_condition(scope, arm)
+        }),
+        _ => {
+            join_comparison(scope, expression)
+                || join_inequality(scope, expression)
+                || join_equality(scope, expression)
+        }
+    }
+}
+
+/// `left = right` of columns of two relations of one joinable type, an arm
+/// of an `OR` that `eqjoinsel` estimates.
+fn join_equality(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
+    let Expr::Binary {
+        operator: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = expression
+    else {
+        return false;
+    };
+    let (Some(one), Some(two)) = (column_of(scope, left), column_of(scope, right)) else {
+        return false;
+    };
+    let ctype = |(table, column): (usize, usize)| {
+        let meta = &scope.defs.stored(table).expect("plain table").columns()[column];
+        (meta.ctype, meta.collation)
+    };
+    one.0 != two.0 && ctype(one) == ctype(two) && joinable(ctype(one).0)
+}
+
+/// `clause_selectivity` and `cost_qual_eval` of a condition of several
+/// relations [`join_condition`] accepts: a comparison's `DEFAULT_INEQ_SEL`,
+/// an inequality's complement of `eqjoinsel`, an `OR`'s arms combined as
+/// `s1 + s2 - s1 * s2`, an arm of one relation estimated as its restriction.
+fn join_estimate<'a>(
+    scope: &QueryScope<'a>,
+    expression: &'a Expr<'a>,
+    reader: &RelStatistics<'_, '_, '_>,
+    restriction: &dyn Fn(usize, &'a Expr<'a>) -> Result<Option<(f64, f64)>, SqlError>,
+    costs: Costs,
+) -> Result<Option<(f64, f64)>, SqlError> {
+    if let Expr::Binary {
+        operator: BinaryOp::Or,
+        left,
+        right,
+        ..
+    } = expression
+    {
+        let (mut selectivity, mut cost) = (0.0, 0.0);
+        for arm in [*left, *right] {
+            let Some(vars) = qual_vars(scope, arm) else {
+                return Ok(None);
+            };
+            let rels = vars
+                .as_slice()
+                .iter()
+                .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
+            let estimate = if rels.count_ones() == 1 {
+                restriction(rels.trailing_zeros() as usize, arm)?
+            } else if rels == 0 {
+                None
+            } else {
+                join_estimate(scope, arm, reader, restriction, costs)?
+            };
+            let Some((arm_selectivity, arm_cost)) = estimate else {
+                return Ok(None);
+            };
+            selectivity = selectivity + arm_selectivity - selectivity * arm_selectivity;
+            cost += arm_cost;
+        }
+        return Ok(Some((selectivity, cost)));
+    }
+    if matches!(expression, Expr::Bool(true)) {
+        return Ok(Some((1.0, 0.0)));
+    }
+    if join_comparison(scope, expression) {
+        return Ok(Some((super::DEFAULT_INEQ_SEL, costs.cpu_operator)));
+    }
+    let equality = join_equality(scope, expression);
+    if equality || join_inequality(scope, expression) {
+        let Expr::Binary { left, right, .. } = expression else {
+            unreachable!("a comparison");
+        };
+        let member = |side: &Expr<'_>| {
+            column_of(scope, side).map(|(table, column)| Member::plain(table as u8, column as u16))
+        };
+        let (Some(one), Some(two)) = (member(left), member(right)) else {
+            return Ok(None);
+        };
+        let equal = reader.equality(one, two)?.clamp(0.0, 1.0);
+        let selectivity = if equality { equal } else { 1.0 - equal };
+        return Ok(Some((selectivity, costs.cpu_operator)));
+    }
+    Ok(None)
+}
+
+/// `left <> right` of columns of two relations of one joinable type, which
+/// `neqjoinsel` estimates as the equality's complement.
+fn join_inequality(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
+    let Expr::Binary {
+        operator: BinaryOp::NotEq,
+        left,
+        right,
+        ..
+    } = expression
+    else {
+        return false;
+    };
+    let (Some(one), Some(two)) = (column_of(scope, left), column_of(scope, right)) else {
+        return false;
+    };
+    let ctype = |(table, column): (usize, usize)| {
+        let meta = &scope.defs.stored(table).expect("plain table").columns()[column];
+        (meta.ctype, meta.collation)
+    };
+    one.0 != two.0 && ctype(one) == ctype(two) && joinable(ctype(one).0)
 }
 
 /// `left < right` (or `<=`, `>`, `>=`) of columns of two relations, which
@@ -763,7 +912,7 @@ pub(crate) fn modeled_join<'a>(
     };
     tree.root = root;
     // The conditions: each join's `ON`, then `WHERE`.
-    let mut quals = [&Expr::Null; MAX_QUALS];
+    let mut quals = [&Expr::Null; MAX_QUALS + 1];
     let mut constants = Constants {
         held: [(&Expr::Null, ColType::Int4); MAX_QUALS],
         count: 0,
@@ -802,10 +951,20 @@ pub(crate) fn modeled_join<'a>(
             quals[usize::from(id)] = conjunct;
         }
     }
-    let quals = &quals[..tree.qual_count];
     let Ok(mut prepared) = join_tree::prepare(&tree) else {
         return Ok(None);
     };
+    // The constant `true` that replaced outer join clauses
+    // (`reconsider_outer_join_clauses`) is the condition after the query's.
+    quals[tree.qual_count] = &Expr::Bool(true);
+    for placed in &mut prepared.placed[..prepared.placed_count] {
+        if let Placed::Join(join) = placed
+            && join.qual == join_tree::TRUE_QUAL
+        {
+            join.qual = tree.qual_count as u8;
+        }
+    }
+    let quals = &quals[..=tree.qual_count];
     // `remove_useless_joins`: a left join to one relation no row above
     // reads, which a unique index makes match at most one row, is dropped
     // with it.
@@ -885,6 +1044,7 @@ pub(crate) fn modeled_join<'a>(
         outer_selectivity: None,
         outer_relids: 0,
         operands: None,
+        other: super::joins::OtherShape::Plain,
         source: None,
     }; MAX_CLAUSES];
     let mut clause_count = 0;
@@ -916,6 +1076,7 @@ pub(crate) fn modeled_join<'a>(
             outer_selectivity: None,
             outer_relids: join.outer_relids,
             operands: None,
+            other: super::joins::OtherShape::Plain,
             source: Some(u16::from(join.qual)),
         };
         clause_count += 1;
@@ -1264,6 +1425,7 @@ pub(crate) fn modeled_join<'a>(
             outer_selectivity: None,
             outer_relids: 0,
             operands: None,
+            other: super::joins::OtherShape::Plain,
             source: None,
         };
         clause_count += 1;
@@ -1495,7 +1657,18 @@ pub(crate) fn modeled_join<'a>(
     });
     // The conditions other than equalities evaluated at joins: one
     // relation's (`clause_selectivity` as a restriction, its evaluation
-    // cost) or a comparison of two relations' columns (`DEFAULT_INEQ_SEL`).
+    // cost) or several relations' (`join_estimate`).
+    let early_reader = RelStatistics {
+        planners: &planners,
+        rels: &base,
+    };
+    let restriction =
+        |table: usize, expression: &'a Expr<'a>| -> Result<Option<(f64, f64)>, SqlError> {
+            let rel = rels[table].expect("planned");
+            let single = QueryScope::resolve_schema(storage, rel.from, txid, arena, None)?;
+            let planner = planners[table].as_ref().expect("planned");
+            super::paths::restriction_estimate(planner, &single, expression, params, arena)
+        };
     let mut single_rel_columns = [0u64; MAX_JOIN_RELS];
     for clause in clauses[..placed_join_count].iter_mut() {
         if clause.form != ClauseForm::Other {
@@ -1522,19 +1695,46 @@ pub(crate) fn modeled_join<'a>(
                 }
                 single_rel_columns[table] |= columns;
             }
-            let rel = rels[table].expect("planned");
-            let single = QueryScope::resolve_schema(storage, rel.from, txid, arena, None)?;
-            let planner = planners[table].as_ref().expect("planned");
-            match super::paths::restriction_estimate(planner, &single, expression, params, arena)? {
+            match restriction(table, expression)? {
                 Some(estimate) => estimate,
                 None => return Ok(None),
             }
         } else {
-            (super::DEFAULT_INEQ_SEL, costs.cpu_operator)
+            match join_estimate(scope, expression, &early_reader, &restriction, costs)? {
+                Some(estimate) => estimate,
+                None => return Ok(None),
+            }
         };
         clause.selectivity = Some(selectivity);
         clause.outer_selectivity = Some(selectivity);
         clause.cost = cost;
+        clause.other = match expression {
+            Expr::Binary {
+                operator: BinaryOp::Or,
+                ..
+            } => super::joins::OtherShape::Composite,
+            Expr::Binary { left, right, .. } if join_inequality(scope, expression) => {
+                let nulls = |side: &Expr<'_>| {
+                    column_of(scope, side).map_or(0.0, |(table, column)| {
+                        let variable = planners[table].as_ref().expect("planned").variable(column);
+                        if variable.analyzed {
+                            variable.null_fraction
+                        } else {
+                            0.0
+                        }
+                    })
+                };
+                super::joins::OtherShape::Inequality {
+                    left_nulls: nulls(left),
+                    right_nulls: nulls(right),
+                }
+            }
+            _ => super::joins::OtherShape::Plain,
+        };
+        // A semi or anti join estimates these its own way, once.
+        if clause.other != super::joins::OtherShape::Plain {
+            clause.outer_selectivity = None;
+        }
     }
     // The foreign keys between the query's relations whose every column
     // pair a class or join clauses equate (`get_relation_foreign_keys`,

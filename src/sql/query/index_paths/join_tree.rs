@@ -32,6 +32,9 @@ pub(crate) const MAX_PLACED: usize = 96;
 pub(crate) const MAX_SPECIALS: usize = MAX_JOIN_RELS;
 /// No qual: a column a class needs.
 pub(crate) const NO_QUAL: u8 = u8::MAX;
+/// The constant `true` that stands in for an outer join clause
+/// `reconsider_outer_join_clauses` replaced.
+pub(crate) const TRUE_QUAL: u8 = u8::MAX - 1;
 
 /// A column of a base relation: `(relation, column)`.
 pub(crate) type Var = (u8, u16);
@@ -304,7 +307,7 @@ impl Prepared {
             return Err("a removable join's relation in an equivalence class");
         }
         let mut kept = 0;
-        let mut dropped_quals = [false; MAX_QUALS];
+        let mut dropped_quals = [false; MAX_QUALS + 1];
         for index in 0..self.placed_count {
             let mut entry = self.placed[index];
             let keep = match &mut entry {
@@ -401,6 +404,9 @@ struct BuildClass {
     constant: Option<(u8, u16, u8)>,
     merged_into: Option<u8>,
     sources: u8,
+    /// Whether `reconsider_outer_join_clauses` derived one of its
+    /// equalities, which then has no qual of its own.
+    derived: bool,
 }
 
 /// An outer join's clause waiting for `reconsider_outer_join_clauses`.
@@ -503,6 +509,7 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
             constant: None,
             merged_into: None,
             sources: 0,
+            derived: false,
         }; MAX_CLASSES],
         class_count: 0,
         placed: [Placed::Restriction { rel: 0, qual: 0 }; MAX_PLACED],
@@ -1566,6 +1573,7 @@ impl Prep<'_> {
             constant: None,
             merged_into: None,
             sources: 0,
+            derived: false,
         };
         self.class_count += 1;
         Ok(at as u8)
@@ -1616,6 +1624,7 @@ impl Prep<'_> {
                     held.constant = moved.constant;
                 }
                 held.sources += moved.sources;
+                held.derived |= moved.derived;
                 self.classes[usize::from(two)].merged_into = Some(one);
                 one
             }
@@ -1678,22 +1687,64 @@ impl Prep<'_> {
         Ok((left, right, left_class, right_class))
     }
 
-    /// `reconsider_outer_join_clauses`: a constant equated with an outer
-    /// join clause's outer column is outside the model; every clause goes
-    /// back to its relations, left joins' first.
+    /// `reconsider_outer_join_clauses`: a left or right join's clause whose
+    /// outer column a class equates with constants equates its inner column
+    /// with each of them inside the join's inner side
+    /// (`reconsider_outer_join_clause`), and gives way to a constant `true`
+    /// clause; repeated until nothing changes, then the remaining clauses go
+    /// back to their relations, left joins' first. A full join's clause of
+    /// such a column (`reconsider_full_join_clause`) is outside the model.
     fn reconsider_outer_join_clauses(&mut self) -> Result<(), Outside> {
+        loop {
+            let mut found = false;
+            for right in [false, true] {
+                let mut at = 0;
+                loop {
+                    let count = if right {
+                        self.right_count
+                    } else {
+                        self.left_count
+                    };
+                    if at == count {
+                        break;
+                    }
+                    let join = if right {
+                        self.right_join[at].join
+                    } else {
+                        self.left_join[at].join
+                    };
+                    if !self.reconsider_outer_join_clause(join, !right)? {
+                        at += 1;
+                        continue;
+                    }
+                    found = true;
+                    let (list, count) = if right {
+                        (&mut self.right_join, &mut self.right_count)
+                    } else {
+                        (&mut self.left_join, &mut self.left_count)
+                    };
+                    list.copy_within(at + 1..*count, at);
+                    *count -= 1;
+                    self.distribute_restrictinfo(JoinQual {
+                        qual: TRUE_QUAL,
+                        relids: 0,
+                        merge: None,
+                        ..join
+                    })?;
+                }
+            }
+            if !found {
+                break;
+            }
+        }
         let constant = |prep: &Self, member: Member| {
             prep.class_of(member)
                 .is_some_and(|class| prep.classes[usize::from(class)].class.has_const)
         };
-        for pending in self.left_join[..self.left_count]
-            .iter()
-            .chain(&self.right_join[..self.right_count])
-            .chain(&self.full_join[..self.full_count])
-        {
+        for pending in &self.full_join[..self.full_count] {
             let (left, right, ..) = pending.join.merge.expect("mergeable");
             if constant(self, left) || constant(self, right) {
-                return Err("an outer join clause of a column equated with a constant");
+                return Err("a full join clause of a column equated with a constant");
             }
         }
         let pending = (self.left_join, self.left_count);
@@ -1711,6 +1762,44 @@ impl Prep<'_> {
         Ok(())
     }
 
+    /// `reconsider_outer_join_clause` of `join`, whose outer column is its
+    /// left one when `outer_on_left`: true when a class equates that column
+    /// with a constant, its inner column then equated with that constant in
+    /// the join domain of its relation.
+    fn reconsider_outer_join_clause(
+        &mut self,
+        join: JoinQual,
+        outer_on_left: bool,
+    ) -> Result<bool, Outside> {
+        let (left, right, ..) = join.merge.expect("mergeable");
+        let (outer, inner) = if outer_on_left {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        let Some(class) = self.class_of(outer) else {
+            return Ok(false);
+        };
+        let held = self.classes[usize::from(class)];
+        let Some((qual, constant, _)) = held.constant.filter(|_| held.class.has_const) else {
+            return Ok(false);
+        };
+        if inner.nulling != 0 {
+            return Err("an outer join clause of a nulled column equated with a constant");
+        }
+        let Some(node) = self.tree.nodes[..self.tree.node_count]
+            .iter()
+            .position(|node| matches!(node, TreeNode::Rel(rel) if *rel == inner.rel))
+        else {
+            return Ok(false);
+        };
+        let domain = self.domain[node];
+        self.process_equivalence(qual, inner, None, Some(constant), domain)?;
+        let derived = self.class_of(inner).expect("just equated");
+        self.classes[usize::from(derived)].derived = true;
+        Ok(true)
+    }
+
     /// `generate_base_implied_equalities`: each member of a class with a
     /// constant restricted to it; a class of members of other relations
     /// keeps its members' columns at each of its relations.
@@ -1726,7 +1815,7 @@ impl Prep<'_> {
                     return Err("a constant's class of a nulled column");
                 }
                 // One `column = constant`: the clause itself.
-                if members.len() == 1 && held.sources == 1 {
+                if members.len() == 1 && held.sources == 1 && !held.derived {
                     let (qual, ..) = held.constant.expect("a constant");
                     self.place(Placed::Restriction {
                         rel: members[0].rel,

@@ -113,6 +113,19 @@ pub(crate) enum ClauseForm {
     Other,
 }
 
+/// The shape of a condition other than a mergeable equality, as far as a
+/// semi or anti join's estimate of it differs from an inner join's.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum OtherShape {
+    /// Estimated alike for every join.
+    Plain,
+    /// `left <> right` of columns with these NULL fractions: `neqjoinsel`
+    /// of a semi or anti join is the outer column's non-NULL fraction.
+    Inequality { left_nulls: f64, right_nulls: f64 },
+    /// An `OR` of conditions, whose semi join estimate the model leaves.
+    Composite,
+}
+
 /// Which copy of an outer join's clause a clause is, when the join
 /// commutes with another (`has_clone`, `is_clone`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -142,6 +155,8 @@ pub(crate) struct Clause {
     /// The columns another condition compares, `left op right`, whose
     /// outer side a `Memoize` cache keys by (`check_memoize_hashability`).
     pub(crate) operands: Option<(Member, Member)>,
+    /// What a semi or anti join estimates another condition by.
+    pub(crate) other: OtherShape,
     /// `cost_qual_eval`'s per-tuple cost.
     pub(crate) cost: f64,
     /// Its selectivity for an inner join (`norm_selec`), once computed.
@@ -1580,6 +1595,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 outer_selectivity: None,
                 outer_relids: 0,
                 operands: None,
+                other: OtherShape::Plain,
                 source: None,
             })
             .map_err(|_| arena_full())?;
@@ -1632,6 +1648,31 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     .clamp(0.0, 1.0)
             }
             Some((left, right, ..)) => self.statistics.equality(left, right)?.clamp(0.0, 1.0),
+            None if semi && clause.other != OtherShape::Plain => {
+                let Selectivity::Outer(Some(special)) = mode else {
+                    unreachable!("a semi join's estimate");
+                };
+                let syn_right = self.special(special).syn_right;
+                match (clause.other, clause.operands) {
+                    (
+                        OtherShape::Inequality {
+                            left_nulls,
+                            right_nulls,
+                        },
+                        Some((left, _)),
+                    ) => {
+                        if left.relids() & syn_right & BASE_RELIDS == 0 {
+                            1.0 - left_nulls
+                        } else {
+                            1.0 - right_nulls
+                        }
+                    }
+                    _ => {
+                        self.outside = Some("an OR condition of a semi or anti join");
+                        1.0
+                    }
+                }
+            }
             // Other clauses come with their estimate.
             None => clause
                 .selectivity
@@ -3817,6 +3858,7 @@ mod tests {
                 outer_selectivity: None,
                 outer_relids: 0,
                 operands: None,
+                other: OtherShape::Plain,
                 source: Some(0),
             }],
             needed: &[

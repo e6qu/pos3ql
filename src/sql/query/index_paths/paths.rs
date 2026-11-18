@@ -2371,7 +2371,7 @@ pub(crate) fn scan_path<'a>(
             || (clause_params & 1 << at != 0
                 && matches!(
                     operator,
-                    BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+                    BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
                 )))
         {
             return Ok(Planned::Outside("a join clause other than a comparison"));
@@ -2453,6 +2453,7 @@ pub(crate) fn scan_path<'a>(
             restriction.clause,
             Clause::Compare {
                 comparison: Comparison::Eq
+                    | Comparison::Ne
                     | Comparison::Lt
                     | Comparison::Le
                     | Comparison::Gt

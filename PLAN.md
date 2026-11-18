@@ -934,7 +934,15 @@ above reads, which a unique index's keys (each equated with the join's
 left side or a constant) make match at most one row, is removed with its
 conditions (`remove_useless_joins`); a column only the removed join read
 stays in its relation's scan width, and a query left with one relation
-scans it with the query's output width (`differential_exact/851`). A
+scans it with the query's output width (`differential_exact/851`). Join
+conditions may also be inequalities of two relations' columns
+(`neqjoinsel`, for a semi or anti join the outer column's non-NULL
+fraction) and `OR`s of comparisons, equalities and one relation's
+conditions (`clauselist_selectivity_or`), evaluated as join filters
+(`differential_exact/852`). A constant equated with a left or right
+join's outer column equates its inner column too, inside the join's inner
+side, the join clause giving way to a constant `true` that `EXPLAIN` does
+not print (`reconsider_outer_join_clause`, `differential_exact/853`). A
 single-column btree's NULL keys are laid out as a run of their own at the
 end of the index, sharing posting lists when it deduplicates.
 Hash joins build
@@ -955,13 +963,17 @@ table outgrow its memory while running. `EXPLAIN ANALYZE` counts these nodes, a 
 `Buckets` and memory and a `Materialize` store included, except a merge
 join over an input in index order that is not a plain index scan without
 a filter (`0A000`). Remaining for that search: output expressions other
-than columns, join conditions other than column
-equalities and comparisons, a class holding two columns of one relation
+than columns, join conditions of expressions or of two types
+(`a.int4col = b.int8col`, which PostgreSQL also merges into a class), an
+`OR` whose arm is an `AND` (`extract_restriction_or_clauses`) or that a
+semi or anti join or an indexed relation's parameterized scan evaluates, a
+class holding two columns of one relation
 (`ON a.k = b.k AND a.v = b.k`), a merge join over a partly sorted outer
 input (`Incremental Sort`), parenthesized joins (pulled up as
 `pull_up_subqueries` flattens them), self-join removal
-(`remove_useless_self_joins`), a constant equated with an
-outer join's compared column (`reconsider_outer_join_clause`), several
+(`remove_useless_self_joins`), a constant equated with a full join's
+compared column (`reconsider_full_join_clause`) or with an outer join's
+column another outer join nulls, several
 batches of a hash join returning unmatched inner
 rows, a class with two constants, output expressions, upper
 stages (`ORDER BY`, `LIMIT`, grouping, which also bring the query's

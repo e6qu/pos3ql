@@ -354,6 +354,29 @@ impl ColumnSet {
         }
     }
 
+    pub(crate) fn union(self, other: Self) -> Self {
+        let mut result = self;
+        result.union_with(other);
+        result
+    }
+
+    pub(crate) fn intersection(self, other: Self) -> Self {
+        let mut result = self;
+        for (target, kept) in result.words.iter_mut().zip(other.words) {
+            *target &= kept;
+        }
+        result
+    }
+
+    pub(crate) fn is_subset_of(self, other: Self) -> bool {
+        self.difference(other).is_empty()
+    }
+
+    /// The columns in ascending order.
+    pub(crate) fn iter(self) -> impl Iterator<Item = usize> {
+        (0..MAX_COLUMNS).filter(move |&column| self.contains(column))
+    }
+
     pub(crate) fn difference(self, other: Self) -> Self {
         let mut result = self;
         for (target, removed) in result.words.iter_mut().zip(other.words) {

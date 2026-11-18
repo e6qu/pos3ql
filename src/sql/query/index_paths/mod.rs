@@ -20,7 +20,7 @@ use crate::sql::ast::{BinaryOp, Collation, Expr, IndexAccessMethod};
 use crate::sql::catalog::PlannerIndex;
 use crate::sql::eval::SqlError;
 use crate::sql::types::{ColType, Datum};
-use crate::storage::{ColumnDistribution, MAX_COLUMNS, Storage, TableDef, TableStatistics};
+use crate::storage::{ColumnDistribution, ColumnSet, MAX_COLUMNS, Storage, TableDef, TableStatistics};
 
 use super::scope::{QueryScope, ResolvedColumn};
 
@@ -111,7 +111,7 @@ pub(crate) fn write_shape<'a>(
             }
         });
     }
-    let output = projection.map(|_| read);
+    let output = projection.map(|_| ColumnSet::from_low_word(read));
     Ok((
         scope,
         QueryShape {
@@ -162,7 +162,7 @@ fn write_projection<'a>(
                     scope.find_column(*qualifier, name) =>
             {
                 (
-                    output_width(definition, &statistics, Some(1 << column.min(63))),
+                    output_width(definition, &statistics, Some(ColumnSet::from_column(column))),
                     0.0,
                     Some(column),
                 )
@@ -2087,7 +2087,7 @@ pub(crate) struct QueryShape {
     pub(crate) only: bool,
     /// The columns the scan returns above it (`reltarget`), which set its
     /// width; `None` when they are the columns it reads.
-    pub(crate) output: Option<u64>,
+    pub(crate) output: Option<ColumnSet>,
     /// Only whether PostgreSQL builds any index path matters: the answer is
     /// [`Planned::SeqOnly`] when it builds none.
     pub(crate) probe: bool,
@@ -2279,7 +2279,7 @@ pub(crate) fn column_width(storage: &Storage, txid: u32, slot: usize, column: us
     output_width(
         &storage.table_def(slot, txid),
         &storage.table_statistics(slot, txid),
-        Some(1 << column.min(63)),
+        Some(ColumnSet::from_column(column)),
     )
 }
 
@@ -2288,11 +2288,11 @@ pub(crate) fn column_width(storage: &Storage, txid: u32, slot: usize, column: us
 pub(super) fn output_width(
     definition: &TableDef,
     statistics: &TableStatistics,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
 ) -> u32 {
     let mut width = 0.0;
     for (column, meta) in definition.columns().iter().enumerate() {
-        if needed.is_some_and(|needed| column >= 64 || needed & (1 << column) == 0) {
+        if needed.is_some_and(|needed| !needed.contains(column)) {
             continue;
         }
         width += definition
@@ -2630,7 +2630,7 @@ fn target_entry<'a>(
         && let Ok(ResolvedColumn::Table(0, column)) = scope.find_column(*qualifier, name)
     {
         return Some((
-            output_width(definition, statistics, Some(1 << column.min(63))),
+            output_width(definition, statistics, Some(ColumnSet::from_column(column))),
             0.0,
             Some(column),
         ));
@@ -2695,7 +2695,7 @@ fn query_variables<'a>(
 #[derive(Clone, Copy)]
 struct ScanContext {
     slot: usize,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
     shape: QueryShape,
 }
 
@@ -2719,7 +2719,7 @@ impl Drop for ScanContextScope {
 pub(crate) fn enter_query(
     slot: usize,
     condition: Option<&Expr<'_>>,
-    needed: Option<u64>,
+    needed: Option<ColumnSet>,
     shape: Option<QueryShape>,
 ) -> ScanContextScope {
     let _ = condition;
@@ -2736,7 +2736,7 @@ pub(crate) fn enter_query(
 pub(crate) fn running_query(
     slot: usize,
     condition: Option<&Expr<'_>>,
-) -> Option<(QueryShape, Option<u64>)> {
+) -> Option<(QueryShape, Option<ColumnSet>)> {
     let context = SCAN_CONTEXT.with(core::cell::Cell::get)?;
     let _ = condition;
     (context.slot == slot).then_some((context.shape, context.needed))

@@ -13,7 +13,7 @@ use crate::sql::ast::{
 };
 use crate::sql::eval::SqlError;
 use crate::sql::types::{ColType, Datum};
-use crate::storage::{Storage, TableStatistics};
+use crate::storage::{ColumnSet, Storage, TableStatistics};
 
 use super::join_tree::{self, Placed, Qual, Shape, Tree, TreeJoin, TreeNode, VarList};
 use super::joins::{
@@ -102,7 +102,7 @@ impl<'a> ModeledRel<'a> {
         )?;
         let single = QueryScope::resolve_schema(storage, self.from, txid, arena, None)?;
         let shape = QueryShape {
-            output: Some(self.output),
+            output: Some(ColumnSet::from_low_word(self.output)),
             member: super::Member::Join(scan),
             ..QueryShape::default()
         };
@@ -111,7 +111,7 @@ impl<'a> ModeledRel<'a> {
             &single,
             txid,
             condition,
-            Some(self.read),
+            Some(ColumnSet::from_low_word(self.read)),
             params,
             arena,
             shape,
@@ -3206,11 +3206,11 @@ pub(crate) fn modeled_join<'a>(
                 &single_scope,
                 txid,
                 condition,
-                Some(read),
+                Some(ColumnSet::from_low_word(read)),
                 params,
                 arena,
                 QueryShape {
-                    output: Some(above),
+                    output: Some(ColumnSet::from_low_word(above)),
                     member: super::Member::Join(scan),
                     ..QueryShape::default()
                 },

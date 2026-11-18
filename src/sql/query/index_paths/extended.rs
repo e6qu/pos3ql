@@ -10,10 +10,10 @@ use core::cmp::Ordering;
 use crate::mem::arena::Arena;
 use crate::sql::eval::SqlError;
 use crate::sql::types::{ArrElem, ColType, Datum};
-use crate::storage::{ExtendedStatisticsData, MAX_EXTENDED_STATISTICS_KEYS};
+use crate::storage::{ColumnSet, ExtendedStatisticsData, MAX_EXTENDED_STATISTICS_KEYS};
 
 use super::Comparison;
-use super::clauses::{Clause, Restriction, column_bit};
+use super::clauses::{Clause, Restriction};
 
 /// One statistics object of the table over plain columns, its keys in
 /// PostgreSQL's order.
@@ -28,12 +28,16 @@ pub(crate) struct ExtendedObject<'a> {
 }
 
 impl ExtendedObject<'_> {
-    /// The columns among its keys, as a mask.
-    fn keys_mask(&self) -> u64 {
-        self.columns[..self.n_keys]
+    /// The columns among its keys.
+    fn keys_mask(&self) -> ColumnSet {
+        let mut keys = ColumnSet::EMPTY;
+        for &column in self.columns[..self.n_keys]
             .iter()
             .filter(|&&column| column != usize::MAX)
-            .fold(0, |mask, &column| mask | column_bit(column))
+        {
+            keys.insert(column);
+        }
+        keys
     }
 
     fn key_of(&self, column: usize) -> Option<usize> {
@@ -71,10 +75,6 @@ pub(super) fn table_objects<'a>(
                 *column = definition
                     .column_index(name.as_str())
                     .expect("a statistics column remains in its table");
-                // Columns are masked by bit, the 64th standing for the rest.
-                if *column >= 63 {
-                    return Ok(Err("a statistics object on a column past the 63rd"));
-                }
             }
         }
         // An object with expression keys estimates conditions on those
@@ -190,7 +190,7 @@ impl<'a> super::Planner<'_, 'a> {
     /// (`statext_mcv_clauselist_selectivity` with `is_or`), each object's
     /// result and every other arm then combined as independent.
     pub(super) fn or_selectivity(&self, arms: &[&[Restriction<'a>]]) -> Result<f64, SqlError> {
-        let mut attnums = [0u64; 64];
+        let mut attnums = [ColumnSet::EMPTY; 64];
         if arms.len() > attnums.len() {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -200,10 +200,10 @@ impl<'a> super::Planner<'_, 'a> {
         for (at, arm) in arms.iter().enumerate() {
             attnums[at] = arm
                 .iter()
-                .try_fold(0u64, |mask, restriction| {
-                    mcv_columns(&restriction.clause).map(|columns| mask | columns)
+                .try_fold(ColumnSet::EMPTY, |mask, restriction| {
+                    mcv_columns(&restriction.clause).map(|columns| mask.union(columns))
                 })
-                .unwrap_or(0);
+                .unwrap_or(ColumnSet::EMPTY);
         }
         let mut estimated = 0u64;
         let mut selectivity = 0.0;
@@ -217,8 +217,8 @@ impl<'a> super::Planner<'_, 'a> {
                 let keys = object.keys_mask();
                 let matched = attnums[..arms.len()]
                     .iter()
-                    .filter(|&&mask| mask != 0 && mask & !keys == 0)
-                    .fold(0u64, |all, mask| all | mask)
+                    .filter(|mask| !mask.is_empty() && mask.is_subset_of(keys))
+                    .fold(ColumnSet::EMPTY, |all, &mask| all.union(mask))
                     .count_ones();
                 if matched > best_matched || (matched == best_matched && object.n_keys < best_keys)
                 {
@@ -243,11 +243,11 @@ impl<'a> super::Planner<'_, 'a> {
             let (mut simple_or, mut object_selectivity) = (0.0f64, 0.0f64);
             for (at, arm) in arms.iter().enumerate() {
                 let mask = attnums[at];
-                if mask == 0 || mask & !keys != 0 {
+                if mask.is_empty() || !mask.is_subset_of(keys) {
                     continue;
                 }
                 estimated |= 1 << at;
-                attnums[at] = 0;
+                attnums[at] = ColumnSet::EMPTY;
                 let simple = self.simple_selectivity(arm)?;
                 let overlap_simple = simple_or * simple;
                 simple_or = (simple_or + simple - overlap_simple).clamp(0.0, 1.0);
@@ -320,9 +320,9 @@ impl<'a> super::Planner<'_, 'a> {
         conditions: &[Condition<'_, 'a>],
         estimated: &mut u64,
     ) -> Result<f64, SqlError> {
-        let mut attnums = [0u64; 64];
+        let mut attnums = [ColumnSet::EMPTY; 64];
         for (at, condition) in conditions.iter().enumerate() {
-            attnums[at] = mcv_columns(condition.clause).unwrap_or(0);
+            attnums[at] = mcv_columns(condition.clause).unwrap_or(ColumnSet::EMPTY);
         }
         let mut selectivity = 1.0;
         loop {
@@ -337,8 +337,8 @@ impl<'a> super::Planner<'_, 'a> {
                 let keys = object.keys_mask();
                 let matched = attnums[..conditions.len()]
                     .iter()
-                    .filter(|&&mask| mask != 0 && mask & !keys == 0)
-                    .fold(0u64, |all, mask| all | mask)
+                    .filter(|mask| !mask.is_empty() && mask.is_subset_of(keys))
+                    .fold(ColumnSet::EMPTY, |all, &mask| all.union(mask))
                     .count_ones();
                 if matched > best_matched || (matched == best_matched && object.n_keys < best_keys)
                 {
@@ -356,13 +356,13 @@ impl<'a> super::Planner<'_, 'a> {
             let mut count = 0;
             for (at, condition) in conditions.iter().enumerate() {
                 let mask = attnums[at];
-                if mask == 0 || mask & !keys != 0 {
+                if mask.is_empty() || !mask.is_subset_of(keys) {
                     continue;
                 }
                 chosen[count] = Some(*condition);
                 count += 1;
                 *estimated |= 1 << at;
-                attnums[at] = 0;
+                attnums[at] = ColumnSet::EMPTY;
             }
             let chosen = &chosen[..count];
             let simple = self.clauselist(
@@ -474,14 +474,14 @@ impl<'a> super::Planner<'_, 'a> {
         estimated: &mut u64,
     ) -> f64 {
         let mut attnums = [usize::MAX; 64];
-        let mut clause_columns = 0u64;
+        let mut clause_columns = ColumnSet::EMPTY;
         for (at, condition) in conditions.iter().enumerate() {
             if *estimated & (1 << at) != 0 {
                 continue;
             }
             if let Some(column) = dependency_column(condition.clause) {
                 attnums[at] = column;
-                clause_columns |= column_bit(column);
+                clause_columns.insert(column);
             }
         }
         if clause_columns.count_ones() < 2 {
@@ -490,7 +490,7 @@ impl<'a> super::Planner<'_, 'a> {
         // The dependencies of the objects matching two or more columns.
         let usable = |object: &ExtendedObject<'_>| {
             object.data.dependencies_built
-                && (object.keys_mask() & clause_columns).count_ones() >= 2
+                && object.keys_mask().intersection(clause_columns).count_ones() >= 2
         };
         let mut chosen = [(0usize, 0usize, 0usize); 64];
         let mut chosen_count = 0;
@@ -521,7 +521,7 @@ impl<'a> super::Planner<'_, 'a> {
                         }
                         if dependency.iter().all(|&key| {
                             let column = object.columns[usize::from(key)];
-                            column != usize::MAX && remaining & column_bit(column) != 0
+                            column != usize::MAX && remaining.contains(column)
                         }) {
                             strongest = Some((object_at, at, dependency.len(), degree));
                         }
@@ -545,14 +545,14 @@ impl<'a> super::Planner<'_, 'a> {
             );
             chosen[chosen_count] = (object_at, at, implied);
             chosen_count += 1;
-            remaining &= !column_bit(implied);
+            remaining = remaining.difference(ColumnSet::from_column(implied));
         }
         if chosen_count == 0 {
             return 1.0;
         }
         // `clauselist_apply_dependencies`: each column's own selectivity,
         // then each dependency, weakest last-found first.
-        let mut columns = 0u64;
+        let mut columns = ColumnSet::EMPTY;
         for &(object_at, at, _) in &chosen[..chosen_count] {
             let object = &self.extended[object_at];
             let mut position = 0usize;
@@ -561,7 +561,7 @@ impl<'a> super::Planner<'_, 'a> {
                 &mut |dependency| {
                     if position == at {
                         for &key in dependency {
-                            columns |= column_bit(object.columns[usize::from(key)]);
+                            columns.insert(object.columns[usize::from(key)]);
                         }
                     }
                     position += 1;
@@ -571,10 +571,7 @@ impl<'a> super::Planner<'_, 'a> {
         let mut column_selectivity = [1.0f64; 64];
         let mut column_numbers = [0usize; 64];
         let mut count = 0;
-        for column in 0..64 {
-            if columns & (1 << column) == 0 {
-                continue;
-            }
+        for column in columns.iter() {
             let mut matching = [None::<Condition<'_, 'a>>; 64];
             let mut matched = 0;
             for (at, condition) in conditions.iter().enumerate() {
@@ -733,7 +730,7 @@ fn comparison_holds(comparison: Comparison, order: Ordering) -> bool {
 
 /// The table columns of a clause `statext_is_compatible_clause` accepts for
 /// an MCV list, as a mask.
-fn mcv_columns(clause: &Clause<'_>) -> Option<u64> {
+fn mcv_columns(clause: &Clause<'_>) -> Option<ColumnSet> {
     match *clause {
         Clause::Compare {
             column,
@@ -746,12 +743,12 @@ fn mcv_columns(clause: &Clause<'_>) -> Option<u64> {
             column,
             elements: Some(_),
             ..
-        } => Some(column_bit(column)),
+        } => Some(ColumnSet::from_column(column)),
         Clause::Or(arms) => {
-            let mut mask = 0;
+            let mut mask = ColumnSet::EMPTY;
             for arm in arms {
                 for restriction in *arm {
-                    mask |= mcv_columns(&restriction.clause)?;
+                    mask.union_with(mcv_columns(&restriction.clause)?);
                 }
             }
             Some(mask)

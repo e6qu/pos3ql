@@ -22,7 +22,7 @@ use crate::sql::query::{self, QueryScope};
 use crate::sql::types::{ColDesc, Datum, oid};
 use crate::sql_err;
 use crate::stack_format;
-use crate::storage::Storage;
+use crate::storage::{ColumnSet, Storage};
 use crate::store::BlockIoStats;
 use crate::util::StackStr;
 
@@ -3737,6 +3737,12 @@ fn push_bitmap_tree_keyed(
                 name,
                 key: key(u16::try_from(at).map_err(|_| arena_full())?),
                 depth: depth.saturating_add(node.depth),
+                // `cost_bitmap_and_node` and `cost_bitmap_or_node` start at
+                // their total: nothing returns before every input is built.
+                startup_cost: match node.kind {
+                    BitmapPlanKind::Index { .. } => 0.0,
+                    BitmapPlanKind::And | BitmapPlanKind::Or => node.total_cost,
+                },
                 total_cost: node.total_cost,
                 rows: node.rows as u64,
                 ..PlanNode::EMPTY
@@ -4162,9 +4168,10 @@ fn grouped_scan_path<'a>(
     else {
         return Ok(None);
     };
-    let group_mask = columns_in_order[..count]
-        .iter()
-        .fold(0u64, |mask, &column| mask | (1u64 << column.min(63)));
+    let mut group_mask = ColumnSet::EMPTY;
+    for &column in &columns_in_order[..count] {
+        group_mask.insert(column);
+    }
     let output = query::streaming_pax_columns_ordered(
         scope,
         from,
@@ -4172,8 +4179,8 @@ fn grouped_scan_path<'a>(
         None,
         statement.order_by,
     )
-    .selected_mask(0)
-    .map(|mask| mask | group_mask);
+    .selected_columns(0)
+    .map(|set| set.union(group_mask));
     let needed = query::streaming_pax_columns_ordered(
         scope,
         from,
@@ -4181,8 +4188,8 @@ fn grouped_scan_path<'a>(
         statement.where_clause,
         statement.order_by,
     )
-    .selected_mask(0)
-    .map(|mask| mask | group_mask);
+    .selected_columns(0)
+    .map(|set| set.union(group_mask));
     let shape = QueryShape {
         only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
         output,
@@ -4384,13 +4391,14 @@ fn grouping_sets_scan_path<'a>(
         if set.len == 0 && scan.is_some() {
             continue;
         }
-        let group_mask = key_columns[..n_keys]
-            .iter()
-            .fold(0u64, |mask, &column| mask | (1u64 << column.min(63)));
+        let mut group_mask = ColumnSet::EMPTY;
+        for &column in &key_columns[..n_keys] {
+            group_mask.insert(column);
+        }
         let selected = |condition| {
             query::streaming_pax_columns_ordered(scope, from, statement.items, condition, &[])
-                .selected_mask(0)
-                .map(|mask| mask | group_mask)
+                .selected_columns(0)
+                .map(|set| set.union(group_mask))
         };
         let shape = QueryShape {
             only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
@@ -6688,7 +6696,7 @@ fn plan_pulled_select<'a>(
                     statement.items,
                     statement.where_clause,
                 )
-                .selected_mask(0)
+                .selected_columns(0)
                 .is_some_and(|demanded| index.covers(demanded))
         }
         _ => false,
@@ -6797,7 +6805,7 @@ fn plan_pulled_select<'a>(
                 None,
                 statement.order_by,
             )
-            .selected_mask(0);
+            .selected_columns(0);
             let shape = query::index_paths::QueryShape {
                 only,
                 output,
@@ -6817,7 +6825,7 @@ fn plan_pulled_select<'a>(
                     statement.where_clause,
                     statement.order_by,
                 )
-                .selected_mask(0),
+                .selected_columns(0),
                 &[],
                 arena,
                 shape,

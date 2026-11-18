@@ -800,10 +800,13 @@ keys from the MCV list (`mcv_clauselist_selectivity` combined with the
 simple estimate), then equality conditions from the strongest
 dependencies (`dependencies_clauselist_selectivity`), and
 `estimate_num_groups` counts the groups of a statistics object's keys
-from its ndistinct (`estimate_multivariate_ndistinct`). Remaining: the
-estimates of joins, of plans outside the single-table planner (the
-general `GROUP BY` costing among them), and of an index condition PostgreSQL derives from an `OR` ignore the
-statistics objects without `0A000`, and pg_stats_ext_exprs shows an
+from its ndistinct (`estimate_multivariate_ndistinct`), on a table of any
+width (the column masks are `ColumnSet`s, `differential_exact/896`), and an
+index condition derived from an `OR` is the array condition PostgreSQL
+qualifies the index with, so its MCV matching reads it
+(`differential_exact/897`). Remaining: the estimates of joins and of plans
+outside the single-table planner (the general `GROUP BY` costing among
+them) ignore the statistics objects without `0A000`, and pg_stats_ext_exprs shows an
 expression key's null fraction, distinct values and width, not its MCV
 list or histogram.
 An index key or predicate may call a PL/pgSQL function
@@ -849,8 +852,8 @@ the enclosing query's columns (`Output: ?column?` where PostgreSQL prints
 `(t.a + 1)`), a regular
 expression with embedded options or a director (`(?i)`, `***=`),
 conditions on an expression key of a statistics object (an `OR` through
-an MCV list is estimated with `is_or`, `differential_exact/836`), conditions a
-statistics object on a column past the 63rd or with an MCV list of a type
+an MCV list is estimated with `is_or`, `differential_exact/836`), a
+statistics object with an MCV list of a type
 other than the integer, floating, numeric, character, `name`, `"char"`,
 `oid`, boolean, date, time, timestamp, interval, `bytea`, `money`, network,
 bit string, `pg_lsn` and UUID types estimates, a sub-partitioned table

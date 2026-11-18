@@ -211,7 +211,7 @@ pub(crate) fn local_minmax_subquery<'a>(
         let shape = QueryShape {
             only,
             output: streaming_pax_columns_ordered(&scope, from, items, None, order_by)
-                .selected_mask(0),
+                .selected_columns(0),
             ..shape
         };
         let planned = scan_path(
@@ -220,7 +220,7 @@ pub(crate) fn local_minmax_subquery<'a>(
             txid,
             Some(where_clause),
             streaming_pax_columns_ordered(&scope, from, items, Some(where_clause), order_by)
-                .selected_mask(0),
+                .selected_columns(0),
             &[],
             arena,
             shape,
@@ -265,13 +265,13 @@ pub(crate) fn local_minmax_subquery<'a>(
         txid,
         statement.where_clause,
         streaming_pax_columns_ordered(&scope, from, statement.items, statement.where_clause, &[])
-            .selected_mask(0),
+            .selected_columns(0),
         &[],
         arena,
         QueryShape {
             only,
             output: streaming_pax_columns_ordered(&scope, from, statement.items, None, &[])
-                .selected_mask(0),
+                .selected_columns(0),
             ..QueryShape::default()
         },
     )?;

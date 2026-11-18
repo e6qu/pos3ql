@@ -10762,7 +10762,7 @@ fn drop_table_kind_with_columns(
                                 })
                                 .map(|foreign_key| (child, foreign_key))
                         });
-                        let Some((child, foreign_key)) = inbound else {
+                        let Some((child, _)) = inbound else {
                             break;
                         };
                         if !statement.cascade {
@@ -10772,46 +10772,89 @@ fn drop_table_kind_with_columns(
                                 def.name.as_str()
                             ));
                         }
-                        // The key's copies on the referencing table's
-                        // partitions go with it.
-                        let copies = match arena.alloc_slice_with(storage.table_count() + 1, |_| {
+                        // Every key of the referencing table on the dropped
+                        // one goes in this one statement, with its copies on
+                        // the referencing table's partitions, and each
+                        // table's definition changes once.
+                        let child_definition = storage.table_def(child, txn.txid);
+                        let dropped = storage.table_position(index);
+                        let references = |foreign_key: &crate::storage::ForeignKey| {
+                            (foreign_key.parent_schema == def.schema
+                                && foreign_key.parent == def.name)
+                                || foreign_key.identity.is_some_and(|identity| {
+                                    child_definition.fkey_clone(identity, dropped).is_some()
+                                })
+                        };
+                        let key_count = child_definition
+                            .fkeys()
+                            .iter()
+                            .filter(|key| references(key))
+                            .count();
+                        let width = storage.table_count() + 1;
+                        let pairs = match arena.alloc_slice_with(key_count * width, |_| {
                             (0usize, crate::storage::SqlName::EMPTY)
                         }) {
+                            Ok(pairs) => pairs,
+                            Err(_) => return sql_fail(arena_full()),
+                        };
+                        let copies = match arena
+                            .alloc_slice_with(width, |_| (0usize, crate::storage::SqlName::EMPTY))
+                        {
                             Ok(copies) => copies,
                             Err(_) => return sql_fail(arena_full()),
                         };
-                        let key = storage.table_def(child, txn.txid).fkeys()[foreign_key];
-                        copies[0] = (child, key.name);
-                        let mut copy_count = 1usize;
-                        foreign_key_clones::inherited_key_copies(
-                            storage,
-                            txn.txid,
-                            child,
-                            key.oid(),
-                            copies,
-                            &mut copy_count,
-                        );
-                        for &(child, constraint) in copies[..copy_count].iter() {
-                            let (child_target, child_definition) =
-                                storage.select_table_definition(child, txn.txid);
-                            let lsn = storage.bump_lsn();
-                            if let Err(error) = wal.stage_reserved(
+                        let mut pair_count = 0usize;
+                        for key in child_definition
+                            .fkeys()
+                            .iter()
+                            .filter(|key| references(key))
+                        {
+                            copies[0] = (child, key.name);
+                            let mut copy_count = 1usize;
+                            foreign_key_clones::inherited_key_copies(
+                                storage,
                                 txn.txid,
-                                lsn,
-                                &WalOp::DropTableFk {
-                                    schema: child_definition.schema.as_str(),
-                                    table: child_definition.name.as_str(),
-                                    fk_name: constraint.as_str(),
-                                },
-                            ) {
-                                return sql_fail(error);
+                                child,
+                                key.oid(),
+                                copies,
+                                &mut copy_count,
+                            );
+                            pairs[pair_count..pair_count + copy_count]
+                                .copy_from_slice(&copies[..copy_count]);
+                            pair_count += copy_count;
+                        }
+                        // The definitions change below: release the read.
+                        drop(child_definition);
+                        for at in 0..pair_count {
+                            let table = pairs[at].0;
+                            if pairs[..at].iter().any(|(earlier, _)| *earlier == table) {
+                                continue;
                             }
+                            let (child_target, child_definition) =
+                                storage.select_table_definition(table, txn.txid);
                             let mut updated = TableDefBuilder::from_definition(&child_definition);
-                            if !drop_named_constraint(&mut updated, constraint.as_str()) {
-                                return sql_fail(sql_err!(
-                                    sqlstate::INTERNAL_ERROR,
-                                    "inbound foreign key vanished during DROP TABLE"
-                                ));
+                            for &(_, constraint) in pairs[at..pair_count]
+                                .iter()
+                                .filter(|(own, _)| *own == table)
+                            {
+                                let lsn = storage.bump_lsn();
+                                if let Err(error) = wal.stage_reserved(
+                                    txn.txid,
+                                    lsn,
+                                    &WalOp::DropTableFk {
+                                        schema: child_definition.schema.as_str(),
+                                        table: child_definition.name.as_str(),
+                                        fk_name: constraint.as_str(),
+                                    },
+                                ) {
+                                    return sql_fail(error);
+                                }
+                                if !drop_named_constraint(&mut updated, constraint.as_str()) {
+                                    return sql_fail(sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "inbound foreign key vanished during DROP TABLE"
+                                    ));
+                                }
                             }
                             let mut identity_mapping = [None; MAX_COLUMNS];
                             for (column, target) in identity_mapping

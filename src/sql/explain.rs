@@ -6317,7 +6317,7 @@ fn plan_pulled_select<'a>(
         None => None,
     };
     if let Some(scope) = scope.as_ref() {
-        query::validate_static_grouping(statement, scope, storage, txid, arena)?;
+        query::validate_static_grouping(statement, scope, outer, storage, txid, arena)?;
     }
     let expansions = match (scope.as_ref(), statement.from.as_ref()) {
         (Some(scope), Some(from)) => {
@@ -6345,7 +6345,7 @@ fn plan_pulled_select<'a>(
     }
     let scoped_columns = scope.as_ref().map(|scope| query::CatalogScopeCols {
         scope,
-        outer: None,
+        outer,
         storage,
         txid,
         arena,
@@ -6359,10 +6359,18 @@ fn plan_pulled_select<'a>(
         txid,
         arena,
     };
-    let columns: &dyn crate::sql::exec::ColTypeResolver = scoped_columns.as_ref().map_or(
-        &empty_columns as &dyn crate::sql::exec::ColTypeResolver,
-        |columns| columns,
-    );
+    // A query without FROM items reads only the enclosing queries' columns.
+    let enclosing_catalog = query::storage_catalog(storage, arena, txid);
+    let enclosing_columns = outer.map(|row| crate::sql::eval::RuntimeColumnTypes {
+        row,
+        catalog: Some(&enclosing_catalog),
+    });
+    let columns: &dyn crate::sql::exec::ColTypeResolver =
+        match (scoped_columns.as_ref(), enclosing_columns.as_ref()) {
+            (Some(columns), _) => columns,
+            (None, Some(columns)) => columns,
+            (None, None) => &empty_columns,
+        };
     let aggregate = has_aggregate(statement, storage, txid, columns)?;
     // A join PostgreSQL's join search plans is explained as that plan; a
     // query of one relation planned there for its windows takes its scan,
@@ -8914,7 +8922,16 @@ fn function_scan_estimate<'a>(
             None => source.table,
         };
         let constant = |argument: &'a Expr<'a>| -> Option<Datum<'a>> {
-            if !argument.is_constant(false) {
+            // A support function reads its arguments through
+            // `estimate_expression_value`, which also evaluates a stable
+            // call (`now()`) that reads no column.
+            let mut reads_column = false;
+            argument.for_each_column_reference(&mut |_, _| reads_column = true);
+            if !argument.is_constant(false)
+                && (reads_column
+                    || argument.contains_subquery()
+                    || query::expression_contains_volatile(argument, storage, txid, false))
+            {
                 return None;
             }
             let catalog = query::storage_catalog(storage, arena, txid);
@@ -8993,11 +9010,7 @@ fn function_scan_estimate<'a>(
                                     context: crate::sql::ast::CastContext::Implicit,
                                 })
                                 .map_err(|_| arena_full())?;
-                            *value = if argument.is_constant(false) {
-                                constant(cast)
-                            } else {
-                                None
-                            };
+                            *value = constant(cast);
                         }
                         // The bounds and step the support function reads; a
                         // timestamp series also takes a time zone.
@@ -9005,18 +9018,9 @@ fn function_scan_estimate<'a>(
                         if read.iter().any(|value| matches!(value, Some(Datum::Null))) {
                             0.0
                         } else if read.iter().any(Option::is_none) {
-                            // `estimate_expression_value` also evaluates a
-                            // stable call (`now()`), which is not modeled; an
-                            // argument reading a column gives no estimate.
-                            for (value, argument) in read.iter().zip(args) {
-                                if value.is_none() {
-                                    let mut found = false;
-                                    argument.for_each_column_reference(&mut |_, _| found = true);
-                                    if !found {
-                                        return Err(unsupported(source.table));
-                                    }
-                                }
-                            }
+                            // An argument `estimate_expression_value` cannot
+                            // reduce to a constant (a column, a volatile call
+                            // or a subquery) gives the default estimate.
                             signature.catalog.rows
                         } else {
                             series_rows(support, read, arena)?.unwrap_or(signature.catalog.rows)
@@ -14877,6 +14881,7 @@ fn preprocess_select<'a>(
         _ => inlined,
     };
     let folded = query::fold_select_constants(inlined, arena, storage, txid)?;
+    let folded = query::fold_sublinks(folded, arena, storage, txid, None)?;
     Ok(
         if core::ptr::eq(folded, expanded) && core::ptr::eq(expanded, select) {
             select

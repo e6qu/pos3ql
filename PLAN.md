@@ -829,21 +829,24 @@ another order. An index whose expression no longer resolves after
 its hint, without a cursor (`differential_exact/863`). Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
 methods, expression indexes whose keys still call a user-defined routine or read
-a user-defined type after inlining, a call of a SQL function PostgreSQL
-inlines inside a subquery whose arguments read an enclosing query's columns
-(it stays a call, and `EXPLAIN SELECT (SELECT f(t.a) FROM u LIMIT 1) FROM t`
-fails with `42P01` while a plan's types are captured), a set-returning SQL
-function in `FROM` PostgreSQL inlines with a polymorphic, variadic or
-lateral argument or a body with windows or a coerced column (bodies in
-`BEGIN ATOMIC`, defaults and `WITH` queries inline, `differential_exact/835`). A call of a SQL function PostgreSQL inlines
-packs a variadic input's elements into an array, resolves a polymorphic
-input or result from its arguments, and inlines in a `MERGE` or an `INSERT`'s
-`RETURNING` and with a user-type literal (`differential_exact/890`,
-`differential_exact/891`). Remaining: a
-function scan of a built-in whose support function estimates its rows
-other than `generate_series` over integers, `numeric` and timestamps
-(`differential_exact/813`) and `unnest`, or whose bound or step is a stable
-expression the support function would evaluate (`now()`), a regular
+a user-defined type after inlining, a set-returning SQL function in `FROM`
+PostgreSQL inlines with a `LATERAL` argument (the inlined subquery would join
+parameterized, a plan of the join planner), and a window `PARTITION BY` over
+an expression, whose `WindowAgg` target list prints names where PostgreSQL
+prints expressions. A call of a SQL function PostgreSQL inlines packs a
+variadic input's elements into an array (zero elements do not exist), resolves
+a polymorphic input or result from its arguments, and inlines in a `MERGE` or
+an `INSERT`'s `RETURNING`, with a user-type literal and, in a subquery,
+reading the enclosing query's columns: the folding preprocesses each
+sublink with the enclosing levels' columns in reach, so an `EXISTS` over such
+a call joins as PostgreSQL's plan does (`differential_exact/890`, `891`,
+`892`, `893`). A set-returning function in `FROM` inlines with a window
+body, a column coerced to the declared type (not printed at the top of a
+target entry), and polymorphic or variadic arguments (`894`); its rows come
+from `generate_series` and `unnest` support functions over stable arguments
+too (`895`). Remaining: the `VERBOSE` target list of a subplan reading
+the enclosing query's columns (`Output: ?column?` where PostgreSQL prints
+`(t.a + 1)`), a regular
 expression with embedded options or a director (`(?i)`, `***=`),
 conditions on an expression key of a statistics object (an `OR` through
 an MCV list is estimated with `is_or`, `differential_exact/836`), conditions a

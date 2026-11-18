@@ -420,9 +420,21 @@ impl<'a> BlockTargets<'a> {
         for item in statement.items {
             match item {
                 SelectItem::Expr { expression, .. } => {
+                    // An implicit coercion at the top of a target entry is not
+                    // shown (`get_rule_expr_toplevel`).
+                    let shown = match expression {
+                        Expr::Cast {
+                            operand,
+                            context:
+                                crate::sql::ast::CastContext::Implicit
+                                | crate::sql::ast::CastContext::Assignment,
+                            ..
+                        } => operand,
+                        other => other,
+                    };
                     let (entry, window_clause) = match window_entry(expression)? {
                         Some((entry, clause)) => (entry, Some(clause)),
-                        None => (deparse(expression)?, None),
+                        None => (deparse(shown)?, None),
                     };
                     push(
                         &mut targets,

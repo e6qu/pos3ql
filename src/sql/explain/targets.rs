@@ -581,11 +581,13 @@ impl<'a> BlockTargets<'a> {
             let active = window_calls
                 .iter()
                 .any(|call| matches!(call, Expr::Call { over: Some(used), .. } if **used == *spec));
+            // `transformWindowDefinitions` adds the `ORDER BY` keys the list
+            // lacks before the `PARTITION BY` ones.
             for key in spec
-                .partition_by
+                .order_by
                 .iter()
-                .copied()
-                .chain(spec.order_by.iter().map(|order| order.expression))
+                .map(|order| order.expression)
+                .chain(spec.partition_by.iter().copied())
             {
                 let at = keyed(&mut targets, key, false)?;
                 mark(&mut targets, at, &|target| {

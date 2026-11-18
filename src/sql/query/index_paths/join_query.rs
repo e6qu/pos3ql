@@ -568,6 +568,19 @@ fn nonnullable(
         Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => {
             nonnullable(scope, strict_call, operand, false)
         }
+        // `COALESCE`, `GREATEST`, `LEAST` and `NULLIF` are expressions of
+        // their own, never strict (`find_nonnullable_vars`).
+        Expr::Call {
+            name,
+            over: None,
+            filter: None,
+            ..
+        } if ["coalesce", "greatest", "least", "nullif"]
+            .iter()
+            .any(|form| name.eq_ignore_ascii_case(form)) =>
+        {
+            Some(VarList::default())
+        }
         // `func_strict`: a strict function is null when an argument is.
         Expr::Call {
             args,
@@ -1054,6 +1067,7 @@ fn join_condition(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
             join_comparison(scope, expression)
                 || join_inequality(scope, expression)
                 || join_equality(scope, expression)
+                || several_relations_constant(scope, expression).is_some()
         }
     }
 }
@@ -1108,6 +1122,7 @@ fn and_estimate<'a>(
     expression: &'a Expr<'a>,
     reader: &RelStatistics<'_, '_, '_>,
     restriction: &dyn Fn(usize, &'a Expr<'a>) -> Result<Option<(f64, f64)>, SqlError>,
+    expression_cost: &dyn Fn(&'a Expr<'a>) -> f64,
     costs: Costs,
     arena: &'a Arena,
 ) -> Result<Option<(f64, f64)>, SqlError> {
@@ -1154,7 +1169,15 @@ fn and_estimate<'a>(
         } else if rels == 0 {
             None
         } else {
-            join_estimate(scope, conjuncts[at], reader, restriction, costs, arena)?
+            join_estimate(
+                scope,
+                conjuncts[at],
+                reader,
+                restriction,
+                expression_cost,
+                costs,
+                arena,
+            )?
         };
         let Some((own_selectivity, own_cost)) = estimate else {
             return Ok(None);
@@ -1170,6 +1193,7 @@ fn join_estimate<'a>(
     expression: &'a Expr<'a>,
     reader: &RelStatistics<'_, '_, '_>,
     restriction: &dyn Fn(usize, &'a Expr<'a>) -> Result<Option<(f64, f64)>, SqlError>,
+    expression_cost: &dyn Fn(&'a Expr<'a>) -> f64,
     costs: Costs,
     arena: &'a Arena,
 ) -> Result<Option<(f64, f64)>, SqlError> {
@@ -1200,9 +1224,25 @@ fn join_estimate<'a>(
                     ..
                 }
             ) {
-                and_estimate(scope, arm, reader, restriction, costs, arena)?
+                and_estimate(
+                    scope,
+                    arm,
+                    reader,
+                    restriction,
+                    expression_cost,
+                    costs,
+                    arena,
+                )?
             } else {
-                join_estimate(scope, arm, reader, restriction, costs, arena)?
+                join_estimate(
+                    scope,
+                    arm,
+                    reader,
+                    restriction,
+                    expression_cost,
+                    costs,
+                    arena,
+                )?
             };
             let Some((arm_selectivity, arm_cost)) = estimate else {
                 return Ok(None);
@@ -1217,6 +1257,19 @@ fn join_estimate<'a>(
     }
     if join_comparison(scope, expression) {
         return Ok(Some((super::DEFAULT_INEQ_SEL, costs.cpu_operator)));
+    }
+    // An expression of several relations compared with a constant: the
+    // join selectivity of operands without statistics, whose distinct count
+    // is the default (`eqjoinsel` and `neqjoinsel` over
+    // `DEFAULT_NUM_DISTINCT`, `scalarineqsel`'s default).
+    if let Some(operator) = several_relations_constant(scope, expression) {
+        let equal = 1.0 / super::DEFAULT_NUM_DISTINCT;
+        let selectivity = match operator {
+            BinaryOp::Eq => equal,
+            BinaryOp::NotEq => 1.0 - equal,
+            _ => super::DEFAULT_INEQ_SEL,
+        };
+        return Ok(Some((selectivity, expression_cost(expression))));
     }
     let equality = join_equality(scope, expression);
     if equality || join_inequality(scope, expression) {
@@ -1234,6 +1287,39 @@ fn join_estimate<'a>(
         return Ok(Some((selectivity, costs.cpu_operator)));
     }
     Ok(None)
+}
+
+/// The comparison operator of an expression of several relations' columns
+/// with a plain constant (`(a.x + b.y) = 10`, `COALESCE(b.k, a.k) = 30`).
+fn several_relations_constant(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<BinaryOp> {
+    let Expr::Binary {
+        operator:
+            operator @ (BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq),
+        left,
+        right,
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    let side = match (plain_constant(left), plain_constant(right)) {
+        (None, Some(_)) => left,
+        (Some(_), None) => right,
+        _ => return None,
+    };
+    if side.contains_volatile_function().is_some() {
+        return None;
+    }
+    let rels = qual_vars(scope, side)?
+        .as_slice()
+        .iter()
+        .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
+    (rels.count_ones() > 1).then_some(*operator)
 }
 
 /// `left <> right` of columns of two relations of one joinable type, which
@@ -3716,6 +3802,18 @@ pub(crate) fn modeled_join<'a>(
             let planner = planners[table].as_ref().expect("planned");
             super::paths::restriction_estimate(planner, &single, expression, params, arena)
         };
+    // `cost_qual_eval` of a condition over several relations.
+    let scope_columns = crate::sql::query::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    let expression_cost = |expression: &'a Expr<'a>| {
+        super::super::plan::qual_cost(expression, &scope_columns, storage, txid, arena) / 2.0
+            * costs.cpu_operator
+    };
     let mut single_rel_columns = [0u64; MAX_JOIN_RELS];
     for (id, clause) in clauses[..placed_join_count].iter_mut().enumerate() {
         if clause.form != ClauseForm::Other {
@@ -3749,7 +3847,15 @@ pub(crate) fn modeled_join<'a>(
                 }
             }
         } else {
-            match join_estimate(scope, expression, &early_reader, &restriction, costs, arena)? {
+            match join_estimate(
+                scope,
+                expression,
+                &early_reader,
+                &restriction,
+                &expression_cost,
+                costs,
+                arena,
+            )? {
                 Some(estimate) => estimate,
                 None => {
                     return Ok(None);

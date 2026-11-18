@@ -480,6 +480,9 @@ struct Prep<'t> {
     /// The `COALESCE(left, right) = constant` quals of the query's join
     /// domain: the qual, its sides and its constant.
     coalesce: [(u8, Var, Var, u16); MAX_QUALS],
+    /// Each held `COALESCE`'s placement, which an ordinary filter of the
+    /// joined rows takes when no full join clause matches it.
+    coalesce_join: [Option<JoinQual>; MAX_QUALS],
     coalesce_count: usize,
     /// Each node's join domain (`JoinDomain`): the query's is 0.
     domain: [u8; MAX_NODES],
@@ -559,6 +562,7 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         full_join: [Pending { join: empty_join() }; MAX_QUALS],
         full_count: 0,
         coalesce: [(0, (0, 0), (0, 0), 0); MAX_QUALS],
+        coalesce_join: [None; MAX_QUALS],
         coalesce_count: 0,
         domain: [0; MAX_NODES],
         domain_count: 1,
@@ -1540,6 +1544,7 @@ impl Prep<'_> {
                 }
                 *self.coalesce.get_mut(self.coalesce_count).ok_or(FULL)? =
                     (qual_id, left, right, constant);
+                self.coalesce_join[self.coalesce_count] = Some(join);
                 self.coalesce_count += 1;
                 return Ok(());
             }
@@ -1873,13 +1878,15 @@ impl Prep<'_> {
                 break;
             }
         }
-        // A `COALESCE` no full join clause matched filters the joined rows
-        // by an expression of several relations.
-        if self.coalesce[..self.coalesce_count]
-            .iter()
-            .any(|&(qual, ..)| qual != NO_QUAL)
-        {
-            return Err("a COALESCE of a full join's columns equated with a constant");
+        // A `COALESCE` no full join clause matched (its operands in the
+        // other order, say) filters the joined rows by an expression of
+        // several relations.
+        for at in 0..self.coalesce_count {
+            if self.coalesce[at].0 != NO_QUAL {
+                self.coalesce[at].0 = NO_QUAL;
+                let join = self.coalesce_join[at].expect("held with its placement");
+                self.distribute_restrictinfo(join)?;
+            }
         }
         let constant = |prep: &Self, member: Member| {
             prep.class_of(member)

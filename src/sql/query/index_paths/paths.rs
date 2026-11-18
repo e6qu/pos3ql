@@ -2867,17 +2867,19 @@ pub(crate) fn scan_path<'a>(
             Err(shape) => Planned::Outside(shape),
         });
     }
-    // A statistics object would estimate a join clause with the
-    // restrictions it covers (`statext_clauselist_selectivity`).
-    if join_count > 0
-        && storage
-            .extended_statistics_for_table(slot, txid)
-            .next()
-            .is_some()
-    {
-        return Ok(Planned::Outside("a statistics object on a join's relation"));
-    }
-    let rows = clamp_row_est(planner.size.tuples * planner.selectivity(restrictions)?);
+    // A parameterized scan's conditions include join clauses, which read
+    // another relation: `clauselist_selectivity` finds no single relation
+    // for them (`find_single_rel_for_clauses`) and applies no statistics
+    // object (`get_parameterized_baserel_size`).
+    let estimating = Planner {
+        extended: if join_count > 0 {
+            &[]
+        } else {
+            planner.extended
+        },
+        ..planner
+    };
+    let rows = clamp_row_est(planner.size.tuples * estimating.selectivity(restrictions)?);
     paths.rows = rows;
     match build(
         &mut paths,

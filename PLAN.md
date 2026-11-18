@@ -1065,7 +1065,14 @@ inputs extend the grouping's pathkeys by the keys most of them share
 (`differential_exact/887`); a query of one relation is planned through the
 same search for either. An `EXPLAIN` showing costs of a scan, aggregate or
 window whose estimates the planner model did not produce fails with
-`0A000` rather than print pos3ql's own figures. A join condition whose
+`0A000` rather than print pos3ql's own figures. pos3ql plans no parallel
+query. `max_parallel_workers_per_gather` is PostgreSQL's setting (default 2,
+0 to 1024, shown by `EXPLAIN (SETTINGS)`): a relation below
+`min_parallel_table_scan_size` gets no parallel workers in PostgreSQL
+(`compute_parallel_worker`), so its plans match at any value, and with the
+setting above 0 an `EXPLAIN` scanning a relation at least that large fails
+with `0A000`, since PostgreSQL may choose a `Gather` there; at 0 every plan
+is exact (`differential_exact/931`). A join condition whose
 side is an expression of one relation's columns (`a.k + 1 = b.k`,
 `lower(a.t) = lower(b.t)`) makes the expression a member of its
 equivalence class (`process_equivalence`), computed by its relation's scan:
@@ -1088,9 +1095,19 @@ a `Hash`, `Sort`, `Materialize` or `Memoize` or a batched hash join's outer
 scan only the columns needed, another scan its physical columns (an
 index-only scan its index's), a unique-ified relation's input and a merge
 join's sort the compared expressions they compute, and a join with a
-unique inner relation `Inner Unique: true` (`differential_exact/930`).
-Remaining for `VERBOSE` there: the lists of a join under grouping, windows
-or row locks, which fail with `0A000`. Remaining for windows: window functions inside
+unique inner relation `Inner Unique: true` (`differential_exact/930`);
+under grouping and windows the join computes their input target and each
+node its own list, a window's `ORDER BY` keys entering the list before its
+`PARTITION BY` keys (`transformWindowDefinitions`). A join with row locks is
+planned outside that search. An expression of several relations compared
+with a constant (`(a.x + b.y) = 10`, a `COALESCE` whose operands no full
+join clause matches in order, such as `COALESCE(b.k, a.k) = 30` under
+`a FULL JOIN b ON a.k = b.k`) filters the join's rows, estimated as
+`eqjoinsel` of operands without statistics (`DEFAULT_NUM_DISTINCT`) or the
+default inequality selectivity. A relation with a statistics object joins:
+its parameterized scans' estimates apply no statistics object, as
+`find_single_rel_for_clauses` finds no single relation for a list holding
+a join clause (`differential_exact/889`). Remaining for windows: window functions inside
 expressions or the `ORDER BY`, windows over one relation's groups, the
 merging of window clauses equal once `optimize_window_clauses` frees their
 frames, run conditions (`find_window_run_conditions`, which needs the
@@ -1099,9 +1116,9 @@ under a limit directly above them or over a join's groups (`0A000`:
 execution reads the input by its own scan); for presorted aggregates:
 `EXPLAIN ANALYZE` of their sort (`0A000`: its tuples' memory is not modeled).
 Remaining for that search: an equality whose side reads several
-relations (`a.x + b.y = c.z`) and other conditions over several relations
-than comparisons of columns (`COALESCE(a.id, 0) < b.id`, a `COALESCE` no
-full join clause matches), an `OR`
+relations (`a.x + b.y = c.z`, an equivalence class member PostgreSQL hashes
+and merges by) and other conditions comparing expressions of several
+relations with each other (`COALESCE(a.id, 0) < b.id`), an `OR`
 of join conditions that a semi or anti join evaluates
 (`clauselist_selectivity_or` under `eqjoinsel_semi`), an `OR` join clause
 that an indexed relation's parameterized scan evaluates (as a filter, or

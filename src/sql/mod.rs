@@ -24038,6 +24038,10 @@ impl Engine {
                                 eval::with_generic_plan_parameters(prepared_params, plan)
                             }
                         });
+                        let plan = plan.and_then(|plan| {
+                            explain::refuse_parallel_candidates(&plan, &self.storage, txn.txid)
+                                .map(|()| plan)
+                        });
                         match plan {
                             Ok(plan) => Some(plan),
                             Err(error) => return Ok(Err(error)),
@@ -29734,6 +29738,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "lock_timeout",
     "max_connections",
     "max_locks_per_transaction",
+    "max_parallel_workers_per_gather",
     "max_prepared_transactions",
     "min_parallel_index_scan_size",
     "min_parallel_table_scan_size",

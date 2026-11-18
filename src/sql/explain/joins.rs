@@ -44,9 +44,11 @@ pub(super) fn join_plan<'a>(
         scanned: scanned_rels(&model.plan, model.plan.top),
         targets,
     };
-    // The stages' outputs, the join's first.
+    // The stages' outputs, bottom up: the join's, the grouping and window
+    // nodes' (`group`, top first), the `Sort`'s, the `Limit`'s.
     let stage_output = |index: usize| targets.map(|targets| targets.stage(index));
-    let stages = 1 + usize::from(model.plan.upper.sort.is_some());
+    let sort_stage = 1 + group.len();
+    let stages = sort_stage + usize::from(model.plan.upper.sort.is_some());
     // The query's `Limit` and `Sort` above the join, with the target
     // list's width.
     let upper = model.plan.upper;
@@ -97,8 +99,8 @@ pub(super) fn join_plan<'a>(
             rows: rows as u64,
             width,
             keys: sort_keys,
-            output_unprintable: stage_output(1).is_none(),
-            output: stage_output(1).unwrap_or_default(),
+            output_unprintable: stage_output(sort_stage).is_none(),
+            output: stage_output(sort_stage).unwrap_or_default(),
             ..PlanNode::EMPTY
         };
         if let Some(prefix) = presorted {
@@ -115,8 +117,12 @@ pub(super) fn join_plan<'a>(
         plan.push(node)?;
         depth += 1;
     }
-    for node in group {
-        plan.push(PlanNode { depth, ..*node })?;
+    for (at, node) in group.iter().enumerate() {
+        let mut node = PlanNode { depth, ..*node };
+        if targets.is_some() {
+            node.set_output(stage_output(group.len() - at));
+        }
+        plan.push(node)?;
         depth += 1;
     }
     writer.path(&mut plan, model.plan.top, depth, Demand::Exact)?;

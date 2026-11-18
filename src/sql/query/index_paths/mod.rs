@@ -944,6 +944,7 @@ impl IndexInfo {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct Planner<'s, 'a> {
     /// The key expressions of the table's indexes, numbered after its
     /// columns.

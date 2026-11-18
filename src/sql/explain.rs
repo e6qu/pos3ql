@@ -6405,6 +6405,8 @@ fn plan_pulled_select<'a>(
     if let Some(scope) = scope.as_ref()
         && let Some(model) = modeled
     {
+        // The plan names a parenthesized join's members.
+        let scope = model.scope(scope);
         // The sort's keys: the `ORDER BY` items its pathkeys keep.
         let order = order_keys(statement, arena)?;
         let sorted = arena

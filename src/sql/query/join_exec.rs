@@ -1079,7 +1079,26 @@ pub(super) fn run_modeled<'a>(
     hooks: &EvalHooks<'_, 'a>,
     visit: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
+    // The plan's relations; a parenthesized join's members fill its
+    // written entry's columns in order, so one flat row serves both.
+    let written = scope;
+    let scope = model.scope(written);
     let n = scope.n;
+    let written_offsets = arena
+        .alloc_slice_with(written.n, |_| 0usize)
+        .map_err(|_| arena_full())?;
+    let mut written_width = 0;
+    for (table, offset) in written_offsets.iter_mut().enumerate() {
+        *offset = written_width;
+        written_width += written.stored_width(table);
+    }
+    let written_offsets: &[usize] = written_offsets;
+    let written_rowids = arena
+        .alloc_slice_with(written.n, |_| None::<u64>)
+        .map_err(|_| arena_full())?;
+    let written_values = arena
+        .alloc_slice_with(written_width, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
     let offsets = arena
         .alloc_slice_with(n, |_| 0usize)
         .map_err(|_| arena_full())?;
@@ -1170,11 +1189,55 @@ pub(super) fn run_modeled<'a>(
             rowids[table] = row.rowid;
         }
         let _block = super::instrument::enter_block(block);
+        let Some(nested) = model.nested.as_ref() else {
+            return visit(&JoinRow {
+                scope,
+                values: JoinRowValues::Flat { values, offsets },
+                rowids,
+                visible: n,
+            });
+        };
+        // Each written entry's row from its members' rows; a parenthesized
+        // join's is a joined row of no one row.
+        let mut leaf = 0;
+        for table in 0..written.n {
+            let count = (leaf..n)
+                .take_while(|&member| usize::from(nested.entries[member]) == table)
+                .count();
+            let mut at = written_offsets[table];
+            let members = leaf..leaf + count;
+            leaf += count;
+            if nested.joined & 1 << table == 0 {
+                let width = scope.stored_width(members.start);
+                written_values[at..at + width]
+                    .copy_from_slice(&values[offsets[members.start]..][..width]);
+                written_rowids[table] = rowids[members.start];
+                continue;
+            }
+            written_rowids[table] = None;
+            for _ in 0..2 {
+                for member in members.clone() {
+                    let width = scope.stored_width(member);
+                    written_values[at..at + width]
+                        .copy_from_slice(&values[offsets[member]..][..width]);
+                    at += width;
+                }
+            }
+            for member in members {
+                let nulled =
+                    bound[member].is_none_or(|row| core::ptr::eq(row.values, nulls[member]));
+                written_values[at] = Datum::Int4(i32::from(nulled));
+                at += 1;
+            }
+        }
         visit(&JoinRow {
-            scope,
-            values: JoinRowValues::Flat { values, offsets },
-            rowids,
-            visible: n,
+            scope: written,
+            values: JoinRowValues::Flat {
+                values: written_values,
+                offsets: written_offsets,
+            },
+            rowids: written_rowids,
+            visible: written.n,
         })
     })?;
     runner.check()

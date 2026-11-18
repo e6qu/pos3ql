@@ -264,6 +264,32 @@ pub(crate) struct ModeledJoin<'a> {
     pub(crate) sort_shown: &'a [Option<(usize, usize)>],
     /// The classes' expression members, by [`Member::expression_id`].
     pub(crate) expressions: &'a [JoinExpression<'a>],
+    /// The base relations of the written FROM's parenthesized joins, which
+    /// the plan's relation numbers name; `None` when the plan's relations
+    /// are the written FROM's entries.
+    pub(crate) nested: Option<NestedMembers<'a>>,
+}
+
+/// The base relations of a FROM clause holding parenthesized joins
+/// (`a LEFT JOIN (b JOIN c ON x) ON y`), each its own relation of the join
+/// search.
+pub(crate) struct NestedMembers<'a> {
+    /// The members, resolved in written order.
+    pub(crate) scope: QueryScope<'a>,
+    /// Each member's written FROM entry.
+    pub(crate) entries: [u8; MAX_JOIN_RELS],
+    /// The written entries that are parenthesized joins, by bit: each
+    /// one's row holds its members' columns in order, each member's again
+    /// (`member.*`), then each member's `num_nulls` of its whole row.
+    pub(crate) joined: u32,
+}
+
+impl<'a> ModeledJoin<'a> {
+    /// The scope the plan's relation numbers resolve in: the members of
+    /// the written FROM's parenthesized joins, or `written` itself.
+    pub(crate) fn scope<'s>(&'s self, written: &'s QueryScope<'a>) -> &'s QueryScope<'a> {
+        self.nested.as_ref().map_or(written, |nested| &nested.scope)
+    }
 }
 
 /// How the plan groups the joined rows.
@@ -1437,6 +1463,111 @@ fn join_comparison(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
 
 /// The plan PostgreSQL's join search chooses for `statement`, when the
 /// query is inside the model; `None` otherwise.
+/// Builds the written join tree's nodes: each comma-separated item a
+/// chain of joins, an unaliased parenthesized join its own subtree, base
+/// relations numbered in written order, and each outer join's range table
+/// entry after those of the joins inside it, as parse analysis numbers
+/// them.
+struct ChainBuilder<'t, 'a> {
+    tree: &'t mut Tree,
+    next: u8,
+    rtindex: u8,
+    /// Each join's node and condition, inner joins' first.
+    sources: [(u8, &'a Expr<'a>); MAX_JOIN_RELS],
+    source_count: usize,
+}
+
+impl<'a> ChainBuilder<'_, 'a> {
+    fn source(&mut self, node: u8, on: &'a Expr<'a>) -> Option<()> {
+        *self.sources.get_mut(self.source_count)? = (node, on);
+        self.source_count += 1;
+        Some(())
+    }
+
+    /// The node of FROM item `table`: a base relation, or a parenthesized
+    /// join's subtree.
+    fn item(&mut self, table: &'a TableRef<'a>) -> Option<u8> {
+        match parenthesized_join(table) {
+            Some(inner) => {
+                let mut items = [0u8; MAX_JOIN_RELS];
+                let mut count = 0;
+                self.chain(&inner.base, inner.joins, |_| None, &mut items, &mut count)?;
+                (count == 1).then_some(items[0])
+            }
+            None => {
+                let rel = self.next;
+                self.next = rel.checked_add(1)?;
+                self.tree.node(TreeNode::Rel(rel))
+            }
+        }
+    }
+
+    /// The chain `base` then `joins`, its comma-separated items' nodes
+    /// added to `items`; `implied` gives a written join's `USING` or
+    /// `NATURAL` equalities.
+    fn chain(
+        &mut self,
+        base: &'a TableRef<'a>,
+        joins: &'a [crate::sql::ast::Join<'a>],
+        implied: impl Fn(usize) -> Option<&'a Expr<'a>>,
+        items: &mut [u8; MAX_JOIN_RELS],
+        count: &mut usize,
+    ) -> Option<()> {
+        let mut current = self.item(base)?;
+        for (index, join) in joins.iter().enumerate() {
+            let right = self.item(&join.table)?;
+            let (kind, numbered) = match join.kind {
+                JoinKind::Comma => {
+                    *items.get_mut(*count)? = current;
+                    *count += 1;
+                    current = right;
+                    continue;
+                }
+                JoinKind::Left => (TreeJoin::Left, true),
+                JoinKind::Right => (TreeJoin::Right, true),
+                JoinKind::Full => (TreeJoin::Full, true),
+                JoinKind::Inner | JoinKind::Cross => (TreeJoin::Inner, false),
+                _ => return None,
+            };
+            let node = self.tree.node(TreeNode::Join {
+                kind,
+                left: current,
+                right,
+                rtindex: numbered.then_some(self.rtindex),
+            })?;
+            if numbered {
+                self.rtindex += 1;
+            }
+            if let Some(on) = join.on.or_else(|| implied(index)) {
+                self.source(node, on)?;
+            }
+            current = node;
+        }
+        *items.get_mut(*count)? = current;
+        *count += 1;
+        Some(())
+    }
+}
+
+/// The join an unaliased parenthesized FROM item holds, when its members
+/// join by written conditions only (`a LEFT JOIN (b JOIN c ON x) ON y`):
+/// PostgreSQL's `deconstruct_jointree` reads it as a node of the join tree.
+fn parenthesized_join<'a>(table: &'a TableRef<'a>) -> Option<&'a FromClause<'a>> {
+    if table.alias.is_some()
+        || table.col_alias.is_some()
+        || table.lateral
+        || table.join_members.is_none()
+    {
+        return None;
+    }
+    let select = table.subquery?;
+    let from = select.from.as_ref()?;
+    from.joins
+        .iter()
+        .all(|join| join.using.is_none() && !join.natural)
+        .then_some(from)
+}
+
 pub(crate) fn modeled_join<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -1445,9 +1576,142 @@ pub(crate) fn modeled_join<'a>(
     params: &[Datum<'a>],
     arena: &'a Arena,
 ) -> Result<Option<ModeledJoin<'a>>, SqlError> {
-    let Some(from) = statement.from.as_ref() else {
+    let Some(written) = statement.from.as_ref() else {
         return Ok(None);
     };
+    let Some(from) = nested_members(written, arena)? else {
+        return modeled_join_over(storage, txid, statement, written, scope, params, arena);
+    };
+    // A parenthesized join's members are the join's relations, each its
+    // own scope entry; its written entry's columns are theirs in order.
+    if written
+        .joins
+        .iter()
+        .any(|join| join.using.is_some() || join.natural)
+    {
+        return Ok(None);
+    }
+    let members = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+    let mut entries = [0u8; MAX_JOIN_RELS];
+    let mut joined = 0u32;
+    let mut leaf = 0;
+    for (table, item) in core::iter::once(&written.base)
+        .chain(written.joins.iter().map(|join| &join.table))
+        .enumerate()
+    {
+        let count = leaf_count(item);
+        if table >= scope.n || leaf + count > members.n {
+            return Ok(None);
+        }
+        let mut width: usize = (leaf..leaf + count)
+            .map(|member| members.stored_width(member))
+            .sum();
+        // A parenthesized join's row: its columns, each member's again
+        // (`member.*`), then whether each member's row is NULL.
+        if parenthesized_join(item).is_some() {
+            width = 2 * width + count;
+            joined |= 1 << table;
+        }
+        if width != scope.stored_width(table) {
+            return Ok(None);
+        }
+        entries[leaf..leaf + count].fill(table as u8);
+        leaf += count;
+    }
+    let Some(mut model) =
+        modeled_join_over(storage, txid, statement, from, &members, params, arena)?
+    else {
+        return Ok(None);
+    };
+    // Grouping and windows read the written entries.
+    if model.group.is_some() || model.plan.upper.group.is_some() || !model.windows.is_empty() {
+        return Ok(None);
+    }
+    model.nested = Some(NestedMembers {
+        scope: members,
+        entries,
+        joined,
+    });
+    Ok(Some(model))
+}
+
+/// The FROM item count of `table`: one base relation, or a parenthesized
+/// join's members.
+fn leaf_count(table: &TableRef<'_>) -> usize {
+    match parenthesized_join(table) {
+        Some(inner) => {
+            leaf_count(&inner.base)
+                + inner
+                    .joins
+                    .iter()
+                    .map(|join| leaf_count(&join.table))
+                    .sum::<usize>()
+        }
+        None => 1,
+    }
+}
+
+/// `from` with each parenthesized join replaced by its members, joined by
+/// commas, or `None` when it holds none: the base relations of its join
+/// tree in written order.
+fn nested_members<'a>(
+    from: &'a FromClause<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a FromClause<'a>>, SqlError> {
+    fn leaves<'a>(
+        table: &'a TableRef<'a>,
+        out: &mut crate::mem::arena::ArenaList<'a, &'a TableRef<'a>>,
+    ) -> Result<(), SqlError> {
+        match parenthesized_join(table) {
+            Some(inner) => {
+                leaves(&inner.base, out)?;
+                for join in inner.joins {
+                    leaves(&join.table, out)?;
+                }
+                Ok(())
+            }
+            None => out.push(table).map_err(|_| crate::sql::eval::arena_full()),
+        }
+    }
+    let items = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+    if items.clone().all(|item| parenthesized_join(item).is_none()) {
+        return Ok(None);
+    }
+    let mut out = crate::mem::arena::ArenaList::new(arena);
+    for item in items {
+        leaves(item, &mut out)?;
+    }
+    let out = out.as_slice();
+    let joins = arena
+        .alloc_slice_with(out.len() - 1, |at| crate::sql::ast::Join {
+            table: *out[at + 1],
+            kind: JoinKind::Comma,
+            on: None,
+            using: None,
+            natural: false,
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    arena
+        .alloc(FromClause {
+            base: *out[0],
+            joins,
+        })
+        .map(|from| Some(&*from))
+        .map_err(|_| crate::sql::eval::arena_full())
+}
+
+/// [`modeled_join`] of the base relations `from` (the written FROM, or its
+/// parenthesized joins' members) resolved by `scope`, its join tree as
+/// written.
+fn modeled_join_over<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    from: &'a FromClause<'a>,
+    scope: &QueryScope<'a>,
+    params: &[Datum<'a>],
+    arena: &'a Arena,
+) -> Result<Option<ModeledJoin<'a>>, SqlError> {
     let n = scope.n;
     // A query of one relation is planned here for its window functions.
     let windowed = statement.items.iter().any(|item| {
@@ -1912,63 +2176,45 @@ pub(crate) fn modeled_join<'a>(
     // The pulled-up `EXISTS` and `IN` subqueries' semi and anti joins come
     // last; each wraps the joins and `WHERE` before it
     // (`pull_up_sublinks`).
-    let semi_start = from
+    let written = statement.from.as_ref().expect("a modeled join reads FROM");
+    let semi_start = written
         .joins
         .iter()
         .position(|join| join.kind.is_semi_or_anti())
-        .unwrap_or(from.joins.len());
-    if from.joins[semi_start..]
+        .unwrap_or(written.joins.len());
+    if written.joins[semi_start..]
         .iter()
         .any(|join| !join.kind.is_semi_or_anti())
     {
         return Ok(None);
     }
+    // Each written join's node and its `ON` (a `USING` or `NATURAL` join's
+    // implied equalities), in the order `deconstruct_jointree` reads them.
+    let mut chain = ChainBuilder {
+        tree: &mut tree,
+        next: 0,
+        rtindex: 0,
+        sources: [(0, &Expr::Null); MAX_JOIN_RELS],
+        source_count: 0,
+    };
     let mut items = [0u8; MAX_JOIN_RELS];
     let mut item_count = 0;
-    let mut join_nodes = [None::<u8>; MAX_JOIN_RELS];
-    let Some(mut current) = tree.node(TreeNode::Rel(0)) else {
+    let built = chain.chain(
+        &written.base,
+        &written.joins[..semi_start],
+        |index| scope.join_on.get(index).copied().flatten(),
+        &mut items,
+        &mut item_count,
+    );
+    let Some(()) = built else {
         return Ok(None);
     };
-    let mut rtindex = 0u8;
-    for (index, join) in from.joins[..semi_start].iter().enumerate() {
-        let table = (index + 1) as u8;
-        let Some(right) = tree.node(TreeNode::Rel(table)) else {
-            return Ok(None);
-        };
-        let (kind, numbered) = match join.kind {
-            JoinKind::Comma => {
-                items[item_count] = current;
-                item_count += 1;
-                current = right;
-                continue;
-            }
-            JoinKind::Left => (TreeJoin::Left, true),
-            JoinKind::Right => (TreeJoin::Right, true),
-            JoinKind::Full => (TreeJoin::Full, true),
-            _ => (TreeJoin::Inner, false),
-        };
-        let Some(node) = tree.node(TreeNode::Join {
-            kind,
-            left: current,
-            right,
-            rtindex: numbered.then_some(rtindex),
-        }) else {
-            return Ok(None);
-        };
-        if numbered {
-            rtindex += 1;
-        }
-        join_nodes[index] = Some(node);
-        current = node;
-    }
-    items[item_count] = current;
-    item_count += 1;
-    let Some(inner_root) = tree.list_of(&items[..item_count]) else {
+    let Some(inner_root) = chain.tree.list_of(&items[..item_count]) else {
         return Ok(None);
     };
     let mut current = inner_root;
-    for (index, join) in from.joins.iter().enumerate().skip(semi_start) {
-        let Some(right) = tree.node(TreeNode::Rel((index + 1) as u8)) else {
+    for (index, join) in written.joins.iter().enumerate().skip(semi_start) {
+        let Some(right) = chain.item(&join.table) else {
             return Ok(None);
         };
         let kind = if join.kind == JoinKind::Semi {
@@ -1976,7 +2222,7 @@ pub(crate) fn modeled_join<'a>(
         } else {
             TreeJoin::Anti
         };
-        let Some(node) = tree.node(TreeNode::Join {
+        let Some(node) = chain.tree.node(TreeNode::Join {
             kind,
             left: current,
             right,
@@ -1984,17 +2230,28 @@ pub(crate) fn modeled_join<'a>(
         }) else {
             return Ok(None);
         };
-        join_nodes[index] = Some(node);
+        if let Some(on) = join.on.or(scope.join_on.get(index).copied().flatten())
+            && chain.source(node, on).is_none()
+        {
+            return Ok(None);
+        }
         current = node;
     }
-    let root = if semi_start == from.joins.len() {
+    if usize::from(chain.next) != n {
+        return Ok(None);
+    }
+    let root = if semi_start == written.joins.len() {
         inner_root
     } else {
-        let Some(root) = tree.list_of(&[current]) else {
+        let Some(root) = chain.tree.list_of(&[current]) else {
             return Ok(None);
         };
         root
     };
+    let joined = &chain.sources[..chain.source_count];
+    let joined = arena
+        .alloc_slice_copy(joined)
+        .map_err(|_| crate::sql::eval::arena_full())?;
     tree.root = root;
     // The conditions: each join's `ON`, then `WHERE`.
     let mut quals = [&Expr::Null; MAX_QUALS + 1];
@@ -2008,21 +2265,11 @@ pub(crate) fn modeled_join<'a>(
         &[one, two] => Some((one, two)),
         _ => None,
     };
-    let sources = from
-        .joins
-        .iter()
-        .enumerate()
-        .filter_map(|(index, join)| {
-            // `USING` and `NATURAL` join by the equalities they imply.
-            join.on
-                .or(scope.join_on[index])
-                .map(|on| (join_nodes[index], on))
-        })
-        .chain(
-            statement
-                .where_clause
-                .map(|condition| (Some(inner_root), condition)),
-        );
+    let sources = joined.iter().map(|&(node, on)| (Some(node), on)).chain(
+        statement
+            .where_clause
+            .map(|condition| (Some(inner_root), condition)),
+    );
     for (node, condition) in sources {
         let Some(node) = node else {
             return Ok(None);
@@ -4538,6 +4785,7 @@ pub(crate) fn modeled_join<'a>(
             .alloc_slice_copy(&sort_shown[..sort_keys.as_slice().len()])
             .map_err(|_| crate::sql::eval::arena_full())?,
         expressions: expressions.alloc()?,
+        nested: None,
     }))
 }
 

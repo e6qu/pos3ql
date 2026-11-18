@@ -10723,10 +10723,7 @@ pub(super) fn refuse_parallel_candidates(
     // (`standard_planner`'s `parallelModeOK`, `max_parallel_hazard`).
     if nodes.iter().any(|node| {
         let name = node.name.as_str();
-        name == "LockRows"
-            || ["Insert", "Update", "Delete", "Merge"]
-                .iter()
-                .any(|write| name == *write)
+        ["LockRows", "Insert", "Update", "Delete", "Merge"].contains(&name)
     }) {
         return Ok(());
     }

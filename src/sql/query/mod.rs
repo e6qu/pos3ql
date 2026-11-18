@@ -16940,7 +16940,11 @@ fn select_into_rows_mode<'a>(
     // Sorting, deduplication and row locks need a materialized source. Plain
     // LIMIT/OFFSET use the streaming path so later rows are never evaluated.
     if statement.distinct || !statement.order_by.is_empty() || !statement.locking.is_empty() {
-        if storage.spill_attached() {
+        if storage.spill_attached()
+            && !materialize::sorts_modeled_join(
+                storage, txid, statement, &scope, params, arena, outer,
+            )?
+        {
             external_materialized_into(
                 storage,
                 &scope,

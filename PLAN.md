@@ -884,7 +884,11 @@ its size (`get_foreign_key_join_selectivity`); and a merge join runs as
 `EXPLAIN ANALYZE` counts what it fetched from each input
 (`differential_exact/844`). A join column equated with a constant
 restricts every member of its class to it and joins nothing
-(`generate_base_implied_equalities_const`, `differential_exact/845`).
+(`generate_base_implied_equalities_const`, `differential_exact/845`); a
+class equating two different constants in the query's own join domain
+empties the joined relation, which runs as a `Result` whose `One-Time
+Filter` is `false` under the query's sort, limit or aggregate
+(`differential_exact/872`).
 Outer joins limit the join order (`join_is_legal`,
 `have_join_order_restriction`), a full join plans its sides as separate
 join problems (`make_rel_from_joinlist`), and each join's left, right,
@@ -965,8 +969,32 @@ planner out of such joins, and fail with `0A000` should their one-batch
 table outgrow its memory while running. `EXPLAIN ANALYZE` counts these nodes, a hash's
 `Buckets` and memory and a `Materialize` store included, except a merge
 join over an input in index order that is not a plain index scan without
-a filter (`0A000`). Remaining for that search: output expressions other
-than columns, join conditions of expressions or of two types
+a filter (`0A000`). The query's `ORDER BY` of columns and a constant
+`LIMIT` or `OFFSET` enter the search as PostgreSQL's `grouping_planner`
+brings them in: the ordering's pathkeys (a column's class, or a new one
+for a column no class holds as the output reads it, a constant's or an
+already ordered class's key dropped) keep index and merge join orders
+useful for it (`truncate_useless_pathkeys`, `right_merge_direction`,
+`select_outer_pathkeys_for_merge`), a limit makes every relation weigh
+startup cost (`consider_startup`), and the joined relation's paths are
+kept presorted, sorted or incrementally sorted (`create_ordered_paths`)
+under a `Limit` (`create_limit_path`), the cheapest of those running,
+each sort key shown as its class's first member the target list holds
+(`prepare_sort_from_pathkeys`, `differential_exact/870`). A one-table
+query's `Sort Key` drops a key of a column an earlier key orders, as its
+redundant pathkey. The select list's expressions cost each joined
+row (`create_projection_path`), and a select list of plain aggregates
+runs an `Aggregate` over the join's cheapest path, the join returning the
+columns the aggregates read (`differential_exact/871`). Such a join's
+`Sort` sorts as `tuplesort` does in memory (quicksort, or past twice a
+limit's rows a bounded heap), and its `Incremental Sort` sorts batches of
+its input's groups as `ExecIncrementalSort` does, so rows with equal keys
+come back in PostgreSQL's order; `EXPLAIN ANALYZE` of such an incremental
+sort, whose group figures are not modeled, fails with `0A000`. Remaining
+for that search: a merge join ordered descending or with NULLs first (a
+descending `ORDER BY` of a merge join's class), `ORDER BY` expressions,
+grouping, `DISTINCT`, window functions and a `LIMIT` above an aggregate,
+which keep pos3ql's join order, join conditions of expressions or of two types
 (`a.int4col = b.int8col`, which PostgreSQL also merges into a class), an
 `OR` whose arm is an `AND` (`extract_restriction_or_clauses`) or that a
 semi or anti join or an indexed relation's parameterized scan evaluates, a
@@ -976,10 +1004,8 @@ input (`Incremental Sort`), parenthesized joins (pulled up as
 `pull_up_subqueries` flattens them), self-join removal
 (`remove_useless_self_joins`), a constant equated with a full join's
 compared column (`reconsider_full_join_clause`) or with an outer join's
-column another outer join nulls, a class with two constants, output
-expressions, upper
-stages (`ORDER BY`, `LIMIT`, grouping, which also bring the query's
-pathkeys and tuple fraction into the search), derived tables, `UPDATE ...
+column another outer join nulls, a class with two constants inside an
+outer join (a dummy inner relation), derived tables, `UPDATE ...
 FROM` and `DELETE ... USING` through the same search, more relations than
 `join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,
 not ported; such queries keep pos3ql's join order and refuse cost output
@@ -1525,7 +1551,9 @@ domain with a non-default collation derives it, a `CREATE TABLE AS` column
 keeps the collation its query derives, and `pg_collation_for` reports it. A
 custom collation a domain uses is a `pg_depend` dependency of the domain and
 its array: `DROP COLLATION` refuses it, and with `CASCADE` drops the domain
-and the columns of its type (`differential_exact/864`). Remaining: `ALTER
+and the columns of its type (`differential_exact/864`). `DROP TYPE` drops a
+domain as `DROP DOMAIN` does, freeing its slot (`differential_exact/865`).
+Remaining: `ALTER
 COLUMN ... TYPE` to a type that is not built in (a domain, enum or
 composite) fails with `0A000` where PostgreSQL rewrites the column through
 the type's checks. Target and expression count errors of an `INSERT`, also with subscripted

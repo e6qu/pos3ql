@@ -6426,8 +6426,7 @@ fn plan_pulled_select<'a>(
     );
     let aggregate = has_aggregate(statement, storage, txid, columns)?;
     // A join PostgreSQL's join search plans is explained as that plan.
-    if !aggregate
-        && outer.is_none()
+    if outer.is_none()
         && foreign_scan.is_none()
         && let Some(scope) = scope.as_ref()
         && let Some(model) = query::index_paths::join_query::modeled_join(
@@ -6439,7 +6438,103 @@ fn plan_pulled_select<'a>(
             arena,
         )?
     {
-        let mut plan = joins::join_plan(storage, txid, scope, &model, block, arena)?;
+        // The sort's keys: the `ORDER BY` items its pathkeys keep.
+        let order = order_keys(statement, arena)?;
+        let sorted = arena
+            .alloc_slice_with(model.sort_items.len(), |at| {
+                order[usize::from(model.sort_items[at])]
+            })
+            .map_err(|_| arena_full())?;
+        // Each key shows its class's first member the target list holds.
+        for (key, &(table, column)) in sorted.iter_mut().zip(model.sort_shown) {
+            let Some(definition) = scope.defs.stored(table) else {
+                continue;
+            };
+            let name = arena
+                .alloc_str_display(format_args!(
+                    "{}",
+                    definition.columns()[column].name.as_str()
+                ))
+                .map_err(|_| arena_full())?;
+            key.0 = arena
+                .alloc(Expr::Column {
+                    qualifier: Some(scope.names[table]),
+                    name,
+                })
+                .map_err(|_| arena_full())?;
+        }
+        let sorted: &[KeyItem<'_>] = sorted;
+        let sort_keys = plan_keys(
+            storage,
+            txid,
+            Some(scope),
+            statement,
+            KeyLabel::Sort,
+            sorted,
+            arena,
+        )?;
+        let presorted = match model.plan.upper.sort {
+            Some((_, _, presorted)) if presorted > 0 => Some(plan_keys(
+                storage,
+                txid,
+                Some(scope),
+                statement,
+                KeyLabel::Sort,
+                &sorted[..usize::from(presorted)],
+                arena,
+            )?),
+            _ => None,
+        };
+        // A plain aggregate's `Aggregate` over the join (`cost_agg`).
+        let aggregate_node = if model.aggregated {
+            let expressions = arena
+                .alloc_slice_with(statement.items.len(), |at| match statement.items[at] {
+                    SelectItem::Expr { expression, .. } => expression,
+                    _ => &Expr::Null,
+                })
+                .map_err(|_| arena_full())?;
+            let Some(costs) =
+                query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+            else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN of an aggregate PostgreSQL's cost model is not modeled for over a join is not supported"
+                ));
+            };
+            let top = model.plan.path(model.plan.top);
+            let (startup, total, _) = query::index_paths::cost_agg(
+                query::index_paths::AggStrategy::Plain,
+                &costs,
+                0,
+                1.0,
+                query::index_paths::AggInput {
+                    startup: top.startup,
+                    total: model.plan.upper.top_total,
+                    rows: top.rows,
+                    width: model.output_width,
+                },
+            );
+            Some(PlanNode {
+                name: StackStr::from_str("Aggregate"),
+                key: Some(NodeKey::new(block, Role::Aggregate)),
+                startup_cost: startup,
+                total_cost: total,
+                rows: 1,
+                width,
+                ..PlanNode::EMPTY
+            })
+        } else {
+            None
+        };
+        let mut plan = joins::join_plan(
+            storage,
+            txid,
+            scope,
+            &model,
+            (sort_keys, presorted, aggregate_node),
+            block,
+            arena,
+        )?;
         plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         return Ok(plan);
     }
@@ -7212,7 +7307,28 @@ fn plan_pulled_select<'a>(
             .map_err(|_| arena_full())?;
         let mut count = 0;
         for key in keys {
-            if !constant_fixed_key(statement, key.0, storage, txid, arena)? {
+            // A key of a column an earlier key orders is redundant too.
+            let repeated = kept[..count].iter().flatten().any(|earlier: &KeyItem<'_>| {
+                *earlier.0 == *key.0
+                    || match (earlier.0, key.0, scope.as_ref()) {
+                        (
+                            Expr::Column {
+                                qualifier: one,
+                                name: first,
+                            },
+                            Expr::Column {
+                                qualifier: two,
+                                name: second,
+                            },
+                            Some(scope),
+                        ) => matches!(
+                            (scope.find_column(*one, first), scope.find_column(*two, second)),
+                            (Ok(left), Ok(right)) if left == right
+                        ),
+                        _ => false,
+                    }
+            });
+            if !repeated && !constant_fixed_key(statement, key.0, storage, txid, arena)? {
                 kept[count] = Some(*key);
                 count += 1;
             }

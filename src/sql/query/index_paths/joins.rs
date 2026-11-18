@@ -666,15 +666,131 @@ pub(crate) struct UpperProblem {
     /// The query's `GROUP BY`, whose pathkeys `sort` then holds as the
     /// query's pathkeys.
     pub(crate) group: Option<GroupProblem>,
+    /// The query's window clauses, evaluated between the join and the
+    /// sort.
+    pub(crate) windows: WindowsProblem,
+    /// The per-row cost of the target list the top window computes.
+    pub(crate) windows_output_cost: f64,
+}
+
+impl UpperProblem {
+    /// `query_pathkeys`: the first window's, else a grouping's, else
+    /// [`Self::sort`].
+    pub(crate) fn query_keys(&self) -> Keys {
+        match (self.windows.as_slice().first(), self.group) {
+            (Some(window), _) => window.keys,
+            (None, Some(group)) if !group.distinct && !group.keys.as_slice().is_empty() => {
+                group.keys
+            }
+            _ => self.sort,
+        }
+    }
+}
+
+/// The most window clauses a modeled query evaluates.
+pub(crate) const MAX_WINDOWS: usize = 8;
+
+/// The window clauses above the join, in the order PostgreSQL evaluates
+/// them (`select_active_windows`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WindowsProblem {
+    pub(crate) clauses: [WindowProblem; MAX_WINDOWS],
+    pub(crate) count: u8,
+    /// The width of the joined rows the bottom window reads
+    /// (`make_window_input_target`).
+    pub(crate) input_width: f64,
+}
+
+impl WindowsProblem {
+    pub(crate) const NONE: Self = Self {
+        clauses: [WindowProblem::NONE; MAX_WINDOWS],
+        count: 0,
+        input_width: 0.0,
+    };
+
+    pub(crate) fn as_slice(&self) -> &[WindowProblem] {
+        &self.clauses[..usize::from(self.count)]
+    }
+}
+
+/// How far a window clause's frame reaches past the current row, which
+/// sets the rows its first output row reads
+/// (`get_windowclause_startup_tuples`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FrameEnd {
+    UnboundedFollowing,
+    /// `CURRENT ROW` in `ROWS` mode (`rows`), or in `RANGE` or `GROUPS`
+    /// mode.
+    CurrentRow {
+        rows: bool,
+    },
+    OffsetPreceding,
+    /// `n FOLLOWING`: the offset when it is an integer constant (a NULL's
+    /// is one), else `None`.
+    OffsetFollowing {
+        rows: bool,
+        offset: Option<f64>,
+    },
+}
+
+/// One window clause (`create_one_window_path`, `cost_windowagg`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WindowProblem {
+    /// `make_pathkeys_for_window`: its partition, then order pathkeys.
+    pub(crate) keys: Keys,
+    /// Its `PARTITION BY` and `ORDER BY` columns, as
+    /// `estimate_num_groups` reads them.
+    pub(crate) partition: [Member; MAX_KEYS],
+    pub(crate) partition_count: u8,
+    pub(crate) order: [Member; MAX_KEYS],
+    pub(crate) order_count: u8,
+    pub(crate) frame_end: FrameEnd,
+    /// Its window functions' startup cost and cost per row.
+    pub(crate) startup_cost: f64,
+    pub(crate) per_row: f64,
+    /// The width its functions' results add to the rows (for a window
+    /// below the top one).
+    pub(crate) added_width: f64,
+}
+
+impl WindowProblem {
+    pub(crate) const NONE: Self = Self {
+        keys: Keys::NONE,
+        partition: [Member::plain(0, 0); MAX_KEYS],
+        partition_count: 0,
+        order: [Member::plain(0, 0); MAX_KEYS],
+        order_count: 0,
+        frame_end: FrameEnd::UnboundedFollowing,
+        startup_cost: 0.0,
+        per_row: 0.0,
+        added_width: 0.0,
+    };
+}
+
+/// A window clause's nodes as the plan chose them: the sort of its input
+/// (startup and total cost, presorted keys, width), and its `WindowAgg`'s
+/// startup and total cost and width.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WindowStep {
+    pub(crate) sort: Option<(f64, f64, u8)>,
+    pub(crate) sort_width: f64,
+    pub(crate) startup: f64,
+    pub(crate) total: f64,
+    pub(crate) width: f64,
 }
 
 /// A `GROUP BY` of plain columns, or the one group of a query's plain
 /// aggregates, above the join (`create_grouping_paths`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GroupProblem {
-    /// `group_pathkeys`, in `processed_groupClause` order; none for plain
-    /// aggregation (`AGG_PLAIN`).
+    /// `group_pathkeys`, in `processed_groupClause` order, then the keys
+    /// of the ordered aggregates it presorts for
+    /// (`adjust_group_pathkeys_for_groupagg`); none for plain aggregation
+    /// (`AGG_PLAIN`) of no presorted aggregate.
     pub(crate) keys: Keys,
+    /// The grouping's own keys among [`Self::keys`]
+    /// (`num_groupby_pathkeys`).
+    pub(crate) columns: u8,
     /// `sort_pathkeys` of the query's `ORDER BY` of the groups.
     pub(crate) sort: Keys,
     /// Each key's grouping column, which `get_number_of_groups` counts the
@@ -739,6 +855,8 @@ pub(crate) struct UpperPlan {
     pub(crate) top_total: f64,
     /// The grouping between the join and the sort, when the query groups.
     pub(crate) group: Option<GroupPlan>,
+    /// The window clauses between the join and the sort, bottom first.
+    pub(crate) windows: [WindowStep; MAX_WINDOWS],
 }
 
 /// The join problem.
@@ -810,7 +928,19 @@ pub(crate) fn search<'a>(
     arena: &'a Arena,
 ) -> Result<Result<JoinPlan<'a>, Outside>, SqlError> {
     let n = problem.rels.len();
-    if !(2..=MAX_JOIN_RELS).contains(&n) {
+    // One relation is planned for the windows or ordered aggregates above
+    // it.
+    let least = if problem.upper.windows.count > 0
+        || problem
+            .upper
+            .group
+            .is_some_and(|group| group.aggregates.ordered)
+    {
+        1
+    } else {
+        2
+    };
+    if !(least..=MAX_JOIN_RELS).contains(&n) {
         return Ok(Err("a join of more relations than join_collapse_limit"));
     }
     if problem.clauses.len() > MAX_CLAUSES {
@@ -2073,22 +2203,52 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let limit_tuples = upper
             .limit
             .and_then(|(count, offset)| count.map(|count| count.max(1.0) + offset.max(0.0)));
-        let cheapest = rel.cheapest_total;
+        // The paths `create_ordered_paths` reads: the joined relation's
+        // under its target list, or the window relation's.
+        let mut inputs = [(
+            0u32,
+            self.path(rel.cheapest_total),
+            [WindowStep::default(); MAX_WINDOWS],
+        ); MAX_REL_PATHS];
+        let (input_count, cheapest) = if upper.windows.count > 0 {
+            // The joined rows carry the windows' input target list.
+            let mut candidates = [(0u32, self.path(rel.cheapest_total)); MAX_REL_PATHS];
+            for (at, &id) in rel.paths[..usize::from(rel.count)].iter().enumerate() {
+                let mut path = self.path(id);
+                path.width = upper.windows.input_width;
+                path.total += upper.target_cost * path.rows;
+                candidates[at] = (id, path);
+            }
+            self.window_paths(
+                &candidates[..usize::from(rel.count)],
+                rel.cheapest_total,
+                &mut inputs,
+            )?
+        } else {
+            let mut cheapest = 0;
+            for (at, &id) in rel.paths[..usize::from(rel.count)].iter().enumerate() {
+                let mut input = self.path(id);
+                input.total += upper.target_cost * input.rows;
+                inputs[at] = (id, input, [WindowStep::default(); MAX_WINDOWS]);
+                if id == rel.cheapest_total {
+                    cheapest = at;
+                }
+            }
+            (usize::from(rel.count), cheapest)
+        };
         // Each upper path, the join path below it and its sort and limit.
-        let mut store = [self.path(cheapest); MAX_UPPER];
-        let mut below = [(cheapest, None::<(f64, f64, u8)>); MAX_UPPER];
+        let mut store = [inputs[cheapest].1; MAX_UPPER];
+        let mut below = [(inputs[cheapest].0, None::<(f64, f64, u8)>, cheapest); MAX_UPPER];
         let mut stored = 0usize;
         let mut ordered = [0u32; MAX_REL_PATHS];
         let mut ordered_count = 0usize;
-        for &id in &rel.paths[..usize::from(rel.count)] {
-            let mut input = self.path(id);
-            input.total += upper.target_cost * input.rows;
+        for (at, &(id, input, _)) in inputs[..input_count].iter().enumerate() {
             let mut path = input;
             let mut sorted = None;
             let presorted = sort.common_prefix(&input.keys);
             if sort_len > 0 && presorted < sort_len {
                 let incremental = presorted > 0 && settings.incremental_sort;
-                if id != cheapest && !incremental {
+                if at != cheapest && !incremental {
                     continue;
                 }
                 let costs = settings.costs;
@@ -2116,12 +2276,12 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 ordered[ordered_count] = stored as u32;
                 ordered_count += 1;
                 store[stored] = path;
-                below[stored] = (id, None);
+                below[stored] = (id, None, at);
                 stored += 1;
                 continue;
             }
             store[stored] = path;
-            below[stored] = (id, sorted);
+            below[stored] = (id, sorted, at);
             let (count, accepted) = add_to_pathlist(
                 &mut ordered,
                 ordered_count,
@@ -2181,7 +2341,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 chosen = at;
             }
         }
-        let (top, sort) = below[chosen as usize];
+        let (top, sort, input) = below[chosen as usize];
         let joined = self.path(top);
         Ok((
             top,
@@ -2190,8 +2350,177 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 limit: limits[chosen as usize],
                 top_total: joined.total + upper.target_cost * joined.rows,
                 group: None,
+                windows: inputs[input].2,
             },
         ))
+    }
+
+    /// `create_window_paths`: a window path over the joined relation's
+    /// cheapest path and over each path sorted by a prefix of the first
+    /// window's pathkeys, each window clause sorting its input unless it is
+    /// already sorted (incrementally when it is by a prefix of its keys),
+    /// kept as `add_path` keeps them. `candidates` are the input relation's
+    /// paths under the windows' input target list, each tagged. Fills `out`
+    /// with each kept path, its input's tag and its windows' nodes, and
+    /// returns their count and the cheapest's position (`set_cheapest`).
+    fn window_paths(
+        &self,
+        candidates: &[(u32, Path)],
+        cheapest_tag: u32,
+        out: &mut [(u32, Path, [WindowStep; MAX_WINDOWS]); MAX_REL_PATHS],
+    ) -> Result<(usize, usize), SqlError> {
+        let upper = self.problem.upper;
+        let settings = self.problem.settings;
+        let costs = settings.costs;
+        let windows = upper.windows.as_slice();
+        let mut built =
+            [(0u32, candidates[0].1, [WindowStep::default(); MAX_WINDOWS]); MAX_REL_PATHS];
+        let mut kept = [0u32; MAX_REL_PATHS];
+        let mut kept_count = 0usize;
+        let mut count = 0usize;
+        for &(tag, input) in candidates {
+            let mut path = input;
+            let first = windows[0].keys;
+            if tag != cheapest_tag
+                && !first.contained_in(&path.keys)
+                && first.common_prefix(&path.keys) == 0
+            {
+                continue;
+            }
+            let mut steps = [WindowStep::default(); MAX_WINDOWS];
+            for (at, window) in windows.iter().enumerate() {
+                let step = &mut steps[at];
+                if !window.keys.contained_in(&path.keys) {
+                    let presorted = window.keys.common_prefix(&path.keys);
+                    let (startup, total) = if presorted == 0 || !settings.incremental_sort {
+                        let (startup, run) =
+                            super::paths::tuplesort_cost(path.rows, path.width, None, costs);
+                        path.disabled += u32::from(!settings.sort);
+                        (startup + path.total, startup + path.total + run)
+                    } else {
+                        self.incremental_sort_cost(
+                            &path,
+                            &window.keys,
+                            presorted,
+                            path.width,
+                            None,
+                        )?
+                    };
+                    step.sort = Some((
+                        startup,
+                        total,
+                        if presorted == 0 || !settings.incremental_sort {
+                            0
+                        } else {
+                            presorted as u8
+                        },
+                    ));
+                    step.sort_width = path.width;
+                    path.startup = startup;
+                    path.total = total;
+                    path.keys = window.keys;
+                }
+                // `cost_windowagg`.
+                let rows = path.rows;
+                let input_startup = path.startup + window.startup_cost;
+                let mut total = path.total + window.per_row * rows;
+                total += costs.cpu_operator
+                    * f64::from(window.partition_count + window.order_count)
+                    * rows;
+                total += costs.cpu_tuple * rows;
+                let mut startup = input_startup;
+                let startup_tuples = self.window_startup_tuples(window, rows)?;
+                if startup_tuples > 1.0 {
+                    startup += (total - input_startup) / rows * (startup_tuples - 1.0);
+                }
+                // The top window computes the query's target list.
+                if at + 1 == windows.len() {
+                    total += upper.windows_output_cost * rows;
+                    path.width = upper.width;
+                } else {
+                    path.width = (path.width + window.added_width).round();
+                }
+                path.startup = startup;
+                path.total = total;
+                step.startup = startup;
+                step.total = total;
+                step.width = path.width;
+            }
+            built[count] = (tag, path, steps);
+            let (held, accepted) = add_to_pathlist(
+                &mut kept,
+                kept_count,
+                (count as u32, path),
+                &|at| built[at as usize].1,
+                self.consider_startup,
+            )?;
+            kept_count = held;
+            count += usize::from(accepted);
+        }
+        let mut cheapest = 0usize;
+        for (at, &id) in kept[..kept_count].iter().enumerate() {
+            out[at] = built[id as usize];
+            let compared = compare_costs(&out[cheapest].1, &out[at].1, false);
+            if at > 0
+                && (compared > 0
+                    || (compared == 0
+                        && compare_keys(&out[cheapest].1.keys, &out[at].1.keys)
+                            == KeysOrder::Better2))
+            {
+                cheapest = at;
+            }
+        }
+        Ok((kept_count, cheapest))
+    }
+
+    /// `get_windowclause_startup_tuples`: the rows `window` reads from its
+    /// `input_tuples` rows before it returns its first.
+    fn window_startup_tuples(
+        &self,
+        window: &WindowProblem,
+        input_tuples: f64,
+    ) -> Result<f64, SqlError> {
+        let partition_count = usize::from(window.partition_count);
+        let order_count = usize::from(window.order_count);
+        let partition_tuples = if partition_count > 0 {
+            input_tuples
+                / self
+                    .statistics
+                    .num_groups(&window.partition[..partition_count], input_tuples)?
+        } else {
+            input_tuples
+        };
+        let peer_tuples = if order_count > 0 {
+            partition_tuples
+                / self
+                    .statistics
+                    .num_groups(&window.order[..order_count], partition_tuples)?
+        } else {
+            1.0
+        };
+        let return_tuples = match window.frame_end {
+            FrameEnd::UnboundedFollowing => partition_tuples,
+            FrameEnd::CurrentRow { rows: true } | FrameEnd::OffsetPreceding => 1.0,
+            FrameEnd::CurrentRow { rows: false } if order_count == 0 => partition_tuples,
+            FrameEnd::CurrentRow { rows: false } => peer_tuples,
+            FrameEnd::OffsetFollowing { rows, offset } => {
+                // `DEFAULT_INEQ_SEL` of the partition's peer groups for an
+                // offset that is no integer constant.
+                let offset =
+                    offset.unwrap_or(partition_tuples / peer_tuples * 0.333_333_333_333_333_3);
+                if rows {
+                    offset + 1.0
+                } else {
+                    peer_tuples * (offset + 1.0)
+                }
+            }
+        };
+        let return_tuples = if partition_count > 0 || order_count > 0 {
+            (return_tuples + 1.0).min(partition_tuples)
+        } else {
+            return_tuples.min(partition_tuples)
+        };
+        Ok(clamp_row_est(return_tuples))
     }
 
     /// `cost_incremental_sort` of `input`'s rows of `width`, sorted by
@@ -2245,7 +2574,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let upper = self.problem.upper;
         let settings = self.problem.settings;
         let costs = settings.costs;
-        let columns = group.keys.as_slice().len();
+        let columns = usize::from(group.columns);
+        let sort_len = group.keys.as_slice().len();
         let plain = columns == 0;
         let cheapest = rel.cheapest_total;
         // `get_number_of_groups` over the joined relation's rows; plain
@@ -2286,19 +2616,22 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 // `group_keys_reorder_by_pathkeys`: the path's leading
                 // grouping keys first, then the others in their order.
                 let mut reordered = Keys::NONE;
+                let grouping = &group.keys.as_slice()[..columns];
                 for &key in input.keys.as_slice() {
-                    if reordered.as_slice().len() >= columns
-                        || !group.keys.as_slice().contains(&key)
-                    {
+                    if reordered.as_slice().len() >= columns || !grouping.contains(&key) {
                         break;
                     }
                     let _ = reordered.push(key);
                 }
                 let matched = reordered.as_slice().len();
-                for &key in group.keys.as_slice() {
+                for &key in grouping {
                     if !reordered.as_slice().contains(&key) {
                         let _ = reordered.push(key);
                     }
+                }
+                // The presorted aggregates' keys stay last.
+                for &key in &group.keys.as_slice()[columns..] {
+                    let _ = reordered.push(key);
                 }
                 if matched > 0
                     && (settings.incremental_sort || matched == columns)
@@ -2312,7 +2645,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 let presorted = ordering.common_prefix(&input.keys);
                 let mut sorted = input;
                 let mut input_sort = None;
-                if presorted < columns {
+                if presorted < sort_len {
                     let incremental = presorted > 0 && settings.incremental_sort;
                     if id != cheapest && !incremental {
                         continue;
@@ -2472,6 +2805,42 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 cheapest_grouped = at;
             }
         }
+        // `create_window_paths` over the grouped paths, each window path
+        // stored with its grouped path's plan.
+        let mut window_steps = [[WindowStep::default(); MAX_WINDOWS]; MAX_GROUPED];
+        let mut sort_width = group.output_width;
+        if upper.windows.count > 0 {
+            let mut candidates = [(0u32, store[cheapest_grouped as usize]); MAX_REL_PATHS];
+            for (at, &id) in grouped[..grouped_count].iter().enumerate() {
+                candidates[at] = (id, store[id as usize]);
+            }
+            let mut windowed = [(
+                0u32,
+                store[cheapest_grouped as usize],
+                [WindowStep::default(); MAX_WINDOWS],
+            ); MAX_REL_PATHS];
+            let (count, cheapest) = self.window_paths(
+                &candidates[..grouped_count],
+                cheapest_grouped,
+                &mut windowed,
+            )?;
+            grouped_count = 0;
+            for (at, &(tag, path, steps)) in windowed[..count].iter().enumerate() {
+                if stored == MAX_GROUPED {
+                    return Err(too_many());
+                }
+                store[stored] = path;
+                plans[stored] = plans[tag as usize];
+                window_steps[stored] = steps;
+                grouped[grouped_count] = stored as u32;
+                grouped_count += 1;
+                if at == cheapest {
+                    cheapest_grouped = stored as u32;
+                }
+                stored += 1;
+            }
+            sort_width = upper.width;
+        }
         // `create_ordered_paths` over the grouped paths, then
         // `create_limit_path`.
         let sort = group.sort;
@@ -2493,20 +2862,10 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     continue;
                 }
                 let (startup, total) = if incremental {
-                    self.incremental_sort_cost(
-                        &input,
-                        &sort,
-                        presorted,
-                        group.output_width,
-                        limit_tuples,
-                    )?
+                    self.incremental_sort_cost(&input, &sort, presorted, sort_width, limit_tuples)?
                 } else {
-                    let (startup, run) = super::paths::tuplesort_cost(
-                        input.rows,
-                        group.output_width,
-                        limit_tuples,
-                        costs,
-                    );
+                    let (startup, run) =
+                        super::paths::tuplesort_cost(input.rows, sort_width, limit_tuples, costs);
                     path.disabled += u32::from(!settings.sort);
                     (startup + input.total, startup + input.total + run)
                 };
@@ -2524,6 +2883,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             }
             store[stored] = path;
             plans[stored] = plans[at as usize];
+            window_steps[stored] = window_steps[at as usize];
             sorts[stored] = sorted;
             if sort_len == 0 {
                 ordered[ordered_count] = stored as u32;
@@ -2565,6 +2925,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             }
             store[stored] = path;
             plans[stored] = plans[at as usize];
+            window_steps[stored] = window_steps[at as usize];
             sorts[stored] = sorts[at as usize];
             limits[stored] = limit;
             let (count, accepted) = add_to_pathlist(
@@ -2597,6 +2958,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 limit: limits[chosen as usize],
                 top_total: joined.total + upper.target_cost * joined.rows,
                 group: plan,
+                windows: window_steps[chosen as usize],
             },
         ))
     }
@@ -2647,7 +3009,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             }
         }
         // `pathkeys_useful_for_ordering`.
-        let useful = useful.max(self.problem.upper.sort.common_prefix(outer));
+        let useful = useful.max(self.problem.upper.query_keys().common_prefix(outer));
         outer.truncated(useful)
     }
 
@@ -2657,7 +3019,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let wanted = self
             .problem
             .upper
-            .sort
+            .query_keys()
             .as_slice()
             .iter()
             .find(|&&query| query & KEY_CLASS == key & KEY_CLASS)
@@ -2800,7 +3162,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         if count == 0 {
             return all;
         }
-        let query = self.problem.upper.sort;
+        let query = self.problem.upper.query_keys();
         if query.len > 0 {
             let matches = query
                 .as_slice()
@@ -4778,6 +5140,8 @@ mod tests {
                 width: 20.0,
                 target_cost: 0.0,
                 group: None,
+                windows: WindowsProblem::NONE,
+                windows_output_cost: 0.0,
             },
             dummy: false,
             false_relids: 0,

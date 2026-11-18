@@ -4158,6 +4158,7 @@ fn grouped_scan_path<'a>(
     }
     let Some(aggregates) =
         query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+            .filter(|aggregates| !aggregates.ordered)
     else {
         return Ok(None);
     };
@@ -4344,6 +4345,7 @@ fn grouping_sets_scan_path<'a>(
     }
     let Some(aggregates) =
         query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+            .filter(|aggregates| !aggregates.ordered)
     else {
         return Ok(None);
     };
@@ -4564,6 +4566,7 @@ fn plain_aggregate_cost<'a>(
     }
     let Some(costs) =
         query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+            .filter(|aggregates| !aggregates.ordered)
     else {
         return Ok(None);
     };
@@ -5503,7 +5506,9 @@ fn scan_node<'a>(
         relations: StackStr::new(),
         plain_relations: StackStr::new(),
         output_unprintable: false,
-        unmodeled_costs: false,
+        // Without a modeled path a table's estimates are pos3ql's own; a
+        // function's, `WITH` query's or subquery's are set by its caller.
+        unmodeled_costs: !derived,
         remote_sql: StackStr::new(),
         batch_size: None,
         passthrough: false,
@@ -6359,18 +6364,30 @@ fn plan_pulled_select<'a>(
         |columns| columns,
     );
     let aggregate = has_aggregate(statement, storage, txid, columns)?;
-    // A join PostgreSQL's join search plans is explained as that plan.
-    if outer.is_none()
-        && foreign_scan.is_none()
-        && let Some(scope) = scope.as_ref()
-        && let Some(model) = query::index_paths::join_query::modeled_join(
+    // A join PostgreSQL's join search plans is explained as that plan; a
+    // query of one relation planned there for its windows takes its scan,
+    // windows, sort and limit from it.
+    let modeled = match (outer, foreign_scan.as_ref(), scope.as_ref()) {
+        (None, None, Some(scope)) => query::index_paths::join_query::modeled_join(
             storage,
             txid,
             statement,
             scope,
             &[],
             arena,
-        )?
+        )?,
+        _ => None,
+    };
+    let (modeled, windowed_scan) = match modeled {
+        Some(model)
+            if !model.windows.is_empty() && scope.as_ref().is_some_and(|scope| scope.n == 1) =>
+        {
+            (None, Some(model))
+        }
+        modeled => (modeled, None),
+    };
+    if let Some(scope) = scope.as_ref()
+        && let Some(model) = modeled
     {
         // The sort's keys: the `ORDER BY` items its pathkeys keep.
         let order = order_keys(statement, arena)?;
@@ -6454,6 +6471,25 @@ fn plan_pulled_select<'a>(
             let unsorted = arena
                 .alloc_slice_with(items.len(), |at| (items[at].0, None))
                 .map_err(|_| arena_full())?;
+            // The sort below also orders by the presorted aggregates' keys.
+            let grouping = items.len();
+            let items = arena
+                .alloc_slice_with(grouping + group.presorted.len(), |at| {
+                    match at.checked_sub(grouping) {
+                        None => items[at],
+                        Some(tail) => {
+                            let (expression, flags) = group.presorted[tail];
+                            (
+                                expression,
+                                Some((
+                                    flags & query::index_paths::joins::KEY_DESCENDING != 0,
+                                    flags & query::index_paths::joins::KEY_NULLS_FIRST != 0,
+                                )),
+                            )
+                        }
+                    }
+                })
+                .map_err(|_| arena_full())?;
             let group_keys = plan_keys(
                 storage,
                 txid,
@@ -6536,16 +6572,60 @@ fn plan_pulled_select<'a>(
                         .with_qual(QualLabel::PresortedKey, presorted_text(&prefix, false))
                         .with_verbose_qual(QualLabel::PresortedKey, presorted_text(&prefix, true));
                 }
+                // Its tuples carry the presorted aggregates' columns, which
+                // the grouping's sort space model does not size.
+                if !group.presorted.is_empty() {
+                    node.analyze_unsupported =
+                        Some("EXPLAIN ANALYZE of a sort for presorted aggregates is not supported");
+                }
                 group_nodes[1] = node;
                 group_count = 2;
             }
+        }
+        // The window clauses' nodes, top first, above any grouping.
+        let mut upper_nodes = [PlanNode::EMPTY; 2 + 2 * query::index_paths::joins::MAX_WINDOWS];
+        let mut upper_count = 0;
+        if !model.windows.is_empty() {
+            let (nodes, _, _) = window_stages(
+                storage,
+                txid,
+                Some(scope),
+                statement,
+                columns,
+                &[],
+                Some(ModeledWindows {
+                    kept: model.windows,
+                    steps: &model.plan.upper.windows[..model.windows.len()],
+                    rows: model
+                        .plan
+                        .upper
+                        .group
+                        .map_or(model.plan.path(model.plan.top).rows, |group| group.rows),
+                }),
+                block,
+                arena,
+            )?;
+            for node in nodes.iter().rev() {
+                upper_nodes[upper_count] = *node;
+                // Execution computes windows over the joined rows only.
+                if model.plan.upper.group.is_some() {
+                    upper_nodes[upper_count].analyze_unsupported = Some(
+                        "EXPLAIN ANALYZE of window functions over a join's groups is not supported",
+                    );
+                }
+                upper_count += 1;
+            }
+        }
+        for node in &group_nodes[..group_count] {
+            upper_nodes[upper_count] = *node;
+            upper_count += 1;
         }
         let mut plan = joins::join_plan(
             storage,
             txid,
             scope,
             &model,
-            (sort_keys, presorted, &group_nodes[..group_count]),
+            (sort_keys, presorted, &upper_nodes[..upper_count]),
             block,
             arena,
         )?;
@@ -6669,6 +6749,12 @@ fn plan_pulled_select<'a>(
     // without grouping, for its ordering and row limit.
     let mut chosen_tree = None;
     let chosen_path = match (scope.as_ref(), statement.from.as_ref()) {
+        _ if windowed_scan.is_some() => Some(windowed_scan_path(
+            storage,
+            txid,
+            windowed_scan.as_ref().expect("checked"),
+            arena,
+        )?),
         (Some(scope), Some(from)) if single_relation_planned(storage, txid, statement, scope) => {
             let only = from.base.inheritance == crate::sql::ast::RelationInheritance::Only;
             let shape = if aggregate {
@@ -6979,6 +7065,9 @@ fn plan_pulled_select<'a>(
             (estimated_rows as f64).sqrt().ceil().max(1.0) as u64
         };
         let mut aggregate_startup = 0.0;
+        // The aggregate's costs are PostgreSQL's `cost_agg` of a modeled
+        // path, else pos3ql's own.
+        let mut aggregate_modeled = exact.is_some();
         match exact {
             Some((startup, total)) => {
                 aggregate_startup = startup;
@@ -7105,6 +7194,7 @@ fn plan_pulled_select<'a>(
                 )?;
             }
             aggregate_name = sets.strategy.node_name();
+            aggregate_modeled = true;
             aggregate_startup = sets.startup;
             total_cost = sets.total;
             estimated_rows = sets.rows as u64;
@@ -7151,6 +7241,7 @@ fn plan_pulled_select<'a>(
             planned_partitions = path.planned_partitions;
             hash_agg_sizing = Some(path.hash_agg);
             aggregate_keys = Some(grouped.group_keys);
+            aggregate_modeled = true;
             aggregate_startup = path.startup;
             total_cost = path.total;
             estimated_rows = path.rows as u64;
@@ -7171,6 +7262,7 @@ fn plan_pulled_select<'a>(
                         })
                         .map_err(|_| arena_full())?;
                     query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+                        .filter(|aggregates| !aggregates.ordered)
                         .and_then(|aggregates| {
                             query::index_paths::hash_agg_sizing(
                                 &aggregates,
@@ -7220,6 +7312,7 @@ fn plan_pulled_select<'a>(
                 width,
                 object_requests,
                 cache_blocks,
+                unmodeled_costs: !aggregate_modeled,
                 ..PlanNode::EMPTY
             }
             .with_qual(
@@ -7247,6 +7340,11 @@ fn plan_pulled_select<'a>(
     let mut window_names: &[&str] = &[];
     if has_window(statement) {
         total_cost += estimated_rows as f64 * 0.02;
+        let modeled = windowed_scan.as_ref().map(|model| ModeledWindows {
+            kept: model.windows,
+            steps: &model.plan.upper.windows[..model.windows.len()],
+            rows: model.plan.path(model.plan.top).rows,
+        });
         let (nodes, sorted, names) = window_stages(
             storage,
             txid,
@@ -7254,22 +7352,47 @@ fn plan_pulled_select<'a>(
             statement,
             columns,
             window_sorted,
+            modeled,
             block,
             arena,
         )?;
         window_sorted = sorted;
         window_names = names;
+        // Execution reads the windows' input by a sequential scan, to its
+        // end, which a limit right above the windows would stop.
+        let analyze_unsupported = chosen_path
+            .filter(|_| windowed_scan.is_some())
+            .is_some_and(|path| {
+                path.kind != query::index_paths::ScanKind::Seq
+                    || (limit_needed(statement.limit, statement.offset)
+                        && path.sort == query::index_paths::SortKind::None)
+            })
+            .then_some(
+                "EXPLAIN ANALYZE of window functions over an index scan or under a LIMIT is not supported",
+            );
         for node in nodes {
+            let node = &PlanNode {
+                analyze_unsupported: analyze_unsupported.or(node.analyze_unsupported),
+                ..*node
+            };
             add_stage(
                 &mut stages,
                 &mut stage_count,
-                PlanNode {
-                    total_cost,
-                    rows: estimated_rows,
-                    width,
-                    object_requests,
-                    cache_blocks,
-                    ..*node
+                if node.unmodeled_costs {
+                    PlanNode {
+                        total_cost,
+                        rows: estimated_rows,
+                        width,
+                        object_requests,
+                        cache_blocks,
+                        ..*node
+                    }
+                } else {
+                    PlanNode {
+                        object_requests,
+                        cache_blocks,
+                        ..*node
+                    }
                 },
             )?;
         }
@@ -7405,7 +7528,9 @@ fn plan_pulled_select<'a>(
             node.startup_cost = startup;
             node.total_cost = total;
             node.rows = path.rows as u64;
-            node.width = path.width;
+            node.width = windowed_scan
+                .as_ref()
+                .map_or(path.width, |model| model.final_width as u32);
         }
         if let Some(grouped) = grouped_path.and_then(|path| path.grouped)
             && let Some((startup, total)) = grouped.output_sort
@@ -7565,7 +7690,16 @@ fn plan_pulled_select<'a>(
                         .map(|cost| (grouped.width, cost))
                 })
                 .or_else(|| {
-                    chosen_path.and_then(|path| path.limit_cost.map(|cost| (path.width, cost)))
+                    chosen_path.and_then(|path| {
+                        path.limit_cost.map(|cost| {
+                            (
+                                windowed_scan
+                                    .as_ref()
+                                    .map_or(path.width, |model| model.final_width as u32),
+                                cost,
+                            )
+                        })
+                    })
                 }) {
                 // The chosen path's limit as PostgreSQL's planner costs it.
                 Some((width, (startup, total, rows))) => PlanNode {
@@ -9189,24 +9323,6 @@ fn presorted_order_keys(
     (matched != 0).then_some(matched)
 }
 
-/// PostgreSQL's window functions whose result does not depend on the frame,
-/// for which its planner evaluates the window `ROWS UNBOUNDED PRECEDING`.
-fn frame_independent(node: &Expr<'_>) -> bool {
-    let Expr::Call { name, .. } = node else {
-        return false;
-    };
-    [
-        "row_number",
-        "rank",
-        "dense_rank",
-        "percent_rank",
-        "cume_dist",
-        "ntile",
-    ]
-    .iter()
-    .any(|function| name.eq_ignore_ascii_case(function))
-}
-
 /// A window definition as PostgreSQL's EXPLAIN prints it: `name AS
 /// (PARTITION BY ... ORDER BY ... frame)`, keys without their directions.
 #[expect(clippy::too_many_arguments, reason = "plan key context")]
@@ -9387,11 +9503,58 @@ type WindowStages<'e> = (
     &'e [&'e str],
 );
 
+/// The scan PostgreSQL's planner chose for a query of one relation with
+/// window functions, carrying the sort and limit above its windows.
+fn windowed_scan_path<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    model: &query::index_paths::join_query::ModeledJoin<'a>,
+    arena: &'a Arena,
+) -> Result<query::index_paths::ScanPath<'a>, SqlError> {
+    let query::index_paths::joins::PathKind::Scan { rel, path } =
+        model.plan.path(model.plan.top).kind
+    else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of window functions over a relation a constant false condition empties is not supported"
+        ));
+    };
+    let mut scan = model.rels[usize::from(rel)]
+        .scan(storage, txid, path, &[], arena)?
+        .path;
+    let upper = model.plan.upper;
+    scan.sort = match upper.sort {
+        None => query::index_paths::SortKind::None,
+        Some((_, _, 0)) => query::index_paths::SortKind::Full,
+        Some((_, _, presorted)) => {
+            query::index_paths::SortKind::Incremental(usize::from(presorted))
+        }
+    };
+    scan.sort_cost = upper.sort.map(|(startup, total, _)| (startup, total));
+    scan.limit_cost = upper.limit;
+    Ok(scan)
+}
+
+/// The windows PostgreSQL's planner chose for a query
+/// (`create_window_paths`): per clause in evaluation order, the positions in
+/// its `window_sort_keys` of the keys its pathkeys keep and its nodes'
+/// costs, and the rows they return.
+#[derive(Clone, Copy)]
+struct ModeledWindows<'m> {
+    kept: &'m [([u8; query::index_paths::joins::MAX_KEYS], u8)],
+    steps: &'m [query::index_paths::joins::WindowStep],
+    rows: f64,
+}
+
 /// The `WindowAgg` nodes of a query and the sorts of their inputs, bottom
 /// first, the keys the last window leaves its rows sorted by, and each
 /// window clause's name. Each window clause sorts its input unless the rows
 /// (`presorted` on entry) already follow its keys, incrementally when they
 /// follow a prefix of them, as PostgreSQL plans.
+///
+/// `modeled` holds the plan's windows when PostgreSQL's planner was
+/// modeled for them (`create_window_paths`): each clause's kept pathkeys,
+/// its nodes' costs and the rows; without it the nodes' costs are pos3ql's.
 #[expect(clippy::too_many_arguments, reason = "the window plan's context")]
 fn window_stages<'e>(
     storage: &Storage,
@@ -9400,6 +9563,7 @@ fn window_stages<'e>(
     statement: &'e Select<'e>,
     columns: &dyn crate::sql::exec::ColTypeResolver,
     presorted: &'e [crate::sql::ast::OrderBy<'e>],
+    modeled: Option<ModeledWindows<'_>>,
     block: BlockId,
     arena: &'e Arena,
 ) -> Result<WindowStages<'e>, SqlError> {
@@ -9427,14 +9591,28 @@ fn window_stages<'e>(
     let last = windows.clauses.len().saturating_sub(1);
     for (index, &(spec, name)) in windows.clauses.iter().enumerate() {
         let position = u16::try_from(index).map_err(|_| arena_full())?;
-        let keys = query::window_sort_keys(spec, arena)?;
-        let held = keys.len() <= sorted.len() && *keys == sorted[..keys.len()];
+        let mut keys = query::window_sort_keys(spec, arena)?;
+        let step = modeled.map(|modeled| (modeled.steps[index], modeled.kept[index]));
+        if let Some((_, (kept, count))) = step {
+            // The keys its pathkeys keep (`prepare_sort_from_pathkeys`).
+            let all = keys;
+            keys = arena
+                .alloc_slice_with(usize::from(count), |at| all[usize::from(kept[at])])
+                .map_err(|_| arena_full())?;
+        }
+        let held = match step {
+            Some((step, _)) => step.sort.is_none(),
+            None => keys.len() <= sorted.len() && *keys == sorted[..keys.len()],
+        };
         if !keys.is_empty() && !held {
-            let presorted = keys
-                .iter()
-                .zip(sorted)
-                .take_while(|(key, held)| key == held)
-                .count();
+            let presorted = match step.and_then(|(step, _)| step.sort) {
+                Some((_, _, presorted)) => usize::from(presorted),
+                None => keys
+                    .iter()
+                    .zip(sorted)
+                    .take_while(|(key, held)| key == held)
+                    .count(),
+            };
             let items = arena
                 .alloc_slice_with(keys.len(), |at| {
                     (
@@ -9460,8 +9638,17 @@ fn window_stages<'e>(
                 }),
                 key: Some(NodeKey::new(block, Role::WindowSort(position))),
                 keys: shown,
+                unmodeled_costs: step.is_none(),
                 ..PlanNode::EMPTY
             };
+            if let (Some(modeled), Some((step, _))) = (modeled, step)
+                && let Some((startup, total, _)) = step.sort
+            {
+                sort.startup_cost = startup;
+                sort.total_cost = total;
+                sort.rows = modeled.rows as u64;
+                sort.width = step.sort_width as u32;
+            }
             if presorted != 0 {
                 let prefix = plan_keys(
                     storage,
@@ -9501,7 +9688,7 @@ fn window_stages<'e>(
             .iter()
             .zip(windows.of_node)
             .filter(|(_, clause)| **clause == index)
-            .all(|(node, _)| frame_independent(node));
+            .all(|(node, _)| query::frame_independent(node));
         let definition = |verbose| {
             window_definition(
                 storage,
@@ -9525,6 +9712,11 @@ fn window_stages<'e>(
                     Role::WindowAgg(position)
                 },
             )),
+            unmodeled_costs: step.is_none(),
+            startup_cost: step.map_or(0.0, |(step, _)| step.startup),
+            total_cost: step.map_or(0.0, |(step, _)| step.total),
+            rows: modeled.map_or(0, |modeled| modeled.rows as u64),
+            width: step.map_or(0, |(step, _)| step.width as u32),
             ..PlanNode::EMPTY
         }
         .with_qual(QualLabel::Window, definition(false)?)

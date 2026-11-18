@@ -45,7 +45,12 @@ pub(super) fn join_plan<'a>(
     // Above a grouping the nodes return its groups.
     let (rows, width) = match upper.group {
         Some(chosen) => (chosen.rows, chosen.width as u32),
-        None => (top.rows, model.output_width as u32),
+        None => (top.rows, model.final_width as u32),
+    };
+    // Above windows the rows are the top window's.
+    let width = match model.windows.len() {
+        0 => width,
+        count => upper.windows[count - 1].width as u32,
     };
     let mut depth = 0;
     if let Some((startup, total, rows)) = upper.limit {

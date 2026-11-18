@@ -254,7 +254,9 @@ pub(crate) fn local_minmax_subquery<'a>(
         }
         *slot = &*arena.alloc(plain).map_err(|_| arena_full())?;
     }
-    let Some(aggregate) = aggregate_costs(expressions, storage, txid, &columns, arena)? else {
+    let Some(aggregate) = aggregate_costs(expressions, storage, txid, &columns, arena)?
+        .filter(|costs| !costs.ordered)
+    else {
         return Ok(None);
     };
     let planned = scan_path(

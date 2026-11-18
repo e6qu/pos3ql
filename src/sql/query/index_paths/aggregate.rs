@@ -35,6 +35,10 @@ pub(crate) struct AggregateCosts {
     /// A state allocates memory per group the hash aggregate memory model
     /// does not reproduce.
     pub(crate) unsized_states: bool,
+    /// An aggregate has `DISTINCT` or `ORDER BY` inputs
+    /// (`numOrderedAggs`), which forbids hashing and which PostgreSQL may
+    /// presort.
+    pub(crate) ordered: bool,
 }
 
 use crate::sql::query::postgres_memory::MAX_SIZED_STATES;
@@ -120,8 +124,7 @@ fn same_inputs(left: &Expr<'_>, right: &Expr<'_>) -> bool {
 
 /// `get_agg_clause_costs` of the aggregates `expressions` call at this query
 /// level, with their columns typed by `columns`; `None` when one of them is
-/// outside the model: a grammar-spelled or user-defined aggregate, one with
-/// `DISTINCT` or `ORDER BY` inputs (which PostgreSQL may presort), or a
+/// outside the model: a grammar-spelled or user-defined aggregate, or a
 /// state whose size depends on a type the model has no layout for.
 pub(crate) fn aggregate_costs<'a>(
     expressions: &[&'a Expr<'a>],
@@ -158,9 +161,7 @@ pub(crate) fn aggregate_costs<'a>(
         else {
             return Ok(None);
         };
-        if *distinct || !order_by.is_empty() {
-            return Ok(None);
-        }
+        result.ordered |= *distinct || !order_by.is_empty();
         let Some(AggregateRoutine::Builtin(oid)) = aggregate_routine(call, storage, txid, columns)?
         else {
             return Ok(None);

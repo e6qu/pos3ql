@@ -1025,7 +1025,7 @@ mod window;
 use window::{
     cmp_key_rows, external_window_into, project_window_rows, rewrite_grouped_windows, window_select,
 };
-pub(crate) use window::{window_clauses, window_sort_keys};
+pub(crate) use window::{frame_independent, window_clauses, window_sort_keys};
 
 /// Relation count handled by compact `u64` planner proofs. Wider joins execute
 /// exactly with arena-sized state and skip these optional access-path proofs.

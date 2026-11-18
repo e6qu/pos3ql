@@ -1035,16 +1035,40 @@ selectivity by the restriction's, and a semi or anti join's `OR` of
 one-relation conditions is estimated as an inner join's
 (`differential_exact/883`); a
 parenthesized join that `deconstruct_jointree` reads into the same
-problem plans as one join search (`differential_exact/884`). Remaining
-for that search: aggregates with their own `ORDER BY`
-or `DISTINCT` (presorted aggregate input), join conditions of
+problem plans as one join search (`differential_exact/884`). Window
+functions over one relation, a join or a join's groups are planned as
+`create_window_paths` plans them: a window path over the cheapest path and
+over each path sorted by a prefix of the first window's pathkeys (which
+are the query's pathkeys, so an index ordered by them is a candidate),
+each window clause in `select_active_windows` order sorting its input
+fully or incrementally only when it is not already ordered, costed by
+`cost_windowagg` with `get_windowclause_startup_tuples` (the frame's end,
+the partitions' and peers' group estimates), each lower window's rows
+widened by its functions' results, then the query's sort and limit
+(`differential_exact/886`). Aggregates with `DISTINCT` or `ORDER BY`
+inputs extend the grouping's pathkeys by the keys most of them share
+(`adjust_group_pathkeys_for_groupagg`), so the `GroupAggregate` or plain
+`Aggregate` reads rows sorted by them, and the grouping never hashes
+(`differential_exact/887`); a query of one relation is planned through the
+same search for either. An `EXPLAIN` showing costs of a scan, aggregate or
+window whose estimates the planner model did not produce fails with
+`0A000` rather than print pos3ql's own figures. Remaining for windows:
+partition or order keys that are expressions, window functions inside
+expressions or the `ORDER BY`, windows over one relation's groups, the
+merging of window clauses equal once `optimize_window_clauses` frees their
+frames, run conditions (`find_window_run_conditions`, which needs the
+subquery scan below), and `EXPLAIN ANALYZE` of windows over an index scan,
+under a limit directly above them or over a join's groups (`0A000`:
+execution reads the input by its own scan); for presorted aggregates:
+`ORDER BY` or `DISTINCT` inputs that are expressions, and `EXPLAIN
+ANALYZE` of their sort (`0A000`: its tuples' memory is not modeled).
+Remaining for that search: join conditions of
 expressions (`a.k + 1 = b.k`) and conditions over several relations
 other than comparisons of columns (`COALESCE(a.id, 0) < b.id`), an `OR`
 of join conditions that a semi or anti join evaluates
 (`clauselist_selectivity_or` under `eqjoinsel_semi`), an `OR` join clause
 that an indexed relation's parameterized scan evaluates (as a filter, or
-as a `BitmapOr` of parameterized index scans), window functions'
-`WindowAgg` costs (`cost_windowagg`, modeled for no query yet), a merge join over a partly sorted outer input (`Incremental
+as a `BitmapOr` of parameterized index scans), a merge join over a partly sorted outer input (`Incremental
 Sort`), a right-nested outer join (`a LEFT JOIN (b JOIN c) ON ...`) and
 derived tables kept as subqueries (`SubqueryScan`), self-join removal
 (`remove_useless_self_joins`), a constant equated with a full join's

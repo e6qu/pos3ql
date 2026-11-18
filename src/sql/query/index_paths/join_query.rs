@@ -394,6 +394,30 @@ fn or_arms<'a>(expression: &'a Expr<'a>, arms: &mut [&'a Expr<'a>], count: &mut 
     }
 }
 
+/// Whether each arm of the `OR` `expression`, and each condition of an arm
+/// that is an `AND`, reads a single relation.
+fn or_reads_one_relation_each(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
+    let mut arms = [&Expr::Null; super::super::plan::MAX_CONJUNCTS];
+    let mut count = 0;
+    if !or_arms(expression, &mut arms, &mut count) {
+        return false;
+    }
+    arms[..count].iter().all(|arm| {
+        let mut conjuncts = [&Expr::Null; super::super::plan::MAX_CONJUNCTS];
+        let mut conjunct_count = 0;
+        super::super::plan::flatten_and(arm, &mut conjuncts, &mut conjunct_count)
+            && conjuncts[..conjunct_count].iter().all(|conjunct| {
+                qual_vars(scope, conjunct).is_some_and(|vars| {
+                    vars.as_slice()
+                        .iter()
+                        .fold(0u32, |relids, &(rel, _)| relids | 1 << rel)
+                        .count_ones()
+                        == 1
+                })
+            })
+    })
+}
+
 /// An `ORDER BY` item: a column, or another expression.
 #[derive(Clone, Copy, PartialEq)]
 enum SortTarget<'a> {
@@ -530,9 +554,9 @@ fn qual_vars(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<VarList> {
     let mut vars = VarList::default();
     let mut ok = true;
     expression.for_each_column_reference(&mut |qualifier, name| match scope
-        .find_column(qualifier, name)
+        .probe_column(qualifier, name)
     {
-        Ok(ResolvedColumn::Table(table, column)) if column < 64 => {
+        Some(ResolvedColumn::Table(table, column)) if column < 64 => {
             ok &= vars.add((table as u8, column as u16)).is_some();
         }
         _ => ok = false,
@@ -2640,10 +2664,14 @@ pub(crate) fn modeled_join<'a>(
         );
         clause.cost = cost;
         clause.other = match expression {
+            // An `OR` whose every condition reads one relation is estimated
+            // alike for every join: each is a restriction's selectivity.
             Expr::Binary {
                 operator: BinaryOp::Or,
                 ..
-            } => super::joins::OtherShape::Composite,
+            } if !or_reads_one_relation_each(scope, expression) => {
+                super::joins::OtherShape::Composite
+            }
             Expr::Binary { left, right, .. } if join_inequality(scope, expression) => {
                 let nulls = |side: &Expr<'_>| {
                     column_of(scope, side).map_or(0.0, |(table, column)| {
@@ -3224,7 +3252,7 @@ pub(crate) fn column_of(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option
     let Expr::Column { qualifier, name } = expression else {
         return None;
     };
-    match scope.find_column(*qualifier, name).ok()? {
+    match scope.probe_column(*qualifier, name)? {
         ResolvedColumn::Table(table, column) => Some((table, column)),
         _ => None,
     }

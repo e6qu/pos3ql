@@ -1031,15 +1031,20 @@ precision`, compare across types in one class
 (`differential_exact/882`). An `OR` whose arms are `AND`s restricts each
 relation by the `OR` of its own conditions
 (`extract_restriction_or_clauses`), dividing the join clause's
-selectivity by the restriction's (`differential_exact/883`), and a
+selectivity by the restriction's, and a semi or anti join's `OR` of
+one-relation conditions is estimated as an inner join's
+(`differential_exact/883`); a
 parenthesized join that `deconstruct_jointree` reads into the same
 problem plans as one join search (`differential_exact/884`). Remaining
-for that search: window functions, aggregates with their own `ORDER BY`
+for that search: aggregates with their own `ORDER BY`
 or `DISTINCT` (presorted aggregate input), join conditions of
 expressions (`a.k + 1 = b.k`) and conditions over several relations
 other than comparisons of columns (`COALESCE(a.id, 0) < b.id`), an `OR`
-that a semi or anti join or an indexed relation's parameterized scan
-evaluates, a merge join over a partly sorted outer input (`Incremental
+of join conditions that a semi or anti join evaluates
+(`clauselist_selectivity_or` under `eqjoinsel_semi`), an `OR` join clause
+that an indexed relation's parameterized scan evaluates (as a filter, or
+as a `BitmapOr` of parameterized index scans), window functions'
+`WindowAgg` costs (`cost_windowagg`, modeled for no query yet), a merge join over a partly sorted outer input (`Incremental
 Sort`), a right-nested outer join (`a LEFT JOIN (b JOIN c) ON ...`) and
 derived tables kept as subqueries (`SubqueryScan`), self-join removal
 (`remove_useless_self_joins`), a constant equated with a full join's

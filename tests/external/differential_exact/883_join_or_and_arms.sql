@@ -20,3 +20,12 @@ EXPLAIN SELECT oa883.id, ob883.id FROM oa883 LEFT JOIN ob883 ON oa883.k = ob883.
 SELECT oa883.id, ob883.id FROM oa883 LEFT JOIN ob883 ON oa883.k = ob883.k AND ((oa883.x = 1 AND ob883.x = 1) OR (oa883.x = 2 AND ob883.x = 2)) WHERE oa883.id < 40;
 EXPLAIN SELECT oa883.id, ob883.id FROM oa883 JOIN ob883 ON oa883.k = ob883.k WHERE (oa883.x > 0 AND ob883.z = 1) OR (oa883.x > 1 AND ob883.z = 2);
 SELECT count(*), sum(oa883.id), sum(ob883.id) FROM oa883 JOIN ob883 ON oa883.k = ob883.k WHERE (oa883.x > 0 AND ob883.z = 1) OR (oa883.x > 1 AND ob883.z = 2);
+-- A semi or anti join's OR of one-relation conditions is estimated as an
+-- inner join's (each arm a restriction), and an OR of join conditions
+-- filters a nested loop.
+EXPLAIN SELECT oa883.id FROM oa883 WHERE EXISTS (SELECT 1 FROM ob883 WHERE ob883.k = oa883.k AND (ob883.x = 1 OR oa883.x = 2));
+SELECT count(*), sum(oa883.id) FROM oa883 WHERE EXISTS (SELECT 1 FROM ob883 WHERE ob883.k = oa883.k AND (ob883.x = 1 OR oa883.x = 2));
+EXPLAIN SELECT oa883.id FROM oa883 WHERE NOT EXISTS (SELECT 1 FROM ob883 WHERE ob883.k = oa883.k AND (ob883.x = 1 OR oa883.x = 2));
+SELECT count(*), sum(oa883.id) FROM oa883 WHERE NOT EXISTS (SELECT 1 FROM ob883 WHERE ob883.k = oa883.k AND (ob883.x = 1 OR oa883.x = 2));
+EXPLAIN SELECT oa883.id, ob883.id FROM oa883 JOIN ob883 ON ob883.k = oa883.k OR ob883.x = oa883.x WHERE oa883.id < 3;
+SELECT oa883.id, ob883.id FROM oa883 JOIN ob883 ON ob883.k = oa883.k OR ob883.x = oa883.x WHERE oa883.id < 3;

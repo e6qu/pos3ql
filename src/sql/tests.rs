@@ -56013,9 +56013,9 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     let joined_dml_plan = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN UPDATE probe_keys p SET label = e.payload FROM indexed_events e
+        "EXPLAIN (COSTS OFF) UPDATE probe_keys p SET label = e.payload FROM indexed_events e
            WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted;
-         EXPLAIN DELETE FROM probe_keys p USING indexed_events e
+         EXPLAIN (COSTS OFF) DELETE FROM probe_keys p USING indexed_events e
            WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted",
     ));
     assert_eq!(
@@ -56102,7 +56102,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     let mixed_plan = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN UPDATE probe_keys p SET label = 'mixed' FROM indexed_events e \
+        "EXPLAIN (COSTS OFF) UPDATE probe_keys p SET label = 'mixed' FROM indexed_events e \
            WHERE p.tenant = 1 \
              AND e.tenant = p.tenant + e.event_id - e.event_id \
              AND e.event_id = p.wanted",

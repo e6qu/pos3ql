@@ -226,6 +226,10 @@ fn restriction_columns(scope: &QueryScope<'_>, restriction: Option<&Expr<'_>>) -
     mask
 }
 
+/// Pathkeys extended for presorted aggregates: the keys, each added key's
+/// expression and flags, and how many were added.
+type PresortKeys<'a> = (Keys, [(&'a Expr<'a>, u8); super::joins::MAX_KEYS], usize);
+
 /// The plan of a modeled join and what its nodes read.
 pub(crate) struct ModeledJoin<'a> {
     pub(crate) plan: JoinPlan<'a>,
@@ -2096,8 +2100,7 @@ pub(crate) fn modeled_join<'a>(
         let mut best_keys = (Keys::NONE, [(&Expr::Null, 0u8); super::joins::MAX_KEYS], 0);
         while unprocessed.count_ones() > best.count_ones() {
             let mut chosen = 0u32;
-            let mut current: Option<(Keys, [(&'a Expr<'a>, u8); super::joins::MAX_KEYS], usize)> =
-                None;
+            let mut current: Option<PresortKeys<'a>> = None;
             for at in (0..ordered_count).filter(|at| unprocessed & 1 << at != 0) {
                 let candidate = appended(&ordered[at].0, &ordered[at].1);
                 match current {

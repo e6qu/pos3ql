@@ -19054,7 +19054,7 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<super::exec::StaticTypeMeta> {
-        let entry = self.0.find_column(qualifier, name).ok()?;
+        let entry = self.0.probe_column(qualifier, name)?;
         let ctype = self.0.output_type(entry);
         let type_mod = match entry {
             scope::ResolvedColumn::Table(table, column) => {
@@ -19103,7 +19103,7 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        let entry = self.0.find_column(qualifier, name).ok()?;
+        let entry = self.0.probe_column(qualifier, name)?;
         if self.0.output_type(entry) != ColType::Record {
             return None;
         }

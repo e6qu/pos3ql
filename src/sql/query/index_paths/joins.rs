@@ -668,10 +668,12 @@ pub(crate) struct UpperProblem {
     pub(crate) group: Option<GroupProblem>,
 }
 
-/// A `GROUP BY` of plain columns above the join (`create_grouping_paths`).
+/// A `GROUP BY` of plain columns, or the one group of a query's plain
+/// aggregates, above the join (`create_grouping_paths`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GroupProblem {
-    /// `group_pathkeys`, in `processed_groupClause` order.
+    /// `group_pathkeys`, in `processed_groupClause` order; none for plain
+    /// aggregation (`AGG_PLAIN`).
     pub(crate) keys: Keys,
     /// `sort_pathkeys` of the query's `ORDER BY` of the groups.
     pub(crate) sort: Keys,
@@ -687,6 +689,15 @@ pub(crate) struct GroupProblem {
     pub(crate) hashable: bool,
     pub(crate) hashagg: bool,
     pub(crate) group_by_reordering: bool,
+    /// A `DISTINCT` (`create_final_distinct_paths`): a `Unique` over the
+    /// rows sorted by its keys rather than a `GroupAggregate`, and a
+    /// `HashAggregate` only with `enable_hashagg` on;
+    /// `group_by_reordering` is then `enable_distinct_reordering`.
+    pub(crate) distinct: bool,
+    /// The `HAVING` qualification's cost and selectivity.
+    pub(crate) having: Option<super::aggregate::QualCosts>,
+    /// The per-group cost of the grouping's target list.
+    pub(crate) target_cost: f64,
 }
 
 /// The grouping above the join that `add_paths_to_grouping_rel` chose.
@@ -703,6 +714,8 @@ pub(crate) struct GroupPlan {
     pub(crate) total: f64,
     pub(crate) rows: f64,
     pub(crate) width: f64,
+    /// The groups estimated before any `HAVING` (`numGroups`).
+    pub(crate) groups: f64,
     /// The join's rows as the aggregate reads them.
     pub(crate) input: AggregateInput,
 }
@@ -2233,11 +2246,25 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let settings = self.problem.settings;
         let costs = settings.costs;
         let columns = group.keys.as_slice().len();
+        let plain = columns == 0;
         let cheapest = rel.cheapest_total;
-        // `get_number_of_groups` over the joined relation's rows.
-        let groups = self
-            .statistics
-            .num_groups(&group.members[..columns], self.path(cheapest).rows)?;
+        // `get_number_of_groups` over the joined relation's rows; plain
+        // aggregation returns one.
+        let groups = if plain {
+            1.0
+        } else {
+            self.statistics
+                .num_groups(&group.members[..columns], self.path(cheapest).rows)?
+        };
+        // `create_agg_path`: `cost_agg` with the `HAVING` quals, then the
+        // target list's cost per group it returns.
+        let aggregate = |strategy: AggStrategy, input: AggInput| {
+            let (startup, total, rows) = super::aggregate::with_having(
+                cost_agg(strategy, &group.aggregates, columns, groups, input),
+                group.having,
+            );
+            (startup, total + group.target_cost * rows, rows)
+        };
         // Each grouped path, the join path below it and its plan.
         let mut store = [self.path(cheapest); MAX_GROUPED];
         let mut plans = [(cheapest, None::<GroupPlan>); MAX_GROUPED];
@@ -2317,18 +2344,28 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                         if incremental { presorted as u8 } else { 0 },
                     ));
                 }
-                let (startup, total, rows) = cost_agg(
-                    AggStrategy::Sorted,
-                    &group.aggregates,
-                    columns,
-                    groups,
-                    AggInput {
-                        startup: sorted.startup,
-                        total: sorted.total,
-                        rows: input.rows,
-                        width: group.input_width,
-                    },
-                );
+                let (startup, total, rows) = if group.distinct {
+                    // `create_upper_unique_path`.
+                    (
+                        sorted.startup,
+                        sorted.total + costs.cpu_operator * input.rows * columns as f64,
+                        groups,
+                    )
+                } else {
+                    aggregate(
+                        if plain {
+                            AggStrategy::Plain
+                        } else {
+                            AggStrategy::Sorted
+                        },
+                        AggInput {
+                            startup: sorted.startup,
+                            total: sorted.total,
+                            rows: input.rows,
+                            width: group.input_width,
+                        },
+                    )
+                };
                 if stored == MAX_GROUPED {
                     return Err(too_many());
                 }
@@ -2337,6 +2374,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     total,
                     rows,
                     width: group.output_width,
+                    keys: if plain { Keys::NONE } else { sorted.keys },
                     ..sorted
                 };
                 store[stored] = path;
@@ -2350,6 +2388,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                         total,
                         rows,
                         width: group.output_width,
+                        groups,
                         input: AggregateInput { rows: input.rows },
                     }),
                 );
@@ -2364,14 +2403,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 stored += usize::from(accepted);
             }
         }
-        if group.hashable {
+        // A `DISTINCT` hashes only with `enable_hashagg` on, unless it has
+        // no other path.
+        if group.hashable && !plain && (!group.distinct || group.hashagg || grouped_count == 0) {
             let mut input = self.path(cheapest);
             input.total += upper.target_cost * input.rows;
-            let (startup, total, rows) = cost_agg(
+            let (startup, total, rows) = aggregate(
                 AggStrategy::Hashed,
-                &group.aggregates,
-                columns,
-                groups,
                 AggInput {
                     startup: input.startup,
                     total: input.total,
@@ -2402,6 +2440,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     total,
                     rows,
                     width: group.output_width,
+                    groups,
                     input: AggregateInput { rows: input.rows },
                 }),
             );

@@ -119,7 +119,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        match self.scope.find_column_unsuggested(qualifier, name) {
+        match self.scope.probe_column_result(qualifier, name) {
             Ok(entry) => Some(self.scope.output_type(entry)),
             Err(error)
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
@@ -135,8 +135,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
         self.scope
-            .find_column_unsuggested(qualifier, name)
-            .ok()
+            .probe_column(qualifier, name)
             .map(|entry| self.scope.output_collation(entry))
             .unwrap_or(Collation::None)
     }
@@ -151,7 +150,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self.scope.find_column_unsuggested(qualifier, name).ok()? {
+        match self.scope.probe_column(qualifier, name)? {
             ResolvedColumn::Table(table, column) => {
                 self.scope.defs.get(table)?.columns.get(column)?.user_type
             }
@@ -160,7 +159,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     }
 
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
-        match self.scope.find_column_unsuggested(qualifier, name).ok()? {
+        match self.scope.probe_column(qualifier, name)? {
             ResolvedColumn::Table(table, column) => Some((table as u32, column as u32)),
             ResolvedColumn::Merged(merged) => Some((u32::MAX, merged as u32)),
             ResolvedColumn::TableOid(table) => Some((table as u32, u32::MAX)),
@@ -1255,7 +1254,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         ))
     }
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        match self.0.find_column_unsuggested(qualifier, name) {
+        match self.0.probe_column_result(qualifier, name) {
             Ok(entry) => Some(self.0.output_type(entry)),
             Err(error)
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
@@ -1269,8 +1268,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     }
     fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
         self.0
-            .find_column_unsuggested(qualifier, name)
-            .ok()
+            .probe_column(qualifier, name)
             .map(|entry| self.0.output_collation(entry))
             .unwrap_or(Collation::None)
     }
@@ -1283,7 +1281,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self.0.find_column_unsuggested(qualifier, name).ok()? {
+        match self.0.probe_column(qualifier, name)? {
             super::scope::ResolvedColumn::Table(table, column) => {
                 self.0.defs.get(table)?.columns.get(column)?.user_type
             }
@@ -1293,7 +1291,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         }
     }
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
-        match self.0.find_column_unsuggested(qualifier, name).ok()? {
+        match self.0.probe_column(qualifier, name)? {
             super::scope::ResolvedColumn::Table(t, c) => Some((t as u32, c as u32)),
             super::scope::ResolvedColumn::Merged(m) => Some((u32::MAX, m as u32)),
             super::scope::ResolvedColumn::TableOid(table) => Some((table as u32, u32::MAX)),
@@ -1626,6 +1624,154 @@ fn projected_collations<'a>(
 
 /// DISTINCT over encoded rows; a stable sort keeps each group's first input
 /// row, the representative PostgreSQL's hashed DISTINCT returns.
+/// The distinct rows of a join's `DISTINCT` as PostgreSQL's planner plans
+/// it, in the order its node returns them: a `HashAggregate`'s groups in
+/// its `simplehash` table's order (`TupleHashTableHash` of the keys, each
+/// group at its first row), or a `Unique` over the rows sorted by its keys
+/// (`input_sort`: fully, or incrementally after its first keys), each run
+/// of equal rows' first. Returns the rows kept, at the front of `rows`.
+fn modeled_distinct(
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    rows: &mut [&[u8]],
+    collations: &[Collation],
+    group: super::index_paths::join_query::ModeledGroup<'_>,
+    input_sort: Option<(f64, f64, u8)>,
+) -> Result<usize, SqlError> {
+    let held = arena.alloc_slice_copy(rows).map_err(|_| arena_full())?;
+    let same = |left: u32, right: u32| -> Result<bool, SqlError> {
+        for &(position, _) in group.keys {
+            if !compare_materialized_key(
+                storage,
+                txid,
+                collations[position],
+                crate::sql::exec::ProjectedValue::column(held[left as usize], position),
+                crate::sql::exec::ProjectedValue::column(held[right as usize], position),
+            )?
+            .is_eq()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    let mut kept = 0usize;
+    if group.hashed {
+        // Each row's hash: its keys' hashes, each earlier one rotated left
+        // a bit, a null key hashing to zero (`ExecBuildHash32FromAttrs`).
+        let hashes = arena
+            .alloc_slice_with(held.len(), |_| 0u32)
+            .map_err(|_| arena_full())?;
+        for (hash, row) in hashes.iter_mut().zip(held.iter()) {
+            let mut combined = 0u32;
+            for &(position, _) in group.keys {
+                combined = combined.rotate_left(1);
+                let value = crate::sql::exec::decode_projected_col_record(row, position, arena)?;
+                if !matches!(value, Datum::Null) {
+                    combined ^= super::join_exec::datum_hash(&value).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "the hash order of this DISTINCT key type is not supported"
+                        )
+                    })?;
+                }
+            }
+            *hash = super::simplehash::murmur32(combined);
+        }
+        let firsts = super::simplehash::iteration_order(
+            held.len(),
+            group.buckets,
+            arena,
+            &mut |row| Ok(hashes[row]),
+            &mut |left, right| same(left as u32, right as u32),
+        )?;
+        for &row in firsts {
+            rows[kept] = held[row as usize];
+            kept += 1;
+        }
+        return Ok(kept);
+    }
+    let compare = &mut |left: u32, right: u32| -> Result<core::cmp::Ordering, SqlError> {
+        for &(position, flags) in group.keys {
+            let ordering = compare_ordered_key(
+                storage,
+                txid,
+                collations[position],
+                (
+                    flags & super::index_paths::joins::KEY_DESCENDING != 0,
+                    flags & super::index_paths::joins::KEY_NULLS_FIRST != 0,
+                ),
+                crate::sql::exec::ProjectedValue::column(held[left as usize], position),
+                crate::sql::exec::ProjectedValue::column(held[right as usize], position),
+            )?;
+            if !ordering.is_eq() {
+                return Ok(ordering);
+            }
+        }
+        Ok(core::cmp::Ordering::Equal)
+    };
+    let input = arena
+        .alloc_slice_with(held.len(), |at| at as u32)
+        .map_err(|_| arena_full())?;
+    let order: &[u32] = match input_sort {
+        None => input,
+        Some((_, _, 0)) => {
+            crate::sql::pg_qsort::pg_tuplesort(input, None, compare)?;
+            input
+        }
+        Some((_, _, presorted)) => {
+            let prefix = &group.keys[..usize::from(presorted)];
+            let scratch = arena
+                .alloc_slice_with(held.len() * 2, |_| 0u32)
+                .map_err(|_| arena_full())?;
+            let out = arena
+                .alloc_slice_with(held.len(), |_| 0u32)
+                .map_err(|_| arena_full())?;
+            crate::sql::pg_qsort::pg_incremental_sort(
+                input,
+                scratch,
+                out,
+                None,
+                &mut |left, right| {
+                    for &(position, _) in prefix {
+                        if !compare_materialized_key(
+                            storage,
+                            txid,
+                            collations[position],
+                            crate::sql::exec::ProjectedValue::column(held[left as usize], position),
+                            crate::sql::exec::ProjectedValue::column(
+                                held[right as usize],
+                                position,
+                            ),
+                        )?
+                        .is_eq()
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                },
+                compare,
+                &mut |_, _, _| Ok(()),
+            )?;
+            out
+        }
+    };
+    let mut last = None::<u32>;
+    for &at in order {
+        if let Some(previous) = last
+            && same(previous, at)?
+        {
+            continue;
+        }
+        rows[kept] = held[at as usize];
+        kept += 1;
+        last = Some(at);
+    }
+    Ok(kept)
+}
+
 fn sort_dedup_collated(
     storage: &Storage,
     txid: u32,
@@ -2022,7 +2168,10 @@ pub(crate) fn materialized_rows<'a>(
     // A join PostgreSQL's join search plans runs that plan: rows it returns
     // in the query's order need no sort, and its sort sorts as
     // PostgreSQL's does.
-    let modeled = if outer.is_none() && n_order > 0 && ordered_candidates.is_none() {
+    let modeled = if outer.is_none()
+        && (n_order > 0 || (statement.distinct && n_on == 0))
+        && ordered_candidates.is_none()
+    {
         super::index_paths::join_query::modeled_join(
             storage, txid, statement, scope, params, arena,
         )?
@@ -2030,6 +2179,14 @@ pub(crate) fn materialized_rows<'a>(
         None
     };
     let join_sort = modeled.as_ref().map(|model| model.plan.upper.sort);
+    // A limit bounds the sort, which a join's modeled `DISTINCT` runs
+    // below.
+    let sort_bounded = n_on == 0
+        && (!statement.distinct
+            || modeled
+                .as_ref()
+                .and_then(|model| model.group)
+                .is_some_and(|group| group.distinct));
     let join_presorted = join_sort.is_some_and(|sort| sort.is_none());
     let stored_width = width + n_keys + n_raw + n_identities;
     let mut rows = ArenaList::new_persistent(arena);
@@ -2054,7 +2211,10 @@ pub(crate) fn materialized_rows<'a>(
     // limit the scan stops once the limit has its rows, as PostgreSQL's
     // `Limit` stops pulling from the index scan.
     let scan_window = rank_window.filter(|_| {
-        (ordered_candidates.is_some() || join_presorted) && lock_pass.is_none() && !any_postponed
+        (ordered_candidates.is_some() || join_presorted)
+            && lock_pass.is_none()
+            && !any_postponed
+            && !statement.distinct
     });
     // Evaluate each projection once, in scan order. Encoded rows and their
     // references survive the scan's per-row scratch rewinds in the arena tail.
@@ -2247,7 +2407,25 @@ pub(crate) fn materialized_rows<'a>(
             txid,
             arena,
         )?;
-        live = sort_dedup_collated(storage, txid, arena, rows, width, &visible_collations)?;
+        live = match modeled
+            .as_ref()
+            .and_then(|model| model.group)
+            .filter(|group| group.distinct)
+        {
+            Some(group) => modeled_distinct(
+                storage,
+                txid,
+                arena,
+                rows,
+                &visible_collations,
+                group,
+                modeled
+                    .as_ref()
+                    .and_then(|model| model.plan.upper.group)
+                    .and_then(|chosen| chosen.input_sort),
+            )?,
+            None => sort_dedup_collated(storage, txid, arena, rows, width, &visible_collations)?,
+        };
     }
     let rows = &mut rows[..live];
 
@@ -2268,8 +2446,7 @@ pub(crate) fn materialized_rows<'a>(
         // A limit directly over the sort bounds it: like PostgreSQL's,
         // past twice the bound it keeps only a heap of the rows the limit
         // returns.
-        let bound =
-            rank_window.filter(|&bound| !statement.distinct && n_on == 0 && rows.len() > bound * 2);
+        let bound = rank_window.filter(|&bound| sort_bounded && rows.len() > bound * 2);
         let compare = |a: &&[u8], b: &&[u8]| {
             compare_materialized_rows(
                 storage,
@@ -2293,7 +2470,7 @@ pub(crate) fn materialized_rows<'a>(
         );
         // The memory PostgreSQL's sort reports, from the rows in arrival
         // order.
-        let bounded = rank_window.filter(|_| !statement.distinct && n_on == 0);
+        let bounded = rank_window.filter(|_| sort_bounded);
         let space = match bounded {
             Some(bound) if stages.sort.measured() => instrument::SortSpace::postgres_top_n(
                 rows,
@@ -3472,8 +3649,9 @@ pub(crate) fn materialized_stages(limited: bool) -> instrument::Stages {
     stages
 }
 
-/// Whether the ordered query reads a join PostgreSQL's join search plans,
-/// whose rows the in-memory path orders as PostgreSQL's tuplesort does
+/// Whether the ordered or `DISTINCT` query reads a join PostgreSQL's join
+/// search plans, whose rows the in-memory path orders as PostgreSQL's
+/// tuplesort does
 /// (`pg_tuplesort`, `pg_incremental_sort`): a spilling sort's order of
 /// equal rows would differ.
 pub(crate) fn sorts_modeled_join<'a>(
@@ -3486,7 +3664,7 @@ pub(crate) fn sorts_modeled_join<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<bool, SqlError> {
     Ok(outer.is_none()
-        && !statement.order_by.is_empty()
+        && (!statement.order_by.is_empty() || statement.distinct)
         && scope.n > 1
         && super::index_paths::join_query::modeled_join(
             storage, txid, statement, scope, params, arena,

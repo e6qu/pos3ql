@@ -5365,6 +5365,14 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
 impl Chained<'_, '_> {
+    /// Runs a lookup whose failure the caller drops, without leaving the
+    /// position its error recorded.
+    fn probe<R>(&self, lookup: impl FnOnce() -> R) -> R {
+        let saved = crate::sql::error_position::save_pending();
+        let result = lookup();
+        crate::sql::error_position::restore_pending(saved);
+        result
+    }
     /// Whether the inner row's column named `qualifier.name` answers a
     /// reference, rather than an enclosing PL/pgSQL variable of that name.
     fn inner_column_wins(&self, qualifier: Option<&str>, name: &str) -> bool {
@@ -5483,6 +5491,7 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
+        let saved = crate::sql::error_position::save_pending();
         match self.inner.resolve_column_type_unsuggested(qualifier, name) {
             Err(error)
                 if matches!(
@@ -5493,6 +5502,7 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             {
                 match self.outer {
                     Some(outer) if !outer.is_empty_scope() => {
+                        crate::sql::error_position::restore_pending(saved);
                         outer.resolve_column_type_unsuggested(qualifier, name)
                     }
                     _ => Err(error),
@@ -5569,6 +5579,7 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
     }
 
     fn lookup_unsuggested(&self, q: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        let saved = crate::sql::error_position::save_pending();
         match self.inner.lookup_unsuggested(q, name) {
             Ok(v) => {
                 if crate::sql::eval::column_precedes_variable(self.outer, q, name)? {
@@ -5591,33 +5602,39 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
                 Err(e)
             }
             Err(e) => match self.outer {
-                Some(o) => o.lookup_unsuggested(q, name),
+                Some(o) => {
+                    crate::sql::error_position::restore_pending(saved);
+                    o.lookup_unsuggested(q, name)
+                }
                 None => Err(e),
             },
         }
     }
     fn col_type(&self, q: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        self.resolve_column_type_unsuggested(q, name).ok()
+        self.probe(|| self.resolve_column_type_unsuggested(q, name).ok())
     }
     fn column_user_type(
         &self,
         q: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self.inner.resolve_column_type_unsuggested(q, name) {
-            Ok(_) if self.inner_column_wins(q, name) => self.inner.column_user_type(q, name),
-            Ok(_) => self.outer.and_then(|outer| outer.column_user_type(q, name)),
-            Err(error)
-                if matches!(
-                    error.sqlstate.as_str(),
-                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
-                ) && !q
-                    .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
-            {
-                self.outer.and_then(|outer| outer.column_user_type(q, name))
-            }
-            Err(_) => None,
-        }
+        self.probe(
+            || match self.inner.resolve_column_type_unsuggested(q, name) {
+                Ok(_) if self.inner_column_wins(q, name) => self.inner.column_user_type(q, name),
+                Ok(_) => self.outer.and_then(|outer| outer.column_user_type(q, name)),
+                Err(error)
+                    if matches!(
+                        error.sqlstate.as_str(),
+                        sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                    ) && !q.is_some_and(|qualifier| {
+                        self.inner.whole_row_type(qualifier).is_some()
+                    }) =>
+                {
+                    self.outer.and_then(|outer| outer.column_user_type(q, name))
+                }
+                Err(_) => None,
+            },
+        )
     }
 
     /// A relation of the inner scope shadows an outer variable of its name.
@@ -5631,44 +5648,50 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
     }
 
     fn column_type_oid(&self, q: Option<&str>, name: &str) -> Option<i32> {
-        match self.inner.resolve_column_type_unsuggested(q, name) {
-            Ok(_) if self.inner_column_wins(q, name) => self.inner.column_type_oid(q, name),
-            Ok(_) => self.outer.and_then(|outer| outer.column_type_oid(q, name)),
-            Err(error)
-                if matches!(
-                    error.sqlstate.as_str(),
-                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
-                ) && !q
-                    .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
-            {
-                self.outer.and_then(|outer| outer.column_type_oid(q, name))
-            }
-            Err(_) => None,
-        }
+        self.probe(
+            || match self.inner.resolve_column_type_unsuggested(q, name) {
+                Ok(_) if self.inner_column_wins(q, name) => self.inner.column_type_oid(q, name),
+                Ok(_) => self.outer.and_then(|outer| outer.column_type_oid(q, name)),
+                Err(error)
+                    if matches!(
+                        error.sqlstate.as_str(),
+                        sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                    ) && !q.is_some_and(|qualifier| {
+                        self.inner.whole_row_type(qualifier).is_some()
+                    }) =>
+                {
+                    self.outer.and_then(|outer| outer.column_type_oid(q, name))
+                }
+                Err(_) => None,
+            },
+        )
     }
 
     fn collation(&self, q: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        match self.inner.resolve_column_type_unsuggested(q, name) {
-            Ok(_) if self.inner_column_wins(q, name) => self.inner.collation(q, name),
-            Ok(_) => self
-                .outer
-                .map_or(crate::sql::ast::Collation::None, |outer| {
-                    outer.collation(q, name)
-                }),
-            Err(error)
-                if matches!(
-                    error.sqlstate.as_str(),
-                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
-                ) && !q
-                    .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
-            {
-                self.outer
+        self.probe(
+            || match self.inner.resolve_column_type_unsuggested(q, name) {
+                Ok(_) if self.inner_column_wins(q, name) => self.inner.collation(q, name),
+                Ok(_) => self
+                    .outer
                     .map_or(crate::sql::ast::Collation::None, |outer| {
                         outer.collation(q, name)
-                    })
-            }
-            Err(_) => crate::sql::ast::Collation::None,
-        }
+                    }),
+                Err(error)
+                    if matches!(
+                        error.sqlstate.as_str(),
+                        sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                    ) && !q.is_some_and(|qualifier| {
+                        self.inner.whole_row_type(qualifier).is_some()
+                    }) =>
+                {
+                    self.outer
+                        .map_or(crate::sql::ast::Collation::None, |outer| {
+                            outer.collation(q, name)
+                        })
+                }
+                Err(_) => crate::sql::ast::Collation::None,
+            },
+        )
     }
 
     fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {

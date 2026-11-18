@@ -279,7 +279,7 @@ pub(super) fn groups_for_mask<'a>(
                     }
                 }
                 for v in key_vals[..n_keys].iter_mut() {
-                    *v = crate::sql::eval::text_view(*v);
+                    *v = crate::sql::eval::group_key_view(*v);
                 }
                 for (value, &collation) in key_vals[..n_keys].iter().zip(group_collations) {
                     storage.validate_text_collation(collation, value)?;
@@ -400,7 +400,7 @@ pub(super) fn groups_for_mask<'a>(
                         }
                     }
                     for v in key_vals[..n_keys].iter_mut() {
-                        *v = crate::sql::eval::text_view(*v);
+                        *v = crate::sql::eval::group_key_view(*v);
                     }
                     for (value, &collation) in key_vals[..n_keys].iter().zip(group_collations) {
                         storage.validate_text_collation(collation, value)?;

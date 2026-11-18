@@ -21,12 +21,7 @@ pub(super) fn join_plan<'a>(
     txid: u32,
     scope: &QueryScope<'_>,
     model: &ModeledJoin<'_>,
-    (sort_keys, presorted, aggregate, group): (
-        PlanKeys,
-        Option<PlanKeys>,
-        Option<PlanNode>,
-        &[PlanNode],
-    ),
+    (sort_keys, presorted, group): (PlanKeys, Option<PlanKeys>, &[PlanNode]),
     block: query::instrument::BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
@@ -40,7 +35,6 @@ pub(super) fn join_plan<'a>(
         arena,
         top_depth: u8::from(model.plan.upper.limit.is_some())
             + u8::from(model.plan.upper.sort.is_some())
-            + u8::from(aggregate.is_some())
             + group.len() as u8,
         scanned: scanned_rels(&model.plan, model.plan.top),
     };
@@ -54,10 +48,6 @@ pub(super) fn join_plan<'a>(
         None => (top.rows, model.output_width as u32),
     };
     let mut depth = 0;
-    if let Some(node) = aggregate {
-        plan.push(PlanNode { depth, ..node })?;
-        depth += 1;
-    }
     if let Some((startup, total, rows)) = upper.limit {
         plan.push(PlanNode {
             name: StackStr::from_str("Limit"),
@@ -237,7 +227,7 @@ impl Writer<'_, '_, '_, '_> {
                 };
                 for member in &keys[..usize::from(key_count)] {
                     let mut text = StackStr::<512>::new();
-                    self.column(
+                    self.operand(
                         (usize::from(member.rel), usize::from(member.column)),
                         &mut text,
                     );
@@ -287,7 +277,7 @@ impl Writer<'_, '_, '_, '_> {
                 };
                 for member in &keys[..usize::from(key_count)] {
                     let mut text = StackStr::<512>::new();
-                    self.column(
+                    self.operand(
                         (usize::from(member.rel), usize::from(member.column)),
                         &mut text,
                     );
@@ -590,6 +580,25 @@ impl Writer<'_, '_, '_, '_> {
         );
     }
 
+    /// A column as an equality's operand: a type without its own equality
+    /// operator prints relabeled to the type whose operator compares it
+    /// (`varchar` as `text`, `cidr` as `inet`).
+    fn operand(&self, (table, column): (usize, usize), text: &mut StackStr<512>) {
+        let definition = self.scope.defs.stored(table).expect("a plain table");
+        let relabeled = match definition.columns()[column].ctype {
+            crate::sql::types::ColType::Varchar => Some("text"),
+            crate::sql::types::ColType::Cidr => Some("inet"),
+            _ => None,
+        };
+        let Some(relabeled) = relabeled else {
+            self.column((table, column), text);
+            return;
+        };
+        let _ = write!(text, "(");
+        self.column((table, column), text);
+        let _ = write!(text, ")::{relabeled}");
+    }
+
     /// The conditions of `clauses` ANDed, an equality with the column of
     /// `outer` first when given (`get_switched_clauses`), as written
     /// otherwise.
@@ -642,9 +651,9 @@ impl Writer<'_, '_, '_, '_> {
                 core::mem::swap(&mut left, &mut right);
             }
             let _ = write!(text, "(");
-            self.column(left, &mut text);
+            self.operand(left, &mut text);
             let _ = write!(text, " = ");
-            self.column(right, &mut text);
+            self.operand(right, &mut text);
             let _ = write!(text, ")");
         }
         if ids.len() > 1 {

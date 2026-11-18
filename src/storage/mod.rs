@@ -39876,6 +39876,18 @@ impl Storage {
                     },
                 )
             };
+            // `compute_tsvector_stats`: the most common lexemes.
+            if ctype == ColType::TsVector
+                && let Some(set) =
+                    statistics::elements::compute_lexemes(value_at, sampled, target, arena)?
+            {
+                let length = statistics::distribution::encoded_len(&[], &[], Some(&set));
+                let bytes = arena
+                    .alloc_slice_with(length, |_| 0u8)
+                    .map_err(|_| arena_full())?;
+                statistics::distribution::encode(None, &[], &[], Some(&set), bytes);
+                distribution = bytes;
+            }
             ColumnStatistics {
                 valid: true,
                 null_fraction,

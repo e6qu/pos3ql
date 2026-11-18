@@ -330,10 +330,75 @@ pub(crate) fn raw_value_length(value: &Datum<'_>) -> usize {
             }
         }
         Datum::Array { element, raw } => array_data_length(*element, raw),
+        Datum::TsVector(text) => tsvector_data_length(text.as_str()),
         other => {
             crate::storage::rowenc::encoded_len(core::slice::from_ref(other)).saturating_sub(3)
         }
     }
+}
+
+/// The canonical text of a `tsvector` as `(lexeme length, positions)` pairs,
+/// each lexeme quoted with embedded quotes doubled and backslashes escaped.
+pub(crate) fn tsvector_entries(text: &str, mut visit: impl FnMut(&[u8], usize)) {
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    let mut lexeme = [0u8; 2048];
+    while at < bytes.len() {
+        if bytes[at] == b' ' {
+            at += 1;
+            continue;
+        }
+        if bytes[at] != b'\'' {
+            return;
+        }
+        at += 1;
+        let mut length = 0usize;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' if at + 1 < bytes.len() => {
+                    at += 1;
+                }
+                b'\'' if bytes.get(at + 1) == Some(&b'\'') => {
+                    at += 1;
+                }
+                b'\'' => break,
+                _ => {}
+            }
+            if length < lexeme.len() {
+                lexeme[length] = bytes[at];
+            }
+            length += 1;
+            at += 1;
+        }
+        at += 1;
+        let mut positions = 0usize;
+        if bytes.get(at) == Some(&b':') {
+            positions = 1;
+            while at < bytes.len() && bytes[at] != b' ' {
+                if bytes[at] == b',' {
+                    positions += 1;
+                }
+                at += 1;
+            }
+        }
+        visit(&lexeme[..length.min(lexeme.len())], positions);
+    }
+}
+
+/// The bytes of a stored `tsvector` after its four-byte varlena header: a
+/// count, a four-byte entry per lexeme, then each lexeme and, when it has
+/// positions, its count and positions at two-byte alignment.
+fn tsvector_data_length(text: &str) -> usize {
+    let mut entries = 0usize;
+    let mut data = 0usize;
+    tsvector_entries(text, |lexeme, positions| {
+        entries += 1;
+        data += lexeme.len();
+        if positions > 0 {
+            data = data.next_multiple_of(2) + 2 + 2 * positions;
+        }
+    });
+    4 + 4 * entries + data
 }
 
 /// The bytes of a PostgreSQL array after its four-byte varlena header

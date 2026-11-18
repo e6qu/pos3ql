@@ -261,3 +261,197 @@ pub(crate) fn compute<'a>(
         counts: histogram,
     }))
 }
+
+/// `compute_tsvector_stats` (`ts_typanalyze.c`): the most common lexemes of a
+/// `tsvector` column with their frequencies among the non-NULL rows,
+/// by lossy counting over the sample in order; the lexemes sort by length,
+/// then bytes. `None` when every row is NULL.
+pub(crate) fn compute_lexemes<'a>(
+    value_at: &mut dyn FnMut(usize) -> Result<Datum<'a>, SqlError>,
+    sampled: usize,
+    target: usize,
+    arena: &'a Arena,
+) -> Result<Option<ElementSet<'a>>, SqlError> {
+    let arena_full = crate::sql::eval::arena_full;
+    let mut num_mcelem = target * 10;
+    let bucket_width = ((num_mcelem + 10) * 1000 / 7).max(1);
+    // Every lexeme occurrence the sample can add, and the bytes they hold.
+    let (mut capacity, mut bytes_needed) = (0usize, 0usize);
+    let mut nonnull = 0usize;
+    for row in 0..sampled {
+        if let Datum::TsVector(text) = value_at(row)? {
+            nonnull += 1;
+            super::scalar::tsvector_entries(text.as_str(), |lexeme, _| {
+                capacity += 1;
+                bytes_needed += lexeme.len();
+            });
+        }
+    }
+    if nonnull == 0 {
+        return Ok(None);
+    }
+    #[derive(Clone, Copy)]
+    struct Lexeme {
+        at: usize,
+        length: usize,
+        frequency: u32,
+        delta: u32,
+        live: bool,
+    }
+    let storage = arena
+        .alloc_slice_with(bytes_needed.max(1), |_| 0u8)
+        .map_err(|_| arena_full())?;
+    let tracked = arena
+        .alloc_slice_with(capacity.max(1), |_| Lexeme {
+            at: 0,
+            length: 0,
+            frequency: 0,
+            delta: 0,
+            live: false,
+        })
+        .map_err(|_| arena_full())?;
+    let table_size = (capacity.max(1) * 2).next_power_of_two();
+    let table = arena
+        .alloc_slice_with(table_size, |_| 0u32)
+        .map_err(|_| arena_full())?;
+    let hash = |lexeme: &[u8]| -> usize {
+        let mut value = 0xcbf2_9ce4_8422_2325u64;
+        for &byte in lexeme {
+            value = (value ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+        value as usize
+    };
+    let (mut used, mut stored) = (0usize, 0usize);
+    let mut b_current = 1u32;
+    let mut lexeme_no = 0usize;
+    for row in 0..sampled {
+        crate::sql::query::check_timeout()?;
+        let Datum::TsVector(text) = value_at(row)? else {
+            continue;
+        };
+        super::scalar::tsvector_entries(text.as_str(), |lexeme, _| {
+            let mut slot = hash(lexeme) & (table_size - 1);
+            let found = loop {
+                let held = table[slot];
+                if held == 0 {
+                    break None;
+                }
+                let entry = tracked[held as usize - 1];
+                if entry.live && &storage[entry.at..entry.at + entry.length] == lexeme {
+                    break Some(held as usize - 1);
+                }
+                slot = (slot + 1) & (table_size - 1);
+            };
+            match found {
+                Some(at) => tracked[at].frequency += 1,
+                None => {
+                    storage[stored..stored + lexeme.len()].copy_from_slice(lexeme);
+                    tracked[used] = Lexeme {
+                        at: stored,
+                        length: lexeme.len(),
+                        frequency: 1,
+                        delta: b_current - 1,
+                        live: true,
+                    };
+                    stored += lexeme.len();
+                    used += 1;
+                    table[slot] = used as u32;
+                }
+            }
+            lexeme_no += 1;
+            if lexeme_no.is_multiple_of(bucket_width) {
+                for entry in &mut tracked[..used] {
+                    if entry.live && entry.frequency + entry.delta <= b_current {
+                        entry.live = false;
+                    }
+                }
+                table.fill(0);
+                for (at, entry) in tracked[..used].iter().enumerate() {
+                    if !entry.live {
+                        continue;
+                    }
+                    let mut slot =
+                        hash(&storage[entry.at..entry.at + entry.length]) & (table_size - 1);
+                    while table[slot] != 0 {
+                        slot = (slot + 1) & (table_size - 1);
+                    }
+                    table[slot] = at as u32 + 1;
+                }
+                b_current += 1;
+            }
+        });
+    }
+    let storage: &'a [u8] = storage;
+    let cutoff = 9 * lexeme_no / bucket_width;
+    let order = arena
+        .alloc_slice_with(used.max(1), |_| 0usize)
+        .map_err(|_| arena_full())?;
+    let mut keep = 0usize;
+    let (mut minfreq, mut maxfreq) = (lexeme_no as u32, 0u32);
+    for (at, entry) in tracked[..used].iter().enumerate() {
+        if entry.live && entry.frequency as usize > cutoff {
+            order[keep] = at;
+            keep += 1;
+            minfreq = minfreq.min(entry.frequency);
+            maxfreq = maxfreq.max(entry.frequency);
+        }
+    }
+    if num_mcelem < keep {
+        order[..keep]
+            .sort_by(|&left, &right| tracked[right].frequency.cmp(&tracked[left].frequency));
+        minfreq = tracked[order[num_mcelem - 1]].frequency;
+    } else {
+        num_mcelem = keep;
+    }
+    if num_mcelem == 0 {
+        return Ok(Some(ElementSet {
+            values: &[],
+            frequencies: &[],
+            counts: &[],
+        }));
+    }
+    let chosen = &mut order[..num_mcelem];
+    chosen.sort_by(|&left, &right| {
+        let (left, right) = (tracked[left], tracked[right]);
+        left.length.cmp(&right.length).then_with(|| {
+            storage[left.at..left.at + left.length].cmp(&storage[right.at..right.at + right.length])
+        })
+    });
+    let mut failure = None;
+    let values = arena
+        .alloc_slice_with(num_mcelem, |at| {
+            let entry = tracked[chosen[at]];
+            match core::str::from_utf8(&storage[entry.at..entry.at + entry.length]) {
+                Ok(text) => Datum::Text(text),
+                Err(_) => {
+                    failure = Some(());
+                    Datum::Null
+                }
+            }
+        })
+        .map_err(|_| arena_full())?;
+    if failure.is_some() {
+        return Err(crate::sql_err!(
+            crate::sql::eval::sqlstate::INTERNAL_ERROR,
+            "tsvector lexeme is not valid text"
+        ));
+    }
+    let nonnull = nonnull as f64;
+    let numbers = arena
+        .alloc_slice_with(num_mcelem + 2, |at| {
+            let count = if at < num_mcelem {
+                tracked[chosen[at]].frequency
+            } else if at == num_mcelem {
+                minfreq
+            } else {
+                maxfreq
+            };
+            (f64::from(count) / nonnull) as f32
+        })
+        .map_err(|_| arena_full())?;
+    Ok(Some(ElementSet {
+        values,
+        frequencies: numbers,
+        counts: &[],
+    }))
+}

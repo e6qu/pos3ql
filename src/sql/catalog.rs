@@ -18651,6 +18651,7 @@ fn pg_stats<'a>(
                 } else {
                     column_statistics.distinct_values as f32
                 };
+                let mut element_slots = (Datum::Null, Datum::Null, Datum::Null);
                 let (most_common, frequencies, histogram, correlation) =
                     match statistics.columns.distribution(*record) {
                         Some(distribution) => {
@@ -18665,10 +18666,12 @@ fn pg_stats<'a>(
                                     ctype.name()
                                 )
                             })?;
+                            element_slots = statistics_element_slots(distribution, ctype, arena)?;
                             statistics_slots(distribution, ctype, element, arena)?
                         }
                         None => (Datum::Null, Datum::Null, Datum::Null, Datum::Null),
                     };
+                let (common_elements, element_frequencies, element_counts) = element_slots;
                 rows[count] = row(
                     &[
                         text(index.schema.as_str(), arena)?,
@@ -18682,9 +18685,9 @@ fn pg_stats<'a>(
                         frequencies,
                         histogram,
                         correlation,
-                        Datum::Null,
-                        Datum::Null,
-                        Datum::Null,
+                        common_elements,
+                        element_frequencies,
+                        element_counts,
                         Datum::Null,
                         Datum::Null,
                         Datum::Null,
@@ -18788,8 +18791,11 @@ fn statistics_element_slots<'a>(
     arena: &'a Arena,
 ) -> Result<(Datum<'a>, Datum<'a>, Datum<'a>), SqlError> {
     use super::types::ArrElem;
-    let ColType::Array(element) = ctype else {
-        return Ok((Datum::Null, Datum::Null, Datum::Null));
+    let element = match ctype {
+        ColType::Array(element) => element,
+        // The lexemes of a `tsvector` are `text` values.
+        ColType::TsVector => ArrElem::Text,
+        _ => return Ok((Datum::Null, Datum::Null, Datum::Null)),
     };
     let numbers = |count: usize, at: &dyn Fn(usize) -> f32| -> Result<Datum<'a>, SqlError> {
         if count == 0 {

@@ -3229,47 +3229,46 @@ fn grouped<'a>(
         }
         (keys, lead, presorted)
     };
-    let sort_input =
-        |input: &Candidate, reordered: bool| -> Option<(Candidate, Option<(f64, f64, u8)>)> {
-            let (_, keys, presorted) = arrangement(input, reordered);
-            if sort_len == 0 || presorted >= sort_len {
-                return Some((*input, None));
-            }
-            let incremental = presorted > 0 && methods.incremental_sort;
-            if !input.same_scan(&cheapest) && !incremental {
-                return None;
-            }
-            Some(if incremental {
-                let (startup, total) = incremental_sort_cost(
-                    input,
-                    rows,
-                    width,
-                    None,
-                    estimate_groups(planner, &keys[..presorted], rows),
-                    costs,
-                );
-                (
-                    Candidate {
-                        startup,
-                        total,
-                        ..*input
-                    },
-                    Some((startup, total, presorted as u8)),
-                )
-            } else {
-                let (startup, run) = tuplesort_cost(rows, width, None, costs);
-                let startup = startup + input.total;
-                (
-                    Candidate {
-                        startup,
-                        total: startup + run,
-                        disabled: input.disabled + u32::from(!methods.sort),
-                        ..*input
-                    },
-                    Some((startup, startup + run, 0)),
-                )
-            })
-        };
+    let sort_input = |input: &Candidate, reordered: bool| -> Option<SortedInput> {
+        let (_, keys, presorted) = arrangement(input, reordered);
+        if sort_len == 0 || presorted >= sort_len {
+            return Some((*input, None));
+        }
+        let incremental = presorted > 0 && methods.incremental_sort;
+        if !input.same_scan(&cheapest) && !incremental {
+            return None;
+        }
+        Some(if incremental {
+            let (startup, total) = incremental_sort_cost(
+                input,
+                rows,
+                width,
+                None,
+                estimate_groups(planner, &keys[..presorted], rows),
+                costs,
+            );
+            (
+                Candidate {
+                    startup,
+                    total,
+                    ..*input
+                },
+                Some((startup, total, presorted as u8)),
+            )
+        } else {
+            let (startup, run) = tuplesort_cost(rows, width, None, costs);
+            let startup = startup + input.total;
+            (
+                Candidate {
+                    startup,
+                    total: startup + run,
+                    disabled: input.disabled + u32::from(!methods.sort),
+                    ..*input
+                },
+                Some((startup, startup + run, 0)),
+            )
+        })
+    };
     let mut sorted_paths = [None::<Candidate>; MAX_CANDIDATES];
     let mut sorted_count = 0;
     for input in kept {
@@ -4121,6 +4120,10 @@ pub(super) struct Upper {
     pub(super) sort_cost: Option<(f64, f64)>,
     pub(super) limit_cost: Option<(f64, f64, f64)>,
 }
+
+/// A grouping's input path with the sort it needs: the sorted path, and the
+/// sort's startup and total cost with the leading keys the path presorts.
+type SortedInput = (Candidate, Option<(f64, f64, u8)>);
 
 /// `cost_incremental_sort` of `path`'s `rows` rows of `width` bytes sorted
 /// in `groups` groups of equal presorted keys, `limit_tuples` of them

@@ -2847,6 +2847,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             self.hooks,
             outer,
             PaxReadDemand::full_row(PaxFullRowReason::WildcardProjection),
+            scan.path,
             &mut |row| {
                 let columns = row.table_values(0).unwrap_or(&[]);
                 let values = self

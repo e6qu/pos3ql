@@ -85,11 +85,11 @@ impl<'a> ModeledRel<'a> {
             .iter()
             .enumerate()
         {
-            if (1 << rel | self.scan.param_nulling[at]) & !candidate.param == 0 {
+            if (1 << rel | self.scan.param_others[at]) & !candidate.param == 0 {
                 if self.scan.clause_params & 1 << at != 0 {
                     scan.clause_params |= 1 << scan.param_count;
                 }
-                scan.param_nulling[usize::from(scan.param_count)] = self.scan.param_nulling[at];
+                scan.param_others[usize::from(scan.param_count)] = self.scan.param_others[at];
                 scan.params[usize::from(scan.param_count)] = (class, rel);
                 joins[usize::from(scan.param_count)] = self.joins[at];
                 scan.param_count += 1;
@@ -615,22 +615,33 @@ fn nonnullable(
     }
 }
 
-/// The columns `expression` reads, or `None` when it reads something other
-/// than the query's base columns.
+/// The columns `expression` reads, an aggregate's `ORDER BY` and `FILTER`
+/// included, or `None` when it reads something other than the query's base
+/// columns.
 fn qual_vars(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<VarList> {
     let mut vars = VarList::default();
     let mut ok = true;
-    expression.for_each_column_reference(&mut |qualifier, name| match scope
-        .probe_column(qualifier, name)
-    {
+    let mut add = |qualifier: Option<&str>, name: &str| match scope.probe_column(qualifier, name) {
         Some(ResolvedColumn::Table(table, column)) if column < 64 => {
             ok &= vars.add((table as u8, column as u16)).is_some();
         }
         _ => ok = false,
-    });
+    };
+    expression.for_each_column_reference(&mut add);
     let mut whole_row = false;
     let _ = super::super::walk_expression_tree(expression, &mut |node| {
         whole_row |= matches!(node, Expr::WholeRow(_));
+        if let Expr::Call {
+            order_by, filter, ..
+        } = node
+        {
+            for order in order_by.iter() {
+                order.expression.for_each_column_reference(&mut add);
+            }
+            if let Some(filter) = filter {
+                filter.for_each_column_reference(&mut add);
+            }
+        }
     });
     (ok && !whole_row && !expression.contains_subquery()).then_some(vars)
 }
@@ -755,14 +766,12 @@ impl<'a> Expressions<'a> {
     }
 
     /// The class member `expression` is, with its type and collation: a
-    /// column, or an expression of one relation's columns (of `several`
-    /// relations', for a join condition) of a type the model hashes and
-    /// merges; `None` for anything else.
+    /// column, or an expression of one or several relations' columns of a
+    /// type the model hashes and merges; `None` for anything else.
     fn member(
         &mut self,
         scope: &QueryScope<'a>,
         expression: &'a Expr<'a>,
-        several: bool,
     ) -> Result<Option<(Member, ColType, crate::sql::ast::Collation)>, SqlError> {
         if let Some((table, column)) = column_of(scope, expression) {
             let meta = &scope.defs.stored(table).expect("plain table").columns()[column];
@@ -780,7 +789,6 @@ impl<'a> Expressions<'a> {
             .iter()
             .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
         if rels == 0
-            || (rels.count_ones() > 1 && !several)
             || expression.contains_volatile_function().is_some()
             || crate::sql::query::expr_has_window(expression)
             || crate::sql::query::expression_has_project_set(expression, self.storage, self.txid)
@@ -1007,11 +1015,11 @@ fn analyze_qual<'a>(
             // one relation's columns, or a constant.
             let one = match plain_constant(left) {
                 Some(_) => None,
-                None => expressions.member(scope, left, true)?,
+                None => expressions.member(scope, left)?,
             };
             let two = match plain_constant(right) {
                 Some(_) => None,
-                None => expressions.member(scope, right, true)?,
+                None => expressions.member(scope, right)?,
             };
             match (one, two) {
                 (
@@ -2111,6 +2119,9 @@ pub(crate) fn modeled_join<'a>(
     for placed in prepared.placed() {
         let (table, restriction) = match *placed {
             Placed::Restriction { rel, qual } => (usize::from(rel), quals[usize::from(qual)]),
+            // An expression of several relations equated with the
+            // constant filters their join, below.
+            Placed::Implied { member, .. } if member.reads != 0 => continue,
             Placed::Implied { member, class } => {
                 let Some(value) = constant_of(usize::from(class)) else {
                     return Ok(None);
@@ -2151,9 +2162,38 @@ pub(crate) fn modeled_join<'a>(
         source: None,
     }; MAX_CLAUSES];
     let mut clause_count = 0;
+    // The equalities of expressions of several relations with their
+    // class's constant, conditions after the query's.
+    let mut implied = [&Expr::Null; MAX_JOIN_EXPRESSIONS];
+    let mut implied_count = 0;
     for placed in prepared.placed() {
-        let Placed::Join(join) = *placed else {
-            continue;
+        let join = match *placed {
+            Placed::Join(join) => join,
+            // `process_implied_equality` of a member reading several
+            // relations: a join clause of them all.
+            Placed::Implied { member, class } if member.reads != 0 => {
+                let Some(value) = constant_of(usize::from(class)) else {
+                    return Ok(None);
+                };
+                if implied_count == implied.len() {
+                    return Ok(None);
+                }
+                implied[implied_count] =
+                    equals_constant(scope, &expressions, member, value, arena)?;
+                implied_count += 1;
+                let relids = member.relids();
+                join_tree::JoinQual {
+                    qual: (quals.len() + implied_count - 1) as u8,
+                    relids,
+                    required: relids,
+                    pushed_down: true,
+                    clone: super::joins::CloneKind::None,
+                    incompatible: 0,
+                    outer_relids: 0,
+                    merge: None,
+                }
+            }
+            _ => continue,
         };
         if clause_count == MAX_CLAUSES {
             return Ok(None);
@@ -2188,12 +2228,22 @@ pub(crate) fn modeled_join<'a>(
             outer_relids: join.outer_relids,
             operands: None,
             other: super::joins::OtherShape::Plain,
-            constant: matches!(quals[usize::from(join.qual)], Expr::Bool(true)),
+            constant: quals
+                .get(usize::from(join.qual))
+                .is_some_and(|qual| matches!(qual, Expr::Bool(true))),
             source: Some(u16::from(join.qual)),
         };
         clause_count += 1;
     }
     let placed_join_count = clause_count;
+    let quals = &*arena
+        .alloc_slice_with(quals.len() + implied_count, |at| {
+            match at.checked_sub(quals.len()) {
+                Some(extra) => implied[extra],
+                None => quals[at],
+            }
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?;
     // The outer joins that can null each relation (`nulling_relids`).
     let mut nulling_relids = [0 as Relids; MAX_JOIN_RELS];
     for special in &prepared.specials[..prepared.special_count] {
@@ -2208,6 +2258,13 @@ pub(crate) fn modeled_join<'a>(
             }
         }
     }
+    // The outer joins that null any of the base relations `relids`.
+    let member_nulling = |relids: Relids| {
+        (0..n)
+            .filter(|&table| relids & 1 << table != 0)
+            .fold(0, |nulling, table| nulling | nulling_relids[table])
+            & !BASE_RELIDS
+    };
     // The query's pathkeys (`make_pathkeys_for_sortclauses`): each `ORDER
     // BY` column's class, a new one when no class holds the column as the
     // query's output reads it, a key of a class already ordered or of a
@@ -2318,6 +2375,7 @@ pub(crate) fn modeled_join<'a>(
     let mut expression_classes = [(0u8, &Expr::Null); super::joins::MAX_KEYS];
     let mut expression_class_count = 0;
     for &(target, flags, item) in sort_entries {
+        let mut several: Relids = 0;
         let (table, column) = match target {
             SortTarget::Column(table, column) => (table, column),
             SortTarget::Expression(expression) => {
@@ -2328,8 +2386,9 @@ pub(crate) fn modeled_join<'a>(
                 // An expression of one relation's columns sorting the joined
                 // rows is a member of its class (`get_eclass_for_sort_expr`).
                 if !(grouped || aggregated || windowed)
-                    && let Some((member, ..)) = expressions.member(scope, expression, false)?
+                    && let Some((member, ..)) = expressions.member(scope, expression)?
                 {
+                    several = member.reads;
                     (usize::from(member.rel), usize::from(member.column))
                 } else {
                     let class = match expression_classes[..expression_class_count]
@@ -2368,8 +2427,8 @@ pub(crate) fn modeled_join<'a>(
         let member = Member {
             rel: table as u8,
             column: column as u16,
-            nulling: nulling_relids[table] & !BASE_RELIDS,
-            reads: 0,
+            nulling: member_nulling(1 << table | several),
+            reads: several,
         };
         let class = match extended[..class_count]
             .iter()
@@ -2549,14 +2608,14 @@ pub(crate) fn modeled_join<'a>(
                 }
                 // A column, or an expression of one relation's columns
                 // (`get_eclass_for_sort_expr`).
-                let Some((member, ctype, _)) = expressions.member(scope, expression, false)? else {
+                let Some((member, ctype, _)) = expressions.member(scope, expression)? else {
                     return Ok(None);
                 };
                 if (member.expression_id().is_none() && member.column >= 64) || !joinable(ctype) {
                     return Ok(None);
                 }
                 let member = Member {
-                    nulling: nulling_relids[usize::from(member.rel)] & !BASE_RELIDS,
+                    nulling: member_nulling(member.base_relids()),
                     ..member
                 };
                 let class = match extended[..class_count]
@@ -2697,7 +2756,7 @@ pub(crate) fn modeled_join<'a>(
                 let member = match column_of(scope, expression) {
                     Some((table, column)) => Member::plain(table as u8, column as u16),
                     None if !(grouped || aggregated) => {
-                        match expressions.member(scope, expression, false)? {
+                        match expressions.member(scope, expression)? {
                             Some((member, ..)) => member,
                             None => return Ok(None),
                         }
@@ -2717,7 +2776,7 @@ pub(crate) fn modeled_join<'a>(
                 let member = match column_of(scope, order.expression) {
                     Some((table, column)) => Member::plain(table as u8, column as u16),
                     None if !(grouped || aggregated) => {
-                        match expressions.member(scope, order.expression, false)? {
+                        match expressions.member(scope, order.expression)? {
                             Some((member, ..)) => member,
                             None => return Ok(None),
                         }
@@ -2739,13 +2798,12 @@ pub(crate) fn modeled_join<'a>(
                     if grouped || aggregated {
                         return Ok(None);
                     }
-                    let Some((member, ..)) = expressions.member(scope, key.expression, false)?
-                    else {
+                    let Some((member, ..)) = expressions.member(scope, key.expression)? else {
                         return Ok(None);
                     };
                     let id = member.expression_id().expect("an expression member");
                     let member = Member {
-                        nulling: nulling_relids[usize::from(member.rel)] & !BASE_RELIDS,
+                        nulling: member_nulling(member.base_relids()),
                         ..member
                     };
                     if window_expressions & 1 << id == 0 {
@@ -2998,7 +3056,7 @@ pub(crate) fn modeled_join<'a>(
         params: [(0, 0); MAX_JOIN_PARAMS],
         param_count: 0,
         clause_params: 0,
-        param_nulling: [0; MAX_JOIN_PARAMS],
+        param_others: [0; MAX_JOIN_PARAMS],
         classes: [NO_CLASS; 64],
         merging: 0,
         order: Keys::NONE,
@@ -3174,7 +3232,7 @@ pub(crate) fn modeled_join<'a>(
                 return Ok(None);
             }
             scan.params[at] = (own_class, other_rel);
-            scan.param_nulling[at] = clause.relids & !BASE_RELIDS;
+            scan.param_others[at] = clause.relids & !BASE_RELIDS;
             scan.clause_params |= 1 << at;
             join_conjuncts[table][at] = expression;
             param_clause[table][at] = Some(id as u8);
@@ -3196,29 +3254,10 @@ pub(crate) fn modeled_join<'a>(
                 continue;
             }
             for other in class.members() {
-                if other.rel == own.rel && other.reads == 0 {
-                    continue;
-                }
-                // An index scan parameterized by an expression of several
-                // relations needs them all outside it, a parameterization
-                // the model's scans do not take.
-                if other.reads != 0 {
-                    let key = match own.expression_id() {
-                        Some(id) => expression_keys[id].map(usize::from),
-                        None => Some(usize::from(own.column)),
-                    };
-                    let slot = scope.slots[table];
-                    let Some(catalog) = super::paths::catalog_indexes(storage, txid, slot, arena)?
-                    else {
-                        return Ok(None);
-                    };
-                    if catalog.iter().any(|index| {
-                        key.is_some_and(|key| {
-                            index.n_cols > 0 && usize::from(index.columns[0]) == key
-                        })
-                    }) {
-                        return Ok(None);
-                    }
+                // A member reading the relation is no value from outside it
+                // (`generate_implied_equalities_for_column`); an expression
+                // of several relations parameterizes the scan by them all.
+                if other.base_relids() & relids != 0 {
                     continue;
                 }
                 let at = usize::from(scan.param_count);
@@ -3226,7 +3265,7 @@ pub(crate) fn modeled_join<'a>(
                     return Ok(None);
                 }
                 scan.params[at] = (class_id as u8, other.rel);
-                scan.param_nulling[at] = other.nulling;
+                scan.param_others[at] = other.nulling | other.reads;
                 join_conjuncts[table][at] = equality(scope, &expressions, *own, *other, arena)?;
                 scan.param_count += 1;
             }
@@ -3587,7 +3626,7 @@ pub(crate) fn modeled_join<'a>(
             let params = &rel.scan.params[..usize::from(rel.scan.param_count)];
             for (at, (&(_, other), clause)) in params.iter().zip(param_clause[table]).enumerate() {
                 if let Some(id) = clause
-                    && (1 << other | rel.scan.param_nulling[at]) & !param == 0
+                    && (1 << other | rel.scan.param_others[at]) & !param == 0
                 {
                     list.push_id(id)?;
                 }
@@ -3741,10 +3780,11 @@ pub(crate) fn modeled_join<'a>(
                 .iter()
                 .position(|member| usize::from(member.rel) == table && member.reads == 0)
                 .expect("a member of the relation") as u8;
+            let reads = rel.scan.param_others[at] & BASE_RELIDS;
             let other = members
                 .iter()
-                .position(|member| member.rel == other_rel && member.reads == 0)
-                .expect("a member of the other relation") as u8;
+                .position(|member| member.rel == other_rel && member.reads == reads)
+                .expect("a member of the other relations") as u8;
             let reversed = clauses[..clause_count].iter().any(|clause| {
                 clause.source.is_none()
                     && clause.form
@@ -3783,6 +3823,17 @@ pub(crate) fn modeled_join<'a>(
     let mut variables = [None::<super::ExpressionVariables<'a>>; MAX_JOIN_RELS];
     let mut expression_columns = [0usize; MAX_JOIN_EXPRESSIONS];
     let mut expression_vars = [VarList::default(); MAX_JOIN_EXPRESSIONS];
+    // An expression of several relations has no variable of its own:
+    // `estimate_num_groups` counts the columns it reads.
+    for (id, vars) in expression_vars
+        .iter_mut()
+        .enumerate()
+        .take(expressions.count)
+    {
+        if expressions.get(id).reads != 0 {
+            *vars = expressions.get(id).vars;
+        }
+    }
     for table in 0..n {
         let ids = (0..expressions.count).filter(|&id| expressions.get(id).of(table));
         if ids.clone().next().is_none() {

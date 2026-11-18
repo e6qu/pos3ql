@@ -2013,9 +2013,6 @@ impl Prep<'_> {
                 if members.iter().any(|member| member.nulling != 0) {
                     return Err("a constant's class of a nulled column");
                 }
-                if members.iter().any(|member| member.reads != 0) {
-                    return Err("a constant's class of an expression of several relations");
-                }
                 // One `column = constant`: the clause itself.
                 if members.len() == 1 && held.sources == 1 && !held.derived {
                     let (qual, ..) = held.constant.expect("a constant");
@@ -2030,6 +2027,15 @@ impl Prep<'_> {
                         member,
                         class: at as u8,
                     })?;
+                    // A member of several relations is a join clause of
+                    // them, which reads its columns there.
+                    if member.reads != 0
+                        && let Some(id) = member.expression_id()
+                    {
+                        for &var in self.tree.expression_vars[id].as_slice() {
+                            self.note_needed(var, member.base_relids(), NO_QUAL)?;
+                        }
+                    }
                 }
                 continue;
             }

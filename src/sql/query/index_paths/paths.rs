@@ -302,7 +302,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     /// The other relation join clause `at` reads, by bit.
     fn join_rel(&self, at: usize) -> u32 {
         let scan = self.join.expect("a join clause").scan;
-        1 << scan.params[at].1 | scan.param_nulling[at]
+        1 << scan.params[at].1 | scan.param_others[at]
     }
 
     /// The relations the join clauses among `clauses` read.

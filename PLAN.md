@@ -1121,9 +1121,17 @@ evaluates it over their rows: it hashes or merges that join with the other
 side (a sort above the join computing it), estimated without statistics
 (`DEFAULT_NUM_DISTINCT`, `estimate_hash_bucket_stats`' default, the
 expression's columns counted per relation for groups,
-`differential_exact/932`). Remaining for that search: an index scan
-parameterized by such an expression (`0A000` where an index could take
-it), a class holding both such an expression and a constant, conditions
+`differential_exact/932`). Such an expression also parameterizes an
+index scan of its class's other member, run by a nested loop over the
+join of its relations (`generate_implied_equalities_for_column`), filters
+that join when its class holds a constant
+(`generate_base_implied_equalities_const`), and keys an `ORDER BY`, window
+or ordered aggregate (`differential_exact/933`). A nested loop's
+parameterized scan reads only the rows an index finds for the outer row's
+keys, except under `EXPLAIN ANALYZE`, which reads the relation's every
+row per loop to count the path's own reads, so many loops over a large
+relation exhaust the statement arena (`54000`). Remaining for that search:
+`GROUP BY` of an expression (`0A000` when costs print), conditions
 comparing expressions of several relations other than by a mergeable
 equality (`COALESCE(a.id, 0) < b.id`), an `OR`
 of join conditions that a semi or anti join evaluates

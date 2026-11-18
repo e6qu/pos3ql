@@ -13038,11 +13038,11 @@ fn rewrite_sublinks<'a>(
         Failed,
     > {
         let replaced = match node {
-            Expr::Subquery(select) => Expr::Subquery(nested(select).map_err(&set_aside)?),
-            Expr::Exists(select) => Expr::Exists(nested(select).map_err(&set_aside)?),
-            Expr::ArraySubquery(select) => Expr::ArraySubquery(nested(select).map_err(&set_aside)?),
+            Expr::Subquery(select) => Expr::Subquery(nested(select).map_err(set_aside)?),
+            Expr::Exists(select) => Expr::Exists(nested(select).map_err(set_aside)?),
+            Expr::ArraySubquery(select) => Expr::ArraySubquery(nested(select).map_err(set_aside)?),
             Expr::RowSubquery { select, arity } => Expr::RowSubquery {
-                select: nested(select).map_err(&set_aside)?,
+                select: nested(select).map_err(set_aside)?,
                 arity: *arity,
             },
             Expr::InSubquery {
@@ -13050,9 +13050,8 @@ fn rewrite_sublinks<'a>(
                 select,
                 negated,
             } => Expr::InSubquery {
-                operand: rewrite_sublinks(operand, row, arena, storage, txid)
-                    .map_err(&set_aside)?,
-                select: nested(select).map_err(&set_aside)?,
+                operand: rewrite_sublinks(operand, row, arena, storage, txid).map_err(set_aside)?,
+                select: nested(select).map_err(set_aside)?,
                 negated: *negated,
             },
             Expr::QuantifiedSubquery {
@@ -13061,10 +13060,9 @@ fn rewrite_sublinks<'a>(
                 select,
                 all,
             } => Expr::QuantifiedSubquery {
-                operand: rewrite_sublinks(operand, row, arena, storage, txid)
-                    .map_err(&set_aside)?,
+                operand: rewrite_sublinks(operand, row, arena, storage, txid).map_err(set_aside)?,
                 operator: *operator,
-                select: nested(select).map_err(&set_aside)?,
+                select: nested(select).map_err(set_aside)?,
                 all: *all,
             },
             _ => return Ok(None),

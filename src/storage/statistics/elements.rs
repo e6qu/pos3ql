@@ -139,18 +139,18 @@ pub(crate) fn compute<'a>(
             distinct_count += 1;
             element_no += 1;
             // Prune after each bucket (`prune_element_hashtable`).
-            if element_no % bucket_width == 0 {
+            if element_no.is_multiple_of(bucket_width) {
                 for entry in &mut tracked[..used] {
                     if entry.live && entry.frequency + entry.delta <= b_current {
                         entry.live = false;
                     }
                 }
                 table.fill(0);
-                for at in 0..used {
-                    if !tracked[at].live {
+                for (at, entry) in tracked[..used].iter().enumerate() {
+                    if !entry.live {
                         continue;
                     }
-                    let mut slot = (hash(&tracked[at].value)? as usize) & (table_size - 1);
+                    let mut slot = (hash(&entry.value)? as usize) & (table_size - 1);
                     while table[slot] != 0 {
                         slot = (slot + 1) & (table_size - 1);
                     }

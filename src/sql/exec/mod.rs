@@ -66994,6 +66994,16 @@ pub(crate) fn drop_type(
         let mut count = 0;
         for name in names {
             let (class, slot, oid) = if let Some(slot) = match name.schema {
+                Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
+                None => storage.resolve_domain_slot(name.name, txn.txid),
+            } {
+                // `DROP TYPE` drops a domain as `DROP DOMAIN` does.
+                (
+                    crate::storage::AccessClass::Domain,
+                    slot,
+                    super::catalog::domain_oid(storage, slot, txn.txid),
+                )
+            } else if let Some(slot) = match name.schema {
                 Some(schema) => storage.enum_slot(schema, name.name, txn.txid),
                 None => storage.resolve_enum_slot(name.name, txn.txid),
             } {
@@ -67051,6 +67061,44 @@ pub(crate) fn drop_type(
     })();
     let outcome = run_reported_drop(report, responder, |responder| {
         for name in names {
+            let domain = match name.schema {
+                Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
+                None => storage.resolve_domain_slot(name.name, txn.txid),
+            };
+            if let Some(slot) = domain {
+                let object = crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Domain,
+                    slot: slot as u16,
+                };
+                if let Err(error) = storage.require_not_extension_member(object, txn.txid, "type") {
+                    return sql_fail(error);
+                }
+                if let Err(error) = storage.require_owner(object, txn.txid, "type") {
+                    return sql_fail(error);
+                }
+                let selected = match arena
+                    .alloc_slice_with(storage.domain_count(), |candidate| candidate == slot)
+                {
+                    Ok(values) => values,
+                    Err(_) => return sql_fail(arena_full()),
+                };
+                if let Err(error) = drop_domain_selection(
+                    storage,
+                    wal,
+                    txn,
+                    scratch,
+                    selected,
+                    None,
+                    cascade,
+                    0,
+                    arena,
+                    seq_session,
+                    responder,
+                ) {
+                    return sql_fail(error);
+                }
+                continue;
+            }
             let slot = match name.schema {
                 Some(schema) => storage.enum_slot(schema, name.name, txn.txid),
                 None => storage.resolve_enum_slot(name.name, txn.txid),

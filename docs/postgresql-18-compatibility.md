@@ -1239,9 +1239,10 @@ file and restart to let larger sorts run.
 table: at least 1024 buckets, the next power of two above the node's row
 estimate, doubled while the rows outnumber them, and `Memory Usage` counting
 each row as PostgreSQL stores it plus 8 bytes per bucket. For example, a
-1,500-row build reports `Buckets: 2048  Batches: 1`. It always reports one
-batch: a build larger than `work_mem` times 2 (PostgreSQL's default
-`hash_mem_multiplier`), which PostgreSQL splits into batches, still runs whole.
+1,500-row build reports `Buckets: 2048  Batches: 1`. A join PostgreSQL's
+join search plans splits a build larger than `work_mem` times
+`hash_mem_multiplier` into batches as PostgreSQL does; another query's
+join runs such a build whole and reports one batch.
 A `Materialize` node reports the memory PostgreSQL's tuplestore holds:
 `Storage: Memory  Maximum Storage: 18kB` for 40 small rows, mostly its
 initial array of 2048 row pointers.

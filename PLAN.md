@@ -957,7 +957,10 @@ times `hash_mem_multiplier` runs in batches as PostgreSQL's does
 skew buckets from `ExecHashBuildSkewHash` and `ExecHashJoinNewBatch`), its
 rows assigned by `hashint2`/`hashint4`/`hashint8`/`hashtext`/`hashchar`
 values, so rows, `Batches` and `Memory Usage` match
-(`differential_exact/843`); keys of other types (`numeric`) keep the
+(`differential_exact/843`), a right or full join returning each batch's
+unmatched inner rows once its outer rows are probed, batch 0's skew
+buckets after its main buckets (`differential_exact/854`); a session sets
+`hash_mem_multiplier`, which hash joins and hash aggregates read; keys of other types (`numeric`) keep the
 planner out of such joins, and fail with `0A000` should their one-batch
 table outgrow its memory while running. `EXPLAIN ANALYZE` counts these nodes, a hash's
 `Buckets` and memory and a `Materialize` store included, except a merge
@@ -973,9 +976,8 @@ input (`Incremental Sort`), parenthesized joins (pulled up as
 `pull_up_subqueries` flattens them), self-join removal
 (`remove_useless_self_joins`), a constant equated with a full join's
 compared column (`reconsider_full_join_clause`) or with an outer join's
-column another outer join nulls, several
-batches of a hash join returning unmatched inner
-rows, a class with two constants, output expressions, upper
+column another outer join nulls, a class with two constants, output
+expressions, upper
 stages (`ORDER BY`, `LIMIT`, grouping, which also bring the query's
 pathkeys and tuple fraction into the search), derived tables, `UPDATE ...
 FROM` and `DELETE ... USING` through the same search, more relations than

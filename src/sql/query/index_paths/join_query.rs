@@ -1840,7 +1840,7 @@ pub(crate) fn modeled_join<'a>(
         settings: JoinSettings {
             costs,
             work_mem_bytes: f64::from(crate::sql::guc::work_mem_kilobytes()) * 1024.0,
-            hash_mem_bytes: f64::from(crate::sql::guc::work_mem_kilobytes()) * 1024.0 * 2.0,
+            hash_mem_bytes: crate::sql::guc::hash_memory_bytes(),
             nestloop: methods.nestloop,
             hashjoin: methods.hashjoin,
             mergejoin: value("enable_mergejoin") != 0.0,

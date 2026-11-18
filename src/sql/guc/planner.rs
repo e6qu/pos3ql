@@ -33,6 +33,7 @@ const METHOD: &str = "Query Tuning / Planner Method Configuration";
 const COST: &str = "Query Tuning / Planner Cost Constants";
 const GEQO: &str = "Query Tuning / Genetic Query Optimizer";
 const OTHER: &str = "Query Tuning / Other Planner Options";
+const MEMORY: &str = "Resource Usage / Memory";
 
 const fn method(name: &'static str, default: bool, description: &'static str) -> PlannerSettingDef {
     PlannerSettingDef {
@@ -84,7 +85,7 @@ const fn int(
     }
 }
 
-pub(super) const PLANNER_SETTING_COUNT: usize = 52;
+pub(super) const PLANNER_SETTING_COUNT: usize = 53;
 
 /// Ordered by name, as `SHOW ALL` lists them.
 pub(super) const PLANNER_SETTINGS: [PlannerSettingDef; PLANNER_SETTING_COUNT] = [
@@ -330,6 +331,14 @@ pub(super) const PLANNER_SETTINGS: [PlannerSettingDef; PLANNER_SETTING_COUNT] = 
         i32::MAX,
         GEQO,
         "Sets the threshold of FROM items beyond which GEQO is used.",
+    ),
+    real(
+        "hash_mem_multiplier",
+        2.0,
+        1.0,
+        1000.0,
+        MEMORY,
+        "Multiple of \"work_mem\" to use for hash tables.",
     ),
     PlannerSettingDef {
         name: "jit",

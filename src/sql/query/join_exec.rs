@@ -515,6 +515,10 @@ impl<'a> BatchTable<'a> {
                     .map_err(|_| arena_full())?;
             }
         }
+        // Only batch 0 has skew buckets.
+        if self.current != 0 {
+            return Ok(());
+        }
         let skew_rows = self.skew_rows.borrowed_slice();
         for (bucket, slot) in self.skew.borrowed_slice().iter().enumerate() {
             if slot.removed {
@@ -2061,12 +2065,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         let Some(mut table) = table else {
             return Ok(true);
         };
-        if fill_inner && table.batches > 1 {
-            return Err(crate::sql_err!(
-                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                "a hash join returning unmatched inner rows over several batches is not supported"
-            ));
-        }
         if table.batches == 1 {
             self.frozen[id as usize].set(Some(table.frozen()));
             if fill_inner && !ended {
@@ -2075,6 +2073,15 @@ impl<'r, 'a> Runner<'r, 'a> {
                 return self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink);
             }
             return Ok(true);
+        }
+        // Each batch returns its unmatched inner rows once its outer rows
+        // are done (`HJ_FILL_INNER_TUPLES`), batch 0's skew buckets too.
+        if fill_inner && !ended {
+            let mut rows = ArenaList::new(self.arena);
+            table.unmatched(&mut rows)?;
+            if !self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink)? {
+                return Ok(false);
+            }
         }
         // `ExecHashJoinNewBatch`.
         table.skew_enabled = false;
@@ -2154,6 +2161,13 @@ impl<'r, 'a> Runner<'r, 'a> {
                     continue;
                 }
                 if !self.probe_batch(table.frozen(), None, hash, &probe, &mut row, sink)? {
+                    return Ok(false);
+                }
+            }
+            if fill_inner {
+                let mut rows = ArenaList::new(self.arena);
+                table.unmatched(&mut rows)?;
+                if !self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink)? {
                     return Ok(false);
                 }
             }

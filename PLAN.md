@@ -830,12 +830,16 @@ its hint, without a cursor (`differential_exact/863`). Remaining, which `EXPLAIN
 shape whenever PostgreSQL could choose an index path: other index access
 methods, expression indexes whose keys still call a user-defined routine or read
 a user-defined type after inlining, a call of a SQL function PostgreSQL
-inlines whose arguments read an enclosing query's columns, are packed
-into a variadic array or are polymorphic,
-in a `MERGE` or an `INSERT`'s `RETURNING`, a set-returning SQL function in
-`FROM` PostgreSQL inlines with a packed variadic, polymorphic or
+inlines inside a subquery whose arguments read an enclosing query's columns
+(it stays a call, and `EXPLAIN SELECT (SELECT f(t.a) FROM u LIMIT 1) FROM t`
+fails with `42P01` while a plan's types are captured), a set-returning SQL
+function in `FROM` PostgreSQL inlines with a polymorphic, variadic or
 lateral argument or a body with windows or a coerced column (bodies in
-`BEGIN ATOMIC`, defaults and `WITH` queries inline, `differential_exact/835`), a
+`BEGIN ATOMIC`, defaults and `WITH` queries inline, `differential_exact/835`). A call of a SQL function PostgreSQL inlines
+packs a variadic input's elements into an array, resolves a polymorphic
+input or result from its arguments, and inlines in a `MERGE` or an `INSERT`'s
+`RETURNING` and with a user-type literal (`differential_exact/890`,
+`differential_exact/891`). Remaining: a
 function scan of a built-in whose support function estimates its rows
 other than `generate_series` over integers, `numeric` and timestamps
 (`differential_exact/813`) and `unnest`, or whose bound or step is a stable

@@ -1103,11 +1103,19 @@ pub(crate) fn inline_call<'a>(
         return Ok(Inlining::Kept);
     }
     let function_oid = crate::storage::routine_oid(&declared);
-    let Some(routine) =
+    let Some(mut routine) =
         storage.function_for_captured_call(function_oid, argument_names, oids, *variadic, txid)
     else {
         return Ok(Inlining::Kept);
     };
+    // A polymorphic input or result takes the type the call's arguments
+    // give it, as the body is analysed with the resolved types.
+    if storage
+        .bind_routine_call_inputs(&mut routine, argument_names, oids, *variadic, txid)
+        .is_none()
+    {
+        return Ok(Inlining::Kept);
+    }
     if !declaration(
         &routine,
         routine.argument_count,
@@ -1138,18 +1146,55 @@ pub(crate) fn inline_call<'a>(
                 count += 1;
             }
         }
+        let packs = matches!(
+            parameter.mode,
+            crate::storage::RoutineParameterMode::Variadic { .. }
+        ) && !*variadic;
         *slot_value = match supplied {
-            Some(argument)
-                if count == 1
-                    && !(matches!(
-                        parameter.mode,
-                        crate::storage::RoutineParameterMode::Variadic { .. }
-                    ) && !*variadic) =>
-            {
-                argument
+            Some(argument) if count == 1 && !packs => argument,
+            // The elements a non-VARIADIC call gives a variadic input pack
+            // into an array (`expand_function_arguments`).
+            Some(_) => {
+                // Each element is converted to the array's element type.
+                let ColType::Array(element) = routine.arguments()[input].ctype else {
+                    return Ok(Inlining::Unmodeled);
+                };
+                if routine.arguments()[input].user_type.is_some() {
+                    return Ok(Inlining::Unmodeled);
+                }
+                let element = element.to_coltype();
+                let mut elements = crate::mem::arena::ArenaList::new(arena);
+                for (at, mapped) in mapping[..args.len()].iter().enumerate() {
+                    if usize::from(*mapped) != input {
+                        continue;
+                    }
+                    let argument = args[at];
+                    let converted = if oids[at] == element.oid() {
+                        argument
+                    } else {
+                        &*arena
+                            .alloc(Expr::Cast {
+                                source_position: ast::SourcePosition::UNKNOWN,
+                                operand: argument,
+                                type_name: element.name(),
+                                type_mod: -1,
+                                binding: CastBinding::Resolve,
+                                context: ast::CastContext::Implicit,
+                            })
+                            .map_err(|_| crate::sql::eval::arena_full())?
+                    };
+                    elements
+                        .push(converted)
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                }
+                &*arena
+                    .alloc(Expr::Array(elements.as_slice()))
+                    .map_err(|_| crate::sql::eval::arena_full())?
             }
-            // Packed variadic elements.
-            Some(_) => return Ok(Inlining::Unmodeled),
+            // No element for a variadic input: an empty array, not modelled.
+            None if packs && parameter.mode.default().is_none() => {
+                return Ok(Inlining::Unmodeled);
+            }
             None => {
                 let source = parameter.mode.default().ok_or_else(missing_contract)?;
                 let parameter_index = routine

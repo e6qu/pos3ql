@@ -13536,7 +13536,27 @@ fn fold_insert_constants_in<'a>(
     txid: u32,
 ) -> Result<crate::sql::ast::Insert<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
-    let folded = with_level_columns(None, &catalog, |columns| {
+    // A `RETURNING` call of an inlinable SQL function reads the target's
+    // columns, which the folding types through the target's schema.
+    let scope = dml_level_scope(
+        returning_expressions(statement.returning.items),
+        storage,
+        txid,
+        || {
+            dependencies::dml_join_scope(
+                storage,
+                statement.table,
+                statement.alias,
+                None,
+                txid,
+                arena,
+                None,
+            )
+            .map(|(scope, _)| scope)
+        },
+        arena,
+    )?;
+    let folded = with_level_columns(scope.as_ref(), &catalog, |columns| {
         fold_insert_level(statement, arena, &catalog, columns)
     })?;
     if let Some(crate::storage::ResolvedRelation::Table(slot)) =
@@ -13712,8 +13732,57 @@ pub(crate) fn fold_merge_constants<'a>(
 ) -> Result<&'a crate::sql::ast::Merge<'a>, SqlError> {
     use crate::sql::ast::{MergeSourceAction, MergeTargetAction, MergeWhen};
     let catalog = storage_catalog(storage, arena, txid);
-    let fold =
-        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    // The target and the source give the actions' calls their columns.
+    let source_from = arena
+        .alloc(FromClause {
+            base: statement.source,
+            joins: &[],
+        })
+        .map_err(|_| arena_full())?;
+    let written = statement
+        .whens
+        .iter()
+        .flat_map(|when| {
+            let (cond, action): (Option<&'a Expr<'a>>, &[(&str, &Expr<'a>)]) = match when {
+                MergeWhen::Matched { cond, action }
+                | MergeWhen::NotMatchedBySource { cond, action } => (
+                    *cond,
+                    match action {
+                        MergeTargetAction::Update(assignments) => assignments,
+                        _ => &[],
+                    },
+                ),
+                MergeWhen::NotMatchedByTarget { cond, .. } => (*cond, &[]),
+            };
+            cond.into_iter()
+                .chain(action.iter().map(|(_, expression)| *expression))
+        })
+        .chain(core::iter::once(statement.on))
+        .chain(returning_expressions(statement.returning.items));
+    let scope = dml_level_scope(
+        written,
+        storage,
+        txid,
+        || {
+            dependencies::dml_join_scope(
+                storage,
+                statement.target,
+                statement.target_alias,
+                Some(source_from),
+                txid,
+                arena,
+                None,
+            )
+            .map(|(scope, _)| scope)
+        },
+        arena,
+    )?;
+    let fold = |expression: &'a Expr<'a>| match &scope {
+        Some(scope) => with_level_columns(Some(scope), &catalog, |columns| {
+            super::eval::fold_constants_in_scope(expression, arena, &catalog, columns)
+        }),
+        None => super::eval::fold_constants(expression, arena, Some(&catalog)),
+    };
     let mut folded = *statement;
     folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
     let fold_assignments = |assignments: &'a [(&'a str, &'a Expr<'a>)]| {

@@ -3661,6 +3661,7 @@ pub(crate) fn modeled_join<'a>(
                         ctype: expression.ctype,
                         collation: expression.collation,
                         statistics: None,
+                        extended: None,
                         unique: false,
                         indexed: false,
                     });

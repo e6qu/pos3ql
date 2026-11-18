@@ -1115,10 +1115,17 @@ subquery scan below), and `EXPLAIN ANALYZE` of windows over an index scan,
 under a limit directly above them or over a join's groups (`0A000`:
 execution reads the input by its own scan); for presorted aggregates:
 `EXPLAIN ANALYZE` of their sort (`0A000`: its tuples' memory is not modeled).
-Remaining for that search: an equality whose side reads several
-relations (`a.x + b.y = c.z`, an equivalence class member PostgreSQL hashes
-and merges by) and other conditions comparing expressions of several
-relations with each other (`COALESCE(a.id, 0) < b.id`), an `OR`
+An equality whose side reads several relations (`a.x + b.y = c.z`) makes
+that expression a class member read at the join of its relations, which
+evaluates it over their rows: it hashes or merges that join with the other
+side (a sort above the join computing it), estimated without statistics
+(`DEFAULT_NUM_DISTINCT`, `estimate_hash_bucket_stats`' default, the
+expression's columns counted per relation for groups,
+`differential_exact/932`). Remaining for that search: an index scan
+parameterized by such an expression (`0A000` where an index could take
+it), a class holding both such an expression and a constant, conditions
+comparing expressions of several relations other than by a mergeable
+equality (`COALESCE(a.id, 0) < b.id`), an `OR`
 of join conditions that a semi or anti join evaluates
 (`clauselist_selectivity_or` under `eqjoinsel_semi`), an `OR` join clause
 that an indexed relation's parameterized scan evaluates (as a filter, or

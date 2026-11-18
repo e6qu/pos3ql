@@ -1466,16 +1466,8 @@ impl Prep<'_> {
         };
         match qual.shape {
             Shape::Columns(left, right) => {
-                let left_member = Member {
-                    rel: left.0,
-                    column: left.1,
-                    nulling: nulling[usize::from(left.0)],
-                };
-                let right_member = Member {
-                    rel: right.0,
-                    column: right.1,
-                    nulling: nulling[usize::from(right.0)],
-                };
+                let left_member = self.var_member(left, &nulling);
+                let right_member = self.var_member(right, &nulling);
                 // `can_join`: each side reads relations the other does not.
                 let can_join = left_member.relids() & right_member.relids() == 0;
                 if maybe_equivalence {
@@ -1517,11 +1509,7 @@ impl Prep<'_> {
                 }
             }
             Shape::Constant { var, constant } => {
-                let member = Member {
-                    rel: var.0,
-                    column: var.1,
-                    nulling: nulling[usize::from(var.0)],
-                };
+                let member = self.var_member(var, &nulling);
                 if maybe_equivalence {
                     let domain = self.domain[usize::from(node)];
                     if self.process_equivalence(qual_id, member, None, Some(constant), domain)? {
@@ -1975,6 +1963,9 @@ impl Prep<'_> {
         if inner.nulling != 0 {
             return Err("an outer join clause of a nulled column equated with a constant");
         }
+        if inner.reads != 0 || outer.reads != 0 {
+            return Ok(false);
+        }
         let Some(node) = self.tree.nodes[..self.tree.node_count]
             .iter()
             .position(|node| matches!(node, TreeNode::Rel(rel) if *rel == inner.rel))
@@ -1986,6 +1977,26 @@ impl Prep<'_> {
         let derived = self.class_of(inner).expect("just equated");
         self.classes[usize::from(derived)].derived = true;
         Ok(true)
+    }
+
+    /// The class member `var` is where `nulling` gives each relation's
+    /// nulling outer joins: an expression of several relations reads them
+    /// all, nulled by any of theirs.
+    fn var_member(&self, var: Var, nulling: &[Relids]) -> Member {
+        let mut member = Member::plain(var.0, var.1);
+        let mut relids: Relids = 1 << var.0;
+        if let Some(id) = member.expression_id() {
+            for &(rel, _) in self.tree.expression_vars[id].as_slice() {
+                relids |= 1 << rel;
+            }
+        }
+        member.reads = relids & !(1 << var.0);
+        for rel in 0..MAX_JOIN_RELS {
+            if relids & 1 << rel != 0 {
+                member.nulling |= nulling[rel];
+            }
+        }
+        member
     }
 
     /// `generate_base_implied_equalities`: each member of a class with a
@@ -2001,6 +2012,9 @@ impl Prep<'_> {
             if held.class.has_const {
                 if members.iter().any(|member| member.nulling != 0) {
                     return Err("a constant's class of a nulled column");
+                }
+                if members.iter().any(|member| member.reads != 0) {
+                    return Err("a constant's class of an expression of several relations");
                 }
                 // One `column = constant`: the clause itself.
                 if members.len() == 1 && held.sources == 1 && !held.derived {
@@ -2025,7 +2039,7 @@ impl Prep<'_> {
             // Each plain member equated with the relation's previous one.
             let mut previous = [None::<Member>; MAX_JOIN_RELS];
             for &member in members {
-                if member.nulling != 0 {
+                if member.nulling != 0 || member.reads != 0 {
                     continue;
                 }
                 let rel = usize::from(member.rel);

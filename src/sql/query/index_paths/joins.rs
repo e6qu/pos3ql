@@ -113,6 +113,19 @@ pub(crate) enum ClauseForm {
     Other,
 }
 
+/// The shape of a condition other than a mergeable equality, as far as a
+/// semi or anti join's estimate of it differs from an inner join's.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum OtherShape {
+    /// Estimated alike for every join.
+    Plain,
+    /// `left <> right` of columns with these NULL fractions: `neqjoinsel`
+    /// of a semi or anti join is the outer column's non-NULL fraction.
+    Inequality { left_nulls: f64, right_nulls: f64 },
+    /// An `OR` of conditions, whose semi join estimate the model leaves.
+    Composite,
+}
+
 /// Which copy of an outer join's clause a clause is, when the join
 /// commutes with another (`has_clone`, `is_clone`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -136,6 +149,14 @@ pub(crate) struct Clause {
     pub(crate) pushed_down: bool,
     pub(crate) clone: CloneKind,
     pub(crate) incompatible: Relids,
+    /// `outer_relids`: an outer join clause's preserved side, which the
+    /// clause cannot move into.
+    pub(crate) outer_relids: Relids,
+    /// The columns another condition compares, `left op right`, whose
+    /// outer side a `Memoize` cache keys by (`check_memoize_hashability`).
+    pub(crate) operands: Option<(Member, Member)>,
+    /// What a semi or anti join estimates another condition by.
+    pub(crate) other: OtherShape,
     /// `cost_qual_eval`'s per-tuple cost.
     pub(crate) cost: f64,
     /// Its selectivity for an inner join (`norm_selec`), once computed.
@@ -454,6 +475,9 @@ pub(crate) enum PathKind {
         /// `singlerow`: the join's inner relation is unique, so an entry
         /// is complete at its first row.
         single_row: bool,
+        /// `binary_mode`: a moved clause no hash equality applies, so keys
+        /// match by their bytes.
+        binary: bool,
     },
     HashJoin {
         jointype: JoinType,
@@ -539,6 +563,8 @@ pub(crate) struct JoinPlan<'a> {
     /// it.
     pub(crate) firsts: &'a [(Relids, Relids)],
     pub(crate) needed: &'a [NeededColumn],
+    /// The relations of removed joins, which the plan binds to NULLs.
+    pub(crate) removed: Relids,
 }
 
 impl JoinPlan<'_> {
@@ -611,6 +637,9 @@ pub(crate) struct JoinProblem<'p> {
     pub(crate) settings: JoinSettings,
     /// The query's foreign keys, as `root->fkey_list` holds them.
     pub(crate) foreign_keys: &'p [ForeignKeyJoin],
+    /// The relations of removed joins (`remove_useless_joins`), which no
+    /// join reads.
+    pub(crate) removed: Relids,
 }
 
 struct Search<'p, 'a, 's> {
@@ -669,7 +698,7 @@ pub(crate) fn search<'a>(
         memoize_rescans: ArenaList::new(arena),
         param_rows: ArenaList::new(arena),
         buckets: [[None; 2]; MAX_CLAUSES],
-        all_baserels: (1 << n) - 1,
+        all_baserels: ((1 << n) - 1) & !problem.removed,
     };
     for clause in problem.clauses {
         search.clauses.push(*clause).map_err(|_| arena_full())?;
@@ -745,7 +774,7 @@ pub(crate) fn search<'a>(
             return Ok(Err("a join search that builds no join"));
         }
     }
-    let all = ((1u32 << n) - 1) as usize;
+    let all = search.all_baserels as usize;
     let Some(top) = search.rels[all] else {
         return Ok(Err("a join the search does not reach"));
     };
@@ -765,6 +794,7 @@ pub(crate) fn search<'a>(
         needed: arena
             .alloc_slice_copy(problem.needed)
             .map_err(|_| arena_full())?,
+        removed: problem.removed,
     }))
 }
 
@@ -1563,6 +1593,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 cost,
                 selectivity: None,
                 outer_selectivity: None,
+                outer_relids: 0,
+                operands: None,
+                other: OtherShape::Plain,
                 source: None,
             })
             .map_err(|_| arena_full())?;
@@ -1615,6 +1648,31 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     .clamp(0.0, 1.0)
             }
             Some((left, right, ..)) => self.statistics.equality(left, right)?.clamp(0.0, 1.0),
+            None if semi && clause.other != OtherShape::Plain => {
+                let Selectivity::Outer(Some(special)) = mode else {
+                    unreachable!("a semi join's estimate");
+                };
+                let syn_right = self.special(special).syn_right;
+                match (clause.other, clause.operands) {
+                    (
+                        OtherShape::Inequality {
+                            left_nulls,
+                            right_nulls,
+                        },
+                        Some((left, _)),
+                    ) => {
+                        if left.relids() & syn_right & BASE_RELIDS == 0 {
+                            1.0 - left_nulls
+                        } else {
+                            1.0 - right_nulls
+                        }
+                    }
+                    _ => {
+                        self.outside = Some("an OR condition of a semi or anti join");
+                        1.0
+                    }
+                }
+            }
             // Other clauses come with their estimate.
             None => clause
                 .selectivity
@@ -2431,14 +2489,23 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let mut keys = [Member::plain(0, 0); MAX_KEYS];
         let mut key_count = 0usize;
         let mut width = 0.0;
+        let mut binary = false;
         for &id in enforced.as_slice() {
-            let Some((left, right, ..)) = self.sides(id) else {
+            binary |= self.sides(id).is_none();
+            let Some((left, right)) = self
+                .sides(id)
+                .map(|(left, right, ..)| (left, right))
+                .or(self.clause(id).operands)
+            else {
                 return Ok(None);
             };
-            let Some(outer_is_left) = self.outer_is_left(id, inputs.outer, inputs.inner) else {
+            let key = if left.relids() & !inputs.outer == 0 && right.relids() & !inputs.inner == 0 {
+                left
+            } else if right.relids() & !inputs.outer == 0 && left.relids() & !inputs.inner == 0 {
+                right
+            } else {
                 return Ok(None);
             };
-            let key = if outer_is_left { left } else { right };
             if !keys[..key_count].contains(&key) {
                 if key_count == MAX_KEYS {
                     return Ok(None);
@@ -2471,6 +2538,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 keys,
                 key_count: key_count as u8,
                 single_row: inputs.inner_unique,
+                binary,
             },
             startup: inner_path.startup + costs.cpu_tuple,
             total: inner_path.total + costs.cpu_tuple,
@@ -2503,10 +2571,27 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             PathKind::Scan { rel, path } => {
                 self.problem.rels[usize::from(rel)].paths[usize::from(path)].enforced
             }
+            // These share their input's `param_info`, whose `ppi_serials`
+            // only a base relation's holds.
             PathKind::Material { input }
             | PathKind::Memoize { input, .. }
-            | PathKind::Unique { input, .. } => self.enforced(input),
+            | PathKind::Unique { input, .. } => match self.path(input).kind {
+                PathKind::Scan { .. } => self.enforced(input),
+                _ => ClauseList::EMPTY,
+            },
             PathKind::NestLoop {
+                outer,
+                inner,
+                clauses,
+                ..
+            }
+            | PathKind::HashJoin {
+                outer,
+                inner,
+                clauses,
+                ..
+            }
+            | PathKind::MergeJoin {
                 outer,
                 inner,
                 clauses,
@@ -2522,17 +2607,16 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 }
                 all
             }
-            PathKind::HashJoin { .. } | PathKind::MergeJoin { .. } => ClauseList::EMPTY,
         }
     }
 
     /// `get_joinrel_parampathinfo`'s clauses of a join parameterized by
-    /// `required` whose inputs read `outer_param` and `inner_param`: per
-    /// class, its first member among `required` equated with its first in
-    /// the join, unless an input can apply that clause; then, for each class
-    /// whose clause the inner path applies, its first member among
-    /// `required` equated with its first in the outer relation, unless the
-    /// outer path applies it.
+    /// `required` whose inputs read `outer_param` and `inner_param`, which
+    /// neither input can apply: the join's own join clauses movable into
+    /// it; then per class, its first member among `required` equated with
+    /// its first in the join; then, for each class whose clause the inner
+    /// path could apply, its first member among `required` equated with
+    /// its first in the outer relation, unless the outer path applies it.
     fn moved_join_clauses(
         &mut self,
         joined: Relids,
@@ -2540,18 +2624,34 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         (outer_param, inner_param): (Relids, Relids),
         required: Relids,
     ) -> Result<ClauseList, SqlError> {
-        // `join_clause_is_movable_into` an input reading `param`.
-        let movable = |input: Relids, param: Relids, one: u8, two: u8| {
-            let relids = 1 << one | 1 << two;
-            param != 0 && relids & !(input | param) == 0 && relids & input != 0
-        };
+        // `join_clause_is_movable_into` relations `current` reading
+        // `available`, `None` for an unparameterized input.
+        let movable =
+            |relids: Relids, outer_relids: Relids, current: Relids, available: Option<Relids>| {
+                available.is_some_and(|available| {
+                    relids & !available == 0 && relids & current != 0 && outer_relids & current == 0
+                })
+            };
+        let join_and_req = Some(joined | required);
+        let outer_and_req = (outer_param != 0).then_some(inputs.outer | outer_param);
+        let inner_and_req = (inner_param != 0).then_some(inputs.inner | inner_param);
         let mut moved = ClauseList::EMPTY;
+        for &id in self.rel(joined).joininfo.as_slice() {
+            let clause = self.clause(id);
+            let (relids, outer_relids) = (clause.relids, clause.outer_relids);
+            if movable(relids, outer_relids, joined, join_and_req)
+                && !movable(relids, outer_relids, inputs.outer, outer_and_req)
+                && !movable(relids, outer_relids, inputs.inner, inner_and_req)
+            {
+                moved.push(id).ok_or_else(too_many)?;
+            }
+        }
         let mut dropped = [0u8; MAX_JOIN_CLAUSES];
         let mut dropped_count = 0;
         let first = |members: &[Member], relids: Relids| {
             members
                 .iter()
-                .position(|member| relids & 1 << member.rel != 0)
+                .position(|member| member.relids() & !relids == 0)
         };
         for class_id in 0..self.problem.classes.len() {
             let class = self.problem.classes[class_id];
@@ -2563,11 +2663,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             else {
                 continue;
             };
-            let (one, two) = (members[outside].rel, members[within].rel);
-            if movable(inputs.outer, outer_param, one, two) {
+            let relids = members[outside].relids() | members[within].relids();
+            if movable(relids, 0, inputs.outer, outer_and_req) {
                 continue;
             }
-            if movable(inputs.inner, inner_param, one, two) {
+            if movable(relids, 0, inputs.inner, inner_and_req) {
                 if dropped_count < dropped.len() {
                     dropped[dropped_count] = class_id as u8;
                     dropped_count += 1;
@@ -2584,12 +2684,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             else {
                 continue;
             };
-            if movable(
-                inputs.outer,
-                outer_param,
-                members[outside].rel,
-                members[outer].rel,
-            ) {
+            let relids = members[outside].relids() | members[outer].relids();
+            if movable(relids, 0, inputs.outer, outer_and_req) {
                 continue;
             }
             let id = self.class_clause(class_id, outside as u8, outer as u8)?;
@@ -2794,10 +2890,6 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             if required & inputs.param_source == 0 && !star {
                 return Ok(());
             }
-            if !self.specials.is_empty() {
-                self.outside = Some("a parameterized join of a query with outer joins");
-                return Ok(());
-            }
             moved = self.moved_join_clauses(
                 joined,
                 inputs,
@@ -2819,32 +2911,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 clauses.push(id).ok_or_else(too_many)?;
             }
         }
-        // `ppi_rows`: the first estimate for the join's parameterization.
-        let param_rows = if required == 0 {
-            None
-        } else if let Some(&(_, _, rows)) = self
-            .param_rows
-            .borrowed_slice()
-            .iter()
-            .find(|(relids, param, _)| *relids == joined && *param == required)
-        {
-            Some(rows)
-        } else {
-            let rows = self
-                .join_size(
-                    joined,
-                    (inputs.outer, inputs.inner),
-                    outer_path.rows,
-                    inner_path.rows,
-                    inputs.special,
-                    &clauses,
-                )?
-                .min(self.rel(joined).rows);
-            self.param_rows
-                .push((joined, required, rows))
-                .map_err(|_| arena_full())?;
-            Some(rows)
-        };
+        let param_rows =
+            self.param_join_rows(joined, inputs, (outer_path, inner_path), required, &clauses)?;
         let (rescan_startup, rescan_total) = self.rescan_cost(inner);
         let mut startup = outer_path.startup + inner_path.startup;
         let mut run = outer_path.total - outer_path.startup;
@@ -2927,6 +2995,73 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         )
     }
 
+    /// `ppi_rows` of a join parameterized by `required` evaluating
+    /// `clauses`: the first estimate for the join's parameterization
+    /// (`get_parameterized_joinrel_size`), or `None` unparameterized.
+    fn param_join_rows(
+        &mut self,
+        joined: Relids,
+        inputs: &JoinInputs,
+        (outer_path, inner_path): (Path, Path),
+        required: Relids,
+        clauses: &ClauseList,
+    ) -> Result<Option<f64>, SqlError> {
+        if required == 0 {
+            return Ok(None);
+        }
+        if let Some(&(_, _, rows)) = self
+            .param_rows
+            .borrowed_slice()
+            .iter()
+            .find(|(relids, param, _)| *relids == joined && *param == required)
+        {
+            return Ok(Some(rows));
+        }
+        let rows = self
+            .join_size(
+                joined,
+                (inputs.outer, inputs.inner),
+                outer_path.rows,
+                inner_path.rows,
+                inputs.special,
+                clauses,
+            )?
+            .min(self.rel(joined).rows);
+        self.param_rows
+            .push((joined, required, rows))
+            .map_err(|_| arena_full())?;
+        Ok(Some(rows))
+    }
+
+    /// `calc_non_nestloop_required_outer` of a hash or merge join, and the
+    /// clauses it evaluates: those its parameterization moves into it
+    /// (`get_joinrel_parampathinfo`), then the restriction list. `None`
+    /// when the parameterization is not one the join may take.
+    fn non_nestloop_clauses(
+        &mut self,
+        joined: Relids,
+        inputs: &JoinInputs,
+        (outer_path, inner_path): (Path, Path),
+    ) -> Result<Option<(Relids, ClauseList)>, SqlError> {
+        let required = outer_path.param | inner_path.param;
+        if required == 0 {
+            return Ok(Some((0, inputs.restrict)));
+        }
+        if required & inputs.param_source == 0 {
+            return Ok(None);
+        }
+        let mut clauses = self.moved_join_clauses(
+            joined,
+            inputs,
+            (outer_path.param, inner_path.param),
+            required,
+        )?;
+        for &id in inputs.restrict.as_slice() {
+            clauses.push(id).ok_or_else(too_many)?;
+        }
+        Ok(Some((required, clauses)))
+    }
+
     /// `cost_rescan`.
     fn rescan_cost(&self, id: u32) -> (f64, f64) {
         let path = self.path(id);
@@ -2979,15 +3114,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     ) -> Result<(), SqlError> {
         let settings = self.problem.settings;
         let (outer_path, inner_path) = (self.path(outer), self.path(inner));
-        // `calc_non_nestloop_required_outer`.
-        let required = outer_path.param | inner_path.param;
-        if required != 0 {
-            if required & inputs.param_source == 0 {
-                return Ok(());
-            }
-            self.outside = Some("a parameterized merge join");
+        let Some((required, restrict)) =
+            self.non_nestloop_clauses(joined, inputs, (outer_path, inner_path))?
+        else {
             return Ok(());
-        }
+        };
         // A sort the input's order already satisfies is dropped.
         let outer_sort = outer_sort.filter(|sort| !sort.contained_in(&outer_path.keys));
         let inner_sort = inner_sort.filter(|sort| !sort.contained_in(&inner_path.keys));
@@ -3054,12 +3185,12 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let inner_run = (sorted_total - sorted_startup) * (inner_end - inner_start);
         // `final_cost_mergejoin`.
         let merge_cost = self.qual_cost(&merge);
-        let other_cost = self.qual_cost(&inputs.restrict) - merge_cost;
+        let other_cost = self.qual_cost(&restrict) - merge_cost;
         let selectivity = self.clauselist_selectivity(&merge, Selectivity::Inner)?;
         let merged = clamp_row_est(selectivity * outer_path.rows * inner_path.rows);
         // A semi or anti join, or a unique inner relation, every clause of
         // which merges needs no mark.
-        let skip_mark_restore = inputs.first_match() && inputs.restrict.len == merge.len;
+        let skip_mark_restore = inputs.first_match() && restrict.len == merge.len;
         let rescanned = if skip_mark_restore || matches!(outer_path.kind, PathKind::Unique { .. }) {
             0.0
         } else {
@@ -3089,6 +3220,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         run += merge_cost
             * ((outer_rows_read - outer_skip) + (inner_rows_read - inner_skip) * rescan_ratio);
         run += (settings.costs.cpu_tuple + other_cost) * merged;
+        let param_rows = self.param_join_rows(
+            joined,
+            inputs,
+            (outer_path, inner_path),
+            required,
+            &restrict,
+        )?;
         let rel = self.rel(joined);
         self.add_path(
             joined,
@@ -3097,7 +3235,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     jointype: inputs.path_jointype(),
                     outer,
                     inner,
-                    clauses: inputs.restrict,
+                    clauses: restrict,
                     merge,
                     outer_sort: outer_sort.unwrap_or(Keys::NONE),
                     inner_sort: inner_sort.unwrap_or(Keys::NONE),
@@ -3105,13 +3243,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     inner_unique: inputs.inner_unique,
                 },
                 relids: joined,
-                rows: rel.rows,
+                rows: param_rows.unwrap_or(rel.rows),
                 width: rel.width,
                 startup,
                 total: startup + run,
                 disabled,
                 keys,
-                param: 0,
+                param: required,
             },
         )
     }
@@ -3233,14 +3371,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let settings = self.problem.settings;
         let costs = settings.costs;
         let (outer_path, inner_path) = (self.path(outer), self.path(inner));
-        let required = outer_path.param | inner_path.param;
-        if required != 0 {
-            if required & inputs.param_source == 0 {
-                return Ok(());
-            }
-            self.outside = Some("a parameterized hash join");
+        let Some((required, restrict)) =
+            self.non_nestloop_clauses(joined, inputs, (outer_path, inner_path))?
+        else {
             return Ok(());
-        }
+        };
         let clauses = f64::from(hash.len);
         let mut startup = outer_path.startup;
         let mut run = outer_path.total - outer_path.startup;
@@ -3287,7 +3422,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             disabled += 0;
         }
         let hash_cost = self.qual_cost(&hash);
-        let other_cost = self.qual_cost(&inputs.restrict) - hash_cost;
+        let other_cost = self.qual_cost(&restrict) - hash_cost;
         let tuples = if inputs.first_match() {
             // Each outer row stops at its first match.
             let matched = (outer_path.rows * inputs.match_fraction).round_ties_even();
@@ -3311,6 +3446,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             clamp_row_est(selectivity * outer_path.rows * inner_path.rows)
         };
         run += (costs.cpu_tuple + other_cost) * tuples;
+        let param_rows = self.param_join_rows(
+            joined,
+            inputs,
+            (outer_path, inner_path),
+            required,
+            &restrict,
+        )?;
         let rel = self.rel(joined);
         self.add_path(
             joined,
@@ -3319,19 +3461,19 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     jointype: inputs.path_jointype(),
                     outer,
                     inner,
-                    clauses: inputs.restrict,
+                    clauses: restrict,
                     hash,
                     buckets: sizing.buckets,
                     batches: sizing.batches,
                 },
                 relids: joined,
-                rows: rel.rows,
+                rows: param_rows.unwrap_or(rel.rows),
                 width: rel.width,
                 startup,
                 total: startup + run,
                 disabled,
                 keys: Keys::NONE,
-                param: 0,
+                param: required,
             },
         )
     }
@@ -3714,6 +3856,9 @@ mod tests {
                 cost: 0.0025,
                 selectivity: None,
                 outer_selectivity: None,
+                outer_relids: 0,
+                operands: None,
+                other: OtherShape::Plain,
                 source: Some(0),
             }],
             needed: &[
@@ -3734,6 +3879,7 @@ mod tests {
             ],
             settings: settings(),
             foreign_keys: &[],
+            removed: 0,
         };
         let plan = search(&problem, &Uniform, &arena).unwrap().unwrap();
         let top = plan.path(plan.top);

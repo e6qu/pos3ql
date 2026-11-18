@@ -189,6 +189,7 @@ impl Writer<'_, '_, '_, '_> {
                 input,
                 keys,
                 key_count,
+                binary,
                 ..
             } => {
                 let mut key = StackStr::<512>::new();
@@ -204,7 +205,14 @@ impl Writer<'_, '_, '_, '_> {
                 let node = self
                     .node("Memoize", &path, depth)
                     .with_qual(QualLabel::CacheKey, Some(key))
-                    .with_qual(QualLabel::CacheMode, Some(StackStr::from_str("logical")));
+                    .with_qual(
+                        QualLabel::CacheMode,
+                        Some(StackStr::from_str(if binary {
+                            "binary"
+                        } else {
+                            "logical"
+                        })),
+                    );
                 plan.push(self.keyed(node, query::instrument::Role::Memoize, id))?;
                 self.path(plan, input, depth + 1)
             }
@@ -371,7 +379,10 @@ impl Writer<'_, '_, '_, '_> {
             QueryScope::resolve_schema(self.storage, modeled.from, self.txid, self.arena, None)?;
         let (mut node, used) = chosen_scan_node(&single, depth, &scan.path);
         let definition = single.defs.stored(0).expect("a plain table");
-        let pushed = super::push_outer_mask(self.scope, u32::from(scan.param));
+        let pushed = super::push_outer_mask(
+            self.scope,
+            scan.param & query::index_paths::joins::BASE_RELIDS,
+        );
         let quals = |index: Option<&query::IndexAccessPlan<'_>>| {
             single_relation_quals(
                 self.storage,
@@ -416,6 +427,10 @@ impl Writer<'_, '_, '_, '_> {
             node = node.with_qual(QualLabel::RecheckCond, recheck);
         }
         node.output_unprintable = true;
+        // A scan left alone by removed joins carries the query's output.
+        if depth == 0 {
+            node.width = self.model.output_width as u32;
+        }
         let block = self.block.child(query::join_exec_scan_segment(rel));
         node.key = Some(query::instrument::NodeKey::new(
             block,
@@ -454,7 +469,21 @@ impl Writer<'_, '_, '_, '_> {
         clauses: &ClauseList,
         outer: Option<Relids>,
     ) -> Result<Option<StackStr<512>>, SqlError> {
-        let ids = clauses.as_slice();
+        // The constant `true` an outer join clause gave way to
+        // (`reconsider_outer_join_clauses`) prints as nothing.
+        let mut kept = [0u8; query::index_paths::joins::MAX_CLAUSES];
+        let mut count = 0;
+        for &id in clauses.as_slice() {
+            let clause = &self.model.plan.clauses[usize::from(id)];
+            if !matches!(
+                self.model.condition(clause),
+                Some(crate::sql::ast::Expr::Bool(true))
+            ) {
+                kept[count] = id;
+                count += 1;
+            }
+        }
+        let ids = &kept[..count];
         if ids.is_empty() {
             return Ok(None);
         }

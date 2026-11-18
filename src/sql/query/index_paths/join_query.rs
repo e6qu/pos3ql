@@ -55,8 +55,9 @@ pub(crate) struct RelScan<'a> {
     pub(crate) condition: Option<&'a Expr<'a>>,
     pub(crate) shape: QueryShape,
     pub(crate) read: u64,
-    /// The relations whose values the condition reads.
-    pub(crate) param: u8,
+    /// The relations whose values the condition reads, and the outer
+    /// joins that null them.
+    pub(crate) param: u32,
 }
 
 impl<'a> ModeledRel<'a> {
@@ -74,6 +75,7 @@ impl<'a> ModeledRel<'a> {
         let candidate = self.paths[usize::from(path)];
         let mut scan = JoinScan {
             param_count: 0,
+            clause_params: 0,
             describe: Some(candidate.describe),
             ..self.scan
         };
@@ -82,7 +84,11 @@ impl<'a> ModeledRel<'a> {
             .iter()
             .enumerate()
         {
-            if candidate.param & 1 << rel != 0 {
+            if (1 << rel | self.scan.param_nulling[at]) & !candidate.param == 0 {
+                if self.scan.clause_params & 1 << at != 0 {
+                    scan.clause_params |= 1 << scan.param_count;
+                }
+                scan.param_nulling[usize::from(scan.param_count)] = self.scan.param_nulling[at];
                 scan.params[usize::from(scan.param_count)] = (class, rel);
                 joins[usize::from(scan.param_count)] = self.joins[at];
                 scan.param_count += 1;
@@ -487,7 +493,7 @@ fn analyze_qual<'a>(
         _ => Shape::Other,
     };
     // A condition above one relation must be one the model estimates.
-    if rels.count_ones() > 1 && shape == Shape::Other && !join_comparison(scope, expression) {
+    if rels.count_ones() > 1 && shape == Shape::Other && !join_condition(scope, expression) {
         return None;
     }
     let strict = strict?;
@@ -502,6 +508,155 @@ fn analyze_qual<'a>(
         forced_null,
         shape,
     })
+}
+
+/// A condition of several relations the model estimates: a comparison of
+/// two relations' columns, or an `OR` whose arms are such comparisons or
+/// conditions of one relation (`clauselist_selectivity_or`). An arm that
+/// is itself an `AND` would also restrict its relations' scans
+/// (`extract_restriction_or_clauses`), which the model leaves.
+fn join_condition(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
+    match expression {
+        Expr::Binary {
+            operator: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => [left, right].iter().all(|arm| {
+            let Some(vars) = qual_vars(scope, arm) else {
+                return false;
+            };
+            let rels = vars
+                .as_slice()
+                .iter()
+                .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
+            if rels.count_ones() <= 1 {
+                return !matches!(
+                    arm,
+                    Expr::Binary {
+                        operator: BinaryOp::And,
+                        ..
+                    }
+                );
+            }
+            join_condition(scope, arm)
+        }),
+        _ => {
+            join_comparison(scope, expression)
+                || join_inequality(scope, expression)
+                || join_equality(scope, expression)
+        }
+    }
+}
+
+/// `left = right` of columns of two relations of one joinable type, an arm
+/// of an `OR` that `eqjoinsel` estimates.
+fn join_equality(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
+    let Expr::Binary {
+        operator: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = expression
+    else {
+        return false;
+    };
+    let (Some(one), Some(two)) = (column_of(scope, left), column_of(scope, right)) else {
+        return false;
+    };
+    let ctype = |(table, column): (usize, usize)| {
+        let meta = &scope.defs.stored(table).expect("plain table").columns()[column];
+        (meta.ctype, meta.collation)
+    };
+    one.0 != two.0 && ctype(one) == ctype(two) && joinable(ctype(one).0)
+}
+
+/// `clause_selectivity` and `cost_qual_eval` of a condition of several
+/// relations [`join_condition`] accepts: a comparison's `DEFAULT_INEQ_SEL`,
+/// an inequality's complement of `eqjoinsel`, an `OR`'s arms combined as
+/// `s1 + s2 - s1 * s2`, an arm of one relation estimated as its restriction.
+fn join_estimate<'a>(
+    scope: &QueryScope<'a>,
+    expression: &'a Expr<'a>,
+    reader: &RelStatistics<'_, '_, '_>,
+    restriction: &dyn Fn(usize, &'a Expr<'a>) -> Result<Option<(f64, f64)>, SqlError>,
+    costs: Costs,
+) -> Result<Option<(f64, f64)>, SqlError> {
+    if let Expr::Binary {
+        operator: BinaryOp::Or,
+        left,
+        right,
+        ..
+    } = expression
+    {
+        let (mut selectivity, mut cost) = (0.0, 0.0);
+        for arm in [*left, *right] {
+            let Some(vars) = qual_vars(scope, arm) else {
+                return Ok(None);
+            };
+            let rels = vars
+                .as_slice()
+                .iter()
+                .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
+            let estimate = if rels.count_ones() == 1 {
+                restriction(rels.trailing_zeros() as usize, arm)?
+            } else if rels == 0 {
+                None
+            } else {
+                join_estimate(scope, arm, reader, restriction, costs)?
+            };
+            let Some((arm_selectivity, arm_cost)) = estimate else {
+                return Ok(None);
+            };
+            selectivity = selectivity + arm_selectivity - selectivity * arm_selectivity;
+            cost += arm_cost;
+        }
+        return Ok(Some((selectivity, cost)));
+    }
+    if matches!(expression, Expr::Bool(true)) {
+        return Ok(Some((1.0, 0.0)));
+    }
+    if join_comparison(scope, expression) {
+        return Ok(Some((super::DEFAULT_INEQ_SEL, costs.cpu_operator)));
+    }
+    let equality = join_equality(scope, expression);
+    if equality || join_inequality(scope, expression) {
+        let Expr::Binary { left, right, .. } = expression else {
+            unreachable!("a comparison");
+        };
+        let member = |side: &Expr<'_>| {
+            column_of(scope, side).map(|(table, column)| Member::plain(table as u8, column as u16))
+        };
+        let (Some(one), Some(two)) = (member(left), member(right)) else {
+            return Ok(None);
+        };
+        let equal = reader.equality(one, two)?.clamp(0.0, 1.0);
+        let selectivity = if equality { equal } else { 1.0 - equal };
+        return Ok(Some((selectivity, costs.cpu_operator)));
+    }
+    Ok(None)
+}
+
+/// `left <> right` of columns of two relations of one joinable type, which
+/// `neqjoinsel` estimates as the equality's complement.
+fn join_inequality(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
+    let Expr::Binary {
+        operator: BinaryOp::NotEq,
+        left,
+        right,
+        ..
+    } = expression
+    else {
+        return false;
+    };
+    let (Some(one), Some(two)) = (column_of(scope, left), column_of(scope, right)) else {
+        return false;
+    };
+    let ctype = |(table, column): (usize, usize)| {
+        let meta = &scope.defs.stored(table).expect("plain table").columns()[column];
+        (meta.ctype, meta.collation)
+    };
+    one.0 != two.0 && ctype(one) == ctype(two) && joinable(ctype(one).0)
 }
 
 /// `left < right` (or `<=`, `>`, `>=`) of columns of two relations, which
@@ -757,7 +912,7 @@ pub(crate) fn modeled_join<'a>(
     };
     tree.root = root;
     // The conditions: each join's `ON`, then `WHERE`.
-    let mut quals = [&Expr::Null; MAX_QUALS];
+    let mut quals = [&Expr::Null; MAX_QUALS + 1];
     let mut constants = Constants {
         held: [(&Expr::Null, ColType::Int4); MAX_QUALS],
         count: 0,
@@ -796,10 +951,48 @@ pub(crate) fn modeled_join<'a>(
             quals[usize::from(id)] = conjunct;
         }
     }
-    let quals = &quals[..tree.qual_count];
-    let Ok(prepared) = join_tree::prepare(&tree) else {
+    let Ok(mut prepared) = join_tree::prepare(&tree) else {
         return Ok(None);
     };
+    // The constant `true` that replaced outer join clauses
+    // (`reconsider_outer_join_clauses`) is the condition after the query's.
+    quals[tree.qual_count] = &Expr::Bool(true);
+    for placed in &mut prepared.placed[..prepared.placed_count] {
+        if let Placed::Join(join) = placed
+            && join.qual == join_tree::TRUE_QUAL
+        {
+            join.qual = tree.qual_count as u8;
+        }
+    }
+    let quals = &quals[..=tree.qual_count];
+    // `remove_useless_joins`: a left join to one relation no row above
+    // reads, which a unique index makes match at most one row, is dropped
+    // with it.
+    let mut removed: Relids = 0;
+    'restart: loop {
+        for at in 0..prepared.special_count {
+            let info = prepared.specials[at];
+            if info.kind != super::joins::SpecialKind::Left
+                || info.min_right.count_ones() != 1
+                || info.min_right & !BASE_RELIDS != 0
+            {
+                continue;
+            }
+            let table = info.min_right.trailing_zeros() as usize;
+            if !join_is_removable(storage, txid, scope, &prepared, &info, table, output[table]) {
+                continue;
+            }
+            if info.syn_right != info.min_right {
+                return Ok(None);
+            }
+            if prepared.remove_left_join(at).is_err() {
+                return Ok(None);
+            }
+            removed |= info.min_right;
+            continue 'restart;
+        }
+        break;
+    }
     let classes = prepared.classes();
     let class_count = classes.len();
     // The constant a class equates its members with.
@@ -849,12 +1042,12 @@ pub(crate) fn modeled_join<'a>(
         cost: costs.cpu_operator,
         selectivity: None,
         outer_selectivity: None,
+        outer_relids: 0,
+        operands: None,
+        other: super::joins::OtherShape::Plain,
         source: None,
     }; MAX_CLAUSES];
     let mut clause_count = 0;
-    // Each join clause's `outer_relids` (the side of an outer join its
-    // clause cannot move into).
-    let mut outer_relids = [0 as Relids; MAX_CLAUSES];
     for placed in prepared.placed() {
         let Placed::Join(join) = *placed else {
             continue;
@@ -881,9 +1074,11 @@ pub(crate) fn modeled_join<'a>(
             cost: costs.cpu_operator,
             selectivity: None,
             outer_selectivity: None,
+            outer_relids: join.outer_relids,
+            operands: None,
+            other: super::joins::OtherShape::Plain,
             source: Some(u16::from(join.qual)),
         };
-        outer_relids[clause_count] = join.outer_relids;
         clause_count += 1;
     }
     let placed_join_count = clause_count;
@@ -901,6 +1096,37 @@ pub(crate) fn modeled_join<'a>(
             }
         }
     }
+    // The columns each other condition of two relations compares, each
+    // nulled by the outer joins the clause reads it above.
+    for clause in &mut clauses[..placed_join_count] {
+        if clause.form != ClauseForm::Other {
+            continue;
+        }
+        if let Expr::Binary {
+            operator:
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq,
+            left,
+            right,
+            ..
+        } = quals[usize::from(clause.source.expect("written"))]
+            && let (Some(one), Some(two)) = (column_of(scope, left), column_of(scope, right))
+            && one.0 != two.0
+            && one.1 < 64
+            && two.1 < 64
+        {
+            let member = |(table, column): (usize, usize)| Member {
+                rel: table as u8,
+                column: column as u16,
+                nulling: clause.relids & nulling_relids[table] & !BASE_RELIDS,
+            };
+            clause.operands = Some((member(one), member(two)));
+        }
+    }
     // Each relation's join clauses an index may apply: the outer joins'
     // clauses movable into it (`join_clause_is_movable_to`), and its
     // column of each class equated with every other member
@@ -908,6 +1134,8 @@ pub(crate) fn modeled_join<'a>(
     let mut scans = [JoinScan {
         params: [(0, 0); MAX_JOIN_PARAMS],
         param_count: 0,
+        clause_params: 0,
+        param_nulling: [0; MAX_JOIN_PARAMS],
         classes: [NO_CLASS; 64],
         rel_rows: [0.0; 8],
         total_table_pages: 0.0,
@@ -925,7 +1153,9 @@ pub(crate) fn modeled_join<'a>(
             .position(|class| class.members().contains(&member))
     };
     for table in 0..n {
-        total_table_pages += super::relation_size(storage, scope.slots[table], txid).pages;
+        if removed & 1 << table == 0 {
+            total_table_pages += super::relation_size(storage, scope.slots[table], txid).pages;
+        }
         let scan = &mut scans[table];
         let relids: Relids = 1 << table;
         // `pathkeys_useful_for_merging` at the relation: a class with a
@@ -958,8 +1188,7 @@ pub(crate) fn modeled_join<'a>(
                 *slot = class as u8;
             }
         }
-        // The columns its btree indexes key: a join clause reading none of
-        // them gives the relation no parameterized path.
+        // The columns its btree indexes key.
         let mut keyed = 0u64;
         crate::sql::catalog::planner_indexes(storage, txid, scope.slots[table], &mut |index| {
             if index.method == crate::sql::ast::IndexAccessMethod::Btree {
@@ -970,20 +1199,10 @@ pub(crate) fn modeled_join<'a>(
                 }
             }
         });
-        let reads_key = |expression: &Expr<'_>| {
-            let mut reads = false;
-            expression.for_each_column_reference(&mut |qualifier, name| {
-                if let Ok(ResolvedColumn::Table(at, column)) = scope.find_column(qualifier, name) {
-                    reads |= at == table && column < 64 && keyed & 1 << column != 0;
-                }
-            });
-            reads
-        };
-        let mut oj_params = false;
         for (id, clause) in clauses[..placed_join_count].iter().enumerate() {
             if !clause.in_joininfo_of(relids)
                 || clause.relids & relids == 0
-                || outer_relids[id] & relids != 0
+                || clause.outer_relids & relids != 0
                 || clause.relids & nulling_relids[table] != 0
                 || clause.clone == super::joins::CloneKind::Is
             {
@@ -991,45 +1210,52 @@ pub(crate) fn modeled_join<'a>(
             }
             // Without an index the relation has no parameterized path; with
             // one, each path parameterized by the clause's other relations
-            // also filters by every other movable clause
-            // (`get_baserel_parampathinfo`), which the model applies only as
-            // an index key's equality.
+            // filters by it unless an index applies it
+            // (`get_baserel_parampathinfo`).
             if keyed == 0 {
                 continue;
             }
-            if !reads_key(quals[usize::from(clause.source.expect("written"))]) {
-                return Ok(None);
-            }
-            let ClauseForm::Join {
-                left,
-                right,
-                left_class,
-                right_class,
-            } = clause.form
-            else {
-                return Ok(None);
+            let expression = quals[usize::from(clause.source.expect("written"))];
+            // An equality's sides sort by their own classes; another
+            // comparison of two columns has none.
+            let (own_class, other_rel) = match clause.form {
+                ClauseForm::Join {
+                    left,
+                    right,
+                    left_class,
+                    right_class,
+                } => {
+                    if usize::from(left.rel) == table {
+                        (left_class, right.rel)
+                    } else {
+                        (right_class, left.rel)
+                    }
+                }
+                _ => {
+                    let Expr::Binary { left, right, .. } = expression else {
+                        return Ok(None);
+                    };
+                    match (column_of(scope, left), column_of(scope, right)) {
+                        (Some((one, _)), Some((two, _))) if one == table && two != table => {
+                            (NO_CLASS, two as u8)
+                        }
+                        (Some((one, _)), Some((two, _))) if two == table && one != table => {
+                            (NO_CLASS, one as u8)
+                        }
+                        _ => return Ok(None),
+                    }
+                }
             };
-            let (own, other, own_class) = if usize::from(left.rel) == table {
-                (left, right, left_class)
-            } else {
-                (right, left, right_class)
-            };
-            if own.nulling != 0 || other.relids() & !BASE_RELIDS != 0 {
-                return Ok(None);
-            }
             let at = usize::from(scan.param_count);
-            if at == MAX_JOIN_PARAMS
-                || scan.params[..at]
-                    .iter()
-                    .any(|&(class, _)| class == own_class)
-            {
+            if at == MAX_JOIN_PARAMS {
                 return Ok(None);
             }
-            scan.params[at] = (own_class, other.rel);
-            join_conjuncts[table][at] = quals[usize::from(clause.source.expect("written"))];
+            scan.params[at] = (own_class, other_rel);
+            scan.param_nulling[at] = clause.relids & !BASE_RELIDS;
+            scan.clause_params |= 1 << at;
+            join_conjuncts[table][at] = expression;
             param_clause[table][at] = Some(id as u8);
             scan.param_count += 1;
-            oj_params = true;
         }
         for (class_id, class) in classes.iter().enumerate() {
             let Some(own) = class
@@ -1046,18 +1272,12 @@ pub(crate) fn modeled_join<'a>(
                 if other.rel == own.rel {
                     continue;
                 }
-                // Clauses of outer joins and of classes moved into one scan
-                // order their index conditions in ways the model leaves.
-                if (oj_params && own.column < 64 && keyed & 1 << own.column != 0)
-                    || other.nulling != 0
-                {
-                    return Ok(None);
-                }
                 let at = usize::from(scan.param_count);
                 if at == MAX_JOIN_PARAMS {
                     return Ok(None);
                 }
                 scan.params[at] = (class_id as u8, other.rel);
+                scan.param_nulling[at] = other.nulling;
                 join_conjuncts[table][at] = equality(scope, *own, *other, arena)?;
                 scan.param_count += 1;
             }
@@ -1069,8 +1289,8 @@ pub(crate) fn modeled_join<'a>(
     // The columns above each relation's scan: the output's and those a join
     // or outer join reads (`attr_needed`).
     let mut join_columns = [0u64; MAX_JOIN_RELS];
-    for &((rel, column), relids) in &prepared.needed[..prepared.needed_count] {
-        if relids & !(1 << rel) != 0 && column < 64 {
+    for &((rel, column), relids, _) in &prepared.needed[..prepared.needed_count] {
+        if relids != 0 && column < 64 {
             join_columns[usize::from(rel)] |= 1 << column;
             note(usize::from(rel), usize::from(column));
         }
@@ -1203,6 +1423,9 @@ pub(crate) fn modeled_join<'a>(
             cost: costs.cpu_operator,
             selectivity: None,
             outer_selectivity: None,
+            outer_relids: 0,
+            operands: None,
+            other: super::joins::OtherShape::Plain,
             source: None,
         };
         clause_count += 1;
@@ -1223,16 +1446,16 @@ pub(crate) fn modeled_join<'a>(
             classes[usize::from(class)]
                 .members()
                 .iter()
-                .position(|member| usize::from(member.rel) == table)
+                .position(|member| member.relids() == 1 << table)
         };
         // The clauses a path parameterized by `param` moves into the scan:
         // the outer joins' movable clauses, then one per class.
-        let moved = |param: u8, derive: &mut dyn FnMut(u8, u8, u8) -> Option<u8>| {
+        let moved = |param: u32, derive: &mut dyn FnMut(u8, u8, u8) -> Option<u8>| {
             let mut list = ClauseList::EMPTY;
             let params = &rel.scan.params[..usize::from(rel.scan.param_count)];
-            for (&(_, other), clause) in params.iter().zip(param_clause[table]) {
+            for (at, (&(_, other), clause)) in params.iter().zip(param_clause[table]).enumerate() {
                 if let Some(id) = clause
-                    && param & 1 << other != 0
+                    && (1 << other | rel.scan.param_nulling[at]) & !param == 0
                 {
                     list.push_id(id)?;
                 }
@@ -1248,7 +1471,7 @@ pub(crate) fn modeled_join<'a>(
                 let Some(outer) = held
                     .members()
                     .iter()
-                    .position(|member| param & 1 << member.rel != 0)
+                    .position(|member| member.relids() & !param == 0)
                 else {
                     continue;
                 };
@@ -1434,7 +1657,18 @@ pub(crate) fn modeled_join<'a>(
     });
     // The conditions other than equalities evaluated at joins: one
     // relation's (`clause_selectivity` as a restriction, its evaluation
-    // cost) or a comparison of two relations' columns (`DEFAULT_INEQ_SEL`).
+    // cost) or several relations' (`join_estimate`).
+    let early_reader = RelStatistics {
+        planners: &planners,
+        rels: &base,
+    };
+    let restriction =
+        |table: usize, expression: &'a Expr<'a>| -> Result<Option<(f64, f64)>, SqlError> {
+            let rel = rels[table].expect("planned");
+            let single = QueryScope::resolve_schema(storage, rel.from, txid, arena, None)?;
+            let planner = planners[table].as_ref().expect("planned");
+            super::paths::restriction_estimate(planner, &single, expression, params, arena)
+        };
     let mut single_rel_columns = [0u64; MAX_JOIN_RELS];
     for clause in clauses[..placed_join_count].iter_mut() {
         if clause.form != ClauseForm::Other {
@@ -1461,19 +1695,46 @@ pub(crate) fn modeled_join<'a>(
                 }
                 single_rel_columns[table] |= columns;
             }
-            let rel = rels[table].expect("planned");
-            let single = QueryScope::resolve_schema(storage, rel.from, txid, arena, None)?;
-            let planner = planners[table].as_ref().expect("planned");
-            match super::paths::restriction_estimate(planner, &single, expression, params, arena)? {
+            match restriction(table, expression)? {
                 Some(estimate) => estimate,
                 None => return Ok(None),
             }
         } else {
-            (super::DEFAULT_INEQ_SEL, costs.cpu_operator)
+            match join_estimate(scope, expression, &early_reader, &restriction, costs)? {
+                Some(estimate) => estimate,
+                None => return Ok(None),
+            }
         };
         clause.selectivity = Some(selectivity);
         clause.outer_selectivity = Some(selectivity);
         clause.cost = cost;
+        clause.other = match expression {
+            Expr::Binary {
+                operator: BinaryOp::Or,
+                ..
+            } => super::joins::OtherShape::Composite,
+            Expr::Binary { left, right, .. } if join_inequality(scope, expression) => {
+                let nulls = |side: &Expr<'_>| {
+                    column_of(scope, side).map_or(0.0, |(table, column)| {
+                        let variable = planners[table].as_ref().expect("planned").variable(column);
+                        if variable.analyzed {
+                            variable.null_fraction
+                        } else {
+                            0.0
+                        }
+                    })
+                };
+                super::joins::OtherShape::Inequality {
+                    left_nulls: nulls(left),
+                    right_nulls: nulls(right),
+                }
+            }
+            _ => super::joins::OtherShape::Plain,
+        };
+        // A semi or anti join estimates these its own way, once.
+        if clause.other != super::joins::OtherShape::Plain {
+            clause.outer_selectivity = None;
+        }
     }
     // The foreign keys between the query's relations whose every column
     // pair a class or join clauses equate (`get_relation_foreign_keys`,
@@ -1575,10 +1836,11 @@ pub(crate) fn modeled_join<'a>(
         clauses: &clauses[..clause_count],
         needed: &needed[..needed_count],
         foreign_keys: &foreign_keys[..foreign_count],
+        removed,
         settings: JoinSettings {
             costs,
             work_mem_bytes: f64::from(crate::sql::guc::work_mem_kilobytes()) * 1024.0,
-            hash_mem_bytes: f64::from(crate::sql::guc::work_mem_kilobytes()) * 1024.0 * 2.0,
+            hash_mem_bytes: crate::sql::guc::hash_memory_bytes(),
             nestloop: methods.nestloop,
             hashjoin: methods.hashjoin,
             mergejoin: value("enable_mergejoin") != 0.0,
@@ -1725,6 +1987,79 @@ pub(crate) fn modeled_join<'a>(
         quals,
         output_width,
     }))
+}
+
+/// `join_is_removable` of left join `info` to relation `table`: no row
+/// above it reads the relation, and a unique index's keys are each equated
+/// with the join's left side by a mergeable clause of the join or with a
+/// constant (`rel_is_distinct_for`).
+fn join_is_removable(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    prepared: &join_tree::Prepared,
+    info: &super::joins::SpecialJoin,
+    table: usize,
+    output: u64,
+) -> bool {
+    let inputs = info.min_left | info.min_right;
+    let joinrelids = inputs | info.oj;
+    if output != 0
+        || prepared.needed[..prepared.needed_count]
+            .iter()
+            .any(|&((rel, _), relids, _)| usize::from(rel) == table && relids & !inputs != 0)
+    {
+        return false;
+    }
+    let mut matched = 0u64;
+    for class in prepared.classes() {
+        if class.has_const {
+            for member in class.members() {
+                if usize::from(member.rel) == table && member.nulling == 0 && member.column < 64 {
+                    matched |= 1 << member.column;
+                }
+            }
+        }
+    }
+    for placed in prepared.placed() {
+        let Placed::Join(join) = placed else {
+            continue;
+        };
+        if join.clone == super::joins::CloneKind::Is
+            || join.required & info.min_right == 0
+            || join.pushed_down
+            || join.required & !joinrelids != 0
+        {
+            continue;
+        }
+        let Some((left, right, ..)) = join.merge else {
+            continue;
+        };
+        for (own, other) in [(left, right), (right, left)] {
+            if own.relids() == info.min_right
+                && other.relids() & !info.min_left == 0
+                && own.column < 64
+            {
+                matched |= 1 << own.column;
+            }
+        }
+    }
+    let mut distinct = false;
+    crate::sql::catalog::planner_indexes(storage, txid, scope.slots[table], &mut |index| {
+        if !index.unique
+            || !index.immediate
+            || index.partial
+            || index.method != crate::sql::ast::IndexAccessMethod::Btree
+        {
+            return;
+        }
+        distinct |= (0..index.n_cols).all(|position| {
+            !index.expression_keys[position]
+                && index.columns[position] < 64
+                && matched & 1 << index.columns[position] != 0
+        });
+    });
+    distinct
 }
 
 fn and<'a>(

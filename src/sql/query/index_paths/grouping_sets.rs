@@ -474,7 +474,7 @@ fn table_size(query: &SetsQuery<'_>, groups: f64) -> f64 {
 
 /// `get_hash_memory_limit` in bytes.
 fn hash_memory() -> f64 {
-    f64::from(crate::sql::guc::work_mem_kilobytes()) * 1024.0 * 2.0
+    crate::sql::guc::hash_memory_bytes()
 }
 
 /// `DiscreteKnapsack` with every item worth one: the items whose weights

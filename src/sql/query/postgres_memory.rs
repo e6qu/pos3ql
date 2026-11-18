@@ -92,6 +92,11 @@ fn datum_layout(value: &Datum<'_>) -> Option<PhysicalLayout> {
         Datum::Numeric(_) => 1700,
         Datum::Uuid(_) => 2950,
         Datum::Bytea(_) => 17,
+        Datum::Cidr(_) => 650,
+        Datum::Macaddr8(_) => 774,
+        Datum::Macaddr(_) => 829,
+        Datum::Inet(_) => 869,
+        Datum::PgLsn(_) => 3220,
         _ => return None,
     };
     crate::sql::type_layouts::builtin(oid)
@@ -105,6 +110,8 @@ pub(crate) fn varlena_payload(value: &Datum<'_>) -> Option<usize> {
         Datum::Text(text) | Datum::Bpchar(text) | Datum::Xml(text) => text.len(),
         Datum::Json { text, jsonb: false } => text.len(),
         Datum::Bytea(bytes) => bytes.len(),
+        // `inet_struct`: family and mask length, then the address bytes.
+        Datum::Inet(address) | Datum::Cidr(address) => 2 + address.addr_len(),
         // `NumericShort` (a two-byte header) when the weight and display
         // scale fit, else the long form, then base-10000 digits.
         Datum::Numeric(value) => match value.sign {

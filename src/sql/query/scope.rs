@@ -4053,6 +4053,27 @@ impl<'d> QueryScope<'d> {
         self.find_column_among_unsuggested(self.n, qualifier, name)
     }
 
+    /// Which column `qualifier.name` names, for a caller that drops a
+    /// failure: no error position is recorded for a reference the
+    /// statement may not report.
+    pub(crate) fn probe_column(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<ResolvedColumn> {
+        self.find_column_prefix(self.n, qualifier, name).ok()
+    }
+
+    /// [`Self::probe_column`]'s failure, unrecorded, for a caller that
+    /// tells failures apart without reporting them.
+    pub(crate) fn probe_column_result(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_column_prefix(self.n, qualifier, name)
+    }
+
     /// [`Self::find_column_among`] without the spelling suggestion.
     pub(crate) fn find_column_among_unsuggested(
         &self,

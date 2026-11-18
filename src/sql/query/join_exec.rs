@@ -610,33 +610,145 @@ impl<'a> Frozen<'a> {
     }
 }
 
-/// Whether [`datum_hash`] hashes values of `ctype`.
-fn datum_type_hashable(ctype: crate::sql::types::ColType) -> bool {
+/// Whether [`datum_hash`] hashes values of `ctype`: the types whose default
+/// hash operator class it computes.
+pub(crate) fn datum_type_hashable(ctype: crate::sql::types::ColType) -> bool {
     use crate::sql::types::ColType;
     matches!(
         ctype,
         ColType::Int2
             | ColType::Int4
             | ColType::Int8
+            | ColType::Oid
             | ColType::Date
             | ColType::Bool
+            | ColType::Char
             | ColType::Text
+            | ColType::Varchar
+            | ColType::Name
+            | ColType::Bpchar
+            | ColType::Bytea
+            | ColType::Uuid
+            | ColType::Numeric
+            | ColType::Float4
+            | ColType::Float8
+            | ColType::Timestamp
+            | ColType::Timestamptz
+            | ColType::Time
+            | ColType::Timetz
+            | ColType::Interval
+            | ColType::PgLsn
+            | ColType::Inet
+            | ColType::Cidr
+            | ColType::Macaddr
+            | ColType::Macaddr8
     )
 }
 
-/// The value hashes `ExecHashGetHashValue` combines: each type's hash
-/// support function (`hashint4`, `hashint8`, `hashtext` under a
-/// deterministic collation, `hashchar` for `bool`).
-pub(super) fn datum_hash(value: &Datum<'_>) -> Option<u32> {
+/// The value hashes `ExecHashGetHashValue` and `TupleHashTableHash`
+/// combine: each type's default hash support function, `hashtext` and
+/// `hashbpchar` under a deterministic collation.
+/// https://github.com/postgres/postgres/blob/REL_18_6/src/backend/access/hash/hashfunc.c
+pub(crate) fn datum_hash(value: &Datum<'_>) -> Option<u32> {
     use crate::sql::identity::{hash_bytea, hash_int64_input, hash_uint32};
+    let bytes = |value: &[u8]| hash_bytea(value) as u32;
     Some(match value {
         Datum::Int2(value) => hash_uint32(*value as i32 as u32),
         Datum::Int4(value) | Datum::Date(value) => hash_uint32(*value as u32),
-        Datum::Int8(value) => hash_uint32(hash_int64_input(*value)),
+        Datum::Oid(value) | Datum::Cid(value) => hash_uint32(*value),
+        Datum::Int8(value)
+        | Datum::Timestamp(value)
+        | Datum::Timestamptz(value)
+        | Datum::Time(value) => hash_uint32(hash_int64_input(*value)),
+        Datum::PgLsn(value) | Datum::Xid8(value) => hash_uint32(hash_int64_input(*value as i64)),
         Datum::Bool(value) => hash_uint32(u32::from(*value)),
-        Datum::Text(value) => hash_bytea(value.as_bytes()) as u32,
+        Datum::Char(value) => hash_uint32((*value as i8 as i32) as u32),
+        Datum::Text(value) => bytes(value.as_bytes()),
+        // `hashbpchar` hashes the value without its trailing blanks.
+        Datum::Bpchar(value) => bytes(value.trim_end_matches(' ').as_bytes()),
+        Datum::Bytea(value) => bytes(value),
+        Datum::Uuid(value) => bytes(value),
+        Datum::Macaddr(value) => bytes(value),
+        Datum::Macaddr8(value) => bytes(value),
+        Datum::Numeric(value) => numeric_hash(value),
+        // `hashfloat4` hashes its value as a `float8`.
+        Datum::Float4(value) => float8_hash(f64::from(*value)),
+        Datum::Float8(value) => float8_hash(*value),
+        // `timetz_hash`: the time's `hashint8` mixed with its zone, which
+        // PostgreSQL stores as seconds west of UTC.
+        Datum::Timetz(micros, offset) => {
+            hash_uint32(hash_int64_input(*micros)) ^ hash_uint32(offset.wrapping_neg() as u32)
+        }
+        // `interval_hash`: the low 64 bits of its 30-day-month span.
+        Datum::Interval(interval) => {
+            let span = i128::from(interval.micros)
+                + i128::from(interval.days) * 86_400_000_000
+                + i128::from(interval.months) * 30 * 86_400_000_000;
+            hash_uint32(hash_int64_input(span as i64))
+        }
+        // `hashinet`: the family (`PGSQL_AF_INET` or `PGSQL_AF_INET6`), the
+        // mask length and the address bytes.
+        Datum::Inet(address) | Datum::Cidr(address) => {
+            let mut held = [0u8; 18];
+            held[0] = if address.family() == 4 { 2 } else { 3 };
+            held[1] = address.bits();
+            let length = address.addr_len();
+            held[2..2 + length].copy_from_slice(&address.addr()[..length]);
+            bytes(&held[..2 + length])
+        }
         _ => return None,
     })
+}
+
+/// Whether two values equal by their type's equality have the same stored
+/// image (`datum_image_eq`).
+fn same_image(left: &Datum<'_>, right: &Datum<'_>) -> bool {
+    match (left, right) {
+        (Datum::Numeric(one), Datum::Numeric(two)) => one.dscale == two.dscale,
+        (Datum::Float4(one), Datum::Float4(two)) => one.to_bits() == two.to_bits(),
+        (Datum::Float8(one), Datum::Float8(two)) => one.to_bits() == two.to_bits(),
+        (Datum::Interval(one), Datum::Interval(two)) => {
+            (one.months, one.days, one.micros) == (two.months, two.days, two.micros)
+        }
+        (Datum::Timetz(one, one_zone), Datum::Timetz(two, two_zone)) => {
+            (one, one_zone) == (two, two_zone)
+        }
+        (Datum::Bpchar(one), Datum::Bpchar(two)) => one == two,
+        _ => true,
+    }
+}
+
+/// `hash_numeric`: the base-10000 digits between the first and last
+/// nonzero ones, in native byte order, the weight mixed in by XOR; NaN and
+/// the infinities hash to zero and zero to all ones.
+fn numeric_hash(value: &crate::sql::numeric::Numeric<'_>) -> u32 {
+    use crate::sql::numeric::Sign;
+    if matches!(value.sign, Sign::NaN | Sign::PosInf | Sign::NegInf) {
+        return 0;
+    }
+    let count = value.ndigits();
+    let Some(first) = (0..count).find(|&at| value.digit(at) != 0) else {
+        return u32::MAX;
+    };
+    let last = (0..count)
+        .rev()
+        .find(|&at| value.digit(at) != 0)
+        .expect("a nonzero digit exists");
+    let mut held = [0u8; 2 * crate::sql::numeric::MAX_NDIGITS];
+    for (at, index) in (first..=last).enumerate() {
+        held[2 * at..2 * at + 2].copy_from_slice(&value.digit(index).to_ne_bytes());
+    }
+    let weight = i32::from(value.weight) - first as i32;
+    (crate::sql::identity::hash_bytea(&held[..2 * (last - first + 1)]) as u32) ^ weight as u32
+}
+
+/// `hashfloat8`: zero of either sign hashes to zero, and every NaN alike.
+fn float8_hash(value: f64) -> u32 {
+    if value == 0.0 {
+        return 0;
+    }
+    let value = if value.is_nan() { f64::NAN } else { value };
+    crate::sql::identity::hash_bytea(&value.to_ne_bytes()) as u32
 }
 
 /// What `MJEvalOuterValues` and `MJEvalInnerValues` make of a row.
@@ -767,6 +879,16 @@ pub(super) fn scan_statement_source<'a>(
             storage, txid, statement, scope, params, arena,
         )?
     {
+        // A `GroupAggregate` over the join's rows sorted by its keys reads
+        // them in its sort's order.
+        if let (Some(group), Some(chosen)) = (model.group, model.plan.upper.group)
+            && !group.distinct
+            && let Some((_, _, presorted)) = chosen.input_sort
+        {
+            return run_modeled_sorted(
+                storage, scope, txid, &model, statement, presorted, arena, params, hooks, visit,
+            );
+        }
         return run_modeled(storage, scope, txid, &model, arena, params, hooks, visit);
     }
     if recycle_rows {
@@ -798,6 +920,143 @@ pub(super) fn scan_statement_source<'a>(
             visit,
         )
     }
+}
+
+/// Runs `model`'s plan and passes its rows to `visit` in the order the
+/// `Sort` below its `GroupAggregate` returns them: PostgreSQL's tuplesort
+/// by the grouping keys, or its incremental sort after the first
+/// `presorted` of them, so each group's aggregates read their rows in
+/// PostgreSQL's order.
+#[allow(clippy::too_many_arguments)]
+fn run_modeled_sorted<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    txid: u32,
+    model: &ModeledJoin<'a>,
+    statement: &'a crate::sql::ast::Select<'a>,
+    presorted: u8,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    visit: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
+    let group = model.group.expect("a sorted grouping");
+    let mut held = crate::mem::arena::ArenaList::new(arena);
+    let mut offsets: &[usize] = &[];
+    run_modeled(
+        storage,
+        scope,
+        txid,
+        model,
+        arena,
+        params,
+        hooks,
+        &mut |row| {
+            let JoinRowValues::Flat {
+                values,
+                offsets: row_offsets,
+            } = row.values
+            else {
+                unreachable!("a modeled join's rows are flat")
+            };
+            offsets = arena
+                .alloc_slice_copy(row_offsets)
+                .map_err(|_| arena_full())?;
+            let values = arena.alloc_slice_copy(values).map_err(|_| arena_full())?;
+            let rowids = arena
+                .alloc_slice_copy(row.rowids)
+                .map_err(|_| arena_full())?;
+            held.push((&*values, &*rowids)).map_err(|_| arena_full())?;
+            Ok(true)
+        },
+    )?;
+    let rows = held.as_slice();
+    // Each grouping key's place in a flat row, collation and direction.
+    let mut keys = [(0usize, Collation::None, 0u8); super::index_paths::joins::MAX_KEYS];
+    for (slot, &(position, flags)) in keys.iter_mut().zip(group.keys) {
+        let (table, column) =
+            super::index_paths::join_query::column_of(scope, statement.group_by[position])
+                .expect("a modeled grouping key is a column");
+        let collation =
+            scope.defs.stored(table).expect("a plain table").columns()[column].collation;
+        *slot = (offsets[table] + column, collation, flags);
+    }
+    let keys = &keys[..group.keys.len()];
+    let compare_key = |key: &(usize, Collation, u8), left: u32, right: u32| {
+        let (at, collation, flags) = *key;
+        let (left, right) = (&rows[left as usize].0[at], &rows[right as usize].0[at]);
+        let nulls_first = flags & super::index_paths::joins::KEY_NULLS_FIRST != 0;
+        Ok::<_, SqlError>(match (left.is_null(), right.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) if nulls_first => Ordering::Less,
+            (true, false) => Ordering::Greater,
+            (false, true) if nulls_first => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => {
+                let compared = crate::sql::eval::compare_datums_collated(
+                    storage, txid, collation, left, right,
+                )?;
+                if flags & super::index_paths::joins::KEY_DESCENDING != 0 {
+                    compared.reverse()
+                } else {
+                    compared
+                }
+            }
+        })
+    };
+    let compare = &mut |left: u32, right: u32| -> Result<Ordering, SqlError> {
+        for key in keys {
+            let ordering = compare_key(key, left, right)?;
+            if !ordering.is_eq() {
+                return Ok(ordering);
+            }
+        }
+        Ok(Ordering::Equal)
+    };
+    let input = arena
+        .alloc_slice_with(rows.len(), |at| at as u32)
+        .map_err(|_| arena_full())?;
+    let order: &[u32] = if presorted == 0 {
+        crate::sql::pg_qsort::pg_tuplesort(input, None, compare)?;
+        input
+    } else {
+        let prefix = &keys[..usize::from(presorted)];
+        let scratch = arena
+            .alloc_slice_with(rows.len() * 2, |_| 0u32)
+            .map_err(|_| arena_full())?;
+        let out = arena
+            .alloc_slice_with(rows.len(), |_| 0u32)
+            .map_err(|_| arena_full())?;
+        crate::sql::pg_qsort::pg_incremental_sort(
+            input,
+            scratch,
+            out,
+            None,
+            &mut |left, right| {
+                for key in prefix {
+                    if !compare_key(key, left, right)?.is_eq() {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            },
+            compare,
+            &mut |_, _, _| Ok(()),
+        )?;
+        out
+    };
+    for &at in order {
+        let (values, rowids) = rows[at as usize];
+        if !visit(&JoinRow {
+            scope,
+            values: JoinRowValues::Flat { values, offsets },
+            rowids,
+            visible: scope.n,
+        })? {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Runs `model`'s plan, passing each joined row to `visit` until it
@@ -1965,25 +2224,17 @@ impl<'r, 'a> Runner<'r, 'a> {
             {
                 return Ok(false);
             }
-            // Binary mode tells apart equal numerics of different scales,
-            // which the other modeled types' bytes never do.
-            if binary
-                && let (Datum::Numeric(one), Datum::Numeric(two)) = (left, right)
-                && one.dscale != two.dscale
-            {
+            // Binary mode (`datum_image_eq`) tells apart equal values whose
+            // stored images differ: numerics of different scales, zeros of
+            // either sign, intervals of different units and times in
+            // different zones.
+            if binary && !same_image(left, right) {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    /// A hash join PostgreSQL plans with several batches
-    /// (`ExecHashJoin` with `ExecHashTableInsert`, `ExecHashIncreaseNumBatches`,
-    /// the skew buckets of `ExecHashBuildSkewHash` and
-    /// `ExecHashJoinNewBatch`): batch 0's outer rows probe as they are read,
-    /// the others are saved to their batch, and each later batch is loaded
-    /// and probed in turn.
-    #[allow(clippy::too_many_arguments)]
     /// Whether every key's type has a hash function here.
     fn hashable(&self, keys: &KeySides) -> bool {
         Self::keys(keys).all(|&(outer, inner)| {
@@ -2000,6 +2251,12 @@ impl<'r, 'a> Runner<'r, 'a> {
         })
     }
 
+    /// A hash join PostgreSQL plans with several batches
+    /// (`ExecHashJoin` with `ExecHashTableInsert`, `ExecHashIncreaseNumBatches`,
+    /// the skew buckets of `ExecHashBuildSkewHash` and
+    /// `ExecHashJoinNewBatch`): batch 0's outer rows probe as they are read,
+    /// the others are saved to their batch, and each later batch is loaded
+    /// and probed in turn.
     #[allow(clippy::too_many_arguments)]
     fn batched_hash_join(
         &self,

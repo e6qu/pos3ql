@@ -310,13 +310,17 @@ fn analyze_mcv_list(
 }
 
 /// The bytes of a variable-length value's data as PostgreSQL stores it,
-/// without the length header. Text, `bytea` and `numeric` (base-10000
-/// digits after a two-byte short or four-byte long header) are exact;
+/// without the length header. Text, `bytea`, `inet`, `cidr` and `numeric`
+/// (base-10000 digits after a two-byte short or four-byte long header) are
+/// exact;
 /// other types count their row encoding's payload.
 pub(crate) fn raw_value_length(value: &Datum<'_>) -> usize {
     match value {
         Datum::Text(text) | Datum::Bpchar(text) => text.len(),
         Datum::Bytea(bytes) => bytes.len(),
+        // `inet_struct`: the family and mask length bytes, then the
+        // address's own bytes (`SET_INET_VARSIZE`).
+        Datum::Inet(address) | Datum::Cidr(address) => 2 + address.addr_len(),
         Datum::Numeric(number) => {
             if number.is_special() {
                 2

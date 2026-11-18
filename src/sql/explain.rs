@@ -4116,10 +4116,12 @@ fn grouped_scan_path<'a>(
     }
     // A `HAVING` reading its aggregates: its cost and selectivity.
     let having = match statement.having {
-        Some(having) => match having_quals(having, storage, txid, columns, arena)? {
-            Some(quals) => Some(quals),
-            None => return Ok(None),
-        },
+        Some(having) => {
+            match query::index_paths::having_quals(having, storage, txid, columns, arena)? {
+                Some(quals) => Some(quals),
+                None => return Ok(None),
+            }
+        }
         None => None,
     };
     // The aggregates' costs, over a list of aggregates, columns and
@@ -4236,74 +4238,6 @@ fn grouped_scan_path<'a>(
         sort_keys,
         group_keys,
         width: output_width,
-    }))
-}
-
-/// The cost and selectivity PostgreSQL's planner gives a `HAVING`
-/// condition that reads aggregates (`cost_qual_eval`, which costs an
-/// aggregate as a column, and `clauselist_selectivity`, whose operators find
-/// no statistics for an aggregate: `DEFAULT_EQ_SEL` for `=`, its complement
-/// for `<>`, `DEFAULT_INEQ_SEL` for an inequality). `None` for a condition
-/// outside that model, or one without an aggregate (which PostgreSQL moves to
-/// `WHERE`).
-fn having_quals(
-    having: &Expr<'_>,
-    storage: &Storage,
-    txid: u32,
-    columns: &dyn crate::sql::exec::ColTypeResolver,
-    arena: &Arena,
-) -> Result<Option<query::index_paths::QualCosts>, SqlError> {
-    use crate::sql::ast::BinaryOp;
-    const DEFAULT_EQ_SEL: f64 = 0.005;
-    const DEFAULT_INEQ_SEL: f64 = 1.0 / 3.0;
-    fn selectivity(condition: &Expr<'_>) -> Option<f64> {
-        match condition {
-            Expr::Binary {
-                operator: BinaryOp::And,
-                left,
-                right,
-                ..
-            } => Some(selectivity(left)? * selectivity(right)?),
-            Expr::Binary {
-                operator: BinaryOp::Or,
-                left,
-                right,
-                ..
-            } => {
-                let (left, right) = (selectivity(left)?, selectivity(right)?);
-                Some(left + right - left * right)
-            }
-            Expr::Binary {
-                operator,
-                left,
-                right,
-                ..
-            } if (left.is_aggregate_use() && right.is_constant(false))
-                || (right.is_aggregate_use() && left.is_constant(false)) =>
-            {
-                match operator {
-                    BinaryOp::Eq => Some(DEFAULT_EQ_SEL),
-                    BinaryOp::NotEq => Some(1.0 - DEFAULT_EQ_SEL),
-                    BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
-                        Some(DEFAULT_INEQ_SEL)
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-    if having.contains_subquery() {
-        return Ok(None);
-    }
-    let Some(selectivity) = selectivity(having) else {
-        return Ok(None);
-    };
-    Ok(Some(query::index_paths::QualCosts {
-        startup: 0.0,
-        per_tuple: query::qual_cost(having, columns, storage, txid, arena) / 2.0
-            * crate::sql::guc::planner_value("cpu_operator_cost"),
-        selectivity,
     }))
 }
 
@@ -6448,7 +6382,10 @@ fn plan_pulled_select<'a>(
         // Each key shows its class's first member the target list holds,
         // a relation no node scans (a dummy one's) unqualified.
         let scanned = joins::scanned_rels(&model.plan, model.plan.top);
-        for (key, &(table, column)) in sorted.iter_mut().zip(model.sort_shown) {
+        for (key, &shown) in sorted.iter_mut().zip(model.sort_shown) {
+            let Some((table, column)) = shown else {
+                continue;
+            };
             let Some(definition) = scope.defs.stored(table) else {
                 continue;
             };
@@ -6490,47 +6427,6 @@ fn plan_pulled_select<'a>(
             )?),
             _ => None,
         };
-        // A plain aggregate's `Aggregate` over the join (`cost_agg`).
-        let aggregate_node = if model.aggregated {
-            let expressions = arena
-                .alloc_slice_with(statement.items.len(), |at| match statement.items[at] {
-                    SelectItem::Expr { expression, .. } => expression,
-                    _ => &Expr::Null,
-                })
-                .map_err(|_| arena_full())?;
-            let Some(costs) =
-                query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
-            else {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "EXPLAIN of an aggregate PostgreSQL's cost model is not modeled for over a join is not supported"
-                ));
-            };
-            let top = model.plan.path(model.plan.top);
-            let (startup, total, _) = query::index_paths::cost_agg(
-                query::index_paths::AggStrategy::Plain,
-                &costs,
-                0,
-                1.0,
-                query::index_paths::AggInput {
-                    startup: top.startup,
-                    total: model.plan.upper.top_total,
-                    rows: top.rows,
-                    width: model.output_width,
-                },
-            );
-            Some(PlanNode {
-                name: StackStr::from_str("Aggregate"),
-                key: Some(NodeKey::new(block, Role::Aggregate)),
-                startup_cost: startup,
-                total_cost: total,
-                rows: 1,
-                width,
-                ..PlanNode::EMPTY
-            })
-        } else {
-            None
-        };
         // A `GROUP BY`'s `HashAggregate`, or its `GroupAggregate` over the
         // joined rows sorted by its keys.
         let mut group_nodes = [PlanNode::EMPTY; 2];
@@ -6540,7 +6436,14 @@ fn plan_pulled_select<'a>(
                 .alloc_slice_with(group.keys.len(), |at| {
                     let (position, flags) = group.keys[at];
                     (
-                        statement.group_by[position],
+                        if group.distinct {
+                            match statement.items[position] {
+                                SelectItem::Expr { expression, .. } => expression,
+                                _ => &Expr::Null,
+                            }
+                        } else {
+                            statement.group_by[position]
+                        },
                         Some((
                             flags & query::index_paths::joins::KEY_DESCENDING != 0,
                             flags & query::index_paths::joins::KEY_NULLS_FIRST != 0,
@@ -6560,20 +6463,41 @@ fn plan_pulled_select<'a>(
                 unsorted,
                 arena,
             )?;
+            let unique = group.distinct && !group.hashed;
             group_nodes[0] = PlanNode {
                 name: StackStr::from_str(if group.hashed {
                     "HashAggregate"
+                } else if unique {
+                    "Unique"
+                } else if group.keys.is_empty() {
+                    "Aggregate"
                 } else {
                     "GroupAggregate"
                 }),
-                key: Some(NodeKey::new(block, Role::Aggregate)),
+                key: Some(NodeKey::new(
+                    block,
+                    if group.distinct {
+                        Role::Unique
+                    } else {
+                        Role::Aggregate
+                    },
+                )),
                 startup_cost: chosen.startup,
                 total_cost: chosen.total,
                 rows: chosen.rows as u64,
                 width: chosen.width as u32,
-                keys: group_keys,
+                // A `Unique` names no keys.
+                keys: if unique { PlanKeys::NONE } else { group_keys },
                 ..PlanNode::EMPTY
-            };
+            }
+            .with_qual(
+                QualLabel::Filter,
+                having_filter(storage, txid, Some(scope), statement.having, false, arena)?,
+            )
+            .with_verbose_qual(
+                QualLabel::Filter,
+                having_filter(storage, txid, Some(scope), statement.having, true, arena)?,
+            );
             group_count = 1;
             if let Some((startup, total, presorted)) = chosen.input_sort {
                 let mut node = PlanNode {
@@ -6621,12 +6545,7 @@ fn plan_pulled_select<'a>(
             txid,
             scope,
             &model,
-            (
-                sort_keys,
-                presorted,
-                aggregate_node,
-                &group_nodes[..group_count],
-            ),
+            (sort_keys, presorted, &group_nodes[..group_count]),
             block,
             arena,
         )?;

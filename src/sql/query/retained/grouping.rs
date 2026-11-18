@@ -754,7 +754,7 @@ impl<'a> GroupState<'a> {
         'a: 'work,
     {
         for (key, &collation) in self.keys.iter().zip(self.collations) {
-            let value = crate::sql::eval::text_view(eval_full(key, work, params, row, hooks)?);
+            let value = crate::sql::eval::group_key_view(eval_full(key, work, params, row, hooks)?);
             storage.validate_text_collation(collation, &value)?;
             values.push(value).map_err(|_| arena_full())?;
         }

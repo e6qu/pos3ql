@@ -1005,28 +1005,43 @@ dummy `Result` whose columns print unqualified, several make their join
 dummy (`populate_joinrel_with_paths`, `differential_exact/876`). A class
 may hold two columns of one relation, which becomes a restriction
 comparing them (`generate_base_implied_equalities_no_const`,
-`differential_exact/877`). A `GROUP BY` of plain columns without `HAVING`
-groups the join's rows as `add_paths_to_grouping_rel` plans it: a
+`differential_exact/877`). The join's rows are grouped as `add_paths_to_grouping_rel` plans it: a
 `HashAggregate` over the cheapest path, returning its groups in the order
-`ExecAgg` walks its `simplehash` table, or a `GroupAggregate` over the
-join sorted (fully or incrementally) by the grouping keys, which take the
-`ORDER BY`'s leading keys' order and directions (`preprocess_groupclause`,
+`ExecAgg` walks its `simplehash` table (each key hashed by its type's
+default hash function: `hash_numeric`, `hashfloat8`, `timestamp_hash`,
+`uuid_hash`, `hashbpchar`, `interval_hash`, `hashinet` and the others,
+`differential_exact/881`), or a `GroupAggregate` over the join sorted
+(fully or incrementally) by the grouping keys, which take the `ORDER BY`'s
+leading keys' order and directions (`preprocess_groupclause`,
 `group_keys_reorder_by_pathkeys`), sized by `estimate_num_groups`, with
-the sort and limit over the groups (`differential_exact/878`); a sorted
-grouping's aggregates whose result depends on their input order, and
-hashing keys of types other than integers, `date`, `bool` and `text`,
-keep pos3ql's join order. Remaining for that search: `ORDER BY`
-expressions, `HAVING`, `DISTINCT`, window functions and a `LIMIT` above
-a plain aggregate, which keep pos3ql's join order, join conditions of expressions or of two types
-(`a.int4col = b.int8col`, which PostgreSQL also merges into a class), an
-`OR` whose arm is an `AND` (`extract_restriction_or_clauses`) or that a
-semi or anti join or an indexed relation's parameterized scan evaluates, a merge join over a partly sorted outer
-input (`Incremental Sort`), parenthesized joins (pulled up as
-`pull_up_subqueries` flattens them), self-join removal
+the sort and limit over the groups (`differential_exact/878`). The
+grouping keys and the select list may be expressions of the grouped
+columns, `HAVING` filters the groups (costed by `cost_qual_eval`), `ORDER
+BY` may name expressions and aggregates, a plain aggregate may carry a
+`LIMIT`, and a sorted grouping feeds order-dependent aggregates
+(`string_agg`, `array_agg`) its sorted rows (`differential_exact/879`).
+`DISTINCT` over a join is a `Unique` over sorted rows or a
+`HashAggregate` (`create_final_distinct_paths`, `differential_exact/880`).
+Join keys of `int2`, `int4` and `int8`, or of `real` and `double
+precision`, compare across types in one class
+(`differential_exact/882`). An `OR` whose arms are `AND`s restricts each
+relation by the `OR` of its own conditions
+(`extract_restriction_or_clauses`), dividing the join clause's
+selectivity by the restriction's (`differential_exact/883`), and a
+parenthesized join that `deconstruct_jointree` reads into the same
+problem plans as one join search (`differential_exact/884`). Remaining
+for that search: window functions, aggregates with their own `ORDER BY`
+or `DISTINCT` (presorted aggregate input), join conditions of
+expressions (`a.k + 1 = b.k`) and conditions over several relations
+other than comparisons of columns (`COALESCE(a.id, 0) < b.id`), an `OR`
+that a semi or anti join or an indexed relation's parameterized scan
+evaluates, a merge join over a partly sorted outer input (`Incremental
+Sort`), a right-nested outer join (`a LEFT JOIN (b JOIN c) ON ...`) and
+derived tables kept as subqueries (`SubqueryScan`), self-join removal
 (`remove_useless_self_joins`), a constant equated with a full join's
 compared column (`reconsider_full_join_clause`) or with an outer join's
-column another outer join nulls, derived tables, `UPDATE ...
-FROM` and `DELETE ... USING` through the same search, more relations than
+column another outer join nulls, `UPDATE ... FROM` and `DELETE ...
+USING` through the same search, more relations than
 `join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,
 not ported; such queries keep pos3ql's join order and refuse cost output
 with `0A000`). A parameterized index scan's cost reads its index's pages:

@@ -392,6 +392,74 @@ pub(crate) struct QualCosts {
     pub(crate) selectivity: f64,
 }
 
+/// The cost and selectivity PostgreSQL's planner gives a `HAVING`
+/// condition that reads aggregates (`cost_qual_eval`, which costs an
+/// aggregate as a column, and `clauselist_selectivity`, whose operators find
+/// no statistics for an aggregate: `DEFAULT_EQ_SEL` for `=`, its complement
+/// for `<>`, `DEFAULT_INEQ_SEL` for an inequality). `None` for a condition
+/// outside that model, or one without an aggregate (which PostgreSQL moves to
+/// `WHERE`).
+pub(crate) fn having_quals(
+    having: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    arena: &Arena,
+) -> Result<Option<QualCosts>, SqlError> {
+    use crate::sql::ast::BinaryOp;
+    const DEFAULT_EQ_SEL: f64 = 0.005;
+    const DEFAULT_INEQ_SEL: f64 = 1.0 / 3.0;
+    fn selectivity(condition: &Expr<'_>) -> Option<f64> {
+        match condition {
+            Expr::Binary {
+                operator: BinaryOp::And,
+                left,
+                right,
+                ..
+            } => Some(selectivity(left)? * selectivity(right)?),
+            Expr::Binary {
+                operator: BinaryOp::Or,
+                left,
+                right,
+                ..
+            } => {
+                let (left, right) = (selectivity(left)?, selectivity(right)?);
+                Some(left + right - left * right)
+            }
+            Expr::Binary {
+                operator,
+                left,
+                right,
+                ..
+            } if (left.is_aggregate_use() && right.is_constant(false))
+                || (right.is_aggregate_use() && left.is_constant(false)) =>
+            {
+                match operator {
+                    BinaryOp::Eq => Some(DEFAULT_EQ_SEL),
+                    BinaryOp::NotEq => Some(1.0 - DEFAULT_EQ_SEL),
+                    BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
+                        Some(DEFAULT_INEQ_SEL)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    if having.contains_subquery() {
+        return Ok(None);
+    }
+    let Some(selectivity) = selectivity(having) else {
+        return Ok(None);
+    };
+    Ok(Some(QualCosts {
+        startup: 0.0,
+        per_tuple: crate::sql::query::qual_cost(having, columns, storage, txid, arena) / 2.0
+            * crate::sql::guc::planner_value("cpu_operator_cost"),
+        selectivity,
+    }))
+}
+
 /// `cost_agg`'s accounting of its `HAVING` quals over the costs and rows it
 /// computed without them: their startup cost, their per-row cost on every
 /// group, and the groups they keep (`clamp_row_est`).

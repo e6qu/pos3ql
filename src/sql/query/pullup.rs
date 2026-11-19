@@ -172,14 +172,14 @@ fn flatten_parenthesized_joins<'a>(
     let push = |joins: &mut crate::mem::arena::ArenaList<'a, Join<'a>>, join: Join<'a>| {
         joins.push(join).map_err(|_| arena_full())
     };
-    let base = if position == 0 {
+    let (base, lifted) = if position == 0 {
         for &join in inner.joins {
             push(&mut joins, join)?;
         }
         for &join in from.joins {
             push(&mut joins, join)?;
         }
-        inner.base
+        (inner.base, None)
     } else {
         for &join in &from.joins[..position - 1] {
             push(&mut joins, join)?;
@@ -193,61 +193,27 @@ fn flatten_parenthesized_joins<'a>(
             JoinKind::Cross
         };
         let last = inner.joins.len();
-        // Each conjunct of the outer join's condition joins the first inner
-        // member by which every relation it names has joined, as the chain
-        // is all inner joins; one naming a relation by an unqualified column,
-        // or reading a subquery or a volatile function, joins the last.
-        let mut placed = [None::<&'a Expr<'a>>; 64];
-        if let Some(on) = outer.on.filter(|_| outer.kind != JoinKind::Comma) {
-            let mut conjuncts = [&Expr::Null; super::plan::MAX_CONJUNCTS];
-            let mut count = 0;
-            let split = super::plan::flatten_and(on, &mut conjuncts, &mut count);
-            let exposed = |table: &TableRef<'a>| table.alias.unwrap_or(table.table);
-            // The relations joined before the inner chain's first member.
-            let before = core::iter::once(&from.base)
-                .chain(from.joins[..position - 1].iter().map(|join| &join.table));
-            let single = [on];
-            for &conjunct in if split {
-                &conjuncts[..count]
+        // With only inner joins in the FROM, the outer join's condition
+        // filters the joined rows, so it joins the query's conditions ahead
+        // of the `WHERE` ones (keeping PostgreSQL's order of the quals):
+        // the old executor then joins by it as soon as its relations have
+        // joined, rather than looping over the members' cross product.
+        let all_inner = from.joins.iter().chain(inner.joins.iter()).all(|join| {
+            matches!(
+                join.kind,
+                JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
+            )
+        });
+        let lifted = (all_inner && outer.kind != JoinKind::Comma)
+            .then_some(outer.on)
+            .flatten();
+        let condition = |at: usize, on: Option<&'a Expr<'a>>| {
+            if outer.kind != JoinKind::Comma && at == last && lifted.is_none() {
+                super::view_write::and_where(on, outer.on, arena)
             } else {
-                &single[..]
-            } {
-                let mut at = 0;
-                let mut known = split
-                    && !conjunct.contains_subquery()
-                    && conjunct.contains_volatile_function().is_none();
-                conjunct.for_each_column_reference(&mut |qualifier, _| {
-                    let Some(qualifier) = qualifier else {
-                        known = false;
-                        return;
-                    };
-                    if before.clone().any(|table| exposed(table) == qualifier) {
-                        return;
-                    }
-                    match core::iter::once(&inner.base)
-                        .chain(inner.joins.iter().map(|join| &join.table))
-                        .position(|table| exposed(table) == qualifier)
-                    {
-                        Some(member) => at = at.max(member),
-                        None => known = false,
-                    }
-                });
-                let at = if known { at } else { last };
-                if at >= placed.len() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "a parenthesized join of more than {} members is not supported",
-                        placed.len()
-                    ));
-                }
-                placed[at] = super::view_write::and_where(placed[at], Some(conjunct), arena)?;
+                Ok(on)
             }
-        }
-        let condition =
-            |at: usize, on: Option<&'a Expr<'a>>| match placed.get(at).copied().flatten() {
-                Some(conjunct) => super::view_write::and_where(on, Some(conjunct), arena),
-                None => Ok(on),
-            };
+        };
         let first_on = condition(0, None)?;
         push(
             &mut joins,
@@ -281,7 +247,7 @@ fn flatten_parenthesized_joins<'a>(
         for &join in &from.joins[position..] {
             push(&mut joins, join)?;
         }
-        from.base
+        (from.base, lifted)
     };
     let flattened = arena
         .alloc(Select {
@@ -289,6 +255,10 @@ fn flatten_parenthesized_joins<'a>(
                 base,
                 joins: joins.into_mut_slice().map_err(|_| arena_full())?,
             }),
+            where_clause: match lifted {
+                Some(on) => super::view_write::and_where(Some(on), select.where_clause, arena)?,
+                None => select.where_clause,
+            },
             ..*select
         })
         .map_err(|_| arena_full())?;

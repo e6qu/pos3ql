@@ -1219,12 +1219,14 @@ named as a later FROM item, a whole-row reference to the join, an outer
 `USING` join of a parenthesized one, and nested aliased joins; `EXPLAIN` of
 any parenthesized join the search does not plan fails with `0A000`. A
 query of a parenthesized inner join that the search does not plan runs the
-old executor over the flattened chain; each conjunct of the outer join's
-condition joins the first member by which the relations it names have
-joined (`differential_exact/951`: 20 seconds down to 0.3). A conjunct that
-names no member the chain starts with, or reads a volatile function or a
-subquery, still leaves a cross product the old executor loops over per row
-(over 20 seconds for 400, 300 and 200 rows). A parenthesized join's own
+old executor over the flattened chain. With only inner joins in the FROM
+the outer join's condition joins the `WHERE` conditions, so the executor
+joins by it once its relations have joined (`differential_exact/951`: 20
+seconds down to 0.3). With an outer join in the FROM, or when the chain's
+first members share no condition (`na JOIN (nb JOIN nc JOIN nd ON ...) ON
+na.id = nd.id`), the written order still leaves a cross product the old
+executor loops over per row (over 20 seconds for 400, 300 and 200 rows):
+it needs PostgreSQL's join order, not the written one. A parenthesized join's own
 query runs only when the search does not plan the query, so one nested in
 another (`a LEFT JOIN (b JOIN (c JOIN d ON z) ON x) ON y`) joins its
 members without reading its rows first (`differential_exact/937`). A

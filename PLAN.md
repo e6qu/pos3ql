@@ -1249,7 +1249,13 @@ index fails with `0A000`, and its join's costs refuse to print), a
 `LATERAL` subquery (PostgreSQL may cache it in a `Memoize`; `EXPLAIN` of
 one the search does not plan fails with `0A000` while `enable_memoize` is
 on), a correlated subplan in an `OR` or compared with a column (`0A000`),
-`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), and more than
+`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), a query
+whose join conditions pass the search's fixed clause capacities (32
+clauses of one join, 48 conditions, 64 clauses): a chain of 34 `USING`
+joins on one column (33 conditions) already does, so its `EXPLAIN (COSTS
+OFF)` prints pos3ql's join order where PostgreSQL filters each join by the
+class's equality, and `join_capacity_diff.py` compares only the analyzed
+128-relation GEQO plan's text; and more than
 128 relations in one query, past which the search holds no plan and such
 queries run pos3ql's join order. An `ORDER BY` over a join keeps every joined row in
 the statement arena before sorting, so a join of millions of rows (seven

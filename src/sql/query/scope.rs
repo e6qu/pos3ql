@@ -632,6 +632,12 @@ pub struct QueryScope<'d> {
     /// runs it as it reads (`derived` holds an empty placeholder), so a
     /// reader that stops early leaves the query's later rows unrun.
     pub(crate) lazy_ctes: &'d mut [Option<LazyCte<'d>>],
+    /// A parenthesized join whose query has not run (`derived` holds an
+    /// empty placeholder): the join search runs its members instead, and
+    /// any other plan runs it first ([`QueryScope::run_deferred_joins`]).
+    deferred_joins: &'d mut [Option<&'d crate::sql::ast::Select<'d>>],
+    /// Parenthesized joins added now wait rather than run.
+    defer_joins: bool,
     /// Whether the FROM item being added is the query's only one, so a
     /// foreign table there streams instead of being read whole first.
     sole_source: bool,
@@ -1538,6 +1544,9 @@ impl<'d> QueryScope<'d> {
         let lazy_ctes = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
+        let deferred_joins = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
         let foreign_streams = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
@@ -1585,6 +1594,8 @@ impl<'d> QueryScope<'d> {
             external_runs,
             foreign_streams,
             lazy_ctes,
+            deferred_joins,
+            defer_joins: false,
             sole_source: false,
             lateral,
             func_scalar,
@@ -2076,12 +2087,14 @@ impl<'d> QueryScope<'d> {
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<QueryScope<'a>, SqlError> {
         Self::resolve_exec_pushed(
-            storage, from, predicate, txid, arena, params, sequences, outer, None,
+            storage, from, predicate, txid, arena, params, sequences, outer, None, false,
         )
     }
 
     /// Execution scope whose single foreign FROM item reads the remote query
-    /// `pushed` planned.
+    /// `pushed` planned. With `defer_joins`, the queries of its unaliased
+    /// parenthesized joins wait: the join search runs their members, and
+    /// another plan runs them first ([`QueryScope::run_deferred_joins`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "scope construction carries explicit query restrictions and execution context"
@@ -2096,8 +2109,10 @@ impl<'d> QueryScope<'d> {
         sequences: Option<&dyn SequenceAccess>,
         outer: Option<&dyn ColumnLookup<'a>>,
         pushed: Option<&crate::sql::foreign::deparse::ForeignSelectPlan<'a>>,
+        defer_joins: bool,
     ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
+        scope.defer_joins = defer_joins;
         scope.sole_source = from.joins.is_empty();
         scope.add_exec(
             storage,
@@ -2127,6 +2142,7 @@ impl<'d> QueryScope<'d> {
             )?;
         }
         scope.right_of_outer_join = false;
+        scope.defer_joins = false;
         scope.check_join_conditions(from, outer, None)?;
         scope.build_merges(from, arena, Some(arena))?;
         scope.name_repeated_columns(arena)?;
@@ -2561,6 +2577,43 @@ impl<'d> QueryScope<'d> {
             self.register_join_members(storage, tref, txid, arena)?;
             return Ok(());
         }
+        // A parenthesized join the join search runs member by member waits:
+        // its own query runs only if a scan reads its rows.
+        if self.defer_joins && tref.join_members.is_some() && outer.is_none() {
+            self.names[self.n] = exposed;
+            self.derived[self.n] = Some(&[]);
+            self.deferred_joins[self.n] = Some(sub);
+            self.slots[self.n] = usize::MAX;
+            self.view_accesses[self.n] = tref.view_access;
+            self.n += 1;
+            self.register_join_members(storage, tref, txid, arena)?;
+            return Ok(());
+        }
+        let (rows, external_run) =
+            Self::run_derived(storage, sub, self.n, txid, arena, params, outer, sequences)?;
+        self.names[self.n] = exposed;
+        self.derived[self.n] = Some(rows);
+        self.external_runs[self.n] = external_run;
+        self.slots[self.n] = usize::MAX;
+        self.view_accesses[self.n] = tref.view_access;
+        self.n += 1;
+        self.register_join_members(storage, tref, txid, arena)?;
+        Ok(())
+    }
+
+    /// Runs the derived table `sub` at scope entry `position`: its rows, or
+    /// the external run holding them.
+    #[allow(clippy::too_many_arguments)]
+    fn run_derived<'a>(
+        storage: &'a Storage,
+        sub: &'a crate::sql::ast::Select<'a>,
+        position: usize,
+        txid: u32,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        outer: Option<&dyn ColumnLookup<'a>>,
+        sequences: Option<&dyn SequenceAccess>,
+    ) -> Result<(&'a [&'a [u8]], Option<crate::sql::external::ExternalRun>), SqlError> {
         // A statement that was not expanded as a whole, such as a routine's
         // static statement, still names the derived table's own `WITH`.
         let sub = if sub.with.is_empty() {
@@ -2572,7 +2625,7 @@ impl<'d> QueryScope<'d> {
         let external_run;
         // The derived table's query is its own block of an explained plan.
         let _block = super::instrument::enter(super::instrument::Segment::Derived(
-            u16::try_from(self.n).unwrap_or(u16::MAX),
+            u16::try_from(position).unwrap_or(u16::MAX),
         ));
         if storage.spill_attached() {
             // A stable all-equal sort is an insertion-order spool. Resetting
@@ -2646,13 +2699,33 @@ impl<'d> QueryScope<'d> {
             };
             external_run = None;
         }
-        self.names[self.n] = exposed;
-        self.derived[self.n] = Some(rows);
-        self.external_runs[self.n] = external_run;
-        self.slots[self.n] = usize::MAX;
-        self.view_accesses[self.n] = tref.view_access;
-        self.n += 1;
-        self.register_join_members(storage, tref, txid, arena)?;
+        Ok((rows, external_run))
+    }
+
+    /// Whether a parenthesized join's query still waits to run.
+    pub(crate) fn has_deferred_joins(&self) -> bool {
+        self.deferred_joins[..self.n].iter().any(Option::is_some)
+    }
+
+    /// Runs the queries of the parenthesized joins that wait, for a plan
+    /// that scans their rows rather than their members.
+    pub(crate) fn run_deferred_joins(
+        &mut self,
+        storage: &'d Storage,
+        txid: u32,
+        arena: &'d Arena,
+        params: &[Datum<'d>],
+        sequences: Option<&dyn SequenceAccess>,
+    ) -> Result<(), SqlError> {
+        for position in 0..self.n {
+            if let Some(sub) = self.deferred_joins[position].take() {
+                let (rows, external_run) = Self::run_derived(
+                    storage, sub, position, txid, arena, params, None, sequences,
+                )?;
+                self.derived[position] = Some(rows);
+                self.external_runs[position] = external_run;
+            }
+        }
         Ok(())
     }
 

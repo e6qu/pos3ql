@@ -1256,6 +1256,35 @@ PostgreSQL. PostgreSQL estimates a table from its current size on disk, so
 a table that rolled-back or deleted rows grew since its last `ANALYZE` (or
 `VACUUM`) can make it pick the other order.
 
+`EXPLAIN (ANALYZE)` shows each node's page accesses on a `Buffers:` line, as
+PostgreSQL 18 does by default (`BUFFERS OFF` hides them). pos3ql has no 8 kB
+buffer pool, so it counts its own pages: the 8 kB heap pages its table's
+rows would fill and the pages of its modeled btree layout, the same pages
+`pg_class.relpages` and the planner's page counts use. For example, a
+sequential scan of a table whose rows fill 22 pages prints `Buffers:
+shared hit=22`; stopped early by a `LIMIT`, it counts the pages up to the
+one it stopped on and the next, which PostgreSQL's read stream has already
+pinned. An index scan counts one page per level from the root to a leaf,
+each further leaf its matching entries fill, and each heap page it moves
+to; an index-only scan its visibility map page and the heap pages not
+marked all-visible; a bitmap heap scan each heap page it reads, its bitmap
+index scans their index pages. A page is a `hit` unless reaching its first
+row needed a storage block that the RAM block cache did not hold, which
+makes it a `read`. A temporary table's pages are `local`; a sort that
+spills to disk writes and reads back its spilled bytes in 8 kB `temp`
+pages, as does a `WITH` query's store that outgrows `work_mem`. Each node
+includes its inputs' pages, and a `WITH` query's pages count under the
+first `CTE Scan` that reads it. Planning reads no pages, since pos3ql keeps
+its catalogs and statistics in memory, so no `Planning:` buffer line
+appears (structured formats show the `Planning` counters as zero), and
+sending rows under `SERIALIZE` reads none either. `EXPLAIN (BUFFERS)`
+without `ANALYZE` prints no node counts, as in PostgreSQL. The numbers
+therefore differ from PostgreSQL's, whose counts depend on its buffer
+cache, but they appear on the same nodes. Writes (`INSERT`, `UPDATE`,
+`DELETE`, `MERGE`), scans on a path that does not count pages, and hash
+joins that run in batches fail `EXPLAIN ANALYZE` with `0A000` while
+`BUFFERS` is on; `EXPLAIN (ANALYZE, BUFFERS OFF)` runs them.
+
 ### Planner settings
 
 PostgreSQL's planner settings (every `pg_settings` row in a "Query Tuning"

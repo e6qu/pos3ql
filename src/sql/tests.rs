@@ -55082,19 +55082,27 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         "{rows:?}"
     );
 
-    // PostgreSQL 18 counts buffers under ANALYZE by default; a relation's
-    // shared buffer counts are not modeled, so they are refused.
+    // PostgreSQL 18 counts buffers under ANALYZE by default: the scan of
+    // the table's one heap page shows it, a plan that did not run none.
     for explain in [
-        "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) SELECT payload FROM ep WHERE id = 2",
-        "EXPLAIN (ANALYZE, TIMING OFF) SELECT payload FROM ep WHERE id = 2",
-        "EXPLAIN (BUFFERS) SELECT * FROM ep",
+        "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) SELECT payload FROM ep WHERE payload = 'b'",
+        "EXPLAIN (ANALYZE, TIMING OFF) SELECT payload FROM ep WHERE payload = 'b'",
     ] {
-        let refused = run_with(&mut engine, &mut budget, explain);
+        let counted = data_rows(&run_with(&mut engine, &mut budget, explain));
         assert!(
-            String::from_utf8_lossy(&refused).contains("0A000"),
-            "{explain}"
+            counted.iter().any(|row| row == "  Buffers: shared hit=1"),
+            "{explain}: {counted:?}"
         );
     }
+    let planned = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (BUFFERS) SELECT * FROM ep",
+    ));
+    assert!(
+        !planned.iter().any(|row| row.contains("Buffers:")),
+        "{planned:?}"
+    );
     let analyzed = run_with(
         &mut engine,
         &mut budget,
@@ -55229,7 +55237,8 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     assert!(
         detailed
             .iter()
-            .any(|row| row.starts_with("Serialization: time=")),
+            // `TIMING OFF` leaves the time out, as `ExplainPrintSerialize` does.
+            .any(|row| row.starts_with("Serialization: output=")),
         "{detailed:?}"
     );
     assert!(

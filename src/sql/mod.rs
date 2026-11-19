@@ -24095,7 +24095,6 @@ impl Engine {
                     }
                 };
                 let actual = if options.analyze {
-                    let before = self.storage.block_io_stats();
                     let (before_wal_records, before_wal_bytes) = self.wal.stage_stats(txn.txid);
                     let touched_mark = txn.touched().len();
                     let started = std::time::Instant::now();
@@ -24132,9 +24131,13 @@ impl Engine {
                     // statement runs.
                     let execution = match (plan.as_mut(), rewritten.as_mut()) {
                         (Some(plan), _) => plan.analyze(arena, *options, run),
-                        (None, Some(queries)) => {
-                            explain::analyze_rewritten(queries, arena, options.timing, run)
-                        }
+                        (None, Some(queries)) => explain::analyze_rewritten(
+                            queries,
+                            arena,
+                            options.timing,
+                            options.buffers,
+                            run,
+                        ),
                         (None, None) => Ok(run()),
                     };
                     let output = responder.finish_discard_query_output();
@@ -24158,7 +24161,6 @@ impl Engine {
                     Some(explain::ExplainActual {
                         rows: explained_root_rows(planned_statement, output.rows),
                         elapsed_micros,
-                        io: self.storage.block_io_stats().saturating_sub(before),
                         serialized_bytes: output.serialized_bytes,
                         serialization_micros: output.serialization_micros,
                         wal_records: after_wal_records

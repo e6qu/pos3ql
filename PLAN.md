@@ -1078,11 +1078,18 @@ setting above 0 an `EXPLAIN` of a query scanning a relation at least that
 large fails with `0A000`, since PostgreSQL may choose a `Gather` there (a
 write or a row lock is never parallel, so its plan prints); at 0 every plan
 is exact (`differential_exact/931`). `BUFFERS` is on by default under
-`ANALYZE`, as in PostgreSQL 18, and accepted without it; a plan reading or
-writing a relation fails with `0A000` there, since PostgreSQL's per-node
-shared buffer counts and planning catalog reads depend on its buffer and
-catalog caches, which pos3ql does not model; a plan reading no relation
-counts none. Windows over a join the search plans read its plan's rows,
+`ANALYZE`, as in PostgreSQL 18, and accepted without it. Each node prints
+pos3ql's own page accesses in PostgreSQL's format and placement (its
+inputs' and a read `WITH` query's included, zero counters omitted in text,
+every counter in structured formats, the `Planning` group zero since
+planning reads no page): a page is an 8 kB page of the modeled heap or
+btree layout (`heap_layout`, and `btree_size`'s leaf pages, whose
+sizing the index-sizing work owns), a hit unless reaching it took
+a block the RAM cache missed, local for a temporary table, temp for an
+external sort's or spilled store's work files (`differential_exact/936`).
+Remaining: writes' `dirtied` and `written` pages (`0A000` under
+`BUFFERS`), scans on paths that keep no page model (`0A000`), and hash
+joins run in batches (`0A000`: their work files are not sized). Windows over a join the search plans read its plan's rows,
 so `EXPLAIN ANALYZE` counts its nodes (`differential_exact/935`); windows
 over a join it does not plan (a window function in the `ORDER BY`) fail
 `EXPLAIN` with `0A000` rather than print pos3ql's join order, and
@@ -1143,19 +1150,19 @@ that join when its class holds a constant
 (`generate_base_implied_equalities_const`), and keys an `ORDER BY`, window
 or ordered aggregate (`differential_exact/933`). A nested loop's
 parameterized scan reads only the rows an index finds for the outer row's
-keys, except under `EXPLAIN ANALYZE`, which reads the relation's every
-row per loop to count the path's own reads, so many loops over a large
-relation exhaust the statement arena (`54000`). An unaliased
+keys; under `EXPLAIN ANALYZE` it reads the rows an index finds for the
+path's own index conditions, counting the rows they reach
+(`differential_exact/938`). An unaliased
 parenthesized join whose members join by written conditions (`a LEFT JOIN
 (b JOIN c ON x) ON y`, nested to any depth) is a node of the join tree
 `deconstruct_jointree` reads: its relations join in the same search, and
 each joined row fills the parenthesized join's columns from its members'
 rows (`differential_exact/934`). Remaining there: an aliased one, one
 joined by `USING` or `NATURAL`, and one under grouping, aggregates or
-windows (`0A000` when costs print); the parenthesized join's rows are
-still read once before the plan runs, and one nested in another
-(`a LEFT JOIN (b JOIN (c JOIN d ON z) ON x) ON y`) exhausts the statement
-arena reading them (`54000`). Remaining for that search:
+windows (`0A000` when costs print); a parenthesized join's own
+query runs only when the search does not plan the query, so one nested in
+another (`a LEFT JOIN (b JOIN (c JOIN d ON z) ON x) ON y`) joins its
+members without reading its rows first (`differential_exact/937`). Remaining for that search:
 `GROUP BY` of an expression (`0A000` when costs print), conditions
 comparing expressions of several relations other than by a mergeable
 equality (`COALESCE(a.id, 0) < b.id`), an `OR`

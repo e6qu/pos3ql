@@ -37,6 +37,21 @@ pub(crate) struct CacheStats {
     pub(crate) insertions: u64,
 }
 
+std::thread_local! {
+    /// The RAM misses this thread's reads took, which `EXPLAIN (BUFFERS)`
+    /// compares around each page a scan reaches to tell reads from hits.
+    static THREAD_MISSES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// The RAM misses the calling thread's block reads have taken so far.
+pub(crate) fn thread_misses() -> u64 {
+    THREAD_MISSES.with(core::cell::Cell::get)
+}
+
+fn count_thread_miss() {
+    THREAD_MISSES.with(|misses| misses.set(misses.get().wrapping_add(1)));
+}
+
 pub(crate) struct BlockCache<S: BlockStore> {
     inner: S,
     /// One slot per frame, each `MAX_PAYLOAD` wide. Payloads are cached rather
@@ -207,6 +222,7 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
             return Ok(block);
         }
         self.stats.misses += 1;
+        count_thread_miss();
         let (len, block_type) = self.inner.get(id, into)?;
         // Admitted from the caller's buffer, which now holds exactly the block
         // the store returned and verified.
@@ -227,6 +243,7 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
             return self.get(expected, into);
         }
         self.stats.misses += 1;
+        count_thread_miss();
         let (len, block_type) = self
             .inner
             .get_packed(container, offset, length, expected, into, scratch)?;

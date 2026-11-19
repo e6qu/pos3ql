@@ -94,6 +94,7 @@ pub(crate) use navigation::{
 
 pub(crate) mod lz4;
 
+pub(crate) use cache::thread_misses;
 pub(crate) use ephemeral::EphemeralBlockStore;
 #[cfg(test)]
 pub(crate) use memory::MemoryBlockStore;

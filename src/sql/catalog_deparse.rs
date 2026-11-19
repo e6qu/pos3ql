@@ -2444,17 +2444,36 @@ impl Context<'_> {
         plan: SublinkPlan,
         output: &mut Output<'_>,
     ) -> Result<(), SqlError> {
+        let (hashed, number) = match plan {
+            SublinkPlan::InitPlan(number) | SublinkPlan::SubPlan(number) => ("", number),
+            SublinkPlan::HashedSubPlan(number) => ("hashed ", number),
+        };
         output.push(if all { "(ALL (" } else { "(ANY (" })?;
-        self.write(operand, None, output)?;
-        output.push_display(format_args!(" {symbol} "))?;
-        match plan {
-            SublinkPlan::InitPlan(number) | SublinkPlan::SubPlan(number) => {
-                output.push_display(format_args!("(SubPlan {number}).col1))"))
+        // `make_row_comparison`: a row's fields compared one by one, `=`
+        // under `AND` and `<>` under `OR`.
+        if let Expr::Call { args, .. } = operand
+            && operand.is_row_constructor()
+        {
+            let joiner = match symbol {
+                "=" => " AND ",
+                "<>" => " OR ",
+                _ => return output.unsupported(),
+            };
+            for (position, field) in args.iter().enumerate() {
+                if position > 0 {
+                    output.push(joiner)?;
+                }
+                output.push("(")?;
+                self.write(field, None, output)?;
+                output.push_display(format_args!(
+                    " {symbol} ({hashed}SubPlan {number}).col{})",
+                    position + 1
+                ))?;
             }
-            SublinkPlan::HashedSubPlan(number) => {
-                output.push_display(format_args!("(hashed SubPlan {number}).col1))"))
-            }
+            return output.push("))");
         }
+        self.write(operand, None, output)?;
+        output.push_display(format_args!(" {symbol} ({hashed}SubPlan {number}).col1))"))
     }
 
     /// `ARRAY[...]`: its items coerced to the element type, `member` when

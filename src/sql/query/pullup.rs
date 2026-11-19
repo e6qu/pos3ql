@@ -68,6 +68,7 @@ pub(crate) fn pull_up_subqueries<'a>(
     // assigns their levels before planning.
     let mut current =
         super::aggregate_levels::assign_aggregate_levels(select, storage, txid, arena)?;
+    current = spell_out_parenthesized_joins(current, storage, txid, arena, outer)?;
     current = flatten_parenthesized_joins(current, arena)?;
     let mut next = 0usize;
     // A grouped query names a subquery's columns in its ungrouped-column
@@ -171,14 +172,14 @@ fn flatten_parenthesized_joins<'a>(
     let push = |joins: &mut crate::mem::arena::ArenaList<'a, Join<'a>>, join: Join<'a>| {
         joins.push(join).map_err(|_| arena_full())
     };
-    let base = if position == 0 {
+    let (base, lifted) = if position == 0 {
         for &join in inner.joins {
             push(&mut joins, join)?;
         }
         for &join in from.joins {
             push(&mut joins, join)?;
         }
-        inner.base
+        (inner.base, None)
     } else {
         for &join in &from.joins[..position - 1] {
             push(&mut joins, join)?;
@@ -192,8 +193,22 @@ fn flatten_parenthesized_joins<'a>(
             JoinKind::Cross
         };
         let last = inner.joins.len();
+        // With only inner joins in the FROM, the outer join's condition
+        // filters the joined rows, so it joins the query's conditions ahead
+        // of the `WHERE` ones (keeping PostgreSQL's order of the quals):
+        // the old executor then joins by it as soon as its relations have
+        // joined, rather than looping over the members' cross product.
+        let all_inner = from.joins.iter().chain(inner.joins.iter()).all(|join| {
+            matches!(
+                join.kind,
+                JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
+            )
+        });
+        let lifted = (all_inner && outer.kind != JoinKind::Comma)
+            .then_some(outer.on)
+            .flatten();
         let condition = |at: usize, on: Option<&'a Expr<'a>>| {
-            if outer.kind != JoinKind::Comma && at == last {
+            if outer.kind != JoinKind::Comma && at == last && lifted.is_none() {
                 super::view_write::and_where(on, outer.on, arena)
             } else {
                 Ok(on)
@@ -232,7 +247,7 @@ fn flatten_parenthesized_joins<'a>(
         for &join in &from.joins[position..] {
             push(&mut joins, join)?;
         }
-        from.base
+        (from.base, lifted)
     };
     let flattened = arena
         .alloc(Select {
@@ -240,10 +255,526 @@ fn flatten_parenthesized_joins<'a>(
                 base,
                 joins: joins.into_mut_slice().map_err(|_| arena_full())?,
             }),
+            where_clause: match lifted {
+                Some(on) => super::view_write::and_where(Some(on), select.where_clause, arena)?,
+                None => select.where_clause,
+            },
             ..*select
         })
         .map_err(|_| arena_full())?;
     flatten_parenthesized_joins(flattened, arena)
+}
+
+/// Spells out each aliased parenthesized join, and each holding `USING` or
+/// `NATURAL` joins, as an unaliased join of `ON` joins whose columns the
+/// query names through its members, as PostgreSQL's planner reads a join's
+/// alias variables (`flatten_join_alias_vars`): a column of the join becomes
+/// its member's column, and a merged column the left member's (inner and
+/// `LEFT` joins), the right one's (`RIGHT`) or their `COALESCE` (`FULL`), as
+/// `buildMergedJoinVar` builds it. Its members then join in the query's join
+/// search. A join whose members' names another FROM item uses, whose merged
+/// columns need a coercion or merge more than two columns, or that the query
+/// reads as a whole row stays as written.
+fn spell_out_parenthesized_joins<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<&'a Select<'a>, SqlError> {
+    let mut current = select;
+    let mut next = 0usize;
+    loop {
+        let Some(from) = current.from.as_ref() else {
+            return Ok(current);
+        };
+        let count = 1 + from.joins.len();
+        let Some(position) = (next..count).find(|&index| {
+            let table = item(from, index);
+            table.join_members.is_some()
+                && (table.alias.is_some()
+                    || table
+                        .subquery
+                        .and_then(|body| body.from.as_ref())
+                        .is_some_and(|inner| {
+                            inner
+                                .joins
+                                .iter()
+                                .any(|join| join.using.is_some() || join.natural)
+                        }))
+        }) else {
+            return Ok(current);
+        };
+        let mark = arena.mark();
+        match spell_out_parenthesized_join(current, position, storage, txid, arena, outer) {
+            Ok(spelled) => current = spelled,
+            Err(Stop::Keep) => {
+                // SAFETY: nothing allocated since `mark` is referenced: the
+                // attempt's scopes and partial rewrites are discarded.
+                unsafe { arena.rewind_to(mark) };
+                next = position + 1;
+            }
+            Err(Stop::Full) => return Err(arena_full()),
+        }
+    }
+}
+
+/// [`spell_out_parenthesized_joins`] of the join at FROM `position`.
+#[allow(clippy::too_many_lines)]
+fn spell_out_parenthesized_join<'a>(
+    select: &'a Select<'a>,
+    position: usize,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Step<&'a Select<'a>> {
+    let from = select.from.as_ref().expect("a FROM item");
+    let table = item(from, position);
+    let members = table.join_members.ok_or(Stop::Keep)?;
+    let inner_from = table
+        .subquery
+        .and_then(|body| body.from.as_ref())
+        .ok_or(Stop::Keep)?;
+    let inner_items = || {
+        core::iter::once(&inner_from.base).chain(inner_from.joins.iter().map(|join| &join.table))
+    };
+    if table.lateral
+        || select.set_body.is_some()
+        || !select.windows.is_empty()
+        || !select.locking.is_empty()
+        || from
+            .joins
+            .iter()
+            .any(|join| join.using.is_some() || join.natural)
+        || inner_items().any(|member| member.join_members.is_some() || member.lateral)
+        || inner_from
+            .joins
+            .iter()
+            .any(|join| join.using.is_some_and(|using| using.alias.is_some()))
+        || members.iter().any(|member| member.using_alias)
+    {
+        return Err(Stop::Keep);
+    }
+    // Unaliased, the members' names must stay unique in the FROM clause. A
+    // member named as an earlier item takes a fresh name, which `EXPLAIN`
+    // prints as PostgreSQL names the later of two equal names (`nb_1`); a
+    // later item named as a member, or visible beside it, stays as written.
+    let names_of = |index: usize| {
+        let other = item(from, index);
+        let visible = other.alias.is_none();
+        core::iter::once(other.alias.unwrap_or(other.table)).chain(
+            other
+                .join_members
+                .unwrap_or(&[])
+                .iter()
+                .filter(move |_| visible)
+                .map(|member| member.name),
+        )
+    };
+    let earlier =
+        |name: &str| (0..position).any(|index| names_of(index).any(|known| known == name));
+    let later = |name: &str| {
+        (position + 1..1 + from.joins.len()).any(|index| names_of(index).any(|known| known == name))
+    };
+    let mut renamed = crate::mem::arena::ArenaList::new(arena);
+    for member in members {
+        if later(member.name) {
+            return Err(Stop::Keep);
+        }
+        let name = if earlier(member.name) {
+            if table.alias.is_none() {
+                return Err(Stop::Keep);
+            }
+            let mut ordinal = 1usize;
+            loop {
+                let mut fresh = crate::mem::arena::ArenaString::new(arena);
+                core::fmt::Write::write_fmt(
+                    &mut fresh,
+                    format_args!("{}_{ordinal}\0merged", member.name),
+                )
+                .map_err(|_| Stop::full())?;
+                let fresh = fresh.as_str();
+                let printed = crate::sql::catalog::deparse::printed_name(fresh);
+                let taken = |known: &str| {
+                    known == fresh || crate::sql::catalog::deparse::printed_name(known) == printed
+                };
+                if !(0..1 + from.joins.len()).any(|index| names_of(index).any(taken))
+                    && !members.iter().any(|member| taken(member.name))
+                    && !renamed.as_slice().iter().any(|known: &&str| taken(known))
+                {
+                    break fresh;
+                }
+                ordinal += 1;
+            }
+        } else {
+            member.name
+        };
+        renamed.push(name).map_err(|_| Stop::full())?;
+    }
+    let renamed = renamed.as_slice();
+    let rename = |name: &'a str| {
+        members
+            .iter()
+            .position(|member| member.name == name)
+            .map_or(name, |at| renamed[at])
+    };
+    let scope = QueryScope::resolve_schema_with_join_conditions(storage, from, txid, arena, outer)?;
+    // An ungrouped column's error names the column as written.
+    super::validate_static_grouping(select, &scope, outer, storage, txid, arena)?;
+    let inner =
+        QueryScope::resolve_schema_with_join_conditions(storage, inner_from, txid, arena, None)?;
+    let visible = scope.defs.get(position).ok_or(Stop::Keep)?.n_columns;
+    if inner.star_columns() != visible {
+        return Err(Stop::Keep);
+    }
+    let column = |table: usize, column: usize| -> Step<&'a Expr<'a>> {
+        Ok(&*arena
+            .alloc(Expr::Column {
+                qualifier: Some(rename(inner.names[table])),
+                name: inner.defs.column_name(table, column),
+            })
+            .map_err(|_| Stop::full())?)
+    };
+    let mut columns = crate::mem::arena::ArenaList::new(arena);
+    for index in 0..visible {
+        let entry = inner.star_entry(index);
+        let expression = match entry {
+            ResolvedColumn::Table(table, at) => column(table, at)?,
+            ResolvedColumn::Merged(merged) => {
+                let merged = &inner.merged[merged];
+                let &[(left, left_column), (right, right_column)] = merged.parts else {
+                    return Err(Stop::Keep);
+                };
+                if [(left, left_column), (right, right_column)]
+                    .iter()
+                    .any(|&(table, at)| {
+                        inner.output_type(ResolvedColumn::Table(table, at)) != merged.ctype
+                    })
+                {
+                    return Err(Stop::Keep);
+                }
+                match inner_from.joins[right - 1].kind {
+                    JoinKind::Inner | JoinKind::Cross | JoinKind::Left => {
+                        column(left, left_column)?
+                    }
+                    JoinKind::Right => column(right, right_column)?,
+                    JoinKind::Full => scope_coalesce(
+                        arena,
+                        column(left, left_column)?,
+                        column(right, right_column)?,
+                    )?,
+                    _ => return Err(Stop::Keep),
+                }
+            }
+            ResolvedColumn::TableOid(_) => return Err(Stop::Keep),
+        };
+        columns.push(expression).map_err(|_| Stop::full())?;
+    }
+    let columns = columns.as_slice();
+    let rewrite = Rewrite {
+        storage,
+        txid,
+        arena,
+        top: Top::Joined {
+            scope: &scope,
+            position,
+            alias: table.alias,
+            columns,
+        },
+    };
+    // The members joined by `ON` conditions: a `USING` or `NATURAL` join's
+    // equalities of its merged columns.
+    let mut inner_joins = crate::mem::arena::ArenaList::new(arena);
+    let renamed_member = |table: &'a TableRef<'a>| -> Step<TableRef<'a>> {
+        let name = table.alias.unwrap_or(table.table);
+        if rename(name) == name {
+            return Ok(*table);
+        }
+        // Only a plain relation's name is free to change: a function's or a
+        // VALUES list's name also names its columns.
+        if table.subquery.is_some()
+            || table.func_args.is_some()
+            || table.rows_from.is_some()
+            || table.cte.is_some()
+        {
+            return Err(Stop::Keep);
+        }
+        Ok(TableRef {
+            alias: Some(rename(name)),
+            ..*table
+        })
+    };
+    let renamed_condition = |condition: &'a Expr<'a>| -> Step<&'a Expr<'a>> {
+        if renamed
+            .iter()
+            .zip(members)
+            .all(|(fresh, member)| *fresh == member.name)
+        {
+            return Ok(condition);
+        }
+        rewrite_expression(condition, arena, &mut |node| match node {
+            Expr::Column {
+                qualifier: Some(qualifier),
+                name,
+            } if rename(qualifier) != *qualifier => Ok(Some(
+                &*arena
+                    .alloc(Expr::Column {
+                        qualifier: Some(rename(qualifier)),
+                        name,
+                    })
+                    .map_err(|_| Stop::full())?,
+            )),
+            Expr::WholeRow(_)
+            | Expr::SchemaColumn { .. }
+            | Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_)
+            | Expr::RowSubquery { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. } => Err(Stop::Keep),
+            _ => Ok(None),
+        })
+    };
+    for (index, join) in inner_from.joins.iter().enumerate() {
+        let mut join = *join;
+        join.table = renamed_member(&inner_from.joins[index].table)?;
+        if join.using.is_some() || join.natural {
+            join.on = inner.join_on.get(index).copied().flatten();
+            join.using = None;
+            join.natural = false;
+            match (join.kind, join.on) {
+                (JoinKind::Inner, None) => join.kind = JoinKind::Cross,
+                (JoinKind::Left | JoinKind::Right | JoinKind::Full, None) => {
+                    join.on = Some(&Expr::Bool(true));
+                }
+                _ => {}
+            }
+        } else if let Some(condition) = join.on
+            && inner_from
+                .joins
+                .iter()
+                .any(|join| join.using.is_some() || join.natural)
+            && reads_unqualified(condition)
+        {
+            // A later condition may name a merged column.
+            return Err(Stop::Keep);
+        }
+        join.on = join.on.map(renamed_condition).transpose()?;
+        inner_joins.push(join).map_err(|_| Stop::full())?;
+    }
+    let inner_from = FromClause {
+        base: renamed_member(&inner_from.base)?,
+        joins: arena
+            .alloc_slice_copy(inner_joins.as_slice())
+            .map_err(|_| Stop::full())?,
+    };
+    let members = arena
+        .alloc_slice_with(members.len(), |at| crate::sql::ast::JoinMember {
+            name: renamed[at],
+            ..members[at]
+        })
+        .map_err(|_| Stop::full())?;
+    let unaliased = unaliased_join(table, inner_from, members, arena)?;
+    let mut items = crate::mem::arena::ArenaList::new(arena);
+    let spell = |items: &mut crate::mem::arena::ArenaList<'a, SelectItem<'a>>,
+                 entry: ResolvedColumn|
+     -> Step<()> {
+        let expression = match entry {
+            ResolvedColumn::Table(at, index) if at == position => rewrite.copy(columns[index])?,
+            entry => scope.star_expression(entry, arena)?,
+        };
+        items
+            .push(SelectItem::Expr {
+                expression,
+                alias: Some(scope.output_name(entry)),
+            })
+            .map_err(|_| Stop::full())
+    };
+    for entry in select.items {
+        match entry {
+            SelectItem::Wildcard(_) => {
+                for index in 0..scope.star_columns() {
+                    spell(&mut items, scope.star_entry(index))?;
+                }
+            }
+            SelectItem::TableWildcard(name) if table.alias == Some(*name) => {
+                for index in 0..scope.qualified_star_columns(name)? {
+                    spell(&mut items, scope.qualified_star_entry(name, index)?)?;
+                }
+            }
+            SelectItem::TableWildcard(_) => {
+                items.push(*entry).map_err(|_| Stop::full())?;
+            }
+            SelectItem::RecordStar(_) => return Err(Stop::Keep),
+            SelectItem::Expr { expression, alias } => {
+                let mapped = rewrite.expression(expression, None)?;
+                let alias = if core::ptr::eq(mapped, *expression) {
+                    *alias
+                } else {
+                    alias.or_else(|| {
+                        let derived = super::super::exec::derived_name(expression);
+                        (derived != "?column?").then_some(derived)
+                    })
+                };
+                items
+                    .push(SelectItem::Expr {
+                        expression: mapped,
+                        alias,
+                    })
+                    .map_err(|_| Stop::full())?;
+            }
+        }
+    }
+    let mut joins = crate::mem::arena::ArenaList::new(arena);
+    for (index, join) in from.joins.iter().enumerate() {
+        let mut join = *join;
+        if index + 1 == position {
+            join.table = unaliased;
+        }
+        if let Some(condition) = join.on {
+            join.on = Some(rewrite.expression(condition, None)?);
+        }
+        joins.push(join).map_err(|_| Stop::full())?;
+    }
+    let output_names = output_names(select.items, &scope, arena)?;
+    Ok(&*arena
+        .alloc(Select {
+            items: arena
+                .alloc_slice_copy(items.as_slice())
+                .map_err(|_| Stop::full())?,
+            distinct_on: rewrite.output_expressions(select.distinct_on, output_names)?,
+            from: Some(FromClause {
+                base: if position == 0 { unaliased } else { from.base },
+                joins: arena
+                    .alloc_slice_copy(joins.as_slice())
+                    .map_err(|_| Stop::full())?,
+            }),
+            where_clause: select
+                .where_clause
+                .map(|condition| rewrite.expression(condition, None))
+                .transpose()?,
+            group_by: rewrite.expressions(select.group_by, None)?,
+            having: select
+                .having
+                .map(|condition| rewrite.expression(condition, None))
+                .transpose()?,
+            order_by: rewrite.output_keys(select.order_by, output_names)?,
+            ..*select
+        })
+        .map_err(|_| Stop::full())?)
+}
+
+/// Whether `expression` names a column without a qualifier.
+fn reads_unqualified(expression: &Expr<'_>) -> bool {
+    let mut found = false;
+    let _ = super::walk_expression_tree(expression, &mut |node| {
+        found |= matches!(
+            node,
+            Expr::Column {
+                qualifier: None,
+                ..
+            }
+        );
+    });
+    found
+}
+
+/// `COALESCE(left, right)`, a full join's merged column.
+fn scope_coalesce<'a>(
+    arena: &'a Arena,
+    left: &'a Expr<'a>,
+    right: &'a Expr<'a>,
+) -> Step<&'a Expr<'a>> {
+    let args = arena
+        .alloc_slice_copy(&[left, right])
+        .map_err(|_| Stop::full())?;
+    Ok(&*arena
+        .alloc(Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            bound_oid: None,
+            bound_strict: None,
+            source_position: SourcePosition::UNKNOWN,
+            name: "coalesce",
+            args,
+            argument_names: &[],
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: &[],
+            over: None,
+            filter: None,
+        })
+        .map_err(|_| Stop::full())?)
+}
+
+/// `table`, a parenthesized join, unaliased over `inner`: the derived table
+/// the parser builds for an unaliased one, its row the join's columns, each
+/// member's columns and whether each member's row is null.
+fn unaliased_join<'a>(
+    table: &'a TableRef<'a>,
+    inner: FromClause<'a>,
+    members: &'a [crate::sql::ast::JoinMember<'a>],
+    arena: &'a Arena,
+) -> Step<TableRef<'a>> {
+    let body = table.subquery.ok_or(Stop::Keep)?;
+    let star = body
+        .items
+        .first()
+        .copied()
+        .filter(|item| matches!(item, SelectItem::Wildcard(_)))
+        .ok_or(Stop::Keep)?;
+    let mut items = crate::mem::arena::ArenaList::new(arena);
+    items.push(star).map_err(|_| Stop::full())?;
+    for member in members {
+        items
+            .push(SelectItem::TableWildcard(member.name))
+            .map_err(|_| Stop::full())?;
+    }
+    for member in members {
+        let row = arena
+            .alloc(Expr::WholeRow(member.name))
+            .map_err(|_| Stop::full())?;
+        let args = arena.alloc_slice_copy(&[&*row]).map_err(|_| Stop::full())?;
+        let presence = arena
+            .alloc(Expr::Call {
+                kind: crate::sql::ast::CallKind::Routine,
+                bound_oid: None,
+                bound_strict: None,
+                source_position: SourcePosition::UNKNOWN,
+                name: "pg_catalog.num_nulls",
+                args,
+                argument_names: &[],
+                variadic: false,
+                star: false,
+                distinct: false,
+                order_by: &[],
+                over: None,
+                filter: None,
+            })
+            .map_err(|_| Stop::full())?;
+        items
+            .push(SelectItem::Expr {
+                expression: presence,
+                alias: None,
+            })
+            .map_err(|_| Stop::full())?;
+    }
+    let body = arena
+        .alloc(Select {
+            items: arena
+                .alloc_slice_copy(items.as_slice())
+                .map_err(|_| Stop::full())?,
+            from: Some(inner),
+            ..*body
+        })
+        .map_err(|_| Stop::full())?;
+    Ok(TableRef {
+        alias: None,
+        col_alias: None,
+        subquery: Some(body),
+        ..*table
+    })
 }
 
 /// Moves each `HAVING` conjunct without aggregates, volatile functions or
@@ -1366,6 +1897,14 @@ enum Top<'r, 'a> {
     /// A query with `USING` or `NATURAL` joins: a merged column becomes its
     /// join output expression.
     Merged { scope: &'r QueryScope<'a> },
+    /// A query reading a parenthesized join's own columns: each becomes the
+    /// member column or merged expression it stands for.
+    Joined {
+        scope: &'r QueryScope<'a>,
+        position: usize,
+        alias: Option<&'a str>,
+        columns: &'r [&'a Expr<'a>],
+    },
     /// The subquery body: its own references are qualified so they cannot
     /// bind to an outer item after the merge.
     Inner {
@@ -1445,6 +1984,33 @@ impl<'a> Rewrite<'_, 'a> {
                     }
                     _ => Ok(None),
                 },
+            },
+            Top::Joined {
+                scope,
+                position,
+                alias,
+                columns,
+            } => match scope.probe_column_result(qualifier, name) {
+                Ok(ResolvedColumn::Table(table, column))
+                    if table == position && column < columns.len() =>
+                {
+                    Ok(Some(self.copy(columns[column])?))
+                }
+                Ok(_) => Ok(None),
+                // The join's whole row (`SELECT j`) names its alias.
+                Err(_)
+                    if alias.is_some() && (qualifier == alias || name == alias.unwrap_or("")) =>
+                {
+                    Err(Stop::Keep)
+                }
+                // An enclosing query's column or a routine's parameter.
+                Err(error)
+                    if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                        || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
+                {
+                    Ok(None)
+                }
+                Err(_) => Err(Stop::Keep),
             },
             Top::Outer {
                 scope,
@@ -1597,7 +2163,7 @@ impl<'a> Rewrite<'_, 'a> {
         match self.top {
             Top::Outer { inner, .. } => binds_column(inner, name),
             Top::Inner { outer, .. } => binds_column(Some(outer), name),
-            Top::Merged { .. } => false,
+            Top::Merged { .. } | Top::Joined { .. } => false,
         }
     }
 
@@ -1606,6 +2172,7 @@ impl<'a> Rewrite<'_, 'a> {
             Top::Outer { alias, inner, .. } => name == alias || names_relation(inner, name),
             Top::Inner { .. } => true,
             Top::Merged { scope } => scope.using_alias(name).is_some(),
+            Top::Joined { alias, .. } => alias == Some(name),
         }
     }
 

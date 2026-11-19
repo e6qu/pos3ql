@@ -2627,10 +2627,10 @@ pub(crate) fn sort_set_rows(
     // the limit returns, as PostgreSQL's does.
     // The memory PostgreSQL's sort reports, from the rows in arrival order.
     let space = match bound {
-        Some(bound) if sort.measured() => {
-            instrument::SortSpace::postgres_top_n(rows, None, 0, bound, arena, compare)?
-        }
-        _ => instrument::SortSpace::postgres(rows, None, bound.is_some())?,
+        Some(bound) if sort.measured() => instrument::SortSpace::postgres_top_n(
+            rows, None, 0, bound, arena, compare, false, None,
+        )?,
+        _ => instrument::SortSpace::postgres(rows, None, bound.is_some(), false)?,
     };
     let bound = bound.filter(|&bound| rows.len() > bound * 2);
     match bound {

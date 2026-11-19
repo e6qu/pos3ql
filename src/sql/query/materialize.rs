@@ -2479,12 +2479,16 @@ pub(crate) fn materialized_rows<'a>(
                 bound,
                 arena,
                 compare,
+                super::sole_item_computed(statement.items),
+                None,
             )?,
             _ => instrument::SortSpace::postgres_locking(
                 rows,
                 Some(&columns[..count]),
                 n_identities,
                 rank_window.is_some(),
+                super::sole_item_computed(statement.items),
+                None,
             )?,
         };
         // An incremental sort's batches, which it reports instead of one
@@ -2554,6 +2558,13 @@ pub(crate) fn materialized_rows<'a>(
                                 let batch_rows = arena
                                     .alloc_slice_with(batch.len(), |at| held[batch[at] as usize])
                                     .map_err(|_| arena_full())?;
+                                let groups: &mut instrument::IncrementalGroups =
+                                    incremental.get_or_insert_with(Default::default);
+                                let kind = if prefix {
+                                    &mut groups.presorted
+                                } else {
+                                    &mut groups.full
+                                };
                                 let space = match sort_bound {
                                     Some(sort_bound) => instrument::SortSpace::postgres_top_n(
                                         batch_rows,
@@ -2562,20 +2573,17 @@ pub(crate) fn materialized_rows<'a>(
                                         sort_bound,
                                         arena,
                                         compare,
+                                        super::sole_item_computed(statement.items),
+                                        Some(&mut kind.array_kept),
                                     )?,
                                     None => instrument::SortSpace::postgres_locking(
                                         batch_rows,
                                         Some(&columns[..count]),
                                         n_identities,
                                         bounded.is_some(),
+                                        super::sole_item_computed(statement.items),
+                                        Some(&mut kind.array_kept),
                                     )?,
-                                };
-                                let groups: &mut instrument::IncrementalGroups =
-                                    incremental.get_or_insert_with(Default::default);
-                                let kind = if prefix {
-                                    &mut groups.presorted
-                                } else {
-                                    &mut groups.full
                                 };
                                 kind.add_sorted(space);
                                 Ok(())
@@ -3121,7 +3129,8 @@ pub(crate) fn external_materialized_into<'a>(
             && !statement.distinct
             && plan.n_on == 0;
         sorter.size_as_postgres(
-            instrument::SortTuples::new(Some(&columns[..count]), plan.n_identities, bounded),
+            instrument::SortTuples::new(Some(&columns[..count]), plan.n_identities, bounded)
+                .map(|tuples| tuples.computed(super::sole_item_computed(statement.items))),
             (bounded && statement.locking.is_empty() && plan.n_order > 0)
                 .then(|| offset.saturating_add(limit).min(usize::MAX as u64) as usize),
         );

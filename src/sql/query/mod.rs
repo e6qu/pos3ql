@@ -69,7 +69,10 @@ pub(crate) use minmax::local_minmax_subquery;
 
 pub(crate) mod partition_prune;
 mod scan;
-pub(crate) use plan::{MAX_CONJUNCTS, flatten_and, order_qual, plan_time_bool, qual_cost};
+pub(crate) use plan::{
+    MAX_CONJUNCTS, flatten_and, order_qual, plan_time_bool, qual_cost, record_subplan_cost,
+    reset_subplan_costs, subplan_qual_cost,
+};
 pub(crate) use scan::Chained;
 #[cfg(test)]
 pub(crate) use scan::JOIN_CANDIDATES;
@@ -1014,7 +1017,7 @@ use subquery::{
     prepare_outer_subqueries,
 };
 pub(crate) use subquery::{
-    enter_sublink_of, subquery_node_correlated, type_witness, walk_children,
+    enter_sublink_of, select_correlated, subquery_node_correlated, type_witness, walk_children,
 };
 pub(crate) use subquery::{
     expression_has_correlated_subquery, subquery_hooks_outer, subquery_hooks_with_outer,
@@ -1022,7 +1025,10 @@ pub(crate) use subquery::{
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
 
+mod material_store;
 mod window;
+mod window_figures;
+mod window_store;
 use window::{
     cmp_key_rows, external_window_into, project_window_rows, rewrite_grouped_windows, window_select,
 };
@@ -10989,6 +10995,12 @@ pub(super) struct ResolvedSortKey<'a> {
     source: SortKeySource,
 }
 
+/// Whether a one-column select list computes its value (an expression, not
+/// a column read from a stored row), which sizes a datum sort's copy.
+pub(super) fn sole_item_computed(items: &[SelectItem<'_>]) -> bool {
+    matches!(items.first(), Some(SelectItem::Expr { expression, .. }) if !matches!(expression, Expr::Column { .. }))
+}
+
 /// The columns of a projected row of `width` output columns followed by
 /// `keys`' values that PostgreSQL's sort holds: the output columns and a
 /// junk column for each key that is not one of them or an earlier key
@@ -14654,6 +14666,29 @@ fn enter_scan_context<'a>(
     resolved_columns: &dyn super::exec::ColTypeResolver,
     arena: &'a Arena,
 ) -> Result<Option<index_paths::ScanContextScope>, SqlError> {
+    // A grouping of one table's columns scans by the path its plan reads.
+    if scope.n == 1
+        && !statement.group_by.is_empty()
+        && statement
+            .where_clause
+            .is_none_or(|condition| !condition.contains_subquery())
+        && let Some((shape, needed)) = crate::sql::explain::grouped_scan_context(
+            storage,
+            txid,
+            statement,
+            scope,
+            from,
+            resolved_columns,
+            arena,
+        )?
+    {
+        return Ok(Some(index_paths::enter_query(
+            scope.slots[0],
+            statement.where_clause,
+            needed,
+            Some(shape),
+        )));
+    }
     Ok(
         if scope.n == 1
             && statement
@@ -16285,12 +16320,19 @@ pub(crate) fn constant_select_resumable<'a>(
                     bound,
                     arena,
                     compare,
+                    sole_item_computed(statement.items),
+                    None,
                 ) {
                     Ok(space) => space,
                     Err(error) => return sql_fail(error),
                 }
             }
-            _ => match instrument::SortSpace::postgres(out_rows, Some(&columns[..count]), false) {
+            _ => match instrument::SortSpace::postgres(
+                out_rows,
+                Some(&columns[..count]),
+                false,
+                sole_item_computed(statement.items),
+            ) {
                 Ok(space) => space,
                 Err(error) => return sql_fail(error),
             },
@@ -16506,8 +16548,9 @@ fn select_into_rows_mode<'a>(
     let statement = expand_select_record_calls(statement, storage, txid, arena, outer)?;
     let statement = pullup::pull_up_subqueries(statement, storage, txid, arena, outer)?;
     // `min` and `max` of a local table read the first row of each ordered
-    // index scan when the planner prefers those InitPlans.
-    if outer.is_none()
+    // index scan when the planner prefers those InitPlans, also in a
+    // subquery reading no enclosing query's names.
+    if (outer.is_none() || !subquery::select_correlated(statement, storage, txid, arena)?)
         && let Some(rewritten) = local_minmax_subquery(storage, txid, statement, arena)?
     {
         return select_into_rows_mode(
@@ -17188,7 +17231,23 @@ fn select_into_rows_mode<'a>(
                 emit,
             );
         }
-        if storage.spill_attached() {
+        // The first window clause's sort outgrowing `work_mem` streams the
+        // windows through external runs.
+        let Some(mut rows) = project_window_rows(
+            storage,
+            txid,
+            statement,
+            from,
+            &scope,
+            win_nodes.as_slice(),
+            &hooks,
+            correlated,
+            &outer_subs.base,
+            arena,
+            params,
+            outer,
+        )?
+        else {
             external_window_into(
                 storage,
                 txid,
@@ -17210,21 +17269,7 @@ fn select_into_rows_mode<'a>(
                 },
             )?;
             return Ok(());
-        }
-        let mut rows = project_window_rows(
-            storage,
-            txid,
-            statement,
-            from,
-            &scope,
-            win_nodes.as_slice(),
-            &hooks,
-            correlated,
-            &outer_subs.base,
-            arena,
-            params,
-            outer,
-        )?;
+        };
         // DISTINCT dedups on the projected values; ORDER BY and LIMIT/OFFSET
         // apply here too (a derived table keeps its inner LIMIT).
         if statement.distinct {

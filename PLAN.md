@@ -1101,19 +1101,38 @@ Remaining: scans of the old multi-relation executor and of subplans that keep
 no page model (`0A000`), and hash joins run in batches (`0A000`: their work
 files are not sized). An `INSERT ... ON CONFLICT` prints its resolution,
 arbiter indexes and, analyzed, its inserted and conflicting tuples
-(`differential_exact/940`); a conflict target's `WHERE`, a `DO UPDATE ...
-WHERE` (`Conflict Filter`) and an expression target fail `EXPLAIN` with
-`0A000`. A `LIMIT` over a `GroupAggregate` over a join reads the whole join
-rather than stopping after its last group, and a merge join over an input
-in order without a sort fails `EXPLAIN ANALYZE` with `0A000`. An
-uncorrelated scalar subquery's `min` or `max` is planned as an `Aggregate`
-over its scan rather than as `preprocess_minmax_aggregates`' InitPlans, and
-an `INSERT ... SELECT`'s InitPlans print under its source scan rather than
-under the `Insert` node. An error a PL/pgSQL `FOR ... IN EXECUTE` query
-raises while it runs (a unique violation, an `EXPLAIN ANALYZE`'s error)
-carries a `SQL statement` context line, which PostgreSQL prints only for
-errors raised while the query is planned (`_SPI_error_callback` is not
-installed around a cursor's fetches). Windows over a join the search plans read its plan's rows, also when
+(`differential_exact/940`). A conflict target infers every unique index
+`infer_arbiter_indexes` picks (plain key columns and key expressions equal
+to the target's as sets, a partial index only when the target's `WHERE`
+implies its predicate), a row conflicting when it equals another on any of
+them, and `EXPLAIN` lists them (`differential_exact/948`); a `DO UPDATE ...
+WHERE` (`Conflict Filter`) fails `EXPLAIN` with `0A000`. A `LIMIT` directly over a sorted grouping stops reading its
+input at the first row of the group after the last one it takes (a
+`GroupAggregate` reads that group's rows, a `Group` of a `GROUP BY`
+without aggregates, costed by `cost_group`, only its first row), and only
+the groups it reads are filtered and projected (`differential_exact/941`).
+A merge join reads an index or index-only scan in order as far as it
+fetches, counting that scan's rows and heap fetches
+(`differential_exact/945`); one over another input in order without a sort
+(a filtered index scan, a join) fails `EXPLAIN ANALYZE` with `0A000`. Under
+`BUFFERS`, an index scan read in part counts its leaf pages from the
+index's average entries per leaf, one page more than PostgreSQL's full
+leaves when the scan stops early, and the visibility map counts no page
+all-visible after any change since `VACUUM`, where PostgreSQL clears only
+the changed pages' bits. An uncorrelated subquery's `min` or `max` is
+planned and run as `preprocess_minmax_aggregates`' InitPlans
+(`differential_exact/942`). An `INSERT` whose source PostgreSQL pulls up
+runs the source's InitPlans in its `Insert` node, as it does a `VALUES`
+row's, and the source's top node computes the target list coerced to the
+columns; a value coerced while the query runs leaves its cost unmodeled
+(`0A000` when costs print), as does a subquery in `ON CONFLICT`
+(`differential_exact/943`). A PL/pgSQL `FOR` loop over a query names it in
+an error's context only when the error is raised planning it
+(`differential_exact/944`). An `IN` or `= ANY` condition of the `WHERE` list over a subquery
+the search does not join, and an `IN`, `ANY` or `ALL` test reading no
+column, fail `EXPLAIN` with `0A000`, since PostgreSQL joins the subquery
+(`convert_ANY_sublink_to_join`) or gates the query with the test.
+Windows over a join the search plans read its plan's rows, also when
 the statement spills their input to object storage,
 so `EXPLAIN ANALYZE` counts its nodes (`differential_exact/935`); windows
 over a join it does not plan (a window function in the `ORDER BY`) fail
@@ -1158,7 +1177,10 @@ a join clause (`differential_exact/889`). Remaining for windows: window function
 expressions or the `ORDER BY`, windows over one relation's groups, the
 merging of window clauses equal once `optimize_window_clauses` frees their
 frames, run conditions (`find_window_run_conditions`, which needs the
-subquery scan below), and `EXPLAIN ANALYZE` of windows over an index scan,
+subquery scan below), the `Memory` of a window's sort and the `Maximum
+Storage` of its tuplestore under `EXPLAIN ANALYZE`, which print pos3ql's
+own row sizes rather than `tuplesort.c`'s and `nodeWindowAgg.c`'s spooled and
+trimmed partitions (fixtures mask them), and `EXPLAIN ANALYZE` of windows over an index scan,
 under a limit directly above them or over a join's groups (`0A000`:
 execution reads the input by its own scan); for presorted aggregates:
 `EXPLAIN ANALYZE` of their sort (`0A000`: its tuples' memory is not modeled).
@@ -1182,12 +1204,35 @@ parenthesized join whose members join by written conditions (`a LEFT JOIN
 (b JOIN c ON x) ON y`, nested to any depth) is a node of the join tree
 `deconstruct_jointree` reads: its relations join in the same search, and
 each joined row fills the parenthesized join's columns from its members'
-rows (`differential_exact/934`). Remaining there: an aliased one, one
-joined by `USING` or `NATURAL`, and one under grouping, aggregates or
-windows (`0A000` when costs print); a parenthesized join's own
+rows (`differential_exact/934`). Grouping, aggregates and `DISTINCT` over
+such joins are planned by the same search, a hashed grouping over a join
+reporting its memory (`differential_exact/946`). So are an aliased one, one
+of `USING` or `NATURAL` joins and one under window functions: a column of
+the join reads its member's column, a merged column the left member's
+(inner and `LEFT` joins), the right one's (`RIGHT`) or their `COALESCE`
+(`FULL`), as `flatten_join_alias_vars` reads `buildMergedJoinVar`'s
+variables, and a member named as an earlier FROM item prints PostgreSQL's
+suffix (`nb nb_1`); windows read each joined row's member columns
+(`differential_exact/947`). Remaining there: a merged column that needs a
+coercion (`int` with `bigint`) or merges more than two columns, a member
+named as a later FROM item, a whole-row reference to the join, an outer
+`USING` join of a parenthesized one, and nested aliased joins; `EXPLAIN` of
+any parenthesized join the search does not plan fails with `0A000`. A
+query of a parenthesized inner join that the search does not plan runs the
+old executor over the flattened chain. With only inner joins in the FROM
+the outer join's condition joins the `WHERE` conditions, so the executor
+joins by it once its relations have joined (`differential_exact/951`: 20
+seconds down to 0.3). With an outer join in the FROM, or when the chain's
+first members share no condition (`na JOIN (nb JOIN nc JOIN nd ON ...) ON
+na.id = nd.id`), the written order still leaves a cross product the old
+executor loops over per row (over 20 seconds for 400, 300 and 200 rows):
+A condition reading a subquery keeps the loop too. It needs PostgreSQL's join order, not the written one. A parenthesized join's own
 query runs only when the search does not plan the query, so one nested in
 another (`a LEFT JOIN (b JOIN (c JOIN d ON z) ON x) ON y`) joins its
-members without reading its rows first (`differential_exact/937`). Remaining for that search:
+members without reading its rows first (`differential_exact/937`). A
+scan's filter testing a subplan (`[NOT] IN`, `ANY`, `ALL`) costs what
+`cost_subplan` charges and keeps half the rows (`differential_exact/950`).
+Remaining for that search:
 `GROUP BY` of an expression (`0A000` when costs print), conditions
 comparing expressions of several relations other than by a mergeable
 equality (`COALESCE(a.id, 0) < b.id`), an `OR`
@@ -1196,12 +1241,25 @@ of join conditions that a semi or anti join evaluates
 that an indexed relation's parameterized scan evaluates (as a filter, or
 as a `BitmapOr` of parameterized index scans), a merge join over a partly sorted outer input (`Incremental
 Sort`), derived tables kept as subqueries (`SubqueryScan`), self-join removal
-(`remove_useless_self_joins`), a constant equated with an outer join's
+(`remove_useless_self_joins`: `EXPLAIN` of two scans of one table joined
+on columns that cover a unique index fails with `0A000`), a constant equated with an outer join's
 column another outer join nulls, `UPDATE ... FROM` and `DELETE ...
-USING` through the same search, more relations than
-`join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,
-not ported; such queries keep pos3ql's join order and refuse cost output
-with `0A000`). A parameterized index scan's cost reads its index's pages:
+USING` through the same search (`EXPLAIN` of one that joins through an
+index fails with `0A000`, and its join's costs refuse to print), a
+`LATERAL` subquery (PostgreSQL may cache it in a `Memoize`; `EXPLAIN` of
+one the search does not plan fails with `0A000` while `enable_memoize` is
+on), a correlated subplan in an `OR` or compared with a column (`0A000`),
+`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), and more than
+128 relations in one query, past which the search holds no plan and such
+queries run pos3ql's join order. An `ORDER BY` over a join keeps every joined row in
+the statement arena before sorting, so a join of millions of rows (seven
+8-row tables cross joined, `ORDER BY 1 LIMIT 1`) fails with `54000` where
+PostgreSQL runs a bounded top-N sort; the join's rows must feed the
+spilling sort instead. A join estimated past 2^64 rows refuses
+`EXPLAIN` with costs (`0A000`), since plan rows are kept as integers where
+PostgreSQL prints its double in full. Joins of never-analyzed tables keep
+pos3ql's join order: modeling them matches PostgreSQL on probe joins but moves 24 lib
+tests (streaming of cold joins, hash-plan expectations) off their plans. A parameterized index scan's cost reads its index's pages:
 an index built over loaded rows is sized as `_bt_buildadd` fills its
 pages (a page closes when its free space and its last tuple's posting
 list fall under the fill factor's reserve, that tuple moving on), but one
@@ -1513,9 +1571,38 @@ the context of by-reference transition states (array initial values and the
 `Int128AggState` of integer averages and sums are modelled). `EXPLAIN
 ANALYZE` of a hash aggregate with another by-reference state (`numeric`
 sums, text `min`/`max`, collecting aggregates) or more than seven grouping
-columns fails with `0A000`; a table that would spill (`Batches` above 1) is
-not modelled, and outside the cost model the bucket array is sized from
-pos3ql's group estimate. A `CTE Scan` prints its query's tuplestore
+columns fails with `0A000`, as does a table that spills
+(`hash_agg_check_limits`'s memory or group limit, from `hash_agg_set_limits`;
+its `Batches`, `Disk Usage` and partitions need the tapes' block allocation,
+`hash_bytes_uint32` hashes and the hyperloglog cardinalities of
+`nodeAgg.c`'s spill batches) and a hash aggregate whose group estimate lies
+outside the cost model (an expression key, a join pos3ql does not plan).
+Aggregates over a join and a `DISTINCT` over one table size their tables
+from the planner's group estimate (`differential_exact/908`). A `Materialize`
+above a merge join's inner sort replays its mark, restore and
+`tuplestore_trim` (`differential_exact/910`); rows with equal window keys
+reach a window's sort and number in `pg_qsort` order
+(`differential_exact/909`). An integer in a window's `PARTITION BY` or `ORDER BY` is a
+constant, never an output position, with or without a `FROM`
+(`differential_exact/914`). Each window clause's sort charges the tuples it
+really holds, the window input target and the results of the clauses below,
+as `tuplesort.c` does (`TuplesortModel`): a sort that outgrows `work_mem` forms
+its runs where `dumptuples` does, sorts each with `pg_qsort` and merges them
+through `pg_tuplesort_runs` (`mergeruns`' tape numbering and binary heap), so
+rows with equal keys come out in PostgreSQL's order and an upper clause needs
+no size prediction (`differential_exact/911`, `912`). With a spill store
+attached, the first clause's sort is charged while the source is counted, and
+when it outgrows `work_mem` the windows stream through external runs instead
+of the arena; arena exhaustion is the named error, never a switch of path.
+Not yet done: the external window path (each clause sorted from a fresh scan
+of the source, tied rows restitched by rank) does not return tied rows in
+`tuplesort.c`'s run and merge order, and its sorts carry no lower clause's
+results; a clause whose tuples hold a value of no PostgreSQL size here
+(`jsonb`, arrays, records) is not accounted and sorts as one quicksort; and
+`ORDER BY` and the other sorts still sort in one quicksort when PostgreSQL's
+would spill, where tied rows come out in a different order. A bounded sort
+(`LIMIT`) that outgrows its heap in `EXPLAIN ANALYZE` still fails with `0A000`.
+A `CTE Scan` prints its query's tuplestore
 (`tuplestore_get_stats`: 2048 row pointers, doubled when a row reaches the
 last free slot, and each row's generation chunk), also when it never ran;
 a `Recursive Union` the sum of its working and intermediate tables, each
@@ -1537,12 +1624,22 @@ multi-pass merge never exceeds because each pass reads a block before it
 writes its replacement; a bounded sort keeps its heap from the row count its
 heap began at (`differential_exact/906`). An incremental sort's batches
 report `Average Disk` and the space its one tuplesort remembers across
-`tuplesort_reset`. A merge join's sort that spills (random-access tapes) stays `0A000`. Remaining: the
-window's storage, the sorts under windows and the incremental sort's group
-memory over windows are pos3ql's own figures; PostgreSQL's need the window's
-`tuplestore_trim` points (its read and mark pointers per frame) and each
-batch's tuplesort reuse, which `differential_exact/472` and `564` still
-mask. A
+`tuplesort_reset` (its array is charged only when the previous batch grew
+it). A merge join's sort that spills (random-access tapes) stays `0A000`.
+`EXPLAIN ANALYZE` of a window replays PostgreSQL over the materialized rows
+(`window_figures.rs`, `window_store.rs`): each clause's `Sort` holds the
+window input target (`make_window_input_target`) plus the functions of the
+clauses below and reports it like any tuplesort, and the `WindowAgg`
+replays its partition tuplestore (`spool_tuples`, each function's mark and
+read pointers, `eval_windowaggregates`, the `RANGE` frame tail,
+`tuplestore_trim`, the spill of a partition past `work_mem`), for the
+default and `ROWS UNBOUNDED PRECEDING` frames and for `row_number`, `rank`,
+`dense_rank` and plain aggregates (`differential_exact/472`, `564`, `907`,
+`935`); other frames and window functions fail with `0A000`. Rows of equal
+keys reach each sort in pos3ql's stable order, not PostgreSQL's quicksort
+order, which matters only when their tuples differ in size. A datum sort of
+a computed varlena counts its four-byte header; set operations' sorts treat
+their values as stored. A
 condition folded to false keeps the query's sort, limit, row locks,
 aggregation and windows over a `Result` with a false `One-Time Filter`. A
 subquery the planner does not merge runs as a subplan: an uncorrelated

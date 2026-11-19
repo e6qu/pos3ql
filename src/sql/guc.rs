@@ -30,8 +30,10 @@ pub(crate) const SHOW_ALL_COLUMNS: [super::types::ColDesc<'static>; 3] = [
     super::types::ColDesc::new("description", super::types::oid::TEXT, -1),
 ];
 
+/// PostgreSQL's `pg_prng_state` (xoroshiro128**), with `pg_prng_seed`,
+/// `pg_prng_fseed`, `pg_prng_double` and `pg_prng_uint64_range`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct PrngState {
+pub(crate) struct PrngState {
     s0: u64,
     s1: u64,
     initialized: bool,
@@ -62,6 +64,13 @@ impl PrngState {
         self.initialized = true;
     }
 
+    /// A state seeded as `pg_prng_fseed(seed)`.
+    pub(crate) fn seeded(seed: f64) -> Self {
+        let mut state = Self::UNINITIALIZED;
+        state.seed_f64(seed);
+        state
+    }
+
     fn seed_f64(&mut self, seed: f64) {
         let integer = (((1_u64 << 52) - 1) as f64 * seed) as i64;
         self.seed_u64(integer as u64);
@@ -76,13 +85,13 @@ impl PrngState {
         value
     }
 
-    fn next_f64(&mut self) -> f64 {
+    pub(crate) fn next_f64(&mut self) -> f64 {
         ((self.next_u64() >> 12) as f64) * 2_f64.powi(-52)
     }
 
     /// Select uniformly from the inclusive range.  Mask-and-reject is the
     /// algorithm PostgreSQL uses; modulo reduction would bias most ranges.
-    fn next_u64_range(&mut self, min: u64, max: u64) -> u64 {
+    pub(crate) fn next_u64_range(&mut self, min: u64, max: u64) -> u64 {
         if max <= min {
             return min;
         }
@@ -4531,6 +4540,7 @@ pub(crate) struct PlannerSettingMetadata {
     pub(crate) vartype: &'static str,
     pub(crate) category: &'static str,
     pub(crate) description: &'static str,
+    pub(crate) extra_description: Option<&'static str>,
     pub(crate) boot: StackStr<32>,
     pub(crate) bounds: Option<(StackStr<32>, StackStr<32>)>,
     pub(crate) enum_names: &'static [&'static str],
@@ -4561,6 +4571,7 @@ pub(crate) fn planner_setting_metadata(name: &str) -> Option<PlannerSettingMetad
         vartype: setting.kind.vartype(),
         category: setting.category,
         description: setting.description,
+        extra_description: planner::extra_description(setting.name),
         boot,
         bounds,
         enum_names,

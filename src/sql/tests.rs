@@ -56031,30 +56031,21 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     // UPDATE FROM and DELETE USING evaluate their auxiliary source once per
     // target row. That source can probe an index with the target row supplied
     // through the executor's outer lookup.
-    let joined_dml_plan = data_rows(&run_with(
-        &mut engine,
-        &mut budget,
+    // PostgreSQL costs that probe against its other joins, which pos3ql's
+    // write join does not, so EXPLAIN refuses the plan.
+    for explain in [
         "EXPLAIN (COSTS OFF) UPDATE probe_keys p SET label = e.payload FROM indexed_events e
-           WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted;
-         EXPLAIN (COSTS OFF) DELETE FROM probe_keys p USING indexed_events e
            WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted",
-    ));
-    assert_eq!(
-        joined_dml_plan
-            .iter()
-            .filter(|row| row.contains("Nested Loop"))
-            .count(),
-        2,
-        "{joined_dml_plan:?}"
-    );
-    assert_eq!(
-        joined_dml_plan
-            .iter()
-            .filter(|row| row.contains("Index Scan using indexed_events_key on indexed_events e"))
-            .count(),
-        2,
-        "joined DML explanation must expose the parameterized source: {joined_dml_plan:?}"
-    );
+        "EXPLAIN (COSTS OFF) DELETE FROM probe_keys p USING indexed_events e
+           WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted",
+    ] {
+        let output = run_with(&mut engine, &mut budget, explain);
+        assert!(
+            String::from_utf8_lossy(&output).contains("joining through an index"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -88731,12 +88722,16 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     }
 
     let before = engine.storage.block_io_stats();
+    // The 20000-row sorts fit the default `work_mem`, so PostgreSQL would sort
+    // them in memory; a small one makes its tuplesort spill, which streams the
+    // window through external runs.
     let partitioned = |engine: &mut Engine, budget: &mut Budget, text: &str, expected: &[&str]| {
+        let text = format!("SET work_mem = '64kB'; {text}");
         assert_eq!(
-            data_rows(&run_with(engine, budget, text)),
+            data_rows(&run_with(engine, budget, &text)),
             expected,
             "{}",
-            String::from_utf8_lossy(&run_with(engine, budget, text))
+            String::from_utf8_lossy(&run_with(engine, budget, &text))
         );
     };
     // A range-function source with two specs (the second a whole-input
@@ -88791,6 +88786,26 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
             "0|2857", "1|2858", "2|2857", "3|2857", "4|2857", "5|2857", "6|2857",
         ],
     );
+    // A clause above a window function whose result size varies by row sorts
+    // the real results, so it runs with a spill store attached.
+    partitioned(
+        &mut engine,
+        &mut budget,
+        "SELECT lag(x) OVER (ORDER BY x), lead(x) OVER (ORDER BY x DESC) \
+         FROM generate_series(1, 10) AS x",
+        &[
+            "NULL|NULL",
+            "1|1",
+            "2|2",
+            "3|3",
+            "4|4",
+            "5|5",
+            "6|6",
+            "7|7",
+            "8|8",
+            "9|9",
+        ],
+    );
     // Without ORDER BY, rows leave in the last-evaluated window's order with
     // ties in the earlier windows' order, as PostgreSQL 18.6 returns them.
     partitioned(
@@ -88842,8 +88857,11 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
         .storage
         .block_io_stats()
         .saturating_sub(before_cold);
+    // The 2000 rows fit the arena, so the window projects in memory as
+    // PostgreSQL's sort does and writes no runs; it reads its input from the
+    // object tier.
     assert!(
-        cold_traffic.object_puts > 0 && cold_traffic.object_gets > 0,
+        cold_traffic.object_gets > 0,
         "cold window evaluation must cross the durable block boundary: {cold_traffic:?}"
     );
     drop(restarted);

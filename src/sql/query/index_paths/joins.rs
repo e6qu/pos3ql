@@ -20,10 +20,13 @@ use crate::sql::eval::SqlError;
 
 use super::{Costs, clamp_row_est};
 
-/// Relations a join search plans at most: `join_collapse_limit`'s and
-/// `from_collapse_limit`'s default, below which PostgreSQL searches one
-/// flat problem.
-pub(crate) const MAX_JOIN_RELS: usize = 8;
+mod geqo;
+pub(crate) use geqo::GeqoSettings;
+
+/// Base relations of one modeled query. Its join problems are split by
+/// `join_collapse_limit` and `from_collapse_limit` and each is searched
+/// exhaustively or, from `geqo_threshold` on, genetically.
+pub(crate) const MAX_JOIN_RELS: usize = 128;
 /// Members per equivalence class and clauses the search holds.
 pub(crate) const MAX_MEMBERS: usize = 16;
 pub(crate) const MAX_CLAUSES: usize = 64;
@@ -35,11 +38,175 @@ const MAX_REL_PATHS: usize = 32;
 
 /// A set of base relations, by bit, and of the outer joins above them
 /// (PostgreSQL's join relids), each at [`OJ_SHIFT`] past its number.
-pub(crate) type Relids = u32;
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub(crate) struct Relids([u64; RELIDS_WORDS]);
+const RELIDS_WORDS: usize = 2 * MAX_JOIN_RELS / 64;
 /// The first outer join's bit.
-pub(crate) const OJ_SHIFT: u32 = 16;
+pub(crate) const OJ_SHIFT: u32 = MAX_JOIN_RELS as u32;
 /// The base relations' bits of a [`Relids`].
-pub(crate) const BASE_RELIDS: Relids = (1 << OJ_SHIFT) - 1;
+pub(crate) const BASE_RELIDS: Relids = Relids::below(OJ_SHIFT);
+
+impl Relids {
+    pub(crate) const EMPTY: Self = Self([0; RELIDS_WORDS]);
+
+    /// The set of member `bit` alone.
+    pub(crate) const fn bit(bit: u32) -> Self {
+        let mut words = [0; RELIDS_WORDS];
+        words[(bit / 64) as usize] = 1 << (bit % 64);
+        Self(words)
+    }
+
+    /// Base relation `rel` alone.
+    pub(crate) fn of(rel: impl RelNumber) -> Self {
+        Self::bit(rel.number())
+    }
+
+    /// The members below `bit`.
+    pub(crate) const fn below(bit: u32) -> Self {
+        let mut words = [0; RELIDS_WORDS];
+        let mut at = 0;
+        while at < RELIDS_WORDS {
+            let start = at as u32 * 64;
+            words[at] = if bit >= start + 64 {
+                u64::MAX
+            } else if bit > start {
+                (1 << (bit - start)) - 1
+            } else {
+                0
+            };
+            at += 1;
+        }
+        Self(words)
+    }
+
+    /// The set of the low 64 members `mask` holds.
+    #[cfg(test)]
+    pub(crate) const fn from_mask(mask: u64) -> Self {
+        let mut words = [0; RELIDS_WORDS];
+        words[0] = mask;
+        Self(words)
+    }
+
+    pub(crate) const fn is_empty(self) -> bool {
+        let mut at = 0;
+        while at < RELIDS_WORDS {
+            if self.0[at] != 0 {
+                return false;
+            }
+            at += 1;
+        }
+        true
+    }
+
+    /// `bms_overlap`.
+    pub(crate) fn overlaps(self, other: Self) -> bool {
+        !(self & other).is_empty()
+    }
+
+    pub(crate) const fn contains(self, bit: u32) -> bool {
+        self.0[(bit / 64) as usize] & 1 << (bit % 64) != 0
+    }
+
+    /// `bms_num_members`.
+    pub(crate) fn count_ones(self) -> u32 {
+        self.0.iter().map(|word| word.count_ones()).sum()
+    }
+
+    /// The lowest member; past every member when empty.
+    pub(crate) fn trailing_zeros(self) -> u32 {
+        let mut zeros = 0;
+        for word in self.0 {
+            if word != 0 {
+                return zeros + word.trailing_zeros();
+            }
+            zeros += 64;
+        }
+        zeros
+    }
+
+    /// The members, lowest first.
+    pub(crate) fn members(self) -> impl Iterator<Item = u32> {
+        let mut rest = self;
+        core::iter::from_fn(move || {
+            if rest.is_empty() {
+                return None;
+            }
+            let bit = rest.trailing_zeros();
+            rest &= !Self::bit(bit);
+            Some(bit)
+        })
+    }
+
+    /// The base relations, as relation numbers.
+    pub(crate) fn rels(self) -> impl Iterator<Item = u8> {
+        (self & BASE_RELIDS).members().map(|bit| bit as u8)
+    }
+
+    /// A hash of the set for the join relation table.
+    fn hash(self) -> u64 {
+        self.0.iter().fold(0u64, |hash, &word| {
+            (hash ^ word)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left(29)
+        })
+    }
+}
+
+/// A base relation's or outer join's number.
+pub(crate) trait RelNumber {
+    fn number(self) -> u32;
+}
+
+impl RelNumber for u8 {
+    fn number(self) -> u32 {
+        u32::from(self)
+    }
+}
+
+impl RelNumber for u32 {
+    fn number(self) -> u32 {
+        self
+    }
+}
+
+impl RelNumber for usize {
+    fn number(self) -> u32 {
+        u32::try_from(self).expect("a relation number")
+    }
+}
+
+impl core::ops::BitOr for Relids {
+    type Output = Self;
+    fn bitor(self, other: Self) -> Self {
+        Self(core::array::from_fn(|at| self.0[at] | other.0[at]))
+    }
+}
+
+impl core::ops::BitAnd for Relids {
+    type Output = Self;
+    fn bitand(self, other: Self) -> Self {
+        Self(core::array::from_fn(|at| self.0[at] & other.0[at]))
+    }
+}
+
+impl core::ops::Not for Relids {
+    type Output = Self;
+    fn not(self) -> Self {
+        Self(self.0.map(|word| !word))
+    }
+}
+
+impl core::ops::BitOrAssign for Relids {
+    fn bitor_assign(&mut self, other: Self) {
+        *self = *self | other;
+    }
+}
+
+impl core::ops::BitAndAssign for Relids {
+    fn bitand_assign(&mut self, other: Self) {
+        *self = *self & other;
+    }
+}
 
 /// `STD_FUZZ_FACTOR`.
 const FUZZ: f64 = 1.01;
@@ -65,20 +232,20 @@ impl Member {
         Self {
             rel,
             column,
-            nulling: 0,
-            reads: 0,
+            nulling: Relids::EMPTY,
+            reads: Relids::EMPTY,
         }
     }
 
     /// Expression `id` reading the base relations `relids`, several of
     /// them, which their join computes.
-    pub(crate) const fn several(relids: Relids, id: u16) -> Self {
+    pub(crate) fn several(relids: Relids, id: u16) -> Self {
         let rel = relids.trailing_zeros() as u8;
         Self {
             rel,
             column: EXPRESSION_COLUMN | id,
-            nulling: 0,
-            reads: relids & !(1 << rel),
+            nulling: Relids::EMPTY,
+            reads: relids & !Relids::of(rel),
         }
     }
 
@@ -98,13 +265,13 @@ impl Member {
     }
 
     /// `em_relids`.
-    pub(crate) const fn relids(&self) -> Relids {
-        1 << self.rel | self.reads | self.nulling
+    pub(crate) fn relids(&self) -> Relids {
+        Relids::of(self.rel) | self.reads | self.nulling
     }
 
     /// The base relations it reads.
-    pub(crate) const fn base_relids(&self) -> Relids {
-        1 << self.rel | self.reads
+    pub(crate) fn base_relids(&self) -> Relids {
+        Relids::of(self.rel) | self.reads
     }
 }
 
@@ -136,7 +303,7 @@ impl EquivalenceClass {
     /// target list, else the first expression it can compute.
     pub(crate) fn sort_member(&self, relids: Relids) -> Option<usize> {
         let members = self.members();
-        let within = |member: &Member| member.base_relids() & !relids == 0;
+        let within = |member: &Member| member.base_relids() & !relids == Relids::EMPTY;
         members
             .iter()
             .position(|member| within(member) && member.expression_id().is_none())
@@ -147,7 +314,7 @@ impl EquivalenceClass {
     pub(crate) fn relids(&self) -> Relids {
         self.members()
             .iter()
-            .fold(0, |relids, member| relids | member.relids())
+            .fold(Relids::EMPTY, |relids, member| relids | member.relids())
     }
 }
 
@@ -233,7 +400,7 @@ pub(crate) struct Clause {
 impl Clause {
     /// `RINFO_IS_PUSHED_DOWN` at a join of `relids`.
     pub(crate) fn is_pushed_down(&self, relids: Relids) -> bool {
-        self.pushed_down || self.required & !relids != 0
+        self.pushed_down || self.required & !relids != Relids::EMPTY
     }
 
     /// A clause of some relation's `joininfo`: one no class absorbed,
@@ -244,7 +411,7 @@ impl Clause {
 
     /// A clause of the `joininfo` of base relation `relids`.
     pub(crate) fn in_joininfo_of(&self, relids: Relids) -> bool {
-        self.in_joininfo() && self.required & relids != 0
+        self.in_joininfo() && self.required & relids != Relids::EMPTY
     }
 }
 
@@ -321,11 +488,12 @@ impl JoinType {
 }
 
 /// One join problem of the query (`make_rel_from_joinlist`): the
-/// relations it joins, a lower problem's joined relations as one item.
-#[derive(Clone, Copy, Debug)]
+/// relations it joins, `items[first..first + count]` of the problems'
+/// items, a lower problem's joined relations as one item.
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Subproblem {
-    pub(crate) items: [Relids; MAX_JOIN_RELS],
-    pub(crate) count: u8,
+    pub(crate) first: u16,
+    pub(crate) count: u16,
 }
 
 /// A base relation's size and the paths `set_plain_rel_pathlist` submits
@@ -414,6 +582,7 @@ pub(crate) struct JoinSettings {
     pub(crate) sort: bool,
     pub(crate) incremental_sort: bool,
     pub(crate) memoize: bool,
+    pub(crate) geqo: GeqoSettings,
 }
 
 /// An ordered list of clause numbers.
@@ -535,7 +704,8 @@ pub(crate) enum PathKind {
     /// unique by an index (`UNIQUE_PATH_NOOP`, which plans no node).
     Unique {
         input: u32,
-        keys: [Member; MAX_KEYS],
+        /// The compared members, `JoinPlan::member_keys`' entry.
+        keys: u32,
         key_count: u8,
         method: UniqueMethod,
     },
@@ -552,7 +722,8 @@ pub(crate) enum PathKind {
     /// values (`Memoize`): `keys` are the outer columns, as class members.
     Memoize {
         input: u32,
-        keys: [Member; MAX_KEYS],
+        /// The cache keys, `JoinPlan::member_keys`' entry.
+        keys: u32,
         key_count: u8,
         /// `singlerow`: the join's inner relation is unique, so an entry
         /// is complete at its first row.
@@ -638,21 +809,34 @@ struct Rel {
     first: (Relids, Relids),
     /// `cheapest_unique_path`, once a semi join asked for it.
     unique: Option<Option<u32>>,
+    /// The next relation of its hash chain ([`NO_REL`] ends it).
+    next: u32,
+}
+
+/// No relation: the end of a hash chain.
+const NO_REL: u32 = u32::MAX;
+/// Hash chains of the relations one search builds (`join_rel_hash`).
+const REL_BUCKETS: usize = 4096;
+
+fn rel_bucket(relids: Relids) -> usize {
+    ((relids & BASE_RELIDS).hash() % REL_BUCKETS as u64) as usize
 }
 
 /// The chosen plan: every path the search built, and the cheapest of the
 /// relation joining them all.
 pub(crate) struct JoinPlan<'a> {
     pub(crate) paths: &'a [Path],
+    /// The members of each Unique and Memoize path.
+    pub(crate) member_keys: &'a [[Member; MAX_KEYS]],
     pub(crate) clauses: &'a [Clause],
     pub(crate) classes: &'a [EquivalenceClass],
     /// The join's chosen path, below [`Self::upper`].
     pub(crate) top: u32,
     pub(crate) upper: UpperPlan,
     pub(crate) settings: JoinSettings,
-    /// For each join relation, by its base relations, the pair that built
-    /// it.
-    pub(crate) firsts: &'a [(Relids, Relids)],
+    /// Each relation built, by its base relations, with the pair that
+    /// built it.
+    pub(crate) firsts: &'a [(Relids, (Relids, Relids))],
     pub(crate) needed: &'a [NeededColumn],
     /// The relations of removed joins, which the plan binds to NULLs.
     pub(crate) removed: Relids,
@@ -663,6 +847,11 @@ impl JoinPlan<'_> {
         &self.paths[id as usize]
     }
 
+    /// The `count` members of a Unique or Memoize path's `keys` entry.
+    pub(crate) fn keys(&self, keys: u32, count: u8) -> &[Member] {
+        &self.member_keys[keys as usize][..usize::from(count)]
+    }
+
     /// The columns of `relids`' target list in its order: each relation's
     /// needed columns that a relation outside `relids` or the output reads,
     /// a join relation's as its building pair's outer then inner lists.
@@ -671,10 +860,16 @@ impl JoinPlan<'_> {
     }
 
     fn target_list_of(&self, part: Relids, above: Relids, visit: &mut dyn FnMut(&NeededColumn)) {
-        let (outer, inner) = self.firsts[(part & BASE_RELIDS) as usize];
-        if inner == 0 {
+        let base = part & BASE_RELIDS;
+        let (_, (outer, inner)) = *self
+            .firsts
+            .iter()
+            .find(|(relids, _)| *relids == base)
+            .expect("a relation of the plan");
+        if inner == Relids::EMPTY {
             for column in self.needed {
-                if part & 1 << column.rel != 0 && (column.output || column.needed_by & !above != 0)
+                if part.contains(u32::from(column.rel))
+                    && (column.output || !(column.needed_by & !above).is_empty())
                 {
                     visit(column);
                 }
@@ -930,6 +1125,8 @@ pub(crate) struct JoinProblem<'p> {
     pub(crate) specials: &'p [SpecialJoin],
     /// The join problems, lower ones first; the last joins them all.
     pub(crate) subproblems: &'p [Subproblem],
+    /// The problems' items.
+    pub(crate) subproblem_items: &'p [Relids],
     /// The query's join clauses in the order PostgreSQL distributes them,
     /// equalities of class members and other clauses above one relation
     /// included, then the clauses its base relations' index paths derived
@@ -963,8 +1160,13 @@ struct Search<'p, 'a, 's> {
     arena: &'a Arena,
     clauses: ArenaList<'a, Clause>,
     paths: ArenaList<'a, Path>,
-    /// Relations by their base relations; `None` until built.
-    rels: &'a mut [Option<Rel>],
+    /// The members of Unique and Memoize paths, kept apart so a path stays
+    /// small.
+    member_keys: ArenaList<'a, [Member; MAX_KEYS]>,
+    /// The relations built (`join_rel_list`), base ones first.
+    rels: ArenaList<'a, Rel>,
+    /// The newest relation of each hash chain of [`Self::rels`].
+    rel_buckets: &'a mut [u32],
     /// The joinrels of each level of the current problem in the order they
     /// were built; its items are the first level (`initial_rels`).
     levels: [ArenaList<'a, Relids>; MAX_JOIN_RELS + 1],
@@ -1007,12 +1209,11 @@ pub(crate) fn search<'a>(
         2
     };
     if !(least..=MAX_JOIN_RELS).contains(&n) {
-        return Ok(Err("a join of more relations than join_collapse_limit"));
+        return Ok(Err("a join of more relations than the join search holds"));
     }
     if problem.clauses.len() > MAX_CLAUSES {
         return Err(too_many());
     }
-    let full = arena_slice(arena, 1usize << n, |_| None::<Rel>)?;
     let mut search = Search {
         problem,
         specials: &[],
@@ -1020,13 +1221,15 @@ pub(crate) fn search<'a>(
         arena,
         clauses: ArenaList::new(arena),
         paths: ArenaList::new(arena),
-        rels: full,
+        member_keys: ArenaList::new(arena),
+        rels: ArenaList::new(arena),
+        rel_buckets: arena_slice(arena, REL_BUCKETS, |_| NO_REL)?,
         levels: core::array::from_fn(|_| ArenaList::new(arena)),
         outside: None,
         memoize_rescans: ArenaList::new(arena),
         param_rows: ArenaList::new(arena),
         buckets: [[None; 2]; MAX_CLAUSES],
-        all_baserels: ((1 << n) - 1) & !problem.removed,
+        all_baserels: Relids::below(n as u32) & !problem.removed,
         consider_startup: problem
             .upper
             .limit
@@ -1036,16 +1239,16 @@ pub(crate) fn search<'a>(
         search.clauses.push(*clause).map_err(|_| arena_full())?;
     }
     for (index, rel) in problem.rels.iter().enumerate() {
-        let relids = 1 << index;
+        let relids = Relids::of(index);
         // `distribute_restrictinfo_to_rels`: a clause required at several
         // relations or outer joins joins each of its base relations.
         let mut joininfo = ClauseList::EMPTY;
         for (id, clause) in problem.clauses.iter().enumerate() {
-            if clause.in_joininfo() && clause.required & relids != 0 {
+            if clause.in_joininfo() && clause.required.overlaps(relids) {
                 joininfo.push(id as u8).ok_or_else(too_many)?;
             }
         }
-        search.rels[relids as usize] = Some(Rel {
+        search.insert_rel(Rel {
             relids,
             joininfo,
             rows: rel.rows,
@@ -1056,9 +1259,10 @@ pub(crate) fn search<'a>(
             cheapest_startup: 0,
             parameterized: [0; MAX_REL_PATHS],
             parameterized_count: 0,
-            first: (relids, 0),
+            first: (relids, Relids::EMPTY),
             unique: None,
-        });
+            next: NO_REL,
+        })?;
         // A relation its constant false condition empties is dummy
         // (`relation_excluded_by_constraints`, `set_dummy_rel_pathlist`).
         if problem.false_relids == relids {
@@ -1084,7 +1288,7 @@ pub(crate) fn search<'a>(
                 },
             )?;
         }
-        search.set_cheapest(relids);
+        search.set_cheapest(relids)?;
     }
     search.reduce_unique_semijoins()?;
     if problem.dummy {
@@ -1100,11 +1304,11 @@ pub(crate) fn search<'a>(
             total: 0.0,
             disabled: 0,
             keys: Keys::NONE,
-            param: 0,
+            param: Relids::EMPTY,
         })?;
         let mut paths = [0; MAX_REL_PATHS];
         paths[0] = id;
-        search.rels[relids as usize] = Some(Rel {
+        search.insert_rel(Rel {
             relids,
             joininfo: ClauseList::EMPTY,
             rows: 0.0,
@@ -1115,12 +1319,15 @@ pub(crate) fn search<'a>(
             cheapest_startup: id,
             parameterized: paths,
             parameterized_count: 1,
-            first: (relids, 0),
+            first: (relids, Relids::EMPTY),
             unique: None,
-        });
+            next: NO_REL,
+        })?;
     }
+    let geqo = problem.settings.geqo;
     for subproblem in problem.subproblems.iter().filter(|_| !problem.dummy) {
-        let items = &subproblem.items[..usize::from(subproblem.count)];
+        let first = usize::from(subproblem.first);
+        let items = &problem.subproblem_items[first..first + usize::from(subproblem.count)];
         if items.len() < 2 {
             continue;
         }
@@ -1130,6 +1337,14 @@ pub(crate) fn search<'a>(
             let relids = search.rel(item).relids;
             search.levels[1].push(relids).map_err(|_| arena_full())?;
         }
+        // `make_rel_from_joinlist`: a genetic search from `geqo_threshold`
+        // relations on, else the exhaustive one.
+        if geqo.enabled && items.len() as i64 >= i64::from(geqo.threshold) {
+            if search.geqo()?.is_none() {
+                return Ok(Err(search.outside.expect("the shape outside the model")));
+            }
+            continue;
+        }
         for level in 2..=items.len() {
             search.one_level(level)?;
             if let Some(outside) = search.outside {
@@ -1137,20 +1352,22 @@ pub(crate) fn search<'a>(
             }
             for at in 0..search.levels[level].len() {
                 let relids = search.levels[level].borrowed_slice()[at];
-                search.set_cheapest(relids);
+                search.set_cheapest(relids)?;
             }
         }
         if search.levels[items.len()].len() != 1 {
             return Ok(Err("a join search that builds no join"));
         }
     }
-    let all = search.all_baserels as usize;
-    let Some(top) = search.rels[all] else {
+    let Some(top) = search.find_rel(search.all_baserels) else {
         return Ok(Err("a join the search does not reach"));
     };
+    let top = search.rels.borrowed_slice()[top];
     let (top, upper) = search.upper_paths(&top)?;
+    let rels = search.rels.borrowed_slice();
     Ok(Ok(JoinPlan {
         paths: search.paths.as_slice(),
+        member_keys: search.member_keys.as_slice(),
         clauses: search.clauses.as_slice(),
         classes: arena
             .alloc_slice_copy(problem.classes)
@@ -1159,8 +1376,8 @@ pub(crate) fn search<'a>(
         upper,
         settings: problem.settings,
         firsts: arena
-            .alloc_slice_with(search.rels.len(), |relids| {
-                search.rels[relids].map_or((0, 0), |rel| rel.first)
+            .alloc_slice_with(rels.len(), |at| {
+                (rels[at].relids & BASE_RELIDS, rels[at].first)
             })
             .map_err(|_| arena_full())?,
         needed: arena
@@ -1180,6 +1397,16 @@ fn arena_slice<T: Copy>(
     fill: impl FnMut(usize) -> T,
 ) -> Result<&mut [T], SqlError> {
     arena.alloc_slice_with(len, fill).map_err(|_| arena_full())
+}
+
+/// The lengths [`Search::save_joins`] records.
+#[derive(Clone, Copy)]
+struct SavedJoins {
+    rels: usize,
+    paths: usize,
+    member_keys: usize,
+    memoize_rescans: usize,
+    param_rows: usize,
 }
 
 /// What `add_paths_to_joinrel` reads of one join.
@@ -1230,6 +1457,13 @@ enum Selectivity {
 }
 
 impl<'p, 'a, 's> Search<'p, 'a, 's> {
+    /// Keeps a Unique or Memoize path's members, returning their entry.
+    fn push_member_keys(&mut self, keys: [Member; MAX_KEYS]) -> Result<u32, SqlError> {
+        let id = self.member_keys.len() as u32;
+        self.member_keys.push(keys).map_err(|_| arena_full())?;
+        Ok(id)
+    }
+
     fn push_path(&mut self, path: Path) -> Result<u32, SqlError> {
         let id = self.paths.len() as u32;
         self.paths.push(path).map_err(|_| arena_full())?;
@@ -1253,8 +1487,93 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             .any(|&held| held == id || (source.is_some() && self.clause(held).source == source))
     }
 
+    /// `find_join_rel`: the relation of `relids`' base relations.
+    fn find_rel(&self, relids: Relids) -> Option<usize> {
+        let base = relids & BASE_RELIDS;
+        let rels = self.rels.borrowed_slice();
+        let mut at = self.rel_buckets[rel_bucket(base)];
+        while at != NO_REL {
+            let rel = &rels[at as usize];
+            if rel.relids & BASE_RELIDS == base {
+                return Some(at as usize);
+            }
+            at = rel.next;
+        }
+        None
+    }
+
     fn rel(&self, relids: Relids) -> Rel {
-        self.rels[(relids & BASE_RELIDS) as usize].expect("the relation was built")
+        let at = self.find_rel(relids).expect("the relation was built");
+        self.rels.borrowed_slice()[at]
+    }
+
+    /// Adds a relation not yet built (`add_join_rel`).
+    fn insert_rel(&mut self, mut rel: Rel) -> Result<(), SqlError> {
+        let bucket = rel_bucket(rel.relids);
+        rel.next = self.rel_buckets[bucket];
+        self.rel_buckets[bucket] = self.rels.len() as u32;
+        self.rels.push(rel).map_err(|_| arena_full())
+    }
+
+    /// Replaces a built relation's state.
+    fn store_rel(&mut self, rel: Rel) -> Result<(), SqlError> {
+        let at = self.find_rel(rel.relids).expect("the relation was built");
+        self.rels.as_mut_slice().map_err(|_| arena_full())?[at] = rel;
+        Ok(())
+    }
+
+    /// The relations and paths built so far, which [`Self::restore_joins`]
+    /// returns to.
+    fn save_joins(&self) -> SavedJoins {
+        SavedJoins {
+            rels: self.rels.len(),
+            paths: self.paths.len(),
+            member_keys: self.member_keys.len(),
+            memoize_rescans: self.memoize_rescans.len(),
+            param_rows: self.param_rows.len(),
+        }
+    }
+
+    /// Drops the relations and paths built since `saved`, as GEQO frees a
+    /// tour's memory context. A kept relation's unique-ified path, which
+    /// PostgreSQL builds in the planner's own context, is kept.
+    fn restore_joins(&mut self, saved: SavedJoins) -> Result<(), SqlError> {
+        let rels = self.rels.borrowed_slice();
+        for rel in rels[saved.rels..].iter().rev() {
+            let bucket = rel_bucket(rel.relids);
+            self.rel_buckets[bucket] = rel.next;
+        }
+        self.rels.truncate(saved.rels);
+        let mut kept = [(0usize, None::<(Path, [Member; MAX_KEYS])>); 2 * MAX_JOIN_RELS];
+        let mut kept_count = 0;
+        for (at, rel) in self.rels.borrowed_slice().iter().enumerate() {
+            if let Some(Some(id)) = rel.unique
+                && id as usize >= saved.paths
+            {
+                let path = self.path(id);
+                let keys = match path.kind {
+                    PathKind::Unique { keys, .. } => {
+                        self.member_keys.borrowed_slice()[keys as usize]
+                    }
+                    _ => unreachable!("a unique-ified path"),
+                };
+                *kept.get_mut(kept_count).ok_or_else(too_many)? = (at, Some((path, keys)));
+                kept_count += 1;
+            }
+        }
+        self.paths.truncate(saved.paths);
+        self.member_keys.truncate(saved.member_keys);
+        self.memoize_rescans.truncate(saved.memoize_rescans);
+        self.param_rows.truncate(saved.param_rows);
+        for &(at, held) in &kept[..kept_count] {
+            let (mut path, members) = held.expect("a kept path");
+            if let PathKind::Unique { keys, .. } = &mut path.kind {
+                *keys = self.push_member_keys(members)?;
+            }
+            let id = self.push_path(path)?;
+            self.rels.as_mut_slice().map_err(|_| arena_full())?[at].unique = Some(Some(id));
+        }
+        Ok(())
     }
 
     fn special(&self, id: u8) -> &SpecialJoin {
@@ -1288,9 +1607,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// outer relation's, `None` when its sides are not the two inputs'.
     fn outer_is_left(&self, id: u8, outer: Relids, inner: Relids) -> Option<bool> {
         let (left, right, ..) = self.sides(id)?;
-        if left.relids() & !outer == 0 && right.relids() & !inner == 0 {
+        if left.relids() & !outer == Relids::EMPTY && right.relids() & !inner == Relids::EMPTY {
             Some(true)
-        } else if right.relids() & !outer == 0 && left.relids() & !inner == 0 {
+        } else if right.relids() & !outer == Relids::EMPTY
+            && left.relids() & !inner == Relids::EMPTY
+        {
             Some(false)
         } else {
             None
@@ -1321,7 +1642,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             let inner = special.min_right;
             let reduced = special.kind == SpecialKind::Semi
                 && inner.count_ones() == 1
-                && inner & !BASE_RELIDS == 0
+                && inner & !BASE_RELIDS == Relids::EMPTY
                 && !self.problem.rels[inner.trailing_zeros() as usize]
                     .unique
                     .is_empty()
@@ -1335,7 +1656,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                         let members = class.members();
                         let first = |side: Relids| {
                             members.iter().position(|member| {
-                                member.relids() & !joined == 0 && member.relids() & !side == 0
+                                member.relids() & !joined == Relids::EMPTY
+                                    && member.relids() & !side == Relids::EMPTY
                             })
                         };
                         if let (Some(outer), Some(within)) = (first(special.min_left), first(inner))
@@ -1363,8 +1685,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     fn has_eclass_joins(&self, relids: Relids) -> bool {
         self.problem.classes.iter().any(|class| {
             class.count > 1
-                && class.relids() & relids & BASE_RELIDS != 0
-                && class.relids() & !relids != 0
+                && class.relids() & relids & BASE_RELIDS != Relids::EMPTY
+                && class.relids() & !relids != Relids::EMPTY
         })
     }
 
@@ -1388,7 +1710,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         if joininfo
             .as_slice()
             .iter()
-            .any(|&id| self.clause(id).required & other != 0)
+            .any(|&id| self.clause(id).required & other != Relids::EMPTY)
         {
             return true;
         }
@@ -1396,8 +1718,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             && self.has_eclass_joins(right)
             && self.problem.classes.iter().any(|class| {
                 class.count > 1
-                    && class.relids() & left & BASE_RELIDS != 0
-                    && class.relids() & right & BASE_RELIDS != 0
+                    && class.relids() & left & BASE_RELIDS != Relids::EMPTY
+                    && class.relids() & right & BASE_RELIDS != Relids::EMPTY
             })
     }
 
@@ -1405,8 +1727,10 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     fn has_join_restriction(&self, relids: Relids) -> bool {
         self.specials.iter().any(|special| {
             special.kind != SpecialKind::Full
-                && !(special.min_left & !relids == 0 && special.min_right & !relids == 0)
-                && (special.min_left & relids != 0 || special.min_right & relids != 0)
+                && !(special.min_left & !relids == Relids::EMPTY
+                    && special.min_right & !relids == Relids::EMPTY)
+                && (special.min_left & relids != Relids::EMPTY
+                    || special.min_right & relids != Relids::EMPTY)
         })
     }
 
@@ -1414,10 +1738,14 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     fn order_restriction(&mut self, left: Relids, right: Relids) -> Result<bool, SqlError> {
         let restricted = self.specials.iter().any(|special| {
             special.kind != SpecialKind::Full
-                && ((special.min_left & !left == 0 && special.min_right & !right == 0)
-                    || (special.min_left & !right == 0 && special.min_right & !left == 0)
-                    || (special.min_right & left != 0 && special.min_right & right != 0)
-                    || (special.min_left & left != 0 && special.min_left & right != 0))
+                && ((special.min_left & !left == Relids::EMPTY
+                    && special.min_right & !right == Relids::EMPTY)
+                    || (special.min_left & !right == Relids::EMPTY
+                        && special.min_right & !left == Relids::EMPTY)
+                    || (special.min_right & left != Relids::EMPTY
+                        && special.min_right & right != Relids::EMPTY)
+                    || (special.min_left & left != Relids::EMPTY
+                        && special.min_left & right != Relids::EMPTY))
         });
         if !restricted {
             return Ok(false);
@@ -1429,7 +1757,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     fn has_legal_joinclause(&mut self, relids: Relids) -> Result<bool, SqlError> {
         let initial = self.levels[1].as_slice();
         for &other in initial {
-            if other & relids != 0 || !self.relevant(relids, other) {
+            if other & relids != Relids::EMPTY || !self.relevant(relids, other) {
                 continue;
             }
             if self.join_is_legal(relids, other, relids | other)?.is_some() {
@@ -1452,10 +1780,10 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let mut matched: Option<u8> = None;
         let mut reversed = false;
         let mut must_be_left = false;
-        let subset = |small: Relids, big: Relids| small & !big == 0;
+        let subset = |small: Relids, big: Relids| small & !big == Relids::EMPTY;
         for (id, special) in self.specials.iter().enumerate() {
             let id = id as u8;
-            if special.min_right & joined == 0 || subset(joined, special.min_right) {
+            if special.min_right & joined == Relids::EMPTY || subset(joined, special.min_right) {
                 continue;
             }
             if (subset(special.min_left, rel1) && subset(special.min_right, rel1))
@@ -1500,10 +1828,12 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 matched = Some(id);
                 reversed = true;
             } else {
-                if special.min_right & rel1 != 0 && special.min_right & rel2 != 0 {
+                if special.min_right & rel1 != Relids::EMPTY
+                    && special.min_right & rel2 != Relids::EMPTY
+                {
                     continue;
                 }
-                if special.kind != SpecialKind::Left || joined & special.min_left != 0 {
+                if special.kind != SpecialKind::Left || joined & special.min_left != Relids::EMPTY {
                     return Ok(None);
                 }
                 must_be_left = true;
@@ -1558,7 +1888,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             }
         }
         rel.unique = Some(result);
-        self.rels[(relids & BASE_RELIDS) as usize] = Some(rel);
+        self.store_rel(rel)?;
         Ok(result)
     }
 
@@ -1572,6 +1902,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let input = self.path(rel.cheapest_total);
         let mut held = [Member::plain(0, 0); MAX_KEYS];
         held[..keys.len()].copy_from_slice(keys);
+        let held = self.push_member_keys(held)?;
         let unique = |method: UniqueMethod| PathKind::Unique {
             input: rel.cheapest_total,
             keys: held,
@@ -1668,30 +1999,32 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let Some(special) = special.map(|id| self.special(id)) else {
             return input;
         };
-        if special.oj == 0 {
+        if special.oj == Relids::EMPTY {
             return input;
         }
         if special.kind != SpecialKind::Left {
             return input | special.oj;
         }
-        if special.commute_below_l & !input != 0 {
+        if special.commute_below_l & !input != Relids::EMPTY {
             return input;
         }
         let mut relids = input | special.oj;
-        if special.commute_above_l != 0 {
+        if special.commute_above_l != Relids::EMPTY {
             let mut above = special.commute_above_l;
             for other in self.specials {
-                if core::ptr::eq(other, special) || other.oj == 0 || other.kind != SpecialKind::Left
+                if core::ptr::eq(other, special)
+                    || other.oj == Relids::EMPTY
+                    || other.kind != SpecialKind::Left
                 {
                     continue;
                 }
-                if other.oj & above == 0 {
+                if other.oj & above == Relids::EMPTY {
                     continue;
                 }
-                if other.oj & relids == 0
-                    && other.min_left & !relids == 0
-                    && other.min_right & !relids == 0
-                    && other.commute_below_l & !relids == 0
+                if other.oj & relids == Relids::EMPTY
+                    && other.min_left & !relids == Relids::EMPTY
+                    && other.min_right & !relids == Relids::EMPTY
+                    && other.commute_below_l & !relids == Relids::EMPTY
                 {
                     relids |= other.oj;
                     above |= other.commute_above_l;
@@ -1709,7 +2042,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             if self.has_joins(old) {
                 let first = if level == 2 { position + 1 } else { 0 };
                 for &other in &singles[first.min(singles.len())..] {
-                    if old & other == 0
+                    if old & other == Relids::EMPTY
                         && (self.relevant(old, other) || self.order_restriction(old, other)?)
                     {
                         self.make_join_rel(old, other, level)?;
@@ -1717,7 +2050,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 }
             } else {
                 for &other in singles {
-                    if old & other == 0 {
+                    if old & other == Relids::EMPTY {
                         self.make_join_rel(old, other, level)?;
                     }
                 }
@@ -1734,7 +2067,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 }
                 let first = if k == other_level { position + 1 } else { 0 };
                 for &new in &upper[first.min(upper.len())..] {
-                    if old & new == 0
+                    if old & new == Relids::EMPTY
                         && (self.relevant(old, new) || self.order_restriction(old, new)?)
                     {
                         self.make_join_rel(old, new, level)?;
@@ -1746,7 +2079,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         if self.levels[level].is_empty() {
             for &old in previous {
                 for &other in singles {
-                    if old & other == 0 {
+                    if old & other == Relids::EMPTY {
                         self.make_join_rel(old, other, level)?;
                     }
                 }
@@ -1758,15 +2091,24 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// `make_join_rel`: builds the relation on its first pair, sized by
     /// that pair's clauses, and adds the paths of the pair's join
     /// (`populate_joinrel_with_paths`).
-    fn make_join_rel(&mut self, rel1: Relids, rel2: Relids, level: usize) -> Result<(), SqlError> {
+    /// The joined relation, `None` when the pair cannot join; a new one
+    /// joins the search's `level` (none for GEQO's, `level` 0).
+    fn make_join_rel(
+        &mut self,
+        rel1: Relids,
+        rel2: Relids,
+        level: usize,
+    ) -> Result<Option<Relids>, SqlError> {
         let Some((special, reversed)) = self.join_is_legal(rel1, rel2, rel1 | rel2)? else {
-            return Ok(());
+            return Ok(None);
         };
         let joined = self.add_outer_joins(rel1 | rel2, special);
         let (rel1, rel2) = if reversed { (rel2, rel1) } else { (rel1, rel2) };
         let restrict = self.restrictlist(rel1, rel2, joined)?;
-        let index = (joined & BASE_RELIDS) as usize;
-        match self.rels[index] {
+        match self
+            .find_rel(joined)
+            .map(|at| self.rels.borrowed_slice()[at])
+        {
             None => {
                 let (outer, inner) = (self.rel(rel1), self.rel(rel2));
                 let rows = self.join_size(
@@ -1778,7 +2120,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     &restrict,
                 )?;
                 let joininfo = self.joinrel_joininfo(joined, rel1, rel2)?;
-                self.rels[index] = Some(Rel {
+                self.insert_rel(Rel {
                     relids: joined,
                     joininfo,
                     rows,
@@ -1791,27 +2133,42 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     parameterized_count: 0,
                     first: (rel1, rel2),
                     unique: None,
-                });
-                self.levels[level].push(joined).map_err(|_| arena_full())?;
+                    next: NO_REL,
+                })?;
+                if level > 0 {
+                    self.levels[level].push(joined).map_err(|_| arena_full())?;
+                }
             }
             Some(rel) if rel.relids != joined => {
                 self.outside = Some("a join relation formed with different outer joins");
-                return Ok(());
+                return Ok(None);
             }
             Some(_) => {}
         }
-        if self.is_dummy(joined) {
-            return Ok(());
+        if !self.is_dummy(joined) {
+            self.populate_joinrel_with_paths(joined, rel1, rel2, special, restrict)?;
         }
+        Ok(Some(joined))
+    }
+
+    /// `populate_joinrel_with_paths`.
+    fn populate_joinrel_with_paths(
+        &mut self,
+        joined: Relids,
+        rel1: Relids,
+        rel2: Relids,
+        special: Option<u8>,
+        restrict: ClauseList,
+    ) -> Result<(), SqlError> {
         let kind = special.map(|id| self.special(id).kind);
         // `populate_joinrel_with_paths`' proofs of an empty join: a dummy
         // input or the constant false condition of a class of two
         // constants, which is pushed down wherever it is evaluated.
         let false_relids = self.problem.false_relids;
         let constant_false = false_relids.count_ones() > 1
-            && false_relids & !(joined & BASE_RELIDS) == 0
-            && false_relids & !rel1 != 0
-            && false_relids & !rel2 != 0;
+            && false_relids & !(joined & BASE_RELIDS) == Relids::EMPTY
+            && false_relids & !rel1 != Relids::EMPTY
+            && false_relids & !rel2 != Relids::EMPTY;
         let (dummy1, dummy2) = (self.is_dummy(rel1), self.is_dummy(rel2));
         let empty = match kind {
             None | Some(SpecialKind::Semi) => dummy1 || dummy2 || constant_false,
@@ -1834,7 +2191,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             Some(SpecialKind::Semi) => {
                 let id = special.expect("a semi join");
                 let info = *self.special(id);
-                if info.min_left & !rel1 == 0 && info.min_right & !rel2 == 0 {
+                if info.min_left & !rel1 == Relids::EMPTY && info.min_right & !rel2 == Relids::EMPTY
+                {
                     self.add_paths(joined, rel1, rel2, JoinType::Semi, special, restrict)?;
                     self.add_paths(joined, rel2, rel1, JoinType::RightSemi, special, restrict)?;
                 }
@@ -1876,7 +2234,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             total: 0.0,
             disabled: 0,
             keys: Keys::NONE,
-            param: 0,
+            param: Relids::EMPTY,
         })?;
         rel.rows = 0.0;
         rel.paths[0] = id;
@@ -1885,8 +2243,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         rel.cheapest_startup = id;
         rel.parameterized[0] = id;
         rel.parameterized_count = 1;
-        self.rels[(relids & BASE_RELIDS) as usize] = Some(rel);
-        Ok(())
+        self.store_rel(rel)
     }
 
     /// `build_joinrel_restrictlist`: the clauses of the inputs' `joininfo`
@@ -1905,14 +2262,15 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         for joininfo in lists {
             for &id in joininfo.as_slice() {
                 let clause = self.clause(id);
-                if clause.required & !joined != 0 {
+                if clause.required & !joined != Relids::EMPTY {
                     continue;
                 }
                 // A copy of a commuting outer join's clause for another
                 // order of the joins, which this pair's inputs must not
                 // already have performed.
                 if clause.clone != CloneKind::None
-                    && (clause.required & !both != 0 || clause.incompatible & both != 0)
+                    && (clause.required & !both != Relids::EMPTY
+                        || clause.incompatible & both != Relids::EMPTY)
                 {
                     continue;
                 }
@@ -1926,25 +2284,31 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 continue;
             }
             let members = class.members();
-            let computable = |member: &&Member| member.relids() & !joined == 0;
+            let computable = |member: &&Member| member.relids() & !joined == Relids::EMPTY;
             let outer_member = members
                 .iter()
                 .filter(computable)
-                .position(|member| member.relids() & !outer == 0);
+                .position(|member| member.relids() & !outer == Relids::EMPTY);
             let inner_member = members
                 .iter()
                 .filter(computable)
-                .position(|member| member.relids() & !inner == 0);
+                .position(|member| member.relids() & !inner == Relids::EMPTY);
             let (Some(_), Some(_)) = (outer_member, inner_member) else {
                 continue;
             };
             let outer_member = members
                 .iter()
-                .position(|member| member.relids() & !joined == 0 && member.relids() & !outer == 0)
+                .position(|member| {
+                    member.relids() & !joined == Relids::EMPTY
+                        && member.relids() & !outer == Relids::EMPTY
+                })
                 .expect("found");
             let inner_member = members
                 .iter()
-                .position(|member| member.relids() & !joined == 0 && member.relids() & !inner == 0)
+                .position(|member| {
+                    member.relids() & !joined == Relids::EMPTY
+                        && member.relids() & !inner == Relids::EMPTY
+                })
                 .expect("found");
             let id = self.class_clause(class_id as u8, outer_member as u8, inner_member as u8)?;
             list.push(id).ok_or_else(too_many)?;
@@ -1963,7 +2327,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let mut list = ClauseList::EMPTY;
         for joininfo in [self.rel(outer).joininfo, self.rel(inner).joininfo] {
             for &id in joininfo.as_slice() {
-                if self.clause(id).required & !joined != 0 && !list.contains(id) {
+                if self.clause(id).required & !joined != Relids::EMPTY && !list.contains(id) {
                     list.push(id).ok_or_else(too_many)?;
                 }
             }
@@ -2006,11 +2370,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 required: relids,
                 pushed_down: true,
                 clone: CloneKind::None,
-                incompatible: 0,
+                incompatible: Relids::EMPTY,
                 cost,
                 selectivity: None,
                 outer_selectivity: None,
-                outer_relids: 0,
+                outer_relids: Relids::EMPTY,
                 operands: None,
                 other: OtherShape::Plain,
                 constant: false,
@@ -2050,12 +2414,16 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     unreachable!("a semi join's estimate");
                 };
                 let special = *self.special(special);
-                let (outer, inner) = if left.relids() & !special.syn_right & BASE_RELIDS == 0 {
-                    (right, left)
-                } else {
-                    (left, right)
-                };
-                let Some(inner_rel) = self.rels[(special.min_right & BASE_RELIDS) as usize] else {
+                let (outer, inner) =
+                    if left.relids() & !special.syn_right & BASE_RELIDS == Relids::EMPTY {
+                        (right, left)
+                    } else {
+                        (left, right)
+                    };
+                let Some(inner_rel) = self
+                    .find_rel(special.min_right)
+                    .map(|at| self.rels.borrowed_slice()[at])
+                else {
                     self.outside = Some("a semi join whose inner relation is not yet built");
                     return Ok(1.0);
                 };
@@ -2079,7 +2447,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                         },
                         Some((left, _)),
                     ) => {
-                        if left.relids() & syn_right & BASE_RELIDS == 0 {
+                        if left.relids() & syn_right & BASE_RELIDS == Relids::EMPTY {
                             1.0 - left_nulls
                         } else {
                             1.0 - right_nulls
@@ -2145,14 +2513,15 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             .needed
             .iter()
             .filter(|column| {
-                relids & 1 << column.rel != 0 && (column.output || column.needed_by & !relids != 0)
+                relids & Relids::of(column.rel) != Relids::EMPTY
+                    && (column.output || column.needed_by & !relids != Relids::EMPTY)
             })
             .map(|column| column.width)
             .sum()
     }
 
     /// `set_cheapest`.
-    fn set_cheapest(&mut self, relids: Relids) {
+    fn set_cheapest(&mut self, relids: Relids) -> Result<(), SqlError> {
         let mut rel = self.rel(relids);
         let mut total: Option<u32> = None;
         let mut startup: Option<u32> = None;
@@ -2161,7 +2530,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let mut parameterized_count = 1usize;
         for &id in &rel.paths[..usize::from(rel.count)] {
             let path = self.path(id);
-            if path.param != 0 {
+            if path.param != Relids::EMPTY {
                 parameterized[parameterized_count] = id;
                 parameterized_count += 1;
                 if total.is_some() {
@@ -2177,7 +2546,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                             } else {
                                 best
                             }
-                        } else if path.param & !held.param == 0 {
+                        } else if path.param & !held.param == Relids::EMPTY {
                             id
                         } else {
                             best
@@ -2224,14 +2593,14 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         rel.cheapest_startup = startup;
         rel.parameterized = parameterized;
         rel.parameterized_count = parameterized_count as u8;
-        self.rels[(relids & BASE_RELIDS) as usize] = Some(rel);
+        self.store_rel(rel)
     }
 
     /// `add_path` without parallel paths into `relids`' relation.
     fn add_path(&mut self, relids: Relids, new: Path) -> Result<(), SqlError> {
         let mut rel = self.rel(relids);
         let id = self.paths.len() as u32;
-        let paths = self.paths.as_slice();
+        let paths = self.paths.borrowed_slice();
         let (count, accepted) = add_to_pathlist(
             &mut rel.paths,
             usize::from(rel.count),
@@ -2243,8 +2612,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             self.push_path(new)?;
         }
         rel.count = count as u8;
-        self.rels[(relids & BASE_RELIDS) as usize] = Some(rel);
-        Ok(())
+        self.store_rel(rel)
     }
 
     /// `create_ordered_paths` over the joined relation `rel`'s paths, then
@@ -2648,11 +3016,15 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         };
         // `create_agg_path`: `cost_agg` with the `HAVING` quals, then the
         // target list's cost per group it returns.
+        // A sorted `GROUP BY` without aggregates is `create_group_path`'s
+        // `Group`.
         let aggregate = |strategy: AggStrategy, input: AggInput| {
-            let (startup, total, rows) = super::aggregate::with_having(
-                cost_agg(strategy, &group.aggregates, columns, groups, input),
-                group.having,
-            );
+            let costed = if strategy == AggStrategy::Sorted && !group.aggregates.aggregated() {
+                super::aggregate::cost_group(columns, groups, input)
+            } else {
+                cost_agg(strategy, &group.aggregates, columns, groups, input)
+            };
+            let (startup, total, rows) = super::aggregate::with_having(costed, group.having);
             (startup, total + group.target_cost * rows, rows)
         };
         // Each grouped path, the join path below it and its plan.
@@ -2663,7 +3035,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let mut grouped_count = 0usize;
         for &id in &rel.paths[..usize::from(rel.count)] {
             let mut input = self.path(id);
-            if input.param != 0 {
+            if input.param != Relids::EMPTY {
                 continue;
             }
             input.total += upper.target_cost * input.rows;
@@ -3026,13 +3398,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// `eclass_useful_for_merging`.
     fn useful_for_merging(&self, class: u8, relids: Relids) -> bool {
         let class = &self.problem.classes[usize::from(class)];
-        if class.has_const || class.count <= 1 || class.relids() & !relids == 0 {
+        if class.has_const || class.count <= 1 || class.relids() & !relids == Relids::EMPTY {
             return false;
         }
         class
             .members()
             .iter()
-            .any(|member| member.relids() & relids == 0)
+            .any(|member| member.relids() & relids == Relids::EMPTY)
     }
 
     /// `build_join_pathkeys`: an outer join that may return the inner
@@ -3145,7 +3517,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             JoinType::Semi | JoinType::Anti => false,
             JoinType::UniqueInner => {
                 let special = self.special(special.expect("a semi join"));
-                special.min_left & !outer == 0
+                special.min_left & !outer == Relids::EMPTY
             }
             JoinType::UniqueOuter => {
                 self.inner_unique(joined, outer, inner, JoinType::Inner, &restrict)
@@ -3163,14 +3535,15 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             } else {
                 (1.0, 1.0)
             };
-        let mut param_source = 0;
+        let mut param_source = Relids::EMPTY;
         for other in self.specials {
-            if joined & other.min_right != 0 && joined & other.min_left == 0 {
+            if joined & other.min_right != Relids::EMPTY && joined & other.min_left == Relids::EMPTY
+            {
                 param_source |= self.all_baserels & !other.min_right;
             }
             if other.kind == SpecialKind::Full
-                && joined & other.min_left != 0
-                && joined & other.min_right == 0
+                && joined & other.min_left != Relids::EMPTY
+                && joined & other.min_right == Relids::EMPTY
             {
                 param_source |= self.all_baserels & !other.min_left;
             }
@@ -3213,7 +3586,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             scores[count] = self.problem.classes[usize::from(class)]
                 .members()
                 .iter()
-                .filter(|member| member.relids() & joined == 0)
+                .filter(|member| member.relids() & joined == Relids::EMPTY)
                 .count() as i32;
             classes[count] = class;
             count += 1;
@@ -3270,8 +3643,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         }
         let mut outer_path = self.rel(inputs.outer).cheapest_total;
         let mut inner_path = self.rel(inputs.inner).cheapest_total;
-        if self.path(outer_path).param & inputs.inner != 0
-            || self.path(inner_path).param & inputs.outer != 0
+        if self.path(outer_path).param & inputs.inner != Relids::EMPTY
+            || self.path(inner_path).param & inputs.outer != Relids::EMPTY
         {
             return Ok(());
         }
@@ -3379,7 +3752,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let inner_rel = self.rel(inputs.inner);
         let settings = self.problem.settings;
         let mut inner_total = Some(inner_rel.cheapest_total)
-            .filter(|&path| self.path(path).param & inputs.outer == 0);
+            .filter(|&path| self.path(path).param & inputs.outer == Relids::EMPTY);
         let mut material = None;
         if inputs.jointype == JoinType::UniqueInner {
             if inner_total.is_none() {
@@ -3395,7 +3768,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         }
         for &held_outer in &outer_rel.paths[..usize::from(outer_rel.count)] {
             // An outer path reading the inner relation's values cannot be.
-            if self.path(held_outer).param & inputs.inner != 0 {
+            if self.path(held_outer).param & inputs.inner != Relids::EMPTY {
                 continue;
             }
             let mut outer = held_outer;
@@ -3505,10 +3878,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     ) -> f64 {
         let mut selectivity = 1.0;
         for key in self.problem.foreign_keys {
-            let (referencing, referenced) = (1 << key.referencing, 1 << key.referenced);
-            let referenced_outer = if outer & referencing != 0 && inner & referenced != 0 {
+            let (referencing, referenced) =
+                (Relids::of(key.referencing), Relids::of(key.referenced));
+            let referenced_outer = if outer & referencing != Relids::EMPTY
+                && inner & referenced != Relids::EMPTY
+            {
                 false
-            } else if outer & referenced != 0 && inner & referencing != 0 {
+            } else if outer & referenced != Relids::EMPTY && inner & referencing != Relids::EMPTY {
                 true
             } else {
                 continue;
@@ -3560,7 +3936,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         jointype: JoinType,
         restrict: &ClauseList,
     ) -> bool {
-        if restrict.len == 0 || inner.count_ones() != 1 || inner & !BASE_RELIDS != 0 {
+        if restrict.len == 0 || inner.count_ones() != 1 || inner & !BASE_RELIDS != Relids::EMPTY {
             return false;
         }
         let base = &self.problem.rels[inner.trailing_zeros() as usize];
@@ -3627,8 +4003,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         if !matches!(inner_path.kind, PathKind::Scan { .. })
             || !settings.memoize
             || self.rel(inputs.outer).rows < 2.0
-            || inner_path.param == 0
-            || inner_path.param & !inputs.outer != 0
+            || inner_path.param == Relids::EMPTY
+            || inner_path.param & !inputs.outer != Relids::EMPTY
         {
             return Ok(None);
         }
@@ -3660,9 +4036,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             else {
                 return Ok(None);
             };
-            let key = if left.relids() & !inputs.outer == 0 && right.relids() & !inputs.inner == 0 {
+            let key = if left.relids() & !inputs.outer == Relids::EMPTY
+                && right.relids() & !inputs.inner == Relids::EMPTY
+            {
                 left
-            } else if right.relids() & !inputs.outer == 0 && left.relids() & !inputs.inner == 0 {
+            } else if right.relids() & !inputs.outer == Relids::EMPTY
+                && left.relids() & !inputs.inner == Relids::EMPTY
+            {
                 right
             } else {
                 return Ok(None);
@@ -3693,6 +4073,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         rescan_total += costs.cpu_operator / 10.0 * evict_ratio * tuples;
         rescan_total += costs.cpu_tuple + costs.cpu_operator * tuples;
         let rescan_startup = inner_path.startup * (1.0 - hit_ratio) + costs.cpu_tuple;
+        let keys = self.push_member_keys(keys)?;
         let id = self.push_path(Path {
             kind: PathKind::Memoize {
                 input: inner,
@@ -3732,7 +4113,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// parameterized join's own clauses and its parameterized inputs'.
     fn enforced(&self, id: u32) -> ClauseList {
         let path = self.path(id);
-        if path.param == 0 {
+        if path.param == Relids::EMPTY {
             return ClauseList::EMPTY;
         }
         match path.kind {
@@ -3798,12 +4179,14 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let movable =
             |relids: Relids, outer_relids: Relids, current: Relids, available: Option<Relids>| {
                 available.is_some_and(|available| {
-                    relids & !available == 0 && relids & current != 0 && outer_relids & current == 0
+                    relids & !available == Relids::EMPTY
+                        && relids & current != Relids::EMPTY
+                        && outer_relids & current == Relids::EMPTY
                 })
             };
         let join_and_req = Some(joined | required);
-        let outer_and_req = (outer_param != 0).then_some(inputs.outer | outer_param);
-        let inner_and_req = (inner_param != 0).then_some(inputs.inner | inner_param);
+        let outer_and_req = (outer_param != Relids::EMPTY).then_some(inputs.outer | outer_param);
+        let inner_and_req = (inner_param != Relids::EMPTY).then_some(inputs.inner | inner_param);
         let mut moved = ClauseList::EMPTY;
         for &id in self.rel(joined).joininfo.as_slice() {
             let clause = self.clause(id);
@@ -3820,7 +4203,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let first = |members: &[Member], relids: Relids| {
             members
                 .iter()
-                .position(|member| member.relids() & !relids == 0)
+                .position(|member| member.relids() & !relids == Relids::EMPTY)
         };
         for class_id in 0..self.problem.classes.len() {
             let class = self.problem.classes[class_id];
@@ -3833,10 +4216,10 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 continue;
             };
             let relids = members[outside].relids() | members[within].relids();
-            if movable(relids, 0, inputs.outer, outer_and_req) {
+            if movable(relids, Relids::EMPTY, inputs.outer, outer_and_req) {
                 continue;
             }
-            if movable(relids, 0, inputs.inner, inner_and_req) {
+            if movable(relids, Relids::EMPTY, inputs.inner, inner_and_req) {
                 if dropped_count < dropped.len() {
                     dropped[dropped_count] = class_id as u8;
                     dropped_count += 1;
@@ -3854,7 +4237,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 continue;
             };
             let relids = members[outside].relids() | members[outer].relids();
-            if movable(relids, 0, inputs.outer, outer_and_req) {
+            if movable(relids, Relids::EMPTY, inputs.outer, outer_and_req) {
                 continue;
             }
             let id = self.class_clause(class_id, outside as u8, outer as u8)?;
@@ -4016,7 +4399,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let mut best: Option<u32> = None;
         for &id in &rel.paths[..usize::from(rel.count)] {
             let path = self.path(id);
-            if path.param != 0 {
+            if path.param != Relids::EMPTY {
                 continue;
             }
             if best.is_some_and(|best| compare_costs(&self.path(best), &path, startup) <= 0) {
@@ -4043,7 +4426,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let (outer_path, inner_path) = (self.path(outer), self.path(inner));
         if let Some(special) = inputs.special {
             let oj = self.special(special).oj;
-            if oj != 0 && (inner_path.param | outer_path.param) & oj != 0 {
+            if oj != Relids::EMPTY && (inner_path.param | outer_path.param) & oj != Relids::EMPTY {
                 return Ok(());
             }
         }
@@ -4053,10 +4436,10 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         // parameterized join.
         let required = (outer_path.param | inner_path.param) & !inputs.outer;
         let mut moved = ClauseList::EMPTY;
-        if required != 0 {
-            let star =
-                inner_path.param & inputs.outer != 0 && inner_path.param & !inputs.outer != 0;
-            if required & inputs.param_source == 0 && !star {
+        if required != Relids::EMPTY {
+            let star = inner_path.param & inputs.outer != Relids::EMPTY
+                && inner_path.param & !inputs.outer != Relids::EMPTY;
+            if required & inputs.param_source == Relids::EMPTY && !star {
                 return Ok(());
             }
             moved = self.moved_join_clauses(
@@ -4070,7 +4453,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         // parameterized join's moved clauses come first
         // (`get_joinrel_parampathinfo`).
         let mut clauses = moved;
-        let enforced = if inner_path.param & inputs.outer != 0 {
+        let enforced = if inner_path.param & inputs.outer != Relids::EMPTY {
             self.enforced(inner)
         } else {
             ClauseList::EMPTY
@@ -4175,7 +4558,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         required: Relids,
         clauses: &ClauseList,
     ) -> Result<Option<f64>, SqlError> {
-        if required == 0 {
+        if required == Relids::EMPTY {
             return Ok(None);
         }
         if let Some(&(_, _, rows)) = self
@@ -4213,10 +4596,10 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         (outer_path, inner_path): (Path, Path),
     ) -> Result<Option<(Relids, ClauseList)>, SqlError> {
         let required = outer_path.param | inner_path.param;
-        if required == 0 {
-            return Ok(Some((0, inputs.restrict)));
+        if required == Relids::EMPTY {
+            return Ok(Some((Relids::EMPTY, inputs.restrict)));
         }
-        if required & inputs.param_source == 0 {
+        if required & inputs.param_source == Relids::EMPTY {
             return Ok(None);
         }
         let mut clauses = self.moved_join_clauses(
@@ -4487,8 +4870,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             outer_rel.cheapest_total,
             inner_rel.cheapest_total,
         );
-        if self.path(total_outer).param & inputs.inner != 0
-            || self.path(total_inner).param & inputs.outer != 0
+        if self.path(total_outer).param & inputs.inner != Relids::EMPTY
+            || self.path(total_inner).param & inputs.outer != Relids::EMPTY
         {
             return Ok(());
         }
@@ -4509,11 +4892,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         }
         self.try_hashjoin(joined, inputs, startup_outer, total_inner, hash)?;
         for &outer in &outer_rel.parameterized[..usize::from(outer_rel.parameterized_count)] {
-            if self.path(outer).param & inputs.inner != 0 {
+            if self.path(outer).param & inputs.inner != Relids::EMPTY {
                 continue;
             }
             for &inner in &inner_rel.parameterized[..usize::from(inner_rel.parameterized_count)] {
-                if self.path(inner).param & inputs.outer != 0 {
+                if self.path(inner).param & inputs.outer != Relids::EMPTY {
                     continue;
                 }
                 if outer == startup_outer && inner == total_inner {
@@ -4844,7 +5227,7 @@ fn add_to_pathlist(
     path: &dyn Fn(u32) -> Path,
     consider_startup: bool,
 ) -> Result<(usize, bool), SqlError> {
-    let consider_startup = consider_startup && new.param == 0;
+    let consider_startup = consider_startup && new.param == Relids::EMPTY;
     let mut kept = [0u32; MAX_REL_PATHS];
     let mut kept_count = 0usize;
     let mut accept = true;
@@ -4857,11 +5240,22 @@ fn add_to_pathlist(
         let mut remove_old = false;
         let costs = compare_fuzzily(&new, &old, FUZZ, consider_startup);
         if costs != CostOrder::Different {
-            let new_keys = if new.param != 0 { Keys::NONE } else { new.keys };
-            let old_keys = if old.param != 0 { Keys::NONE } else { old.keys };
+            let new_keys = if new.param != Relids::EMPTY {
+                Keys::NONE
+            } else {
+                new.keys
+            };
+            let old_keys = if old.param != Relids::EMPTY {
+                Keys::NONE
+            } else {
+                old.keys
+            };
             let keys = compare_keys(&new_keys, &old_keys);
             // `bms_subset_compare` of the parameterizations.
-            let outer = match (new.param & !old.param == 0, old.param & !new.param == 0) {
+            let outer = match (
+                new.param & !old.param == Relids::EMPTY,
+                old.param & !new.param == Relids::EMPTY,
+            ) {
                 (true, true) => Subset::Equal,
                 (true, false) => Subset::Subset1,
                 (false, true) => Subset::Subset2,
@@ -5069,6 +5463,15 @@ mod tests {
             sort: true,
             incremental_sort: true,
             memoize: true,
+            geqo: GeqoSettings {
+                enabled: true,
+                threshold: 12,
+                effort: 5,
+                pool_size: 0,
+                generations: 0,
+                selection_bias: 2.0,
+                seed: 0.0,
+            },
         }
     }
 
@@ -5127,7 +5530,7 @@ mod tests {
             rows,
             disabled: 0,
             keys: Keys::NONE,
-            param: 0,
+            param: Relids::EMPTY,
             enforced: ClauseList::EMPTY,
             mark_restore: false,
             indexed_join_quals: false,
@@ -5166,25 +5569,23 @@ mod tests {
             ],
             classes: &[class],
             specials: &[],
-            subproblems: &[Subproblem {
-                items: [1, 2, 0, 0, 0, 0, 0, 0],
-                count: 2,
-            }],
+            subproblems: &[Subproblem { first: 0, count: 2 }],
+            subproblem_items: &[Relids::of(0u8), Relids::of(1u8)],
             clauses: &[Clause {
                 form: ClauseForm::Equality {
                     class: 0,
                     left: 0,
                     right: 1,
                 },
-                relids: 3,
-                required: 3,
+                relids: Relids::from_mask(3),
+                required: Relids::from_mask(3),
                 pushed_down: true,
                 clone: CloneKind::None,
-                incompatible: 0,
+                incompatible: Relids::EMPTY,
                 cost: 0.0025,
                 selectivity: None,
                 outer_selectivity: None,
-                outer_relids: 0,
+                outer_relids: Relids::EMPTY,
                 operands: None,
                 other: OtherShape::Plain,
                 constant: false,
@@ -5195,21 +5596,21 @@ mod tests {
                     rel: 0,
                     column: 0,
                     width: 12.0,
-                    needed_by: 2,
+                    needed_by: Relids::from_mask(2),
                     output: true,
                 },
                 NeededColumn {
                     rel: 1,
                     column: 0,
                     width: 8.0,
-                    needed_by: 1,
+                    needed_by: Relids::from_mask(1),
                     output: true,
                 },
             ],
             expression_costs: &[],
             settings: settings(),
             foreign_keys: &[],
-            removed: 0,
+            removed: Relids::EMPTY,
             upper: UpperProblem {
                 sort: Keys::NONE,
                 limit: None,
@@ -5220,15 +5621,15 @@ mod tests {
                 windows_output_cost: 0.0,
             },
             dummy: false,
-            false_relids: 0,
+            false_relids: Relids::EMPTY,
         };
         let plan = search(&problem, &Uniform, &arena).unwrap().unwrap();
         let top = plan.path(plan.top);
         let PathKind::HashJoin { outer, inner, .. } = top.kind else {
             panic!("{top:?}");
         };
-        assert_eq!(plan.path(outer).relids, 2);
-        assert_eq!(plan.path(inner).relids, 1);
+        assert_eq!(plan.path(outer).relids, Relids::from_mask(2));
+        assert_eq!(plan.path(inner).relids, Relids::from_mask(1));
         assert_eq!((top.startup, top.total, top.rows), (28.5, 85.0, 2000.0));
     }
 }

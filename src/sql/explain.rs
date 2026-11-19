@@ -15,6 +15,7 @@ use crate::sql::ast::{
 };
 use crate::sql::eval::{ColumnLookup, SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
+use crate::sql::query::index_paths::joins::Relids;
 use crate::sql::query::instrument::{
     BlockId, BufferUsage, HashColumns, NodeCounters, NodeKey, Role, Segment, Slot,
 };
@@ -131,6 +132,9 @@ struct PlanNode {
     planned_partitions: Option<u32>,
     /// What sizes a hash aggregate's memory as PostgreSQL's.
     hash_agg: Option<query::postgres_memory::HashAggSizing>,
+    /// On an InitPlan's top node: what running it once added to the costs
+    /// of the node it is attached to (`SS_charge_for_initplans`).
+    initplan_charge: f64,
 }
 
 /// How a node runs a subplan: once before its first row, or per row.
@@ -443,6 +447,7 @@ impl PlanNode {
         analyze_unsupported: None,
         planned_partitions: None,
         hash_agg: None,
+        initplan_charge: 0.0,
     };
 }
 
@@ -539,6 +544,8 @@ struct Conflict {
     update: bool,
     arbiters: [StackStr<64>; MAX_ARBITERS],
     count: usize,
+    /// A `DO UPDATE ... WHERE`, as `show_upper_qual` prints it.
+    filter: Option<StackStr<512>>,
 }
 
 impl Conflict {
@@ -549,6 +556,12 @@ impl Conflict {
     /// The conflict's analyzed outcome: the rows the insertion path
     /// inserted and those that conflicted, from the rows the write's input
     /// returned.
+    /// The rows the `Conflict Filter` removed, when analyzed.
+    fn filtered(&self, plan: &Plan<'_>) -> Option<u64> {
+        self.filter?;
+        Some(plan.measured?[0].filtered)
+    }
+
     fn tuples(plan: &Plan<'_>) -> Option<(u64, u64)> {
         let measured = plan.measured?;
         let input = (1..plan.count).find(|&at| !plan.nodes[at].target_member)?;
@@ -911,6 +924,67 @@ thread_local! {
 /// Forgets the subplans of the statement explained before.
 fn reset_subplans() {
     SUBPLANS.with(|subplans| subplans.borrow_mut().1 = 0);
+    query::reset_subplan_costs();
+}
+
+/// What a condition reading the sublink `node`, planned as `plan` with top
+/// node `top`, costs per `cost_subplan`, as startup and per-row cost: its
+/// test expression's comparisons per row, plus loading a hash table once,
+/// or rescanning the plan's output per row. An InitPlan's output costs
+/// nothing to read.
+fn subplan_cost(
+    node: &Expr<'_>,
+    plan: crate::sql::catalog::deparse::SublinkPlan,
+    correlated: bool,
+    top: &PlanNode,
+) -> (f64, f64) {
+    use crate::sql::catalog::deparse::SublinkPlan;
+    let operator = crate::sql::guc::planner_value("cpu_operator_cost");
+    let rows = clamp_row_estimate(top.rows as f64);
+    // `cost_qual_eval` of the test expression: one operator per compared
+    // column.
+    let compared = match node {
+        Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } => {
+            match operand {
+                Expr::Call { args, .. } if operand.is_row_constructor() => args.len() as f64,
+                _ => 1.0,
+            }
+        }
+        _ => 0.0,
+    };
+    let mut startup = 0.0;
+    let mut per_tuple = compared * operator;
+    match plan {
+        SublinkPlan::InitPlan(_) => return (0.0, 0.0),
+        SublinkPlan::HashedSubPlan(_) => startup += top.total_cost + operator * top.rows as f64,
+        SublinkPlan::SubPlan(_) => {
+            let run = top.total_cost - top.startup_cost;
+            per_tuple += match node {
+                Expr::Exists(_) => run / rows,
+                Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } => {
+                    0.5 * run + 0.5 * top.rows as f64 * operator
+                }
+                _ => run,
+            };
+            // `ExecMaterializesOutput` of an uncorrelated plan's top node.
+            if !correlated
+                && matches!(
+                    top.name.as_str(),
+                    "Materialize"
+                        | "Function Scan"
+                        | "Table Function Scan"
+                        | "CTE Scan"
+                        | "WorkTable Scan"
+                        | "Sort"
+                )
+            {
+                startup += top.startup_cost;
+            } else {
+                per_tuple += top.startup_cost;
+            }
+        }
+    }
+    (startup, per_tuple)
 }
 
 /// Numbers `select` as the next subplan, as PostgreSQL numbers each
@@ -1036,6 +1110,36 @@ fn sublinks_registered(expression: &Expr<'_>, correlated: bool) -> bool {
 
 /// Calls `visit` with each subquery of `expression` outside other
 /// subqueries, in written order.
+/// Whether `node` is one of the `AND`ed conditions of `condition`.
+fn where_conjunct(condition: &Expr<'_>, node: &Expr<'_>) -> bool {
+    if core::ptr::eq(condition, node) {
+        return true;
+    }
+    match condition {
+        Expr::Binary {
+            operator: crate::sql::ast::BinaryOp::And,
+            left,
+            right,
+            ..
+        } => where_conjunct(left, node) || where_conjunct(right, node),
+        _ => false,
+    }
+}
+
+/// Whether `expression` reads a column (a subquery's own columns are not
+/// its children).
+fn mentions_column(expression: &Expr<'_>) -> bool {
+    if matches!(expression, Expr::Column { .. }) {
+        return true;
+    }
+    let mut found = false;
+    let _ = query::walk_children(expression, &mut |child| {
+        found |= mentions_column(child);
+        Ok(())
+    });
+    found
+}
+
 fn visit_sublinks<'e>(expression: &'e Expr<'e>, visit: &mut dyn FnMut(&'e Expr<'e>)) {
     if matches!(
         expression,
@@ -3345,6 +3449,7 @@ fn push_members(
         analyze_unsupported: None,
         planned_partitions: None,
         hash_agg: None,
+        initplan_charge: 0.0,
         ..PlanNode::EMPTY
     })?;
     for &leaf in expansion.started {
@@ -4073,6 +4178,10 @@ fn has_aggregate(
 #[derive(Clone, Copy)]
 struct GroupedScan<'a> {
     path: query::index_paths::ScanPath<'a>,
+    /// The query shape and read columns the path was planned for, which
+    /// the scan's execution plans it from again.
+    shape: query::index_paths::QueryShape,
+    needed: Option<crate::storage::ColumnSet>,
     sort_keys: &'a [KeyItem<'a>],
     group_keys: &'a [KeyItem<'a>],
     /// The width of the rows the grouping returns, each column of the
@@ -4357,10 +4466,38 @@ fn grouped_scan_path<'a>(
         .map_err(|_| arena_full())?;
     Ok(Some(GroupedScan {
         path,
+        shape,
+        needed,
         sort_keys,
         group_keys,
         width: output_width,
     }))
+}
+
+/// The shape and read columns of a query grouping the rows of one table
+/// by its columns, when PostgreSQL's planner plans its scan and grouping
+/// ([`grouped_scan_path`]): its execution scans by that path, counting
+/// what the path reads.
+pub(crate) fn grouped_scan_context<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    arena: &'a Arena,
+) -> Result<
+    Option<(
+        query::index_paths::QueryShape,
+        Option<crate::storage::ColumnSet>,
+    )>,
+    SqlError,
+> {
+    let (width, _) = projected_shape(statement, Some(scope), None, storage, txid, arena)?;
+    Ok(
+        grouped_scan_path(storage, txid, statement, scope, from, columns, width, arena)?
+            .map(|grouped| (grouped.shape, grouped.needed)),
+    )
 }
 
 /// The grouping sets of a query of one plain table as PostgreSQL's
@@ -5643,6 +5780,7 @@ fn scan_node<'a>(
         analyze_unsupported: None,
         planned_partitions: None,
         hash_agg: None,
+        initplan_charge: 0.0,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -5708,11 +5846,12 @@ fn plan_select_with_ctes<'a>(
         return plan_select_with_ctes(storage, txid, rewritten, ctes, outer, block, arena);
     }
     // `min` and `max` of a local table are planned, and executed, as
-    // PostgreSQL plans them when an index orders them.
-    if outer.is_none()
+    // PostgreSQL plans them when an index orders them, also in a subquery
+    // reading no enclosing query's names.
+    if (outer.is_none() || !query::select_correlated(statement, storage, txid, arena)?)
         && let Some(rewritten) = query::local_minmax_subquery(storage, txid, statement, arena)?
     {
-        return plan_select_with_ctes(storage, txid, rewritten, ctes, outer, block, arena);
+        return plan_select_with_ctes(storage, txid, rewritten, ctes, None, block, arena);
     }
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
@@ -5826,12 +5965,12 @@ thread_local! {
 
 /// Pushes the relations of `mask` in `scope` as the ones whose values a
 /// join's parameterized scan reads, returning how many it pushed.
-fn push_outer_mask(scope: &QueryScope<'_>, mask: u32) -> usize {
+fn push_outer_mask(scope: &QueryScope<'_>, mask: Relids) -> usize {
     OUTER_RELATIONS.with(|outer| {
         let mut outer = outer.borrow_mut();
         let mut pushed = 0;
-        for table in 0..scope.n.min(32) {
-            if mask & 1 << table == 0 {
+        for table in 0..scope.n {
+            if !mask.contains(table as u32) {
                 continue;
             }
             let count = outer.1;
@@ -5950,6 +6089,34 @@ fn plan_sublinks<'a>(
             continue;
         };
         let correlated = query::subquery_node_correlated(node, storage, txid, arena)?;
+        if origin == SublinkOrigin::Where
+            && statement
+                .where_clause
+                .is_some_and(|condition| where_conjunct(condition, node))
+            && let Some((operand, any)) = match node {
+                Expr::InSubquery {
+                    operand, negated, ..
+                } => Some((*operand, !negated)),
+                Expr::QuantifiedSubquery { operand, all, .. } => Some((*operand, !all)),
+                _ => None,
+            }
+        {
+            let columns = mentions_column(operand);
+            // `convert_ANY_sublink_to_join` joins the subquery; a test of no
+            // column gates the query from a `Result` (`One-Time Filter`).
+            // A query without FROM evaluates its conditions in its
+            // `Result` already.
+            if (!columns && statement.from.is_some())
+                || (columns
+                    && any
+                    && !query::expression_contains_volatile(operand, storage, txid, false))
+            {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN of an IN, ANY or ALL subquery PostgreSQL joins or gates the query with is not supported"
+                ));
+            }
+        }
         let outer_slot =
             relation.and_then(|(_, schema, table)| relation_slot(storage, txid, schema, table));
         if correlated && outer_slot.is_none() {
@@ -6007,9 +6174,14 @@ fn plan_sublinks<'a>(
         {
             arena
                 .alloc_slice_with(count + 1, |index| match index {
+                    // `cost_material`: two operator costs per row stored.
                     0 => PlanNode {
                         name: StackStr::from_str("Materialize"),
-                        total_cost: nodes[0].total_cost,
+                        startup_cost: nodes[0].startup_cost,
+                        total_cost: nodes[0].total_cost
+                            + 2.0
+                                * crate::sql::guc::planner_value("cpu_operator_cost")
+                                * nodes[0].rows as f64,
                         rows: nodes[0].rows,
                         width: nodes[0].width,
                         output: nodes[0].output,
@@ -6025,7 +6197,10 @@ fn plan_sublinks<'a>(
         } else {
             &nodes[..count]
         };
-        let number = match register_subplan(select, correlated, compared)? {
+        let registered = register_subplan(select, correlated, compared)?;
+        let (startup, per_tuple) = subplan_cost(node, registered, correlated, &nodes[0]);
+        query::record_subplan_cost(core::ptr::from_ref(select).cast(), startup, per_tuple)?;
+        let number = match registered {
             crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
             | crate::sql::catalog::deparse::SublinkPlan::SubPlan(number)
             | crate::sql::catalog::deparse::SublinkPlan::HashedSubPlan(number) => number,
@@ -6315,6 +6490,11 @@ fn attach_subplans<'a>(
                 } else {
                     node.subplan
                 },
+                initplan_charge: if at == 0 && sublink.kind == SubplanKind::InitPlan {
+                    sublink.initplan_cost()
+                } else {
+                    node.initplan_charge
+                },
                 alias: renamed[offsets[index] + at].unwrap_or(node.alias),
                 ..*node
             })?;
@@ -6508,6 +6688,46 @@ fn plan_pulled_select<'a>(
         )?,
         _ => None,
     };
+    // PostgreSQL 18 may merge two scans of one table joined on a unique
+    // key into one scan, which the join search does not model.
+    if match (&modeled, scope.as_ref(), statement.from.as_ref()) {
+        (Some(model), ..) => model.self_join,
+        (None, Some(scope), Some(from)) => {
+            written_self_join(storage, txid, scope, from, statement.where_clause)
+        }
+        _ => false,
+    } {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a self-join PostgreSQL's remove_useless_self_joins may remove is not supported"
+        ));
+    }
+    // A parenthesized join the join search does not plan would print
+    // pos3ql's own join order.
+    if modeled.is_none()
+        && statement.from.as_ref().is_some_and(|from| {
+            core::iter::once(&from.base)
+                .chain(from.joins.iter().map(|join| &join.table))
+                .any(|table| table.join_members.is_some())
+        })
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a parenthesized join PostgreSQL's join search does not plan here is not supported"
+        ));
+    }
+    // PostgreSQL may cache a LATERAL subquery's rows per outer value in a
+    // `Memoize` node, which only the join search plans.
+    if modeled.is_none()
+        && crate::sql::guc::planner_value("enable_memoize") != 0.0
+        && let (Some(scope), Some(from)) = (scope.as_ref(), statement.from.as_ref())
+        && memoizable_lateral(storage, txid, scope, from)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a LATERAL subquery PostgreSQL may memoize is not supported"
+        ));
+    }
     // Windows over a join the join search does not plan would print
     // pos3ql's own join order and sorts.
     if modeled.is_none() && scope.as_ref().is_some_and(|scope| scope.n > 1) && has_window(statement)
@@ -6567,7 +6787,11 @@ fn plan_pulled_select<'a>(
                 .map_err(|_| arena_full())?;
         }
         let sorted: &[KeyItem<'_>] = sorted;
-        let unscanned = if scanned == 0 { 0 } else { !u64::from(scanned) };
+        let unscanned = if scanned.is_empty() {
+            Relids::EMPTY
+        } else {
+            !scanned
+        };
         let sort_keys = plan_keys_unscanned(
             storage,
             txid,
@@ -6654,8 +6878,10 @@ fn plan_pulled_select<'a>(
                     "Unique"
                 } else if group.keys.is_empty() {
                     "Aggregate"
-                } else {
+                } else if group.aggregated {
                     "GroupAggregate"
+                } else {
+                    "Group"
                 }),
                 key: Some(NodeKey::new(
                     block,
@@ -6671,6 +6897,11 @@ fn plan_pulled_select<'a>(
                 width: chosen.width as u32,
                 // A `Unique` names no keys.
                 keys: if unique { PlanKeys::NONE } else { group_keys },
+                hash_agg: group.hash_agg,
+                analyze_unsupported: (group.hashed && group.hash_agg.is_none())
+                    .then_some(
+                        "EXPLAIN ANALYZE of a hash aggregate whose memory PostgreSQL's figure is not modelled for is not supported",
+                    ),
                 ..PlanNode::EMPTY
             }
             .with_qual(
@@ -7449,7 +7680,11 @@ fn plan_pulled_select<'a>(
                 add_stage(&mut stages, &mut stage_count, node)?;
             }
             if !path.hashed {
-                aggregate_name = "GroupAggregate";
+                aggregate_name = if path.aggregated {
+                    "GroupAggregate"
+                } else {
+                    "Group"
+                };
             }
             planned_partitions = path.planned_partitions;
             hash_agg_sizing = Some(path.hash_agg);
@@ -7460,32 +7695,10 @@ fn plan_pulled_select<'a>(
             estimated_rows = path.rows as u64;
             width = grouped.width;
         }
-        // A hash table's memory, sized from pos3ql's own estimates outside
-        // the cost model.
+        // A hash table's memory, sized from the planner's group estimate;
+        // a grouping outside the cost model has none and fails under ANALYZE.
         let hash_agg = if aggregate_name == "HashAggregate" && sets_keys.is_none() {
-            match hash_agg_sizing {
-                Some(sizing) => sizing,
-                None => {
-                    let expressions = arena
-                        .alloc_slice_with(statement.items.len() + 1, |at| {
-                            match statement.items.get(at) {
-                                Some(SelectItem::Expr { expression, .. }) => *expression,
-                                _ => statement.having.unwrap_or(&Expr::Null),
-                            }
-                        })
-                        .map_err(|_| arena_full())?;
-                    query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
-                        .filter(|aggregates| !aggregates.ordered)
-                        .and_then(|aggregates| {
-                            query::index_paths::hash_agg_sizing(
-                                &aggregates,
-                                estimated_rows as f64,
-                                f64::from(width),
-                                statement.group_by.len(),
-                            )
-                        })
-                }
-            }
+            hash_agg_sizing.flatten()
         } else {
             None
         };
@@ -7493,7 +7706,7 @@ fn plan_pulled_select<'a>(
             && sets_keys.is_none()
             && hash_agg.is_none())
         .then_some(
-            "EXPLAIN ANALYZE of a hash aggregate whose transition states or grouping columns PostgreSQL's memory figure is not modelled for is not supported",
+            "EXPLAIN ANALYZE of a hash aggregate whose transition states, grouping keys or group estimate PostgreSQL's memory figure is not modelled for is not supported",
         );
         add_stage(
             &mut stages,
@@ -7820,6 +8033,38 @@ fn plan_pulled_select<'a>(
             },
         )?;
     } else if statement.distinct || !statement.distinct_on.is_empty() {
+        // The groups `estimate_num_groups` counts for the distinct columns
+        // of one table, as its grouping over them would plan.
+        let distinct_groups = if statement.distinct
+            && statement.distinct_on.is_empty()
+            && statement.group_by.is_empty()
+            && statement.having.is_none()
+            && let (Some(scope), Some(from)) = (scope.as_ref(), statement.from.as_ref())
+            && statement
+                .items
+                .iter()
+                .all(|item| matches!(item, SelectItem::Expr { .. }))
+        {
+            let keys = arena
+                .alloc_slice_with(statement.items.len(), |at| match statement.items[at] {
+                    SelectItem::Expr { expression, .. } => expression,
+                    _ => &Expr::Null,
+                })
+                .map_err(|_| arena_full())?;
+            let derived = &*arena
+                .alloc(Select {
+                    group_by: keys,
+                    distinct: false,
+                    ..*statement
+                })
+                .map_err(|_| arena_full())?;
+            grouped_scan_path(storage, txid, derived, scope, from, columns, width, arena)?
+                .and_then(|grouped| grouped.path.grouped)
+                .map(|grouped| grouped.rows)
+        } else {
+            None
+        };
+        let groups_estimate = distinct_groups.map(|rows| rows as u64);
         estimated_rows = estimated_rows.div_ceil(2);
         total_cost += estimated_rows as f64 * 0.01;
         add_stage(
@@ -7862,7 +8107,7 @@ fn plan_pulled_select<'a>(
                 cache_blocks,
                 ..PlanNode::EMPTY
             }
-            .with_distinct_hash(estimated_rows, width),
+            .with_distinct_hash(groups_estimate.unwrap_or(estimated_rows), width),
         )?;
     }
     // A locking clause locks each row below the limit, as PostgreSQL's
@@ -10484,7 +10729,16 @@ fn plan_keys(
     keys: &[KeyItem<'_>],
     arena: &Arena,
 ) -> Result<PlanKeys, SqlError> {
-    plan_keys_unscanned(storage, txid, scope, statement, label, keys, 0, arena)
+    plan_keys_unscanned(
+        storage,
+        txid,
+        scope,
+        statement,
+        label,
+        keys,
+        Relids::EMPTY,
+        arena,
+    )
 }
 
 /// [`plan_keys`] of a plan that does not scan the relations of
@@ -10497,7 +10751,7 @@ fn plan_keys_unscanned(
     statement: &Select<'_>,
     label: KeyLabel,
     keys: &[KeyItem<'_>],
-    unscanned: u64,
+    unscanned: Relids,
     arena: &Arena,
 ) -> Result<PlanKeys, SqlError> {
     // A query without FROM reads no relation.
@@ -10508,13 +10762,13 @@ fn plan_keys_unscanned(
     let Some(joined) = key_relations(scope, statement, arena)? else {
         return Ok(PlanKeys::NONE);
     };
-    let joined = if unscanned == 0 {
+    let joined = if unscanned.is_empty() {
         joined
     } else {
         &*arena
             .alloc_slice_with(joined.len(), |table| {
                 let mut relation = joined[table];
-                if unscanned & 1 << table != 0 {
+                if unscanned.contains(table as u32) {
                     relation.printed = "";
                 }
                 relation
@@ -11001,6 +11255,7 @@ fn physical_scan_node(
         analyze_unsupported: None,
         planned_partitions: None,
         hash_agg: None,
+        initplan_charge: 0.0,
     }
 }
 
@@ -11178,6 +11433,7 @@ fn push_set_tree(
                 analyze_unsupported: None,
                 planned_partitions: None,
                 hash_agg: None,
+                initplan_charge: 0.0,
             };
             let node = if hashed_union {
                 let width = node.width;
@@ -11553,11 +11809,12 @@ pub(super) fn plan_modification<'a>(
     attach_subplans(plan?, 1, block, initplans, arena)
 }
 
-/// The InitPlans of an `UPDATE` or `DELETE`: each uncorrelated scalar
-/// subquery of its new values, in column order (`SS_process_sublinks` over
-/// the processed target list), then of its `WHERE`. Their outputs are
-/// parameters the write's node computes once. Any other subquery there is
-/// outside this plan.
+/// The InitPlans of a write: each uncorrelated scalar subquery of an
+/// `UPDATE`'s new values or an `INSERT`'s one `VALUES` row, in column order
+/// (`SS_process_sublinks` over the processed target list), of several
+/// `VALUES` rows in their order, then of the `WHERE`. Their outputs are
+/// parameters the write's node computes once. An `INSERT ... SELECT`'s
+/// source plans its own; any other subquery there is outside this plan.
 fn write_initplans<'a, 'e>(
     storage: &Storage,
     txid: u32,
@@ -11581,8 +11838,30 @@ fn write_initplans<'a, 'e>(
                 delete.returning,
                 delete.using.is_some(),
             ),
+            Stmt::Insert(insert) => (insert.table, &[], None, insert.returning, false),
             _ => return Ok(&[]),
         };
+    if let Stmt::Insert(insert) = statement
+        && let Some(on_conflict) = &insert.on_conflict
+    {
+        let mut nested = false;
+        for expression in on_conflict
+            .update
+            .unwrap_or(&[])
+            .iter()
+            .map(|(_, value)| *value)
+            .chain(on_conflict.update_where)
+            .chain(on_conflict.target_where)
+        {
+            visit_sublinks(expression, &mut |_| nested = true);
+        }
+        if nested {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN of a subquery in INSERT ... ON CONFLICT is not supported"
+            ));
+        }
+    }
     let mut found = crate::mem::arena::ArenaList::new(arena);
     let mut collect = |expression: &'e Expr<'e>| -> Result<(), SqlError> {
         let mut failed = false;
@@ -11606,6 +11885,30 @@ fn write_initplans<'a, 'e>(
         None => {
             for (_, value) in assignments {
                 collect(value)?;
+            }
+        }
+    }
+    if let Stmt::Insert(insert) = statement {
+        match (insert.rows, definition.as_deref()) {
+            ([row], Some(definition)) => {
+                for (index, column) in definition.columns().iter().enumerate() {
+                    let at = if insert.columns.is_empty() {
+                        Some(index)
+                    } else {
+                        insert
+                            .columns
+                            .iter()
+                            .position(|named| *named == column.name.as_str())
+                    };
+                    if let Some(value) = at.and_then(|at| row.get(at)) {
+                        collect(value)?;
+                    }
+                }
+            }
+            (rows, _) => {
+                for value in rows.iter().flat_map(|row| row.iter()) {
+                    collect(value)?;
+                }
             }
         }
     }
@@ -11669,12 +11972,17 @@ fn write_initplans<'a, 'e>(
 }
 
 /// The resolution of `on_conflict` on the table in `slot`: the unique
-/// indexes `infer_arbiter_indexes` picks, in OID order.
+/// indexes `infer_arbiter_indexes` picks, in OID order. An index arbitrates
+/// a target whose plain columns are its key columns and whose expressions
+/// hold each of its key expressions; a partial one only when the target's
+/// `WHERE` implies its predicate.
 fn conflict_resolution(
     storage: &Storage,
     txid: u32,
     slot: usize,
+    exposed: &str,
     on_conflict: &crate::sql::ast::OnConflict<'_>,
+    arena: &Arena,
 ) -> Result<Conflict, SqlError> {
     let unsupported = |what: &str| {
         sql_err!(
@@ -11683,51 +11991,156 @@ fn conflict_resolution(
             what
         )
     };
-    if on_conflict.target_where.is_some() {
-        return Err(unsupported("a WHERE on its conflict target"));
-    }
-    if on_conflict.update_where.is_some() {
-        return Err(unsupported("a WHERE on DO UPDATE"));
-    }
-    if on_conflict
-        .target
-        .iter()
-        .any(|target| target.column.is_none())
-    {
-        return Err(unsupported("an expression in its conflict target"));
-    }
     let definition = storage.table_def(slot, txid);
+    // Its columns and the proposed row's (`excluded`), each qualified.
+    let filter =
+        match on_conflict.update_where {
+            Some(condition) => {
+                let joined = [
+                    crate::sql::catalog::deparse::Joined::new(exposed, &*definition),
+                    crate::sql::catalog::deparse::Joined::new("excluded", &*definition),
+                ];
+                let context = crate::sql::catalog::deparse::Context {
+                    storage,
+                    txid,
+                    arena,
+                    dependencies: None,
+                    table: None,
+                    parameters: &[],
+                    joined: &joined,
+                    pretty: false,
+                    qualify: true,
+                    bare: None,
+                    domain_value: None,
+                    sublinks: None,
+                    references: None,
+                    folded: true,
+                };
+                Some(deparse_qual(&context, &[condition], arena)?.ok_or_else(|| {
+                    unsupported("a WHERE on DO UPDATE the deparser does not print")
+                })?)
+            }
+            None => None,
+        };
     let mut wanted = 0u64;
     for target in on_conflict.target {
-        let column = target
-            .column
-            .and_then(|name| definition.column_index(name))
+        let Some(name) = target.column else {
+            continue;
+        };
+        let column = definition
+            .column_index(name)
             .filter(|&column| column < 64)
             .ok_or_else(|| unsupported("a conflict target column past the 64th"))?;
         wanted |= 1 << column;
     }
-    drop(definition);
+    let (schema, table) = (definition.schema, definition.name);
+    // The key expressions and predicate of each unique index, by name.
+    let stored = |name: &str| {
+        storage
+            .unique_indexes_for(schema.as_str(), table.as_str(), txid)
+            .find(|index| index.name.as_str() == name)
+    };
     let mut found = [(0i32, StackStr::<64>::new()); MAX_ARBITERS];
     let mut count = 0;
     let mut overflow = false;
+    let mut failure = None;
     crate::sql::catalog::planner_indexes(storage, txid, slot, &mut |index| {
+        if failure.is_some() {
+            return;
+        }
         let keys = &index.columns[..index.n_cols];
         let mut columns = 0u64;
-        for &column in keys {
-            if column < 64 {
+        for (&column, &expression) in keys.iter().zip(&index.expression_keys) {
+            if !expression && column < 64 {
                 columns |= 1 << column;
             }
         }
         let arbitrates = match on_conflict.constraint {
             Some(name) => index.name.as_str() == name,
+            None if on_conflict.target.is_empty()
+                || !index.unique
+                || !index.immediate
+                || columns != wanted =>
+            {
+                false
+            }
             None => {
-                !on_conflict.target.is_empty()
-                    && index.unique
-                    && index.immediate
-                    && !index.partial
-                    && !index.expression_keys[..index.n_cols].iter().any(|&key| key)
-                    && keys.len() == on_conflict.target.len()
-                    && columns == wanted
+                let held = (index.partial
+                    || index.expression_keys[..index.n_cols].iter().any(|&key| key))
+                .then(|| stored(index.name.as_str()));
+                match held {
+                    None => !on_conflict
+                        .target
+                        .iter()
+                        .any(|target| target.column.is_none()),
+                    Some(None) => false,
+                    Some(Some(held)) => {
+                        let expressions = &held.expressions[..held.n_cols];
+                        // Each target expression is a key expression, and
+                        // each key expression is in the target.
+                        let covered = on_conflict
+                            .target
+                            .iter()
+                            .filter(|target| target.column.is_none())
+                            .all(|target| {
+                                expressions.iter().flatten().any(|stored| {
+                                    crate::sql::exec::same_index_expression(
+                                        stored.as_str(),
+                                        target.expression_text,
+                                    )
+                                })
+                            })
+                            && expressions.iter().flatten().all(|stored| {
+                                on_conflict.target.iter().any(|target| {
+                                    target.column.is_none()
+                                        && crate::sql::exec::same_index_expression(
+                                            stored.as_str(),
+                                            target.expression_text,
+                                        )
+                                })
+                            });
+                        covered
+                            && match (held.predicate, on_conflict.target_where) {
+                                (None, _) => true,
+                                (Some(_), None) => false,
+                                (Some(source), Some(target_where)) => {
+                                    match arena
+                                        .alloc_str(source.as_str())
+                                        .map_err(|_| arena_full())
+                                        .and_then(|text| {
+                                            crate::sql::parser::parse_expr(text, arena).map_err(
+                                                |_| {
+                                                    sql_err!(
+                                                        sqlstate::INTERNAL_ERROR,
+                                                        "stored index predicate does not parse"
+                                                    )
+                                                },
+                                            )
+                                        }) {
+                                        Ok(predicate) => {
+                                            let mut resolve =
+                                                |expression: &Expr<'_>| match expression {
+                                                    Expr::Column { name, .. } => {
+                                                        definition.column_index(name)
+                                                    }
+                                                    _ => None,
+                                                };
+                                            query::predicate_is_implied(
+                                                predicate,
+                                                &[Some(target_where)],
+                                                &definition,
+                                                &mut resolve,
+                                            )
+                                        }
+                                        Err(error) => {
+                                            failure = Some(error);
+                                            false
+                                        }
+                                    }
+                                }
+                            }
+                    }
+                }
             }
         };
         if arbitrates {
@@ -11738,6 +12151,10 @@ fn conflict_resolution(
             count += 1;
         }
     });
+    drop(definition);
+    if let Some(error) = failure {
+        return Err(error);
+    }
     if overflow {
         return Err(unsupported("more than 8 arbiter indexes"));
     }
@@ -11751,6 +12168,7 @@ fn conflict_resolution(
         update: on_conflict.update.is_some(),
         arbiters,
         count,
+        filter,
     })
 }
 
@@ -11854,7 +12272,14 @@ fn plan_write<'a>(
         && let Some(on_conflict) = &insert.on_conflict
         && let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
     {
-        let conflict = conflict_resolution(storage, txid, slot, on_conflict)?;
+        let conflict = conflict_resolution(
+            storage,
+            txid,
+            slot,
+            alias.unwrap_or(target.name),
+            on_conflict,
+            arena,
+        )?;
         plan.conflict = Some(&*arena.alloc(conflict).map_err(|_| arena_full())?);
     }
     let mut name = StackStr::new();
@@ -11899,6 +12324,7 @@ fn plan_write<'a>(
         analyze_unsupported: None,
         planned_partitions: None,
         hash_agg: None,
+        initplan_charge: 0.0,
     };
     plan.push(target_node)?;
     if let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
@@ -12026,6 +12452,14 @@ fn plan_write<'a>(
                 true,
                 arena,
             )?;
+        }
+        // PostgreSQL costs a nested loop over an index against its other
+        // joins; pos3ql's write join picks it unweighed.
+        if parameterized.iter().any(Option::is_some) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN of UPDATE ... FROM or DELETE ... USING joining through an index is not supported"
+            ));
         }
         // The target joins first, then each FROM item in execution order.
         let relations_count = scope.n + 1;
@@ -12225,6 +12659,9 @@ fn plan_write<'a>(
                 join_kind(relations_count - 1),
                 hash_at(relations_count - 1),
             )),
+            // pos3ql's own join order and method, not PostgreSQL's costed
+            // choice.
+            unmodeled_costs: true,
             depth: top_depth as u8,
             total_cost: total_cost + rows as f64 * 0.01,
             rows,
@@ -12286,6 +12723,7 @@ fn plan_write<'a>(
                 PlanNode {
                     name: StackStr::from_str(join_node(join_kind(position), hash_at(position))),
                     depth: (top_depth + relations_count - 1 - position) as u8,
+                    unmodeled_costs: true,
                     ..PlanNode::EMPTY
                 }
                 .with_qual(
@@ -12405,12 +12843,41 @@ fn plan_write<'a>(
             plan.nodes[0].set_output(None);
         }
         // The source query's range table entries join the INSERT's.
-        let source_plan = in_nested_block(|| {
+        let (source_plan, pulled) = in_nested_block(|| {
             rewrite::insert_source_plan(storage, txid, insert, select, block, arena)
         })?;
         let root = source_plan.nodes[0];
-        for source_node in &source_plan.nodes[..source_plan.count] {
+        let source_nodes = &source_plan.nodes[..source_plan.count];
+        // A pulled-up query's InitPlans belong to the `INSERT`, whose node
+        // runs them and pays for them in place of the source's top node.
+        let moved = |at: usize| {
+            pulled
+                && source_nodes[at].depth > root.depth
+                && source_nodes[..=at]
+                    .iter()
+                    .rev()
+                    .find(|node| node.depth == root.depth + 1)
+                    .is_some_and(|top| {
+                        top.subplan
+                            .is_some_and(|(kind, _)| kind == SubplanKind::InitPlan)
+                    })
+        };
+        let charge = (1..source_nodes.len())
+            .filter(|&at| moved(at) && source_nodes[at].depth == root.depth + 1)
+            .map(|at| source_nodes[at].initplan_charge)
+            .sum::<f64>();
+        for at in (1..source_nodes.len()).filter(|&at| moved(at)) {
+            plan.push(source_nodes[at])?;
+        }
+        for (at, source_node) in source_nodes.iter().enumerate() {
+            if at > 0 && moved(at) {
+                continue;
+            }
             let mut source_node = *source_node;
+            if at == 0 {
+                source_node.startup_cost -= charge;
+                source_node.total_cost -= charge;
+            }
             source_node.depth = source_node.depth.saturating_add(1);
             // The INSERT's range table holds the target and its source, so
             // PostgreSQL qualifies the columns of the source's keys.
@@ -14533,6 +15000,12 @@ fn write_tail_text<E>(
             }
             emit(line(format_args!("Conflict Arbiter Indexes: {}", names.as_str())).as_str())?;
         }
+        if let Some(filter) = &conflict.filter {
+            emit(line(format_args!("Conflict Filter: {}", filter.as_str())).as_str())?;
+        }
+        if let Some(removed) = conflict.filtered(plan).filter(|&removed| removed > 0) {
+            emit(line(format_args!("Rows Removed by Conflict Filter: {removed}")).as_str())?;
+        }
         if let Some((inserted, conflicting)) = Conflict::tuples(plan) {
             emit(line(format_args!("Tuples Inserted: {inserted}")).as_str())?;
             emit(line(format_args!("Conflicting Tuples: {conflicting}")).as_str())?;
@@ -14808,6 +15281,7 @@ pub(super) fn visit_text_rows<E>(
         }
         if let NodeActual::Ran(NodeCounters {
             stored: Some(bytes),
+            stored_disk,
             ..
         }) = node_actual
         {
@@ -14817,7 +15291,8 @@ pub(super) fn visit_text_rows<E>(
             }
             let _ = write!(
                 line,
-                "Storage: Memory  Maximum Storage: {}kB",
+                "Storage: {}  Maximum Storage: {}kB",
+                if stored_disk { "Disk" } else { "Memory" },
                 bytes.div_ceil(1024)
             );
             emit(line.as_str())?;
@@ -16010,6 +16485,12 @@ fn structured_node(
         if conflict.count > 0 {
             document.list("Conflict Arbiter Indexes", conflict.arbiters());
         }
+        if let Some(filter) = &conflict.filter {
+            document.text("Conflict Filter", filter.as_str());
+        }
+        if let Some(removed) = conflict.filtered(plan) {
+            document.number("Rows Removed by Conflict Filter", removed);
+        }
         if let Some((inserted, conflicting)) = Conflict::tuples(plan) {
             document.number("Tuples Inserted", inserted);
             document.number("Conflicting Tuples", conflicting);
@@ -16178,10 +16659,11 @@ fn structured_node(
     }
     if let NodeActual::Ran(NodeCounters {
         stored: Some(bytes),
+        stored_disk,
         ..
     }) = node_actual
     {
-        document.text("Storage", "Memory");
+        document.text("Storage", if stored_disk { "Disk" } else { "Memory" });
         document.number("Maximum Storage", bytes.div_ceil(1024));
     }
     if actual.is_some()
@@ -16428,6 +16910,175 @@ fn printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), SqlError> {
         )),
         None => Ok(()),
     }
+}
+
+/// Whether a LATERAL subquery reading a relation filters it by a column of
+/// an earlier table whose statistics repeat values (fewer distinct values
+/// than rows): a parameter `Memoize` may cache the subquery's rows by.
+fn memoizable_lateral(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    from: &crate::sql::ast::FromClause<'_>,
+) -> bool {
+    fn conditions<'e>(select: &'e Select<'e>, visit: &mut dyn FnMut(&'e Expr<'e>)) {
+        if let Some(condition) = select.where_clause {
+            visit(condition);
+        }
+        if let Some(from) = select.from.as_ref() {
+            for table in
+                core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table))
+            {
+                if let Some(on) = from
+                    .joins
+                    .iter()
+                    .find(|join| core::ptr::eq(&join.table, table))
+                    .and_then(|join| join.on)
+                {
+                    visit(on);
+                }
+                if let Some(inner) = table.subquery {
+                    conditions(inner, visit);
+                }
+            }
+        }
+    }
+    let tables = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+    for (position, table) in tables.enumerate().take(scope.n) {
+        let Some(select) = table.subquery.filter(|_| table.lateral) else {
+            continue;
+        };
+        if select.from.is_none() {
+            continue;
+        }
+        let mut repeats = false;
+        conditions(select, &mut |condition| {
+            condition.for_each_column_reference(&mut |qualifier, name| {
+                let Some(qualifier) = qualifier else {
+                    return;
+                };
+                let Some(outer) = (0..position).find(|&at| scope.names[at] == qualifier) else {
+                    return;
+                };
+                let slot = scope.slots[outer];
+                if slot == usize::MAX || scope.derived[outer].is_some() {
+                    return;
+                }
+                let statistics = storage.table_statistics(slot, txid);
+                let definition = storage.table_def(slot, txid);
+                let Some(column) = definition
+                    .columns()
+                    .iter()
+                    .position(|column| column.name.as_str() == name)
+                else {
+                    return;
+                };
+                let distinct = definition
+                    .attributes
+                    .number(column)
+                    .and_then(|attribute| statistics.column(attribute))
+                    .filter(|_| statistics.valid && statistics.rows > 0)
+                    .map(|column_statistics| {
+                        crate::storage::column_distinct_estimate(
+                            &definition.columns()[column],
+                            column_statistics,
+                            statistics.rows,
+                            false,
+                        )
+                    });
+                // Without statistics PostgreSQL assumes 200 distinct values.
+                let rows = storage.planning_row_estimate(slot) as f64;
+                repeats |= distinct.unwrap_or(200.0) < rows;
+            });
+        });
+        if repeats {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether two inner-joined scans of one table equate, in `WHERE` or an
+/// inner join's `ON`, the same columns of each covering a unique index:
+/// a self-join `remove_useless_self_joins` may remove, for a join the join
+/// search does not plan.
+fn written_self_join(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    from: &crate::sql::ast::FromClause<'_>,
+    where_clause: Option<&Expr<'_>>,
+) -> bool {
+    if crate::sql::guc::planner_value("enable_self_join_elimination") == 0.0
+        || scope.n < 2
+        || !from
+            .joins
+            .iter()
+            .all(|join| join.kind.is_cross() || join.kind == crate::sql::ast::JoinKind::Inner)
+    {
+        return false;
+    }
+    let mut conjuncts = [&Expr::Null; query::MAX_CONJUNCTS];
+    let mut count = 0;
+    for condition in where_clause
+        .into_iter()
+        .chain(from.joins.iter().filter_map(|join| join.on))
+    {
+        if !query::flatten_and(condition, &mut conjuncts, &mut count) {
+            return false;
+        }
+    }
+    let column = |side: &Expr<'_>| match side {
+        Expr::Column { qualifier, name } => match scope.probe_column(*qualifier, name) {
+            Some(query::ResolvedColumn::Table(table, column)) => Some((table, column)),
+            _ => None,
+        },
+        _ => None,
+    };
+    for r in 0..scope.n {
+        for k in r + 1..scope.n {
+            if scope.slots[r] == usize::MAX
+                || scope.slots[r] != scope.slots[k]
+                || scope.derived[r].is_some()
+                || scope.derived[k].is_some()
+            {
+                continue;
+            }
+            let mut covered = 0u64;
+            for conjunct in &conjuncts[..count] {
+                let Expr::Binary {
+                    operator: crate::sql::ast::BinaryOp::Eq,
+                    left,
+                    right,
+                    ..
+                } = conjunct
+                else {
+                    continue;
+                };
+                if let (Some((lt, lc)), Some((rt, rc))) = (column(left), column(right))
+                    && lc == rc
+                    && lc < 64
+                    && ((lt, rt) == (r, k) || (lt, rt) == (k, r))
+                {
+                    covered |= 1 << lc;
+                }
+            }
+            let mut unique = false;
+            crate::sql::catalog::planner_indexes(storage, txid, scope.slots[k], &mut |index| {
+                unique |= index.unique
+                    && index.immediate
+                    && (0..index.n_cols).all(|position| {
+                        !index.expression_keys[position]
+                            && index.columns[position] < 64
+                            && covered & 1 << index.columns[position] != 0
+                    });
+            });
+            if covered != 0 && unique {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// [`printable`] for each query a rule produces.

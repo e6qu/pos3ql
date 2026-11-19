@@ -1113,7 +1113,8 @@ under the `Insert` node. An error a PL/pgSQL `FOR ... IN EXECUTE` query
 raises while it runs (a unique violation, an `EXPLAIN ANALYZE`'s error)
 carries a `SQL statement` context line, which PostgreSQL prints only for
 errors raised while the query is planned (`_SPI_error_callback` is not
-installed around a cursor's fetches). Windows over a join the search plans read its plan's rows,
+installed around a cursor's fetches). Windows over a join the search plans read its plan's rows, also when
+the statement spills their input to object storage,
 so `EXPLAIN ANALYZE` counts its nodes (`differential_exact/935`); windows
 over a join it does not plan (a window function in the `ORDER BY`) fail
 `EXPLAIN` with `0A000` rather than print pos3ql's join order, and

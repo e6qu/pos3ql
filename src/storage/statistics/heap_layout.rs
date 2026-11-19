@@ -78,7 +78,7 @@ impl HeapPacking {
 
     /// Places a tuple of `length` bytes; returns its zero-based page.
     pub(crate) fn add(&mut self, length: usize) -> u64 {
-        let needed = length.next_multiple_of(MAXIMUM_ALIGNMENT) + LINE_POINTER;
+        let needed = tuple_space(length);
         if self.pages == 0 || self.tuples == MAX_TUPLES_PER_PAGE || needed > self.free {
             self.pages += 1;
             self.free = BLOCK_SIZE - PAGE_HEADER;
@@ -92,4 +92,15 @@ impl HeapPacking {
     pub(crate) const fn pages(&self) -> u64 {
         self.pages
     }
+
+    /// The bytes the last page has left for tuples and line pointers.
+    pub(crate) const fn free(&self) -> usize {
+        self.free
+    }
+}
+
+/// The page space a tuple of `length` bytes takes: the tuple at maximum
+/// alignment and its line pointer.
+pub(crate) const fn tuple_space(length: usize) -> usize {
+    length.next_multiple_of(MAXIMUM_ALIGNMENT) + LINE_POINTER
 }

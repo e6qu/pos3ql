@@ -148,6 +148,7 @@ pub(crate) mod instrument;
 mod outer_joins;
 pub(crate) mod postgres_memory;
 mod pullup;
+pub(crate) mod write_buffers;
 pub(crate) use cte::expand_dml_ctes_schema;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;

@@ -1564,7 +1564,15 @@ from the planner's group estimate (`differential_exact/908`). A `Materialize`
 above a merge join's inner sort replays its mark, restore and
 `tuplestore_trim` (`differential_exact/910`); rows with equal window keys
 reach a window's sort and number in `pg_qsort` order
-(`differential_exact/909`). A `CTE Scan` prints its query's tuplestore
+(`differential_exact/909`). With a spill store attached, a window query
+chooses its path before any work runs, as `tuplesort.c` does: it sizes every
+window clause's input sort with the `TuplesortModel` and streams through
+external runs when one outgrows `work_mem`; a clause above a window function
+whose result size varies by row (anything but a ranking function, a count, or
+`first_value`, `last_value`, `min`, `max` or `sum` of a non-null fixed-width
+argument) fails with `0A000`, and arena exhaustion on the chosen path is the
+named error, never a switch of path. The external window path's tie order is
+not yet `tuplesort.c`'s run formation and heap merge. A `CTE Scan` prints its query's tuplestore
 (`tuplestore_get_stats`: 2048 row pointers, doubled when a row reaches the
 last free slot, and each row's generation chunk), also when it never ran;
 a `Recursive Union` the sum of its working and intermediate tables, each

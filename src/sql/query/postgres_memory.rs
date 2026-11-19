@@ -102,6 +102,12 @@ fn datum_layout(value: &Datum<'_>) -> Option<PhysicalLayout> {
     crate::sql::type_layouts::builtin(oid)
 }
 
+/// Whether the value's type has one fixed stored length, so every non-null
+/// value of the type takes the same space in a tuple.
+pub(crate) fn has_fixed_width(value: &Datum<'_>) -> bool {
+    datum_layout(value).is_some_and(|layout| layout.length > 0)
+}
+
 /// The bytes of a varlena value's data after its header, as PostgreSQL
 /// stores it uncompressed; `None` for types sized differently from pos3ql.
 pub(crate) fn varlena_payload(value: &Datum<'_>) -> Option<usize> {

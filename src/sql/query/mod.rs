@@ -17228,8 +17228,9 @@ fn select_into_rows_mode<'a>(
                 emit,
             );
         }
-        let preloaded = if storage.spill_attached() && !instrument::active() {
-            window::project_window_rows_fitting(
+        if storage.spill_attached()
+            && !instrument::active()
+            && window::window_sorts_spill(
                 storage,
                 txid,
                 statement,
@@ -17238,15 +17239,11 @@ fn select_into_rows_mode<'a>(
                 win_nodes.as_slice(),
                 &hooks,
                 correlated,
-                &outer_subs.base,
                 arena,
                 params,
                 outer,
             )?
-        } else {
-            None
-        };
-        if storage.spill_attached() && !instrument::active() && preloaded.is_none() {
+        {
             external_window_into(
                 storage,
                 txid,
@@ -17269,23 +17266,20 @@ fn select_into_rows_mode<'a>(
             )?;
             return Ok(());
         }
-        let mut rows = match preloaded {
-            Some(rows) => rows,
-            None => project_window_rows(
-                storage,
-                txid,
-                statement,
-                from,
-                &scope,
-                win_nodes.as_slice(),
-                &hooks,
-                correlated,
-                &outer_subs.base,
-                arena,
-                params,
-                outer,
-            )?,
-        };
+        let mut rows = project_window_rows(
+            storage,
+            txid,
+            statement,
+            from,
+            &scope,
+            win_nodes.as_slice(),
+            &hooks,
+            correlated,
+            &outer_subs.base,
+            arena,
+            params,
+            outer,
+        )?;
         // DISTINCT dedups on the projected values; ORDER BY and LIMIT/OFFSET
         // apply here too (a derived table keeps its inner LIMIT).
         if statement.distinct {

@@ -88721,12 +88721,16 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     }
 
     let before = engine.storage.block_io_stats();
+    // The 20000-row sorts fit the default `work_mem`, so PostgreSQL would sort
+    // them in memory; a small one makes its tuplesort spill, which streams the
+    // window through external runs.
     let partitioned = |engine: &mut Engine, budget: &mut Budget, text: &str, expected: &[&str]| {
+        let text = format!("SET work_mem = '64kB'; {text}");
         assert_eq!(
-            data_rows(&run_with(engine, budget, text)),
+            data_rows(&run_with(engine, budget, &text)),
             expected,
             "{}",
-            String::from_utf8_lossy(&run_with(engine, budget, text))
+            String::from_utf8_lossy(&run_with(engine, budget, &text))
         );
     };
     // A range-function source with two specs (the second a whole-input
@@ -88780,6 +88784,19 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
         &[
             "0|2857", "1|2858", "2|2857", "3|2857", "4|2857", "5|2857", "6|2857",
         ],
+    );
+    // A clause above a window function whose result size varies by row has
+    // no sort size before the windows run, which is refused, not guessed.
+    let refused = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT lag(x) OVER (ORDER BY x), lead(x) OVER (ORDER BY x DESC) \
+         FROM generate_series(1, 10) AS x",
+    );
+    assert!(
+        String::from_utf8_lossy(&refused).contains("cannot be sized before it runs"),
+        "{}",
+        String::from_utf8_lossy(&refused)
     );
     // Without ORDER BY, rows leave in the last-evaluated window's order with
     // ties in the earlier windows' order, as PostgreSQL 18.6 returns them.

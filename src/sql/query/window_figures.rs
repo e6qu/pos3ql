@@ -343,6 +343,7 @@ pub(crate) fn row_size<'a>(
 }
 
 /// A sort's accounting of a window's input, fed in the scan's order.
+#[derive(Clone, Copy)]
 pub(crate) struct InputSort {
     model: TuplesortModel,
 }

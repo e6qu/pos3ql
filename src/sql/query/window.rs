@@ -2656,6 +2656,41 @@ impl<'a> WindowRows<'a> {
     }
 }
 
+/// [`project_window_rows`] when the rows fit the statement arena, as
+/// PostgreSQL sorts in memory when they fit `work_mem`: rows with equal keys
+/// then come back in `pg_qsort` order, which the streaming executor's merge
+/// of runs does not reproduce. `None` (the arena left as it was) when they do
+/// not fit, for the caller to stream them through external runs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_window_rows_fitting<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    from: &'a FromClause<'a>,
+    scope: &QueryScope<'a>,
+    win_nodes: &[&'a Expr<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    correlated: &'a [&'a Expr<'a>],
+    base: &SubqueryValues<'a, 'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<Option<WindowRows<'a>>, SqlError> {
+    let mark = arena.mark();
+    match project_window_rows(
+        storage, txid, statement, from, scope, win_nodes, hooks, correlated, base, arena, params,
+        outer,
+    ) {
+        Ok(rows) => Ok(Some(rows)),
+        Err(error) if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED => {
+            // SAFETY: the failed projection's rows are not used again.
+            unsafe { arena.rewind_to(mark) };
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// How many leading `ORDER BY` keys the window rows already follow: the
 /// keys of the last window clause that sorted its input, as the planner
 /// plans an incremental sort over them (`presorted_order_keys` in EXPLAIN).
@@ -3538,7 +3573,18 @@ pub(crate) fn window_select<'a>(
     }
     // `EXPLAIN ANALYZE` of a window replays PostgreSQL's sort and partition
     // buffer over the materialized rows.
-    if storage.spill_attached() && !instrument::active() {
+    let preloaded = if storage.spill_attached() && !instrument::active() {
+        match project_window_rows_fitting(
+            storage, txid, statement, from, scope, win_nodes, hooks, correlated, base, arena,
+            params, None,
+        ) {
+            Ok(rows) => rows,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
+    if storage.spill_attached() && !instrument::active() && preloaded.is_none() {
         let mut wire_full = false;
         let emitted = match external_window_into(
             storage,
@@ -3576,24 +3622,31 @@ pub(crate) fn window_select<'a>(
     }
     let stages = super::materialize::materialized_stages(limit != u64::MAX);
     let _stages = stages.start();
-    let rows = match project_window_rows(
-        // The top-level query has no enclosing row to resolve against.
-        storage, txid, statement, from, scope, win_nodes, hooks, correlated, base, arena, params,
-        None,
-    )
-    // A sort or distinct above the window reads every row it computes.
-    .inspect(|rows| {
-        if stages.sort.measured() || stages.unique.measured() {
-            stages.window.rows(rows.rows.len() as u64);
-        }
-    })
-    .and_then(|rows| {
-        if statement.distinct {
-            rows.distinct(storage, txid, arena)
-        } else {
-            Ok(rows)
-        }
-    }) {
+    let rows = match preloaded
+        .map_or_else(
+            || {
+                project_window_rows(
+                    // The top-level query has no enclosing row to resolve
+                    // against.
+                    storage, txid, statement, from, scope, win_nodes, hooks, correlated, base,
+                    arena, params, None,
+                )
+            },
+            Ok,
+        )
+        // A sort or distinct above the window reads every row it computes.
+        .inspect(|rows| {
+            if stages.sort.measured() || stages.unique.measured() {
+                stages.window.rows(rows.rows.len() as u64);
+            }
+        })
+        .and_then(|rows| {
+            if statement.distinct {
+                rows.distinct(storage, txid, arena)
+            } else {
+                Ok(rows)
+            }
+        }) {
         Ok(rows) => rows,
         Err(e) => return sql_fail(e),
     };

@@ -1427,9 +1427,10 @@ fixes to a constant (`differential_exact/905`); a grouping whose keys all
 conditions fix is refused. Remaining: aggregates
 with `DISTINCT` or `ORDER BY` inputs, user-defined aggregates, a select
 list computing expressions over aggregates, an `ORDER BY` of an aggregate,
-grouping by expressions and over joins keep pos3ql's own estimate. The
-first ANALYZE of a table with several indexes leaves one index scan's cost
-20 above PostgreSQL's (0.0025 per row of 8000); a second ANALYZE matches. JSON nests as
+grouping by expressions and over joins keep pos3ql's own estimate. A
+table never ANALYZEd costs its ordered index scans too high (20 on a
+text-keyed btree over 8000 rows): the index's pages are sized from default
+key widths and distinct counts rather than measured at CREATE INDEX. JSON nests as
 deeply as PostgreSQL 18.6's `json` and `jsonb` inputs do under the default
 `max_stack_depth` (21,790 and 18,675 levels on the reference build), and
 deeper documents, or a recursion that would exhaust the query thread's

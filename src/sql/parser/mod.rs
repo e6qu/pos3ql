@@ -2316,6 +2316,7 @@ impl<'a> Parser<'a> {
         self.advance()?; // explain
         let mut options = ExplainOptions::DEFAULT;
         let mut summary_specified = false;
+        let mut buffers_specified = false;
         let mut timing_enabled_explicitly = false;
         if self.eat_op("(")? {
             loop {
@@ -2372,6 +2373,7 @@ impl<'a> Parser<'a> {
                         options.settings = enabled;
                     } else if option.eq_ignore_ascii_case("buffers") {
                         options.buffers = enabled;
+                        buffers_specified = true;
                     } else if option.eq_ignore_ascii_case("wal") {
                         options.wal = enabled;
                     } else if option.eq_ignore_ascii_case("timing") {
@@ -2411,19 +2413,9 @@ impl<'a> Parser<'a> {
         if !summary_specified {
             options.summary = options.analyze;
         }
-        if options.buffers && !options.analyze {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(
-                    PARSE_MESSAGE_BYTES,
-                    "EXPLAIN option BUFFERS requires ANALYZE"
-                ),
-                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                cursor: None,
-                hint: None,
-                near: None,
-                detail: None,
-            });
+        // PostgreSQL 18 counts buffers under ANALYZE unless told not to.
+        if !buffers_specified {
+            options.buffers = options.analyze;
         }
         if options.wal && !options.analyze {
             return Err(ParseError {

@@ -194,6 +194,120 @@ pub(crate) struct NodeCounters {
     pub(crate) heap_fetches: u64,
     /// A `Memoize` node's cache figures.
     pub(crate) memoize: Option<MemoizeStats>,
+    /// The pages the node itself read and changed, without its inputs'.
+    pub(crate) buffers: BufferUsage,
+    /// A page model counted the node's pages.
+    pub(crate) paged: bool,
+}
+
+/// Page accesses in PostgreSQL's `BufferUsage` terms, each page the 8 kB
+/// heap or index page the planner's page counts model: `shared` for
+/// permanent relations, `local` for temporary ones, `temp` for the work
+/// files of sorts and tuplestores that outgrow memory.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct BufferUsage {
+    pub(crate) shared_hit: u64,
+    pub(crate) shared_read: u64,
+    pub(crate) shared_dirtied: u64,
+    pub(crate) shared_written: u64,
+    pub(crate) local_hit: u64,
+    pub(crate) local_read: u64,
+    pub(crate) local_dirtied: u64,
+    pub(crate) local_written: u64,
+    pub(crate) temp_read: u64,
+    pub(crate) temp_written: u64,
+}
+
+impl BufferUsage {
+    pub(crate) const fn plus(self, other: Self) -> Self {
+        Self {
+            shared_hit: self.shared_hit.saturating_add(other.shared_hit),
+            shared_read: self.shared_read.saturating_add(other.shared_read),
+            shared_dirtied: self.shared_dirtied.saturating_add(other.shared_dirtied),
+            shared_written: self.shared_written.saturating_add(other.shared_written),
+            local_hit: self.local_hit.saturating_add(other.local_hit),
+            local_read: self.local_read.saturating_add(other.local_read),
+            local_dirtied: self.local_dirtied.saturating_add(other.local_dirtied),
+            local_written: self.local_written.saturating_add(other.local_written),
+            temp_read: self.temp_read.saturating_add(other.temp_read),
+            temp_written: self.temp_written.saturating_add(other.temp_written),
+        }
+    }
+
+    /// `pages` page accesses of a permanent (`local` false) or temporary
+    /// relation, of which `read` needed storage the RAM cache did not hold.
+    pub(crate) const fn accessed(local: bool, pages: u64, read: u64) -> Self {
+        let hit = pages.saturating_sub(read);
+        let mut usage = Self {
+            shared_hit: 0,
+            shared_read: 0,
+            shared_dirtied: 0,
+            shared_written: 0,
+            local_hit: 0,
+            local_read: 0,
+            local_dirtied: 0,
+            local_written: 0,
+            temp_read: 0,
+            temp_written: 0,
+        };
+        if local {
+            usage.local_hit = hit;
+            usage.local_read = read;
+        } else {
+            usage.shared_hit = hit;
+            usage.shared_read = read;
+        }
+        usage
+    }
+
+    pub(crate) const fn is_zero(&self) -> bool {
+        self.shared_hit == 0
+            && self.shared_read == 0
+            && self.shared_dirtied == 0
+            && self.shared_written == 0
+            && self.local_hit == 0
+            && self.local_read == 0
+            && self.local_dirtied == 0
+            && self.local_written == 0
+            && self.temp_read == 0
+            && self.temp_written == 0
+    }
+}
+
+/// How a scan's page accesses are counted: the relation's modeled heap
+/// pages and, for an index search, its index's pages.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PageModel {
+    /// A temporary relation, whose pages are local.
+    pub(crate) local: bool,
+    /// The relation's heap pages and visible rows.
+    pub(crate) relation_pages: u64,
+    pub(crate) rows: u64,
+    /// The index the node searches each loop, if any.
+    pub(crate) index: Option<super::index_paths::IndexPages>,
+    /// A sequential scan, whose read stream holds the page after the one
+    /// it stopped on (`read_stream_next_buffer`).
+    pub(crate) sequential: bool,
+    /// An index-only scan reading the relation's visibility map, which
+    /// pins its one page for the node's whole run.
+    pub(crate) visibility_map: bool,
+}
+
+/// The current loop's page accesses of a node with a [`PageModel`].
+#[derive(Clone, Copy, Default)]
+struct PageLoop {
+    /// The heap page the scan last read, which reading again costs nothing.
+    last: Option<u64>,
+    heap: u64,
+    /// Of `heap`, the pages whose reaching took a block the RAM cache did
+    /// not hold.
+    read: u64,
+    /// Rows a sequential scan examined.
+    examined: u64,
+    /// Index entries the search reached.
+    entries: u64,
+    /// The thread's RAM misses when the last page was counted.
+    misses: u64,
 }
 
 /// A `Memoize` node's cache figures (`MemoizeInstrumentation`).
@@ -1013,6 +1127,9 @@ pub(crate) struct Slot {
     /// A `Materialize` node's tuplestore, as its first loop fills it; `None`
     /// inside once a row had no PostgreSQL size.
     store: Option<Option<super::postgres_memory::Tuplestore>>,
+    /// How the node's page accesses are counted, once a scan installs it.
+    pages: Option<PageModel>,
+    page_loop: PageLoop,
     counters: NodeCounters,
     /// Nested starts of the open loop; only the outermost one counts.
     open: u32,
@@ -1036,6 +1153,15 @@ impl Slot {
             recursive: None,
             hash_agg: None,
             store: None,
+            pages: None,
+            page_loop: PageLoop {
+                last: None,
+                heap: 0,
+                read: 0,
+                examined: 0,
+                entries: 0,
+                misses: 0,
+            },
             counters: NodeCounters {
                 loops: 0,
                 rows: 0,
@@ -1057,6 +1183,19 @@ impl Slot {
                 heap_blocks: 0,
                 heap_fetches: 0,
                 memoize: None,
+                buffers: BufferUsage {
+                    shared_hit: 0,
+                    shared_read: 0,
+                    shared_dirtied: 0,
+                    shared_written: 0,
+                    local_hit: 0,
+                    local_read: 0,
+                    local_dirtied: 0,
+                    local_written: 0,
+                    temp_read: 0,
+                    temp_written: 0,
+                },
+                paged: false,
             },
             open: 0,
             started: None,
@@ -1102,11 +1241,42 @@ impl Slot {
     pub(crate) const fn counters(&self) -> NodeCounters {
         self.counters
     }
+
+    /// Adds the ending loop's page accesses: the heap pages it read, the
+    /// page a sequential scan's read stream holds past the one it stopped
+    /// on, its index search's pages and a visibility map's page.
+    fn end_page_loop(&mut self) {
+        let Some(model) = self.pages else {
+            return;
+        };
+        let pages = self.page_loop;
+        let ahead = model.sequential
+            && pages.examined < model.rows
+            && pages
+                .last
+                .is_some_and(|last| last + 1 < model.relation_pages);
+        let index = model.index.map_or(0, |index| index.search(pages.entries));
+        let map = model.visibility_map && self.counters.loops == 0;
+        let accessed = pages.heap + u64::from(ahead) + index + u64::from(map);
+        self.counters.buffers =
+            self.counters
+                .buffers
+                .plus(BufferUsage::accessed(model.local, accessed, pages.read));
+        self.page_loop = PageLoop {
+            misses: pages.misses,
+            ..PageLoop::default()
+        };
+    }
 }
 
 struct Registry {
     slots: NonNull<[Slot]>,
     timing: bool,
+    /// `BUFFERS`: scans count the pages they access.
+    buffers: bool,
+    /// Tables' heap page maps, built once per statement for the scans
+    /// that count pages (see [`heap_pages`]).
+    heap_pages: [Option<HeapPages>; HEAP_PAGE_TABLES],
     /// For a statement rewrite rules turn into several queries, the
     /// position of the next query to run.
     next_query: Option<u16>,
@@ -1167,9 +1337,15 @@ impl Drop for Restore {
 }
 
 /// Runs `execute` with `slots` counting its operators, starting at the top
-/// block. `timing` measures each loop's time as well.
-pub(crate) fn analyze<R>(slots: &mut [Slot], timing: bool, execute: impl FnOnce() -> R) -> R {
-    install(slots, timing, None, execute)
+/// block. `timing` measures each loop's time as well, `buffers` the pages
+/// each scan accesses.
+pub(crate) fn analyze<R>(
+    slots: &mut [Slot],
+    timing: bool,
+    buffers: bool,
+    execute: impl FnOnce() -> R,
+) -> R {
+    install(slots, timing, buffers, None, execute)
 }
 
 /// [`analyze`] of a statement rewrite rules turn into several queries, each
@@ -1177,20 +1353,24 @@ pub(crate) fn analyze<R>(slots: &mut [Slot], timing: bool, execute: impl FnOnce(
 pub(crate) fn analyze_queries<R>(
     slots: &mut [Slot],
     timing: bool,
+    buffers: bool,
     execute: impl FnOnce() -> R,
 ) -> R {
-    install(slots, timing, Some(0), execute)
+    install(slots, timing, buffers, Some(0), execute)
 }
 
 fn install<R>(
     slots: &mut [Slot],
     timing: bool,
+    buffers: bool,
     next_query: Option<u16>,
     execute: impl FnOnce() -> R,
 ) -> R {
     let mut registry = Registry {
         slots: NonNull::from(slots),
         timing,
+        buffers,
+        heap_pages: [None; HEAP_PAGE_TABLES],
         next_query,
         attempt: 0,
         reruns: 0,
@@ -1229,6 +1409,8 @@ pub(crate) fn restart() {
     // attempts, and nothing else borrows the registry here.
     let registry = unsafe { registry.as_mut() };
     registry.attempt = registry.attempt.wrapping_add(1);
+    // A later attempt may run in a fresh workspace.
+    registry.heap_pages = [None; HEAP_PAGE_TABLES];
     if registry.next_query.is_some() {
         registry.next_query = Some(0);
     }
@@ -1308,6 +1490,66 @@ pub(crate) fn cte_stored(block: BlockId, space: StoredSpace) {
 /// Whether an analyzed statement is counting on this thread.
 pub(crate) fn active() -> bool {
     ACTIVE.with(Cell::get).is_some()
+}
+
+/// The tables whose heap page maps one analyzed statement keeps.
+const HEAP_PAGE_TABLES: usize = 16;
+
+/// A table's `(row identity, heap page)` pairs sorted by identity, and its
+/// heap pages.
+pub(crate) type HeapPageMap<'a> = (&'a [(u64, u64)], u64);
+
+/// A [`HeapPageMap`] the analyzed statement keeps for the table in `slot`.
+#[derive(Clone, Copy)]
+struct HeapPages {
+    slot: usize,
+    rows: NonNull<[(u64, u64)]>,
+    pages: u64,
+}
+
+/// The heap page map of the table in `slot`, built by `build` in the
+/// persistent tail of the statement's owning `arena` the first time a scan
+/// of the analyzed statement asks for it, so a scan run once per outer row
+/// does not build it again.
+pub(crate) fn heap_pages<'a, E>(
+    slot: usize,
+    arena: &'a crate::mem::arena::Arena,
+    build: impl FnOnce(&'a crate::mem::arena::Arena) -> Result<HeapPageMap<'a>, E>,
+) -> Result<HeapPageMap<'a>, E> {
+    let Some(mut registry) = ACTIVE.with(Cell::get) else {
+        return build(arena);
+    };
+    // SAFETY: see `node`; nothing else borrows the registry here.
+    let registry = unsafe { registry.as_mut() };
+    if let Some(held) = registry
+        .heap_pages
+        .iter()
+        .flatten()
+        .find(|held| held.slot == slot)
+    {
+        // SAFETY: the map lives in the owning arena's persistent tail,
+        // which no front rewind reclaims and which outlives the statement's
+        // analysis; a restarted attempt forgets it.
+        return Ok((unsafe { held.rows.as_ref() }, held.pages));
+    }
+    let owner = arena.retention_owner();
+    let (rows, pages) = build(owner)?;
+    if let Some(free) = registry.heap_pages.iter_mut().find(|held| held.is_none()) {
+        *free = Some(HeapPages {
+            slot,
+            rows: NonNull::from(rows),
+            pages,
+        });
+    }
+    Ok((rows, pages))
+}
+
+/// Whether the analyzed statement counts the pages its scans access.
+pub(crate) fn buffers_counted() -> bool {
+    // SAFETY: see `node`; the registry outlives its installation.
+    ACTIVE
+        .with(Cell::get)
+        .is_some_and(|registry| unsafe { registry.as_ref() }.buffers)
 }
 
 /// The block the executor is running.
@@ -1576,6 +1818,16 @@ impl Node {
             {
                 slot.counters.sort = Some(space);
             }
+            // An external merge writes its runs to work files and reads
+            // them back, in pages.
+            if space.method == SortMethod::ExternalMerge {
+                let blocks = space.bytes.div_ceil(8192) as u64;
+                slot.counters.buffers = slot.counters.buffers.plus(BufferUsage {
+                    temp_read: blocks,
+                    temp_written: blocks,
+                    ..BufferUsage::default()
+                });
+            }
         });
     }
 
@@ -1690,6 +1942,53 @@ impl Node {
         });
     }
 
+    /// Counts the node's page accesses by `model` from now on.
+    pub(crate) fn page_model(self, model: PageModel) {
+        self.with(|slot, _| {
+            if slot.pages.is_none() {
+                slot.page_loop.misses = crate::store::thread_misses();
+            }
+            slot.pages = Some(model);
+            slot.counters.paged = true;
+        });
+    }
+
+    /// Counts a read of heap page `page`, unless it is the page the scan
+    /// read last.
+    pub(crate) fn heap_page(self, page: u64) {
+        self.with(|slot, _| {
+            let pages = &mut slot.page_loop;
+            if slot.pages.is_none() || pages.last == Some(page) {
+                return;
+            }
+            pages.last = Some(page);
+            pages.heap += 1;
+            let misses = crate::store::thread_misses();
+            if misses != pages.misses {
+                pages.misses = misses;
+                pages.read += 1;
+            }
+        });
+    }
+
+    /// Counts a row a sequential scan examined.
+    pub(crate) fn examined(self) {
+        self.with(|slot, _| {
+            if slot.pages.is_some() {
+                slot.page_loop.examined += 1;
+            }
+        });
+    }
+
+    /// Counts an index entry the node's search reached.
+    pub(crate) fn index_entry(self) {
+        self.with(|slot, _| {
+            if slot.pages.is_some() {
+                slot.page_loop.entries += 1;
+            }
+        });
+    }
+
     /// Counts a row an index-only scan read from its heap page.
     pub(crate) fn heap_fetch(self) {
         self.with(|slot, _| {
@@ -1747,6 +2046,7 @@ impl Node {
             if slot.open != 0 {
                 return;
             }
+            slot.end_page_loop();
             let first = slot.counters.loops == 0;
             slot.counters.loops = 1;
             if let Some(started) = slot.started.take() {
@@ -1769,6 +2069,7 @@ impl Node {
             if slot.open != 0 {
                 return;
             }
+            slot.end_page_loop();
             slot.counters.loops += 1;
             if let Some(started) = slot.started.take() {
                 let total = elapsed_nanos(started);
@@ -2031,7 +2332,7 @@ mod tests {
             Slot::new(Some(nested)),
             Slot::new(None),
         ];
-        analyze(&mut slots, false, || {
+        analyze(&mut slots, false, false, || {
             let scan = node(Role::Scan(0));
             for _ in 0..2 {
                 let _loop = scan.start();
@@ -2058,7 +2359,7 @@ mod tests {
         let write = NodeKey::new(BlockId::ROOT.child(Segment::Cte(0)), Role::Scan(0));
         let read = NodeKey::new(BlockId::ROOT, Role::Scan(0));
         let mut slots = [Slot::new(Some(write)), Slot::new(Some(read))];
-        analyze(&mut slots, false, || {
+        analyze(&mut slots, false, false, || {
             restart();
             {
                 let _cte = enter(Segment::Cte(0));
@@ -2088,7 +2389,7 @@ mod tests {
     fn a_node_run_in_steps_counts_one_loop() {
         let modify = NodeKey::new(BlockId::ROOT, Role::Modify);
         let mut slots = [Slot::new(Some(modify))];
-        analyze(&mut slots, false, || {
+        analyze(&mut slots, false, false, || {
             for _ in 0..3 {
                 let node = node(Role::Modify);
                 let _step = node.step();
@@ -2123,7 +2424,7 @@ mod tests {
     fn suspended_bodies_count_nothing() {
         let scan = NodeKey::new(BlockId::ROOT, Role::Scan(0));
         let mut slots = [Slot::new(Some(scan))];
-        analyze(&mut slots, true, || {
+        analyze(&mut slots, true, false, || {
             let _body = suspend();
             let scan = node(Role::Scan(0));
             let _loop = scan.start();

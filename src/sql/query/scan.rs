@@ -1117,6 +1117,39 @@ pub(crate) struct IndexedCandidates<'a> {
     payload_mask: ColumnSet,
     keys: Option<&'a [IndexKeyCandidate]>,
     encoded_keys: &'a [u8],
+    /// The candidates hold every row the chosen path's index conditions
+    /// reach, so `EXPLAIN ANALYZE` counts the path over them.
+    reaches_path: bool,
+}
+
+/// The `AND` of an index or index-only scan's index conditions, or of a
+/// single bitmap index scan's, which every row the path reaches meets;
+/// `None` for a path reaching rows otherwise.
+fn path_index_conditions<'a>(
+    path: &super::index_paths::ScanPath<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    use super::index_paths::ScanKind;
+    let conditions = match path.kind {
+        ScanKind::Index | ScanKind::IndexOnly => path.conditions,
+        ScanKind::Bitmap if path.bitmap.len() == 1 => path.conditions,
+        ScanKind::Bitmap | ScanKind::Seq => return Ok(None),
+    };
+    let mut conjunction: Option<&'a Expr<'a>> = None;
+    for condition in conditions {
+        conjunction = Some(match conjunction {
+            None => condition.source,
+            Some(left) => arena
+                .alloc(Expr::Binary {
+                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                    operator: crate::sql::ast::BinaryOp::And,
+                    left,
+                    right: condition.source,
+                })
+                .map_err(|_| arena_full())?,
+        });
+    }
+    Ok(conjunction)
 }
 
 impl<'a> IndexedCandidates<'a> {
@@ -4089,6 +4122,7 @@ fn ranked_knn_candidates<'a>(
             payload_mask: storage.value_binding_include_mask(slot, plan.binding),
             keys: Some(&[]),
             encoded_keys: &[],
+            reaches_path: false,
         }));
     }
     let origin_bounds = crate::sql::geometry::index_bounds(origin)?;
@@ -4273,6 +4307,7 @@ fn ranked_knn_candidates<'a>(
         payload_mask: storage.value_binding_include_mask(slot, plan.binding),
         keys: Some(keys),
         encoded_keys: encoded,
+        reaches_path: false,
     }))
 }
 
@@ -4333,6 +4368,7 @@ fn indexed_candidates_for_plan<'a>(
                     payload_mask: storage.value_binding_include_mask(slot, plan.binding),
                     keys: None,
                     encoded_keys: &[],
+                    reaches_path: false,
                 }));
             }
             if is_inclusion_operator(constraint.operator) {
@@ -4887,6 +4923,7 @@ fn indexed_candidates_for_plan<'a>(
         payload_mask: storage.value_binding_include_mask(slot, plan.binding),
         keys: ordered_keys,
         encoded_keys: retained_key_bytes,
+        reaches_path: false,
     }))
 }
 
@@ -8086,8 +8123,13 @@ fn chosen_scan_reaches<'a>(
         }
     }
     use super::index_paths::ScanKind;
-    if counts.kind == ScanKind::Bitmap {
-        counts.bitmap.row();
+    match counts.kind {
+        ScanKind::Bitmap => {
+            counts.bitmap.row();
+            counts.bitmap.index_entry();
+        }
+        ScanKind::Index | ScanKind::IndexOnly => counts.scan.index_entry(),
+        ScanKind::Seq => counts.scan.examined(),
     }
     // SAFETY: the page table lives in the scan's arena for the scope.
     let pages = unsafe { &*counts.pages };
@@ -8103,10 +8145,16 @@ fn chosen_scan_reaches<'a>(
                 if word < seen.len() && seen[word] & (1 << (page % 64)) == 0 {
                     seen[word] |= 1 << (page % 64);
                     counts.scan.heap_block();
+                    counts.scan.heap_page(page);
                 }
             }
-            ScanKind::IndexOnly if page >= counts.visible_pages => counts.scan.heap_fetch(),
-            _ => {}
+            ScanKind::IndexOnly => {
+                if page >= counts.visible_pages {
+                    counts.scan.heap_fetch();
+                    counts.scan.heap_page(page);
+                }
+            }
+            ScanKind::Index | ScanKind::Seq => counts.scan.heap_page(page),
         }
     }
     Ok(true)
@@ -8145,6 +8193,7 @@ fn bitmap_tree_reaches<'a>(
             }
             if reached {
                 nodes[at].row();
+                nodes[at].index_entry();
             }
             Ok((reached, at + 1))
         }
@@ -8772,34 +8821,102 @@ fn member_scan_counts<'a>(
     } else {
         instrument::Node::NONE
     };
+    let tree_nodes = arena
+        .alloc_slice_with(
+            if path.bitmap.len() > 1 {
+                path.bitmap.len()
+            } else {
+                0
+            },
+            |at| {
+                instrument::node(instrument::Role::MemberBitmapNode(
+                    table,
+                    leaf_role,
+                    u16::try_from(at).unwrap_or(u16::MAX),
+                ))
+            },
+        )
+        .map_err(|_| arena_full())?;
+    chosen_scan_counts(storage, txid, leaf, path, node, bitmap, tree_nodes, arena)
+}
+
+/// The counts `path`'s scan of the table in `slot` keeps while its rows are
+/// read, counting into `scan`, the single bitmap index scan `bitmap` and a
+/// bitmap tree's `tree_nodes`: the heap pages its rows lie on when a bitmap
+/// heap scan or an index-only scan needs them or `BUFFERS` counts them, and
+/// each node's page model.
+#[allow(clippy::too_many_arguments)]
+fn chosen_scan_counts<'a>(
+    storage: &Storage,
+    txid: u32,
+    slot: usize,
+    path: &super::index_paths::ScanPath<'a>,
+    scan: instrument::Node,
+    bitmap: instrument::Node,
+    tree_nodes: &'a [instrument::Node],
+    arena: &'a Arena,
+) -> Result<ChosenScanCounts, SqlError> {
+    use super::index_paths::{BitmapPlanKind, ScanKind};
     let tree: &[super::index_paths::BitmapPlanNode<'a>] = if path.bitmap.len() > 1 {
         path.bitmap
     } else {
         &[]
     };
-    let tree_nodes = arena
-        .alloc_slice_with(tree.len(), |at| {
-            instrument::node(instrument::Role::MemberBitmapNode(
-                table,
-                leaf_role,
-                u16::try_from(at).unwrap_or(u16::MAX),
-            ))
-        })
-        .map_err(|_| arena_full())?;
+    let buffers = instrument::buffers_counted();
     let (pages, page_count, visible_pages) =
-        if matches!(path.kind, ScanKind::Bitmap | ScanKind::IndexOnly) {
-            let (pages, page_count) = heap_pages_of_rows(storage, leaf, txid, arena)?;
-            let statistics = storage.table_statistics(leaf, txid);
-            let activity = storage.relation_cumulative_statistics(leaf);
+        if buffers || matches!(path.kind, ScanKind::Bitmap | ScanKind::IndexOnly) {
+            let (pages, page_count) = instrument::heap_pages(slot, arena, |arena| {
+                heap_pages_of_rows(storage, slot, txid, arena).map(|(rows, pages)| (&*rows, pages))
+            })?;
+            let statistics = storage.table_statistics(slot, txid);
+            let activity = storage.relation_cumulative_statistics(slot);
+            // The visibility map keeps the pages VACUUM set that no later
+            // change touched.
             let visible = if activity.n_dead_tup != 0 {
                 0
             } else {
                 statistics.relation_all_visible_pages().max(0) as u64
             };
-            (pages as *const [(u64, u64)], page_count, visible)
+            (pages, page_count, visible)
         } else {
-            (&[][..] as *const [(u64, u64)], 0, 0)
+            (&[][..], 0, 0)
         };
+    if buffers {
+        let model = instrument::PageModel {
+            local: storage.table_def(slot, txid).persistence
+                == crate::storage::RelationPersistence::Temporary,
+            relation_pages: page_count,
+            rows: pages.len() as u64,
+            index: None,
+            sequential: false,
+            visibility_map: false,
+        };
+        let index = |node: &super::index_paths::BitmapPlanNode<'_>| match node.kind {
+            BitmapPlanKind::Index { pages, .. } => Some(pages),
+            BitmapPlanKind::And | BitmapPlanKind::Or => None,
+        };
+        scan.page_model(instrument::PageModel {
+            index: matches!(path.kind, ScanKind::Index | ScanKind::IndexOnly)
+                .then_some(path.index_pages),
+            sequential: path.kind == ScanKind::Seq,
+            visibility_map: path.kind == ScanKind::IndexOnly && visible_pages > 0,
+            ..model
+        });
+        if let Some(only) = path.bitmap.first().filter(|_| tree.is_empty()) {
+            bitmap.page_model(instrument::PageModel {
+                index: index(only),
+                ..model
+            });
+        }
+        for (node, plan) in tree_nodes.iter().zip(tree) {
+            if let Some(pages) = index(plan) {
+                node.page_model(instrument::PageModel {
+                    index: Some(pages),
+                    ..model
+                });
+            }
+        }
+    }
     let seen = arena
         .alloc_slice_with(page_count.div_ceil(64) as usize, |_| 0u64)
         .map_err(|_| arena_full())?;
@@ -8815,9 +8932,9 @@ fn member_scan_counts<'a>(
         tree: core::ptr::slice_from_raw_parts(tree.as_ptr().cast(), tree.len()),
         tree_nodes: tree_nodes as *const [instrument::Node],
         kind: path.kind,
-        scan: node,
+        scan,
         bitmap,
-        pages,
+        pages: pages as *const [(u64, u64)],
         seen: seen as *mut [u64],
         visible_pages,
     })
@@ -8953,11 +9070,12 @@ pub(crate) fn index_key_order<'a>(
 }
 
 /// `(row identity, heap page)` pairs.
-type RowPages<'a> = &'a mut [(u64, u64)];
+pub(super) type RowPages<'a> = &'a mut [(u64, u64)];
 
 /// The heap page of each visible row of the table in `slot`, sorted by row
-/// identity, and the pages a bitmap scan's page bits need.
-fn heap_pages_of_rows<'a>(
+/// identity, and the table's pages, which a bitmap scan's page bits need:
+/// the map lives in `arena`'s persistent tail.
+pub(super) fn heap_pages_of_rows<'a>(
     storage: &Storage,
     slot: usize,
     txid: u32,
@@ -8970,7 +9088,7 @@ fn heap_pages_of_rows<'a>(
     let schema = &schema[..n_columns];
     let count = storage.visible_row_count(slot, txid)?;
     let pages = arena
-        .alloc_slice_with(count, |_| (0u64, 0u64))
+        .alloc_persistent_slice_with(count, |_| (0u64, 0u64))
         .map_err(|_| arena_full())?;
     let mut packing = crate::storage::heap_layout::HeapPacking::new();
     let mut filled = 0usize;
@@ -9045,6 +9163,14 @@ fn scan_source_mode<'a>(
     planned: Option<super::index_paths::ScanPath<'a>>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
+    // A parenthesized join whose query waits is read only by the join
+    // search, which runs its members.
+    if scope.has_deferred_joins() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a parenthesized join's rows are read before its query ran"
+        ));
+    }
     let current_role = admit_sources(storage, scope, txid, pax_demand)?;
     validate_materialized_view_reads(storage, scope, where_clause, arena, txid)?;
     if !one_time_filter_passes(where_clause, scope, arena, params, hooks, outer)? {
@@ -11345,7 +11471,9 @@ fn scan_source_mode<'a>(
                 } else {
                     None
                 };
-                let access = access.filter(|_| chosen.is_none() || !instrument::active());
+                let access = access.filter(|access| {
+                    chosen.is_none() || !instrument::active() || access.reaches_path
+                });
                 let candidates = access.map(|access| access.rowids).or(hashed);
                 let index_order = match chosen {
                     Some(path) => path.kind != super::index_paths::ScanKind::Seq,
@@ -11366,7 +11494,18 @@ fn scan_source_mode<'a>(
                     StopAfterScope::enter(slot, chosen.and_then(|path| path.stop_after));
                 let _bitmap_loop;
                 let _tree_loops;
-                let _chosen_scope = match chosen {
+                // A described path whose index candidates already come in its
+                // order (a merge join's ordered input) runs on them; it still
+                // counts what its path reads.
+                let counted = chosen.or_else(|| {
+                    planned.filter(|_| {
+                        depth == 0
+                            && scope.n == 1
+                            && instrument::active()
+                            && access.is_some_and(|access| access.preserves_order)
+                    })
+                });
+                let _chosen_scope = match counted {
                     Some(path) if instrument::active() => {
                         use super::index_paths::ScanKind;
                         let bitmap = if path.kind == ScanKind::Bitmap {
@@ -11388,50 +11527,20 @@ fn scan_source_mode<'a>(
                             })
                             .map_err(|_| arena_full())?;
                         _tree_loops = instrument::Loops::start(tree_nodes);
-                        let tree: &[super::index_paths::BitmapPlanNode<'a>] =
+                        Some(ChosenScanScope::enter(Some(chosen_scan_counts(
+                            storage,
+                            txid,
+                            slot,
+                            &path,
+                            depth_nodes[0].scan,
+                            bitmap,
                             if path.bitmap.len() > 1 {
-                                path.bitmap
+                                tree_nodes
                             } else {
                                 &[]
-                            };
-                        let (pages, page_count, visible_pages) =
-                            if matches!(path.kind, ScanKind::Bitmap | ScanKind::IndexOnly) {
-                                let (pages, page_count) =
-                                    heap_pages_of_rows(storage, slot, txid, arena)?;
-                                let statistics = storage.table_statistics(slot, txid);
-                                let activity = storage.relation_cumulative_statistics(slot);
-                                // The visibility map keeps the pages VACUUM set
-                                // that no later change touched.
-                                let visible = if activity.n_dead_tup != 0 {
-                                    0
-                                } else {
-                                    statistics.relation_all_visible_pages().max(0) as u64
-                                };
-                                (pages as *const [(u64, u64)], page_count, visible)
-                            } else {
-                                (&[][..] as *const [(u64, u64)], 0, 0)
-                            };
-                        let seen = arena
-                            .alloc_slice_with(page_count.div_ceil(64) as usize, |_| 0u64)
-                            .map_err(|_| arena_full())?;
-                        Some(ChosenScanScope::enter(Some(ChosenScanCounts {
-                            conditions: core::ptr::slice_from_raw_parts(
-                                path.conditions.as_ptr().cast(),
-                                path.conditions.len(),
-                            ),
-                            predicate: core::ptr::slice_from_raw_parts(
-                                path.predicate.as_ptr().cast(),
-                                path.predicate.len(),
-                            ),
-                            tree: core::ptr::slice_from_raw_parts(tree.as_ptr().cast(), tree.len()),
-                            tree_nodes: tree_nodes as *const [instrument::Node],
-                            kind: path.kind,
-                            scan: depth_nodes[0].scan,
-                            bitmap,
-                            pages,
-                            seen: seen as *mut [u64],
-                            visible_pages,
-                        })))
+                            },
+                            arena,
+                        )?)))
                     }
                     _ => Some(ChosenScanScope::enter(None)),
                 };
@@ -11866,13 +11975,30 @@ fn scan_source_mode<'a>(
 
     let automatic_indexed = if sample_plans.iter().any(Option::is_some) {
         None
-    } else if planned.is_some() {
+    } else if let Some(path) = planned {
         // A join's described scan reads only the rows an index finds for
         // its outer row's keys, a superset its conditions filter, in the
-        // order its path gives them; `EXPLAIN ANALYZE` counts the path's
-        // own reads.
+        // order its path gives them. `EXPLAIN ANALYZE` counts the path's
+        // own reads: it reads the rows an index finds for the path's own
+        // index conditions, every row they reach among them.
         if instrument::active() {
-            None
+            match path_index_conditions(&path, arena)? {
+                Some(conditions) => indexed_candidates(
+                    storage,
+                    scope,
+                    txid,
+                    Some(conditions),
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                )?
+                .map(|candidates| IndexedCandidates {
+                    reaches_path: true,
+                    ..candidates.unordered()
+                }),
+                None => None,
+            }
         } else {
             indexed_candidates(
                 storage,

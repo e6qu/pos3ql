@@ -37626,7 +37626,6 @@ fn execute_plpgsql_dynamic_explain(
                     "EXPLAIN ANALYZE is not available in trigger execution"
                 )));
             };
-            let before = engine.storage.block_io_stats();
             let (before_wal_records, before_wal_bytes) = engine.wal.stage_stats(txn.txid);
             let touched_mark = txn.touched().len();
             let started = std::time::Instant::now();
@@ -37643,10 +37642,14 @@ fn execute_plpgsql_dynamic_explain(
                 )
             };
             let execution = match (plan.as_mut(), rewritten.as_mut()) {
-                (Some(plan), _) => plan.analyze(arena, options.timing, run),
-                (None, Some(queries)) => {
-                    super::explain::analyze_rewritten(queries, arena, options.timing, run)
-                }
+                (Some(plan), _) => plan.analyze(arena, options, run),
+                (None, Some(queries)) => super::explain::analyze_rewritten(
+                    queries,
+                    arena,
+                    options.timing,
+                    options.buffers,
+                    run,
+                ),
                 (None, None) => unreachable!("an unrewritten statement is planned"),
             };
             let output = responder.finish_discard_query_output();
@@ -37667,7 +37670,6 @@ fn execute_plpgsql_dynamic_explain(
             Some(super::explain::ExplainActual {
                 rows: super::explained_root_rows(planned.statement, output.rows),
                 elapsed_micros,
-                io: engine.storage.block_io_stats().saturating_sub(before),
                 serialized_bytes: output.serialized_bytes,
                 serialization_micros: output.serialization_micros,
                 wal_records: after_wal_records

@@ -2371,6 +2371,7 @@ pub(crate) fn scan_path<'a>(
                     .map_or(0, |definition| definition.created_at),
                 pages: 1.0,
                 height: 0,
+                leaves: 1.0,
                 deduplicated: false,
                 tuples: size.tuples,
             }
@@ -2396,7 +2397,7 @@ pub(crate) fn scan_path<'a>(
         arena,
     };
     // The btree layouts, which read the planner's distinct estimates.
-    let mut layouts = [(1.0, 0u32, false); MAX_INDEXES];
+    let mut layouts = [(1.0, 0u32, 1.0, false); MAX_INDEXES];
     for (position, index) in planner.indexes.iter().enumerate() {
         if index.catalog.method == IndexAccessMethod::Btree {
             layouts[position] = super::btree_layout(&planner, index, entries);
@@ -2406,7 +2407,8 @@ pub(crate) fn scan_path<'a>(
         .alloc_slice_with(index_count, |position| IndexInfo {
             pages: layouts[position].0,
             height: layouts[position].1,
-            deduplicated: layouts[position].2,
+            leaves: layouts[position].2,
+            deduplicated: layouts[position].3,
             ..planner.indexes[position]
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
@@ -2603,7 +2605,7 @@ pub(crate) fn scan_path<'a>(
     };
     let all_props = Prop::all(restrictions, arena)?;
     let mut pred_ok = [false; MAX_INDEXES];
-    let mut partial_layouts = [None::<(f64, u32, bool, f64)>; MAX_INDEXES];
+    let mut partial_layouts = [None::<(f64, u32, f64, bool, f64)>; MAX_INDEXES];
     for position in 0..index_count {
         let index = planner.indexes[position].catalog;
         if !usable[position] || !index.partial {
@@ -2633,9 +2635,15 @@ pub(crate) fn scan_path<'a>(
                 "a partial index whose predicate the model does not read",
             ));
         };
-        let (pages, height, deduplicated) =
+        let (pages, height, leaves, deduplicated) =
             super::btree_layout(&planner, &planner.indexes[position], entries);
-        partial_layouts[position] = Some((pages, height, deduplicated, entries.min(size.tuples)));
+        partial_layouts[position] = Some((
+            pages,
+            height,
+            leaves,
+            deduplicated,
+            entries.min(size.tuples),
+        ));
     }
     // The restrictions each usable predicate implies (`indrestrictinfo`); a
     // write's target keeps them all.
@@ -2654,9 +2662,10 @@ pub(crate) fn scan_path<'a>(
     }
     let indexes = arena
         .alloc_slice_with(index_count, |position| match partial_layouts[position] {
-            Some((pages, height, deduplicated, tuples)) => IndexInfo {
+            Some((pages, height, leaves, deduplicated, tuples)) => IndexInfo {
                 pages,
                 height,
+                leaves,
                 deduplicated,
                 tuples,
                 ..planner.indexes[position]
@@ -4314,6 +4323,7 @@ fn describe<'a>(
         kind: chosen.kind,
         index_oid: 0,
         index_name: crate::util::StackStr::new(),
+        index_pages: super::IndexPages::NONE,
         keys: &[],
         conditions: &[],
         bitmap: &[],
@@ -4359,6 +4369,7 @@ fn describe<'a>(
             let info = planner.indexes[index_path.index];
             path.index_oid = info.catalog.oid;
             path.index_name = info.catalog.name;
+            path.index_pages = super::IndexPages::of(&info);
             path.backward = index_path.backward;
             path.deduplicated = info.deduplicated;
             path.keys = arena
@@ -4440,6 +4451,7 @@ fn describe<'a>(
                     index_name,
                     conditions,
                     predicate,
+                    ..
                 } = node.kind
             {
                 path.conditions = conditions;
@@ -4636,6 +4648,7 @@ fn bitmap_plan<'a>(
             outside!(push(BitmapPlanNode {
                 kind: BitmapPlanKind::Index {
                     index_name: info.catalog.name,
+                    pages: super::IndexPages::of(&info),
                     conditions,
                     predicate: predicate_sources(arena, predicate)?,
                 },

@@ -26,8 +26,7 @@ use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
     AggState, GroupedRewrite, Outcome, QueryScope, arena_full, collect_grouped_aggs,
     collect_grouped_sublinks, instrument, pax_column_demand, project_row, record_star_width,
-    rewrite_grouped_expr, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
-    sql_fail, sql_ok, window_row,
+    rewrite_grouped_expr, scan_source_recycling_with_pax_columns, sql_fail, sql_ok, window_row,
 };
 
 /// The WHERE conjuncts the scan applies, and the correlated subqueries the
@@ -1973,33 +1972,58 @@ pub(crate) fn project_window_rows<'a>(
     // scans; the materializing pass is.
     let mut count = 0usize;
     let sizing = instrument::suspend();
-    scan_source_with_pax_columns(
-        storage,
-        scope,
-        from,
-        txid,
-        scan_where,
-        arena,
-        params,
-        hooks,
-        outer,
-        pax_columns,
-        &mut |row| {
-            if !row_passes_correlated_where(
-                where_correlated,
-                statement.where_clause,
-                arena,
-                params,
-                hooks,
-                row,
-                outer,
-            )? {
-                return Ok(true);
+    // A join PostgreSQL's join search plans runs that plan, so its rows
+    // reach the windows in its order and `EXPLAIN ANALYZE` counts its nodes;
+    // one relation's scan is the windows' own.
+    let scan =
+        |visit: &mut dyn FnMut(&super::scan::JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>| {
+            if scope.n > 1 {
+                super::join_exec::scan_statement_source(
+                    statement,
+                    false,
+                    storage,
+                    scope,
+                    from,
+                    txid,
+                    scan_where,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                    pax_columns,
+                    visit,
+                )
+            } else {
+                super::scan_source_with_pax_columns(
+                    storage,
+                    scope,
+                    from,
+                    txid,
+                    scan_where,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                    pax_columns,
+                    visit,
+                )
             }
-            count += 1;
-            Ok(true)
-        },
-    )?;
+        };
+    scan(&mut |row| {
+        if !row_passes_correlated_where(
+            where_correlated,
+            statement.where_clause,
+            arena,
+            params,
+            hooks,
+            row,
+            outer,
+        )? {
+            return Ok(true);
+        }
+        count += 1;
+        Ok(true)
+    })?;
     drop(sizing);
     // Pass 2: materialize each row's columns flat in the arena.
     let empty: &[Datum] = &[];
@@ -2007,49 +2031,37 @@ pub(crate) fn project_window_rows<'a>(
         .alloc_slice_with(count, |_| empty)
         .map_err(|_| arena_full())?;
     let mut at = 0usize;
-    scan_source_with_pax_columns(
-        storage,
-        scope,
-        from,
-        txid,
-        scan_where,
-        arena,
-        params,
-        hooks,
-        outer,
-        pax_columns,
-        &mut |row| {
-            if !row_passes_correlated_where(
-                where_correlated,
-                statement.where_clause,
-                arena,
-                params,
-                hooks,
-                row,
-                outer,
-            )? {
-                return Ok(true);
+    scan(&mut |row| {
+        if !row_passes_correlated_where(
+            where_correlated,
+            statement.where_clause,
+            arena,
+            params,
+            hooks,
+            row,
+            outer,
+        )? {
+            return Ok(true);
+        }
+        let flat = arena
+            .alloc_slice_with(total + scope.n, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (t, offset) in offs.iter().enumerate().take(scope.n) {
+            let def = scope.defs.get(t).expect("resolved");
+            let vals = row.table_values(t).expect("bound");
+            for c in 0..def.n_columns {
+                flat[offset + c] = if vals.is_empty() {
+                    Datum::Null
+                } else {
+                    vals[c]
+                };
             }
-            let flat = arena
-                .alloc_slice_with(total + scope.n, |_| Datum::Null)
-                .map_err(|_| arena_full())?;
-            for (t, offset) in offs.iter().enumerate().take(scope.n) {
-                let def = scope.defs.get(t).expect("resolved");
-                let vals = row.table_values(t).expect("bound");
-                for c in 0..def.n_columns {
-                    flat[offset + c] = if vals.is_empty() {
-                        Datum::Null
-                    } else {
-                        vals[c]
-                    };
-                }
-                flat[total + t] = flat_table_oid(scope, row, t)?;
-            }
-            rows[at] = &flat[..total + scope.n];
-            at += 1;
-            Ok(true)
-        },
-    )?;
+            flat[total + t] = flat_table_oid(scope, row, t)?;
+        }
+        rows[at] = &flat[..total + scope.n];
+        at += 1;
+        Ok(true)
+    })?;
     let rows: &[&[Datum]] = &rows[..count];
 
     // Compute each window function's per-row values.

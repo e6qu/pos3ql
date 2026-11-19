@@ -16,7 +16,7 @@ use crate::sql::ast::{
 use crate::sql::eval::{ColumnLookup, SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
 use crate::sql::query::instrument::{
-    BlockId, HashColumns, NodeCounters, NodeKey, Role, Segment, Slot,
+    BlockId, BufferUsage, HashColumns, NodeCounters, NodeKey, Role, Segment, Slot,
 };
 use crate::sql::query::{self, QueryScope};
 use crate::sql::types::{ColDesc, Datum, oid};
@@ -510,7 +510,6 @@ impl QualLabel {
 pub(super) struct ExplainActual {
     pub(super) rows: u64,
     pub(super) elapsed_micros: u64,
-    pub(super) io: BlockIoStats,
     pub(super) serialized_bytes: u64,
     pub(super) serialization_micros: u64,
     pub(super) wal_records: u64,
@@ -582,13 +581,15 @@ impl<'a> Plan<'a> {
     }
 
     /// Runs `execute`, the statement this plan explains, counting the work
-    /// of each node that has a key; `timing` also measures its time.
+    /// of each node that has a key; `TIMING` also measures its time. A plan
+    /// [`printable`] rejects is rejected before the statement runs.
     pub(super) fn analyze<R>(
         &mut self,
         arena: &'a Arena,
-        timing: bool,
+        options: ExplainOptions,
         execute: impl FnOnce() -> R,
     ) -> Result<R, SqlError> {
+        let timing = options.timing;
         // PostgreSQL's per-scan pruning by a subplan's value runs the subplan
         // first and skips the members it rules out; execution here reads
         // them all, so the counts would differ.
@@ -618,11 +619,12 @@ impl<'a> Plan<'a> {
                     .with_hash_agg(nodes[index].hash_agg)
             })
             .map_err(|_| query::arena_full_pub())?;
-        let result = query::instrument::analyze(slots, timing, execute);
+        let result = query::instrument::analyze(slots, timing, options.buffers, execute);
         let counters = arena
             .alloc_slice_with(self.count, |index| slots[index].counters())
             .map_err(|_| query::arena_full_pub())?;
         mirror_passthrough(nodes, counters);
+        buffers_counted(nodes, counters, options.buffers)?;
         self.measured = Some(counters);
         if counters
             .iter()
@@ -645,17 +647,7 @@ impl<'a> Plan<'a> {
             return None;
         }
         let measured = self.measured?;
-        let named = |at: &usize| {
-            self.nodes[*at].subplan.as_ref().is_some_and(|(_, name)| {
-                name.as_str()
-                    .strip_prefix("CTE ")
-                    .is_some_and(|name| name == node.relation.as_str())
-            })
-        };
-        let root = (0..index)
-            .rev()
-            .find(named)
-            .or_else(|| (index + 1..self.count).find(named));
+        let root = self.cte_root(index);
         let stored = root.and_then(|root| {
             let depth = self.nodes[root].depth;
             (root..self.count)
@@ -741,6 +733,80 @@ impl<'a> Plan<'a> {
         } else {
             NodeActual::NeverExecuted
         }
+    }
+
+    /// The pages node `index` and the nodes below it accessed, as
+    /// PostgreSQL's per-node buffer usage includes its inputs' and
+    /// subplans'; nothing before `EXPLAIN ANALYZE` ran the plan. A `WITH`
+    /// query runs inside the first `CTE Scan` that reads it, so its pages
+    /// count there rather than under the node listing it, with the work
+    /// files of a tuplestore that outgrew memory.
+    fn buffers(&self, index: usize) -> BufferUsage {
+        let Some(measured) = self.measured else {
+            return BufferUsage::default();
+        };
+        let depth = self.nodes[index].depth;
+        let mut usage = BufferUsage::default();
+        let mut at = index;
+        while at < self.count && (at == index || self.nodes[at].depth > depth) {
+            if at != index && self.cte_reader(at).is_some() {
+                at = self.subtree_end(at);
+                continue;
+            }
+            usage = usage.plus(measured[at].buffers);
+            if let Some(root) = self
+                .cte_root(at)
+                .filter(|&root| self.cte_reader(root) == Some(at))
+            {
+                usage = usage.plus(self.buffers(root));
+                if let Some((true, bytes)) = self.cte_storage(at) {
+                    let blocks = bytes.div_ceil(8192) as u64;
+                    usage = usage.plus(BufferUsage {
+                        temp_read: blocks,
+                        temp_written: blocks,
+                        ..BufferUsage::default()
+                    });
+                }
+            }
+            at += 1;
+        }
+        usage
+    }
+
+    /// The index after node `index`'s subtree.
+    fn subtree_end(&self, index: usize) -> usize {
+        let depth = self.nodes[index].depth;
+        (index + 1..self.count)
+            .find(|&at| self.nodes[at].depth <= depth)
+            .unwrap_or(self.count)
+    }
+
+    /// The root of the `WITH` query the `CTE Scan` at `index` reads.
+    fn cte_root(&self, index: usize) -> Option<usize> {
+        let node = &self.nodes[index];
+        if node.name.as_str() != "CTE Scan" {
+            return None;
+        }
+        let named = |at: &usize| {
+            self.nodes[*at].subplan.as_ref().is_some_and(|(_, name)| {
+                name.as_str()
+                    .strip_prefix("CTE ")
+                    .is_some_and(|name| name == node.relation.as_str())
+            })
+        };
+        (0..index)
+            .rev()
+            .find(named)
+            .or_else(|| (index + 1..self.count).find(named))
+    }
+
+    /// The first `CTE Scan` that ran reading the `WITH` query whose root is
+    /// at `root`, which runs it.
+    fn cte_reader(&self, root: usize) -> Option<usize> {
+        let measured = self.measured?;
+        let (_, name) = self.nodes[root].subplan.as_ref()?;
+        name.as_str().strip_prefix("CTE ")?;
+        (0..self.count).find(|&at| measured[at].loops != 0 && self.cte_root(at) == Some(root))
     }
 
     /// What an analyzed `MERGE` did with the rows of its join, the node at
@@ -6411,6 +6477,15 @@ fn plan_pulled_select<'a>(
         )?,
         _ => None,
     };
+    // Windows over a join the join search does not plan would print
+    // pos3ql's own join order and sorts.
+    if modeled.is_none() && scope.as_ref().is_some_and(|scope| scope.n > 1) && has_window(statement)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of window functions over a join PostgreSQL's join search does not plan here is not supported"
+        ));
+    }
     let (modeled, windowed_scan) = match modeled {
         Some(model)
             if !model.windows.is_empty() && scope.as_ref().is_some_and(|scope| scope.n == 1) =>
@@ -6655,6 +6730,12 @@ fn plan_pulled_select<'a>(
                     upper_nodes[upper_count].analyze_unsupported = Some(
                         "EXPLAIN ANALYZE of window functions over a join's groups is not supported",
                     );
+                }
+                // A limit directly above the windows stops them early; their
+                // execution computes every row first.
+                if model.plan.upper.limit.is_some() && model.plan.upper.sort.is_none() {
+                    upper_nodes[upper_count].analyze_unsupported =
+                        Some("EXPLAIN ANALYZE of window functions under a limit is not supported");
                 }
                 upper_count += 1;
             }
@@ -14632,19 +14713,11 @@ pub(super) fn visit_text_rows<E>(
             let _ = write!(filter, "One-Time Filter: false");
             emit(filter.as_str())?;
         }
-        if index == 0 && options.buffers {
-            let actual = actual.expect("BUFFERS requires ANALYZE");
-            let hits = actual.io.ram_hits.saturating_add(actual.io.disk_hits);
-            if hits != 0 || actual.io.object_gets != 0 {
-                let mut buffers = StackStr::<512>::new();
-                let _ = write!(buffers, "  Buffers: shared");
-                if hits != 0 {
-                    let _ = write!(buffers, " hit={hits}");
-                }
-                if actual.io.object_gets != 0 {
-                    let _ = write!(buffers, " read={}", actual.io.object_gets);
-                }
-                emit(buffers.as_str())?;
+        if options.buffers && actual.is_some() && !matches!(node_actual, NodeActual::NeverExecuted)
+        {
+            let usage = plan.buffers(index);
+            if !usage.is_zero() {
+                emit(buffers_text(node_indent(node), usage).as_str())?;
             }
         }
         if index == 0
@@ -14708,31 +14781,44 @@ pub(super) fn visit_text_rows<E>(
             plan.planning_micros as f64 / 1_000.0
         );
         emit(planning.as_str())?;
-        if let Some(actual) = actual {
-            if options.serialize != ExplainSerialize::None {
-                let mut serialization = StackStr::<512>::new();
-                let format = match options.serialize {
-                    ExplainSerialize::None => unreachable!(),
-                    ExplainSerialize::Text => "text",
-                    ExplainSerialize::Binary => "binary",
-                };
-                let _ = write!(
-                    serialization,
-                    "Serialization: time={:.3} ms  output={}kB  format={}",
-                    actual.serialization_micros as f64 / 1_000.0,
-                    actual.serialized_bytes.div_ceil(1024),
-                    format
-                );
-                emit(serialization.as_str())?;
-            }
-            let mut execution = StackStr::<512>::new();
+    }
+    // `ExplainPrintSerialize`, whatever `SUMMARY` says; sending the rows
+    // reads no page, so no `Buffers` line follows it.
+    if let Some(actual) = actual
+        && options.serialize != ExplainSerialize::None
+    {
+        let mut serialization = StackStr::<512>::new();
+        let format = match options.serialize {
+            ExplainSerialize::None => unreachable!(),
+            ExplainSerialize::Text => "text",
+            ExplainSerialize::Binary => "binary",
+        };
+        let _ = write!(serialization, "Serialization: ");
+        if options.timing {
             let _ = write!(
-                execution,
-                "Execution Time: {:.3} ms",
-                actual.elapsed_micros as f64 / 1_000.0
+                serialization,
+                "time={:.3} ms  ",
+                actual.serialization_micros as f64 / 1_000.0
             );
-            emit(execution.as_str())?;
         }
+        let _ = write!(
+            serialization,
+            "output={}kB  format={}",
+            actual.serialized_bytes.div_ceil(1024),
+            format
+        );
+        emit(serialization.as_str())?;
+    }
+    if options.summary
+        && let Some(actual) = actual
+    {
+        let mut execution = StackStr::<512>::new();
+        let _ = write!(
+            execution,
+            "Execution Time: {:.3} ms",
+            actual.elapsed_micros as f64 / 1_000.0
+        );
+        emit(execution.as_str())?;
     }
     Ok(())
 }
@@ -15536,26 +15622,79 @@ fn node_kind(node: &PlanNode) -> NodeKind<'_> {
     kind
 }
 
-/// The buffer counters PostgreSQL shows for a node or for planning. Cache
-/// tiers map onto PostgreSQL's shared hit/read vocabulary; unmodelled local
-/// and temp counters are zero.
-fn structured_buffers(document: &mut Document<'_>, io: Option<BlockIoStats>) {
-    let io = io.unwrap_or_default();
-    let hit = io.ram_hits.saturating_add(io.disk_hits);
+/// The buffer counters PostgreSQL shows for a node, for planning or for
+/// serialization (`show_buffer_usage`), every one even when zero.
+fn structured_buffers(document: &mut Document<'_>, usage: BufferUsage) {
     for (label, value) in [
-        ("Shared Hit Blocks", hit),
-        ("Shared Read Blocks", io.object_gets),
-        ("Shared Dirtied Blocks", 0),
-        ("Shared Written Blocks", 0),
-        ("Local Hit Blocks", 0),
-        ("Local Read Blocks", 0),
-        ("Local Dirtied Blocks", 0),
-        ("Local Written Blocks", 0),
-        ("Temp Read Blocks", 0),
-        ("Temp Written Blocks", 0),
+        ("Shared Hit Blocks", usage.shared_hit),
+        ("Shared Read Blocks", usage.shared_read),
+        ("Shared Dirtied Blocks", usage.shared_dirtied),
+        ("Shared Written Blocks", usage.shared_written),
+        ("Local Hit Blocks", usage.local_hit),
+        ("Local Read Blocks", usage.local_read),
+        ("Local Dirtied Blocks", usage.local_dirtied),
+        ("Local Written Blocks", usage.local_written),
+        ("Temp Read Blocks", usage.temp_read),
+        ("Temp Written Blocks", usage.temp_written),
     ] {
         document.number(label, value);
     }
+}
+
+/// A text plan's `Buffers:` line at `indent`, which shows only the
+/// counters above zero (`show_buffer_usage`).
+fn buffers_text(indent: usize, usage: BufferUsage) -> StackStr<512> {
+    let mut line = StackStr::<512>::new();
+    for _ in 0..indent {
+        let _ = write!(line, " ");
+    }
+    let _ = write!(line, "Buffers:");
+    let groups = [
+        (
+            "shared",
+            [
+                ("hit", usage.shared_hit),
+                ("read", usage.shared_read),
+                ("dirtied", usage.shared_dirtied),
+                ("written", usage.shared_written),
+            ],
+        ),
+        (
+            "local",
+            [
+                ("hit", usage.local_hit),
+                ("read", usage.local_read),
+                ("dirtied", usage.local_dirtied),
+                ("written", usage.local_written),
+            ],
+        ),
+        (
+            "temp",
+            [
+                ("hit", 0),
+                ("read", usage.temp_read),
+                ("dirtied", 0),
+                ("written", usage.temp_written),
+            ],
+        ),
+    ];
+    let mut first = true;
+    for (name, counters) in groups {
+        if counters.iter().all(|&(_, value)| value == 0) {
+            continue;
+        }
+        if !first {
+            let _ = write!(line, ",");
+        }
+        first = false;
+        let _ = write!(line, " {name}");
+        for (label, value) in counters {
+            if value > 0 {
+                let _ = write!(line, " {label}={value}");
+            }
+        }
+    }
+    line
 }
 
 /// `ExplainNode` for the subtree at `at`; returns the index after it.
@@ -15863,16 +16002,17 @@ fn structured_node(
     {
         document.number("Batch Size", size);
     }
-    if let Some(actual) = actual {
-        if options.buffers {
-            structured_buffers(document, Some(actual.io));
-        }
-        if options.wal {
-            document.number("WAL Records", actual.wal_records);
-            document.number("WAL FPI", 0);
-            document.number("WAL Bytes", actual.wal_bytes);
-            document.number("WAL Buffers Full", 0);
-        }
+    if options.buffers {
+        // Every node counts its buffers under `BUFFERS`, analyzed or not.
+        structured_buffers(document, plan.buffers(at));
+    }
+    if let Some(actual) = actual
+        && options.wal
+    {
+        document.number("WAL Records", actual.wal_records);
+        document.number("WAL FPI", 0);
+        document.number("WAL Bytes", actual.wal_bytes);
+        document.number("WAL Buffers Full", 0);
     }
     // An `Append`'s members pruned at executor startup, which structured
     // formats report even when none were (`ExplainMissingMembers`).
@@ -15932,10 +16072,11 @@ fn structured_query(
         }
         document.close_group("Settings", true);
     }
-    if options.memory || (options.buffers && options.summary) {
+    // Planning reads no page: pos3ql's catalogs and statistics are resident.
+    if options.memory || options.buffers {
         document.open_group("Planning", Some("Planning"), true);
         if options.buffers {
-            structured_buffers(document, None);
+            structured_buffers(document, BufferUsage::default());
         }
         if options.memory {
             let (used, allocated) = plan.memory_kib();
@@ -15971,7 +16112,7 @@ fn structured_query(
                 },
             );
             if options.buffers {
-                structured_buffers(document, None);
+                structured_buffers(document, BufferUsage::default());
             }
             document.close_group("Serialization", true);
         }
@@ -15997,6 +16138,66 @@ fn render_document<'a>(
         structured_query(&mut document, plan, options, actual, settings);
     }
     document.finish()
+}
+
+/// Rejects `BUFFERS` (on by default under `ANALYZE`) of a plan whose scan
+/// or write of a relation ran on a path that does not count its pages, or
+/// whose hash join ran in batches, whose work files are not sized, rather
+/// than print a plan missing their `Buffers` lines. A write counts its
+/// pages even when the executor does not count its loops.
+fn buffers_counted(
+    nodes: &[PlanNode],
+    counters: &[NodeCounters],
+    buffers: bool,
+) -> Result<(), SqlError> {
+    if !buffers {
+        return Ok(());
+    }
+    for (node, counters) in nodes.iter().zip(counters) {
+        let ran = counters.loops != 0 || writes(node);
+        if ran && !node.target_member && !counters.paged && accesses_pages(node) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN ANALYZE cannot count the buffers of node \"{}\"",
+                node.name.as_str()
+            ));
+        }
+        if counters
+            .hash
+            .and_then(|table| table.batches)
+            .is_some_and(|batches| batches.batches > 1 || batches.original_batches > 1)
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN ANALYZE cannot count the work file buffers of a hash join run in batches"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `node` writes a relation.
+fn writes(node: &PlanNode) -> bool {
+    matches!(node.name.as_str(), "Insert" | "Update" | "Delete" | "Merge")
+}
+
+/// Whether `node` reads or writes a relation's pages.
+fn accesses_pages(node: &PlanNode) -> bool {
+    let name = node.name.as_str();
+    matches!(
+        name,
+        "Seq Scan"
+            | "Bitmap Heap Scan"
+            | "Bitmap Index Scan"
+            | "Tid Scan"
+            | "Tid Range Scan"
+            | "Sample Scan"
+            | "Insert"
+            | "Update"
+            | "Delete"
+            | "Merge"
+    ) || name.starts_with("Index Scan")
+        || name.starts_with("Index Only Scan")
 }
 
 /// Rejects a plan showing costs pos3ql does not model as PostgreSQL does,
@@ -16122,6 +16323,7 @@ pub(super) fn analyze_rewritten<'a, R>(
     queries: &mut [RewrittenQuery<'a>],
     arena: &'a Arena,
     timing: bool,
+    buffers: bool,
     execute: impl FnOnce() -> R,
 ) -> Result<R, SqlError> {
     let planned = |query: &RewrittenQuery<'a>| match query {
@@ -16146,7 +16348,7 @@ pub(super) fn analyze_rewritten<'a, R>(
     let slots = arena
         .alloc_slice_with(total, slot_at)
         .map_err(|_| query::arena_full_pub())?;
-    let result = query::instrument::analyze_queries(slots, timing, execute);
+    let result = query::instrument::analyze_queries(slots, timing, buffers, execute);
     let mut start = 0;
     for query in queries.iter_mut() {
         if let RewrittenQuery::Planned(plan) = query {
@@ -16154,6 +16356,7 @@ pub(super) fn analyze_rewritten<'a, R>(
                 .alloc_slice_with(plan.count, |index| slots[start + index].counters())
                 .map_err(|_| query::arena_full_pub())?;
             mirror_passthrough(&plan.nodes[..plan.count], counters);
+            buffers_counted(&plan.nodes[..plan.count], counters, buffers)?;
             plan.measured = Some(counters);
             start += plan.count;
         }
@@ -16172,6 +16375,7 @@ fn mirror_passthrough(nodes: &[PlanNode], counters: &mut [NodeCounters]) {
                 sort: None,
                 stored: None,
                 memoize: None,
+                buffers: BufferUsage::default(),
                 ..child
             };
         }
@@ -16223,7 +16427,6 @@ pub(super) fn visit_rewritten_rows<E>(
                 ExplainActual {
                     rows: 0,
                     elapsed_micros: 0,
-                    io: BlockIoStats::default(),
                     serialized_bytes: 0,
                     serialization_micros: 0,
                     wal_records: 0,

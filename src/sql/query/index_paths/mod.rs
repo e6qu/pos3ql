@@ -247,9 +247,15 @@ impl Costs {
     }
 }
 
-/// `clamp_row_est`: `rint`, which rounds a half to even.
+/// `MAXIMUM_ROWCOUNT`: the largest row estimate the planner keeps.
+pub(crate) const MAXIMUM_ROWCOUNT: f64 = 1e100;
+
+/// `clamp_row_est`: at most [`MAXIMUM_ROWCOUNT`] (also for NaN), at least
+/// one, else `rint`, which rounds a half to even.
 pub(crate) fn clamp_row_est(rows: f64) -> f64 {
-    if rows <= 1.0 {
+    if rows > MAXIMUM_ROWCOUNT || rows.is_nan() {
+        MAXIMUM_ROWCOUNT
+    } else if rows <= 1.0 {
         1.0
     } else {
         rows.round_ties_even()

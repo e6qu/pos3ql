@@ -1255,18 +1255,21 @@ queries run pos3ql's join order. An `ORDER BY` over a join keeps every joined ro
 the statement arena before sorting, so a join of millions of rows (seven
 8-row tables cross joined, `ORDER BY 1 LIMIT 1`) fails with `54000` where
 PostgreSQL runs a bounded top-N sort; the join's rows must feed the
-spilling sort instead. A join estimated past 2^64 rows refuses
-`EXPLAIN` with costs (`0A000`), since plan rows are kept as integers where
-PostgreSQL prints its double in full. Joins of never-analyzed tables keep
-Joins of never-analyzed tables keep
+spilling sort instead. Plan rows are doubles, printed in full as
+PostgreSQL's `%.0f` prints them, and every row estimate clamps at
+`MAXIMUM_ROWCOUNT` (1e100) as `clamp_row_est` does, so a cross product past
+the largest double keeps finite costs and GEQO finds PostgreSQL's plan
+(`differential_exact/970`, `971`). A `UNION ALL`'s `EXPLAIN` keeps one
+leaf's planning memory at a time. Joins of never-analyzed tables keep
 pos3ql's join order. Modeling them matches PostgreSQL on probe joins but
-needs, first: the join executor yielding on cold reads as the old executor
-does (the `result_streams` and `result_output_tests` streaming tests);
-GEQO finding a plan for the wide explicit-join trees of
-`wide_join_trees_execute_without_allocation` (it fails with `XX000 geqo
-failed to make a valid plan`); and EXPLAIN of the widest statement fitting
-the statement arena (`54000` today). The hash/merge plan tests then take
-PostgreSQL's plans. A parameterized index scan's cost reads its index's pages:
+moves the joins of the result-stream and cursor tests to PostgreSQL's
+plans (merge joins over sorts, hash joins over hash aggregates), which run
+in the general executor: it holds no retained position, so such a result
+cannot stream as the client reads, nor yield on a cold read after its
+first row. Removing the gate needs a retained executor for those plans
+(merge join, sort, hash and hash aggregate nodes keeping their state
+between rows, as the retained nested-loop and hash levels do). The
+hash/merge plan tests then take PostgreSQL's plans. A parameterized index scan's cost reads its index's pages:
 an index built over loaded rows is sized as `_bt_buildadd` fills its
 pages (a page closes when its free space and its last tuple's posting
 list fall under the fill factor's reserve, that tuple moving on), but one

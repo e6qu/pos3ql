@@ -1103,17 +1103,24 @@ files are not sized). An `INSERT ... ON CONFLICT` prints its resolution,
 arbiter indexes and, analyzed, its inserted and conflicting tuples
 (`differential_exact/940`); a conflict target's `WHERE`, a `DO UPDATE ...
 WHERE` (`Conflict Filter`) and an expression target fail `EXPLAIN` with
-`0A000`. A `LIMIT` over a `GroupAggregate` over a join reads the whole join
-rather than stopping after its last group, and a merge join over an input
-in order without a sort fails `EXPLAIN ANALYZE` with `0A000`. An
-uncorrelated scalar subquery's `min` or `max` is planned as an `Aggregate`
-over its scan rather than as `preprocess_minmax_aggregates`' InitPlans, and
-an `INSERT ... SELECT`'s InitPlans print under its source scan rather than
-under the `Insert` node. An error a PL/pgSQL `FOR ... IN EXECUTE` query
-raises while it runs (a unique violation, an `EXPLAIN ANALYZE`'s error)
-carries a `SQL statement` context line, which PostgreSQL prints only for
-errors raised while the query is planned (`_SPI_error_callback` is not
-installed around a cursor's fetches). Windows over a join the search plans read its plan's rows, also when
+`0A000`. A `LIMIT` directly over a sorted grouping stops reading its
+input at the first row of the group after the last one it takes (a
+`GroupAggregate` reads that group's rows, a `Group` of a `GROUP BY`
+without aggregates, costed by `cost_group`, only its first row), and only
+the groups it reads are filtered and projected (`differential_exact/941`).
+A merge join over an input in order without a sort fails `EXPLAIN
+ANALYZE` with `0A000`. An uncorrelated subquery's `min` or `max` is
+planned and run as `preprocess_minmax_aggregates`' InitPlans
+(`differential_exact/942`). An `INSERT` whose source PostgreSQL pulls up
+runs the source's InitPlans in its `Insert` node, as it does a `VALUES`
+row's, and the source's top node computes the target list coerced to the
+columns; a value coerced while the query runs leaves its cost unmodeled
+(`0A000` when costs print), as does a subquery in `ON CONFLICT`
+(`differential_exact/943`). A PL/pgSQL `FOR` loop over a query names it in
+an error's context only when the error is raised planning it
+(`differential_exact/944`). An `IN` over an aggregating subquery is a
+hashed SubPlan rather than PostgreSQL's join of the subquery's one row.
+Windows over a join the search plans read its plan's rows, also when
 the statement spills their input to object storage,
 so `EXPLAIN ANALYZE` counts its nodes (`differential_exact/935`); windows
 over a join it does not plan (a window function in the `ORDER BY`) fail

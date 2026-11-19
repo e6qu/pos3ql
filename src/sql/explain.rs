@@ -6737,11 +6737,8 @@ fn plan_pulled_select<'a>(
     // `Memoize` node, which only the join search plans.
     if modeled.is_none()
         && crate::sql::guc::planner_value("enable_memoize") != 0.0
-        && statement.from.as_ref().is_some_and(|from| {
-            core::iter::once(&from.base)
-                .chain(from.joins.iter().map(|join| &join.table))
-                .any(|table| table.lateral && table.subquery.is_some())
-        })
+        && let (Some(scope), Some(from)) = (scope.as_ref(), statement.from.as_ref())
+        && memoizable_lateral(storage, txid, scope, from)
     {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -16907,6 +16904,92 @@ fn printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), SqlError> {
         )),
         None => Ok(()),
     }
+}
+
+/// Whether a LATERAL subquery reading a relation filters it by a column of
+/// an earlier table whose statistics repeat values (fewer distinct values
+/// than rows): a parameter `Memoize` may cache the subquery's rows by.
+fn memoizable_lateral(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    from: &crate::sql::ast::FromClause<'_>,
+) -> bool {
+    fn conditions<'e>(select: &'e Select<'e>, visit: &mut dyn FnMut(&'e Expr<'e>)) {
+        if let Some(condition) = select.where_clause {
+            visit(condition);
+        }
+        if let Some(from) = select.from.as_ref() {
+            for table in
+                core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table))
+            {
+                if let Some(on) = from
+                    .joins
+                    .iter()
+                    .find(|join| core::ptr::eq(&join.table, table))
+                    .and_then(|join| join.on)
+                {
+                    visit(on);
+                }
+                if let Some(inner) = table.subquery {
+                    conditions(inner, visit);
+                }
+            }
+        }
+    }
+    let tables = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+    for (position, table) in tables.enumerate().take(scope.n) {
+        let Some(select) = table.subquery.filter(|_| table.lateral) else {
+            continue;
+        };
+        if select.from.is_none() {
+            continue;
+        }
+        let mut repeats = false;
+        conditions(select, &mut |condition| {
+            condition.for_each_column_reference(&mut |qualifier, name| {
+                let Some(qualifier) = qualifier else {
+                    return;
+                };
+                let Some(outer) = (0..position).find(|&at| scope.names[at] == qualifier) else {
+                    return;
+                };
+                let slot = scope.slots[outer];
+                if slot == usize::MAX || scope.derived[outer].is_some() {
+                    return;
+                }
+                let statistics = storage.table_statistics(slot, txid);
+                let definition = storage.table_def(slot, txid);
+                let Some(column) = definition
+                    .columns()
+                    .iter()
+                    .position(|column| column.name.as_str() == name)
+                else {
+                    return;
+                };
+                let distinct = definition
+                    .attributes
+                    .number(column)
+                    .and_then(|attribute| statistics.column(attribute))
+                    .filter(|_| statistics.valid && statistics.rows > 0)
+                    .map(|column_statistics| {
+                        crate::storage::column_distinct_estimate(
+                            &definition.columns()[column],
+                            column_statistics,
+                            statistics.rows,
+                            false,
+                        )
+                    });
+                // Without statistics PostgreSQL assumes 200 distinct values.
+                let rows = storage.planning_row_estimate(slot) as f64;
+                repeats |= distinct.unwrap_or(200.0) < rows;
+            });
+        });
+        if repeats {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether two inner-joined scans of one table equate, in `WHERE` or an

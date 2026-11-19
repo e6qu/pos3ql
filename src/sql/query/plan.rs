@@ -1794,12 +1794,16 @@ pub(super) fn fold_catalog_inputs<'a>(
 /// The most subplans one explained statement records costs for.
 const MAX_SUBPLAN_COSTS: usize = 64;
 
+/// Recorded subplan costs: (query address, startup, per-row cost) each,
+/// and how many are held.
+type SubplanCosts = ([(usize, f64, f64); MAX_SUBPLAN_COSTS], usize);
+
 thread_local! {
     /// Per subquery the statement being explained runs as a subplan, by
     /// the address of its query: what `cost_qual_eval` charges a condition
     /// reading it (`cost_subplan`, its test expression included), as
     /// startup and per-row cost. An InitPlan's output costs nothing to read.
-    static SUBPLAN_COSTS: core::cell::RefCell<([(usize, f64, f64); MAX_SUBPLAN_COSTS], usize)> =
+    static SUBPLAN_COSTS: core::cell::RefCell<SubplanCosts> =
         const { core::cell::RefCell::new(([(0, 0.0, 0.0); MAX_SUBPLAN_COSTS], 0)) };
 }
 

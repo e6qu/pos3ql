@@ -13,6 +13,6 @@ ANALYZE na, nb, nc, nd;
 SET statement_timeout = '20s';
 SELECT count(*), sum(na.k) FROM na JOIN (nb JOIN nc ON nb.id = nc.id) ON na.id = nb.id
   WHERE na.k + 0 = na.k;
-SELECT count(*) FROM na JOIN (nb JOIN nc ON nb.id = nc.id) ON na.id = nb.id
-  AND EXISTS (SELECT 1 FROM nd WHERE nd.id = nc.id) WHERE na.k + 0 = na.k;
+SELECT count(*), sum(nc.k) FROM na JOIN (nb JOIN nc ON nb.id = nc.id) ON na.id = nb.id
+  AND na.k < 20 WHERE na.k + 0 = na.k;
 RESET statement_timeout;

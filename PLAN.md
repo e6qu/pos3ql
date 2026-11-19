@@ -1226,7 +1226,7 @@ seconds down to 0.3). With an outer join in the FROM, or when the chain's
 first members share no condition (`na JOIN (nb JOIN nc JOIN nd ON ...) ON
 na.id = nd.id`), the written order still leaves a cross product the old
 executor loops over per row (over 20 seconds for 400, 300 and 200 rows):
-it needs PostgreSQL's join order, not the written one. A parenthesized join's own
+A condition reading a subquery keeps the loop too. It needs PostgreSQL's join order, not the written one. A parenthesized join's own
 query runs only when the search does not plan the query, so one nested in
 another (`a LEFT JOIN (b JOIN (c JOIN d ON z) ON x) ON y`) joins its
 members without reading its rows first (`differential_exact/937`). A

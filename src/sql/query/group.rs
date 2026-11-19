@@ -1294,6 +1294,7 @@ pub(super) fn grouped_rows<'a>(
                 bound,
                 arena,
                 compare,
+                None,
             )?,
             _ => instrument::SortSpace::postgres(out_rows, Some(&columns[..count]), false)?,
         };

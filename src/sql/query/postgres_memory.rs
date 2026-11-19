@@ -202,14 +202,13 @@ pub(crate) fn projected_tuple_len_with_tids(
 
 /// `datumGetSize` of the value a datum sort copies: nothing for a null,
 /// a pass-by-value datum's eight bytes, a fixed-width value's length, or a
-/// varlena as stored (a one-byte header when short). `column` names the
-/// value in a projected row (the first when `None`).
-pub(crate) fn sorted_datum_size(row: &[u8], column: Option<usize>) -> usize {
-    let value = crate::sql::exec::decode_projected_pub(row, column.unwrap_or(0));
+/// varlena with a one-byte header when its data is short enough, as tuple
+/// forming packs it and a stored column holds it.
+pub(crate) fn datum_written_size(value: &Datum<'_>) -> usize {
     if value.is_null() {
         return 0;
     }
-    let Some(layout) = datum_layout(&value) else {
+    let Some(layout) = datum_layout(value) else {
         return 0;
     };
     if layout.by_value {
@@ -218,11 +217,20 @@ pub(crate) fn sorted_datum_size(row: &[u8], column: Option<usize>) -> usize {
     if layout.length > 0 {
         return layout.length as usize;
     }
-    match varlena_payload(&value) {
+    match varlena_payload(value) {
         Some(payload) if layout.storage != b'p' && payload < SHORT_VARLENA_MAX => payload + 1,
         Some(payload) => payload + 4,
         None => 0,
     }
+}
+
+/// [`datum_written_size`] of the value at `column` of a projected row (the
+/// first when `None`).
+pub(crate) fn sorted_datum_size(row: &[u8], column: Option<usize>) -> usize {
+    datum_written_size(&crate::sql::exec::decode_projected_pub(
+        row,
+        column.unwrap_or(0),
+    ))
 }
 
 /// `work_mem` in bytes, the memory a sort or tuplestore may use.
@@ -299,6 +307,9 @@ pub(crate) struct TuplesortModel {
     heap_at: usize,
     /// The charge of the rows since the last run, which a dump returns.
     tuple_memory: i64,
+    /// The array of a sort reset after a batch that left it at its initial
+    /// size is not charged again (`tuplesort_begin_batch`).
+    reused_array: bool,
     /// The tape bytes of the rows since the last run.
     run_bytes: u64,
     /// `inittapes` ran: the tapes' count and what each holds.
@@ -329,6 +340,7 @@ impl TuplesortModel {
             heap: false,
             heap_at: 0,
             tuple_memory: 0,
+            reused_array: false,
             run_bytes: 0,
             tapes: None,
         }
@@ -336,6 +348,20 @@ impl TuplesortModel {
 
     fn array_space(slots: usize) -> i64 {
         (maxalign(slots * SORT_TUPLE) + CHUNK_HEADER) as i64
+    }
+
+    /// This sort began on the array the previous batch of its tuplesort kept
+    /// (`tuplesort_reset`), which `availMem` does not charge.
+    pub(crate) fn reuse_array(mut self) -> Self {
+        self.available += Self::array_space(INITIAL_SORT_SLOTS);
+        self.reused_array = true;
+        self
+    }
+
+    /// Whether the sort left its array at a size a reset frees and
+    /// allocates anew (charging it again).
+    pub(crate) fn array_regrown(&self) -> bool {
+        self.tapes.is_some() || self.slots != INITIAL_SORT_SLOTS
     }
 
     /// Whether the rows went to a bounded heap, whose memory the caller
@@ -448,7 +474,12 @@ impl TuplesortModel {
                 .sum();
             return TuplesortSpace::Disk((blocks * BLOCK_BYTES) as usize);
         }
-        let array = Self::array_space(self.slots);
+        let array = Self::array_space(self.slots)
+            - if self.reused_array {
+                Self::array_space(INITIAL_SORT_SLOTS)
+            } else {
+                0
+            };
         let rows = if self.heap {
             heap_charge.unwrap_or(0) as i64
         } else {
@@ -561,9 +592,29 @@ pub(crate) struct Tuplestore {
     most: i64,
     /// The bytes written once the rows overflowed `work_mem`.
     file: Option<i64>,
+    /// The rows went to a file at some point (`usedDisk`).
+    used_disk: bool,
+    /// Rows are written with a trailing length word (`EXEC_FLAG_BACKWARD`).
+    backward: bool,
+    /// What the rows in memory write when the store spills.
+    resident_written: i64,
 }
 
 impl Tuplestore {
+    /// A store whose readers read backwards, so its file holds a trailing
+    /// length word after each row.
+    pub(crate) fn backward(mut self) -> Self {
+        self.backward = true;
+        self
+    }
+
+    /// `writetup_heap`: the length word, the tuple after its
+    /// `MINIMAL_TUPLE_DATA_OFFSET` bytes and a trailing length word of a
+    /// backward store.
+    const fn written(&self, length: usize) -> i64 {
+        (length - 10 + 4 + if self.backward { 4 } else { 0 }) as i64
+    }
+
     pub(crate) fn new() -> Self {
         let allowed = work_mem_bytes();
         Self {
@@ -574,6 +625,9 @@ impl Tuplestore {
             grows: true,
             most: 0,
             file: None,
+            used_disk: false,
+            backward: false,
+            resident_written: 0,
         }
     }
 
@@ -581,9 +635,35 @@ impl Tuplestore {
         (maxalign(slots * 8) + CHUNK_HEADER) as i64
     }
 
-    fn update_most(&mut self) {
+    /// The rows `memtupcount` holds, deleted ones included.
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Whether the rows overflowed `work_mem` into a temporary file.
+    pub(crate) fn spilled(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// `tuplestore_trim` freeing a row whose minimal tuple is `length`
+    /// bytes.
+    pub(crate) fn release(&mut self, length: usize) {
+        self.available += generation_chunk_space(length) as i64;
+        self.resident_written -= self.written(length);
+    }
+
+    /// `tuplestore_trim` sliding the pointer array down `removed` rows.
+    pub(crate) fn slide(&mut self, removed: usize) {
+        self.count -= removed;
+    }
+
+    /// `tuplestore_updatemax`.
+    pub(crate) fn update_most(&mut self) {
         let used = match self.file {
-            Some(bytes) => bytes,
+            Some(bytes) => {
+                self.used_disk = true;
+                bytes
+            }
             None => self.allowed - self.available,
         };
         self.most = self.most.max(used);
@@ -592,13 +672,13 @@ impl Tuplestore {
     /// Stores a row whose minimal tuple is `length` bytes
     /// (`tuplestore_puttupleslot`).
     pub(crate) fn put(&mut self, length: usize) {
+        let written = self.written(length);
         if let Some(bytes) = &mut self.file {
-            // `writetup_heap`: the length word and the tuple after its
-            // `MINIMAL_TUPLE_DATA_OFFSET` bytes.
-            *bytes += (length - 10 + 4) as i64;
+            *bytes += written;
             return;
         }
         self.available -= generation_chunk_space(length) as i64;
+        self.resident_written += written;
         if self.count + 1 >= self.slots && self.grows {
             let used = self.allowed - self.available;
             let next = if used <= self.available {
@@ -618,8 +698,9 @@ impl Tuplestore {
         if self.count < self.slots && self.available >= 0 {
             return;
         }
+        // `dumptuples` writes the rows in memory to the file.
         self.update_most();
-        self.file = Some(0);
+        self.file = Some(self.resident_written);
         self.count = 0;
     }
 
@@ -629,13 +710,14 @@ impl Tuplestore {
         self.file = None;
         self.available = self.allowed - Self::array_space(self.slots);
         self.count = 0;
+        self.resident_written = 0;
     }
 
     /// The figures `EXPLAIN` prints: whether the rows went to disk and the
     /// most bytes used.
     pub(crate) fn finish(mut self) -> (bool, usize) {
         self.update_most();
-        (self.file.is_some(), self.most as usize)
+        (self.used_disk, self.most as usize)
     }
 }
 

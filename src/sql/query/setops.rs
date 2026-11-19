@@ -2628,7 +2628,7 @@ pub(crate) fn sort_set_rows(
     // The memory PostgreSQL's sort reports, from the rows in arrival order.
     let space = match bound {
         Some(bound) if sort.measured() => {
-            instrument::SortSpace::postgres_top_n(rows, None, 0, bound, arena, compare)?
+            instrument::SortSpace::postgres_top_n(rows, None, 0, bound, arena, compare, None)?
         }
         _ => instrument::SortSpace::postgres(rows, None, bound.is_some())?,
     };

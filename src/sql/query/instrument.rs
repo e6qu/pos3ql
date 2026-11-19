@@ -179,6 +179,9 @@ pub(crate) struct NodeCounters {
     pub(crate) sort: Option<SortSpace>,
     /// The most bytes of rows a window node held in memory.
     pub(crate) stored: Option<usize>,
+    /// The rows went to a temporary file (`usedDisk`), so the node reports
+    /// its storage as disk.
+    pub(crate) stored_disk: bool,
     /// A hashed aggregate's peak memory (`hash_mem_peak`).
     pub(crate) hash_agg_peak: Option<usize>,
     /// For the first node of a `WITH` query's block, the most bytes its
@@ -360,6 +363,9 @@ pub(crate) struct SortGroups {
     max_space: usize,
     max_disk: bool,
     max_method: SortMethod,
+    /// The tuplesort kept its array at the initial size after the last
+    /// batch, so the next one starts on it uncharged.
+    pub(crate) array_kept: bool,
 }
 
 impl Default for SortGroups {
@@ -381,6 +387,7 @@ impl SortGroups {
         max_space: 0,
         max_disk: false,
         max_method: SortMethod::Quicksort,
+        array_kept: false,
     };
 
     /// `instrumentSortedGroup` after a batch whose sort used `space`.
@@ -405,13 +412,6 @@ impl SortGroups {
             SortMethod::Quicksort => self.quicksort = true,
             SortMethod::ExternalMerge => self.external_merge = true,
         }
-    }
-
-    fn add(&mut self, bytes: usize) {
-        self.add_sorted(SortSpace {
-            method: SortMethod::Quicksort,
-            bytes,
-        });
     }
 
     /// The methods' names in `show_incremental_sort_group_info`'s order.
@@ -449,15 +449,22 @@ pub(crate) struct IncrementalGroups {
 /// group into a full sort, and once a full sort passes 64 rows sorts each
 /// further prefix group on its own (`switchToPresortedPrefixMode`).
 pub(crate) struct IncrementalSortBatches {
-    groups: IncrementalGroups,
     /// The prefix group of the latest row.
     group: u64,
     started: bool,
     state: BatchState,
-    /// The full sort being loaded: each row's prefix group and bytes.
+    /// The full sort being loaded: each row's prefix group, from the input
+    /// row `batch_start`.
     batch_groups: [u64; FULL_SORT_LIMIT],
-    batch_bytes: [usize; FULL_SORT_LIMIT],
+    batch_start: usize,
     batch_rows: usize,
+}
+
+/// Which of an incremental sort's two tuplesorts a batch went through.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BatchKind {
+    Full,
+    Presorted,
 }
 
 const MIN_GROUP: usize = 32;
@@ -469,109 +476,110 @@ enum BatchState {
     /// Loading a full sort; past `MIN_GROUP` rows it takes only rows of
     /// the prefix group of its `MIN_GROUP`th row.
     Full { pivot: Option<u64> },
-    /// Loading the rest of prefix group `group` into a prefix sort.
-    Prefix { group: u64, bytes: usize },
+    /// Loading the rest of prefix group `group`, from input row `start`,
+    /// into a prefix sort.
+    Prefix { group: u64, start: usize },
 }
+
+/// Receives each batch as the input rows it sorted.
+pub(crate) type BatchSorted<'d> =
+    &'d mut dyn FnMut(BatchKind, core::ops::Range<usize>) -> Result<(), crate::sql::SqlError>;
 
 impl IncrementalSortBatches {
     pub(crate) const fn new() -> Self {
         Self {
-            groups: IncrementalGroups {
-                full: SortGroups::NONE,
-                presorted: SortGroups::NONE,
-            },
             group: 0,
             started: false,
             state: BatchState::Full { pivot: None },
             batch_groups: [0; FULL_SORT_LIMIT],
-            batch_bytes: [0; FULL_SORT_LIMIT],
+            batch_start: 0,
             batch_rows: 0,
         }
     }
 
-    /// The next input row: whether its presorted keys differ from the
-    /// previous row's, and its bytes.
-    pub(crate) fn push(&mut self, new_group: bool, bytes: usize) {
+    /// The input row at position `at`: whether its presorted keys differ
+    /// from the previous row's. `sorted` receives each batch it completes.
+    pub(crate) fn push(
+        &mut self,
+        new_group: bool,
+        at: usize,
+        sorted: BatchSorted<'_>,
+    ) -> Result<(), crate::sql::SqlError> {
         if new_group && self.started {
             self.group += 1;
         }
         self.started = true;
         let group = self.group;
         match self.state {
-            BatchState::Prefix {
-                group: held,
-                bytes: held_bytes,
-            } => {
+            BatchState::Prefix { group: held, start } => {
                 if group == held {
-                    self.state = BatchState::Prefix {
-                        group: held,
-                        bytes: held_bytes.saturating_add(bytes),
-                    };
-                    return;
+                    return Ok(());
                 }
-                self.groups.presorted.add(held_bytes);
-                self.start_full(group, bytes);
+                sorted(BatchKind::Presorted, start..at)?;
+                self.start_full(group, at);
             }
             BatchState::Full { pivot } => {
                 if self.batch_rows >= MIN_GROUP && pivot.is_some_and(|pivot| pivot != group) {
-                    self.finish_full();
-                    self.start_full(group, bytes);
-                    return;
+                    self.finish_full(sorted)?;
+                    self.start_full(group, at);
+                    return Ok(());
                 }
                 self.batch_groups[self.batch_rows] = group;
-                self.batch_bytes[self.batch_rows] = bytes;
                 self.batch_rows += 1;
                 if self.batch_rows == MIN_GROUP {
                     self.state = BatchState::Full { pivot: Some(group) };
                 }
                 if self.batch_rows == FULL_SORT_LIMIT {
-                    self.finish_full();
-                    self.switch_to_prefix();
+                    self.finish_full(sorted)?;
+                    self.switch_to_prefix(sorted)?;
                 }
             }
         }
+        Ok(())
     }
 
-    /// The batches, once every row was pushed.
-    pub(crate) fn finish(mut self) -> IncrementalGroups {
+    /// Completes the batch still loading, once `rows` rows were pushed.
+    pub(crate) fn finish(
+        mut self,
+        rows: usize,
+        sorted: BatchSorted<'_>,
+    ) -> Result<(), crate::sql::SqlError> {
         match self.state {
-            BatchState::Full { .. } => self.finish_full(),
-            BatchState::Prefix { bytes, .. } => self.groups.presorted.add(bytes),
+            BatchState::Full { .. } => self.finish_full(sorted),
+            BatchState::Prefix { start, .. } => sorted(BatchKind::Presorted, start..rows),
         }
-        self.groups
     }
 
-    fn start_full(&mut self, group: u64, bytes: usize) {
+    fn start_full(&mut self, group: u64, at: usize) {
         self.batch_groups[0] = group;
-        self.batch_bytes[0] = bytes;
+        self.batch_start = at;
         self.batch_rows = 1;
         self.state = BatchState::Full { pivot: None };
     }
 
-    fn finish_full(&mut self) {
-        let bytes = self.batch_bytes[..self.batch_rows]
-            .iter()
-            .fold(0usize, |total, bytes| total.saturating_add(*bytes));
-        self.groups.full.add(bytes);
+    fn finish_full(&mut self, sorted: BatchSorted<'_>) -> Result<(), crate::sql::SqlError> {
+        sorted(
+            BatchKind::Full,
+            self.batch_start..self.batch_start + self.batch_rows,
+        )
     }
 
     /// Sorts each prefix group of the full sort on its own; the last one
     /// continues in the input.
-    fn switch_to_prefix(&mut self) {
+    fn switch_to_prefix(&mut self, sorted: BatchSorted<'_>) -> Result<(), crate::sql::SqlError> {
         let mut at = 0usize;
         loop {
             let group = self.batch_groups[at];
-            let mut bytes = 0usize;
+            let start = self.batch_start + at;
             while at < self.batch_rows && self.batch_groups[at] == group {
-                bytes = bytes.saturating_add(self.batch_bytes[at]);
                 at += 1;
             }
             if at == self.batch_rows {
                 self.batch_rows = 0;
-                self.state = BatchState::Prefix { group, bytes };
-                return;
+                self.state = BatchState::Prefix { group, start };
+                return Ok(());
             }
-            self.groups.presorted.add(bytes);
+            sorted(BatchKind::Presorted, start..self.batch_start + at)?;
         }
     }
 }
@@ -770,10 +778,14 @@ impl SortTuples {
         count: usize,
         row_at: &dyn Fn(usize) -> &'r [u8],
         heap: Option<(&mut [usize], SortCompare<'_>)>,
+        kept: Option<&mut bool>,
     ) -> Result<Option<super::postgres_memory::TuplesortSpace>, crate::sql::SqlError> {
         let first = (count > 0).then(|| row_at(0));
         let bound = heap.as_ref().map(|(positions, _)| positions.len());
         let mut model = self.model(first, bound.filter(|&bound| bound > 0));
+        if kept.as_deref().copied().unwrap_or(false) {
+            model = model.reuse_array();
+        }
         for row in 0..count {
             if !self.push(&mut model, first, row_at(row)) {
                 return Ok(None);
@@ -785,6 +797,9 @@ impl SortTuples {
             }
             _ => None,
         };
+        if let Some(kept) = kept {
+            *kept = !model.array_regrown();
+        }
         Ok(Some(model.space(heap_charge)))
     }
 }
@@ -798,7 +813,7 @@ impl SortSpace {
         columns: Option<&[usize]>,
         bounded: bool,
     ) -> Result<Self, crate::sql::SqlError> {
-        Self::postgres_locking(rows, columns, 0, bounded)
+        Self::postgres_locking(rows, columns, 0, bounded, None)
     }
 
     /// [`Self::postgres`] of rows that also carry `tids` row identities a
@@ -808,10 +823,11 @@ impl SortSpace {
         columns: Option<&[usize]>,
         tids: usize,
         bounded: bool,
+        kept: Option<&mut bool>,
     ) -> Result<Self, crate::sql::SqlError> {
         let own = Self::in_memory(rows, false);
         let space = match SortTuples::new(columns, tids, bounded) {
-            Some(tuples) => tuples.space(rows.len(), &|row| rows[row], None)?,
+            Some(tuples) => tuples.space(rows.len(), &|row| rows[row], None, kept)?,
             None => None,
         };
         Self::from_postgres(space, own, false)
@@ -827,6 +843,7 @@ impl SortSpace {
         bound: usize,
         arena: &crate::mem::arena::Arena,
         mut compare: impl FnMut(&&[u8], &&[u8]) -> Result<core::cmp::Ordering, crate::sql::SqlError>,
+        kept: Option<&mut bool>,
     ) -> Result<Self, crate::sql::SqlError> {
         let heap = rows.len() > bound * 2 && bound > 0;
         let own = Self::in_memory(rows, heap);
@@ -841,6 +858,7 @@ impl SortSpace {
             rows.len(),
             &|row| rows[row],
             Some((positions, &mut compare)),
+            kept,
         )?;
         Self::from_postgres(space, own, heap)
     }
@@ -1172,6 +1190,7 @@ impl Slot {
                 hash: None,
                 sort: None,
                 stored: None,
+                stored_disk: false,
                 hash_agg_peak: None,
                 cte_stored: None,
                 incremental: None,
@@ -1925,6 +1944,12 @@ impl Node {
         });
     }
 
+    /// [`Self::stored`] for a buffer that may have gone to disk.
+    pub(crate) fn stored_space(self, disk: bool, bytes: usize) {
+        self.stored(bytes);
+        self.with(|slot, _| slot.counters.stored_disk |= disk);
+    }
+
     /// Marks the start of a candidate row in a write's change loop: the
     /// rows qualified or removed before it are final. An attempt that
     /// resumes the write starts at the row it left unfinished, so
@@ -2402,13 +2427,23 @@ mod tests {
 
     fn batches(groups: &[usize]) -> (u64, u64) {
         let mut batches = IncrementalSortBatches::new();
+        let mut counts = (0u64, 0u64);
+        let mut count = |kind: BatchKind, _: core::ops::Range<usize>| {
+            match kind {
+                BatchKind::Full => counts.0 += 1,
+                BatchKind::Presorted => counts.1 += 1,
+            }
+            Ok(())
+        };
+        let mut at = 0usize;
         for &size in groups {
             for row in 0..size {
-                batches.push(row == 0, 1);
+                batches.push(row == 0, at, &mut count).unwrap();
+                at += 1;
             }
         }
-        let groups = batches.finish();
-        (groups.full.count, groups.presorted.count)
+        batches.finish(at, &mut count).unwrap();
+        counts
     }
 
     #[test]

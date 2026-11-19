@@ -1022,6 +1022,8 @@ pub(crate) use subquery::{
 pub use subquery::{prepare_subqueries, subquery_hooks};
 
 mod window;
+mod window_figures;
+mod window_store;
 use window::{
     cmp_key_rows, external_window_into, project_window_rows, rewrite_grouped_windows, window_select,
 };
@@ -16284,6 +16286,7 @@ pub(crate) fn constant_select_resumable<'a>(
                     bound,
                     arena,
                     compare,
+                    None,
                 ) {
                     Ok(space) => space,
                     Err(error) => return sql_fail(error),
@@ -17187,7 +17190,7 @@ fn select_into_rows_mode<'a>(
                 emit,
             );
         }
-        if storage.spill_attached() {
+        if storage.spill_attached() && !instrument::active() {
             external_window_into(
                 storage,
                 txid,

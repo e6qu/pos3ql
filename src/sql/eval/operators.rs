@@ -1288,7 +1288,7 @@ pub(crate) fn compare_datums_as(
                 text: b,
                 jsonb: true,
             },
-        ) => a.cmp(b),
+        ) => crate::sql::json::compare_jsonb(a, b),
         (Datum::Json { jsonb: false, .. }, Datum::Json { .. })
         | (Datum::Json { .. }, Datum::Json { jsonb: false, .. }) => {
             return Err(sql_err!(

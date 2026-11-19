@@ -194,8 +194,18 @@ pub(crate) fn compute<'a>(
     }
     if num_mcelem < keep {
         // The most frequent `num_mcelem`, most frequent first.
-        order[..keep]
-            .sort_by(|&left, &right| tracked[right].frequency.cmp(&tracked[left].frequency));
+        // Equal frequencies keep their first-seen order, which the tiebreak
+        // on the entry's position gives without a stable sort's allocation.
+        crate::util::try_sort_unstable_by::<_, core::convert::Infallible>(
+            &mut order[..keep],
+            |&left, &right| {
+                Ok(tracked[right]
+                    .frequency
+                    .cmp(&tracked[left].frequency)
+                    .then(left.cmp(&right)))
+            },
+        )
+        .unwrap_or_else(|never| match never {});
         minfreq = tracked[order[num_mcelem - 1]].frequency;
     } else {
         num_mcelem = keep;
@@ -204,19 +214,9 @@ pub(crate) fn compute<'a>(
     let mut frequencies: &[f32] = &[];
     if num_mcelem > 0 {
         let chosen = &mut order[..num_mcelem];
-        let mut failure = None;
-        chosen.sort_by(|&left, &right| {
-            if failure.is_some() {
-                return Ordering::Equal;
-            }
-            compare(&tracked[left].value, &tracked[right].value).unwrap_or_else(|error| {
-                failure = Some(error);
-                Ordering::Equal
-            })
-        });
-        if let Some(error) = failure {
-            return Err(error);
-        }
+        crate::util::try_sort_unstable_by(chosen, |&left, &right| {
+            compare(&tracked[left].value, &tracked[right].value)
+        })?;
         let held = arena
             .alloc_slice_with(num_mcelem, |at| tracked[chosen[at]].value)
             .map_err(|_| arena_full())?;
@@ -397,8 +397,18 @@ pub(crate) fn compute_lexemes<'a>(
         }
     }
     if num_mcelem < keep {
-        order[..keep]
-            .sort_by(|&left, &right| tracked[right].frequency.cmp(&tracked[left].frequency));
+        // Equal frequencies keep their first-seen order, which the tiebreak
+        // on the entry's position gives without a stable sort's allocation.
+        crate::util::try_sort_unstable_by::<_, core::convert::Infallible>(
+            &mut order[..keep],
+            |&left, &right| {
+                Ok(tracked[right]
+                    .frequency
+                    .cmp(&tracked[left].frequency)
+                    .then(left.cmp(&right)))
+            },
+        )
+        .unwrap_or_else(|never| match never {});
         minfreq = tracked[order[num_mcelem - 1]].frequency;
     } else {
         num_mcelem = keep;
@@ -411,12 +421,13 @@ pub(crate) fn compute_lexemes<'a>(
         }));
     }
     let chosen = &mut order[..num_mcelem];
-    chosen.sort_by(|&left, &right| {
+    crate::util::try_sort_unstable_by::<_, core::convert::Infallible>(chosen, |&left, &right| {
         let (left, right) = (tracked[left], tracked[right]);
-        left.length.cmp(&right.length).then_with(|| {
+        Ok(left.length.cmp(&right.length).then_with(|| {
             storage[left.at..left.at + left.length].cmp(&storage[right.at..right.at + right.length])
-        })
-    });
+        }))
+    })
+    .unwrap_or_else(|never| match never {});
     let mut failure = None;
     let values = arena
         .alloc_slice_with(num_mcelem, |at| {

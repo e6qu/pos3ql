@@ -109,23 +109,23 @@ pub(crate) fn pg_qsort(
     }
 }
 
-/// PostgreSQL's in-memory tuplesort of `data` in arrival order: a sort
-/// bounded to its `bound` least elements keeps them in a heap once more
-/// than twice the bound arrive (`make_bounded_heap`, `tuplesort_heap_*`
-/// with the sort reversed) and returns them sorted (`sort_bounded_heap`);
-/// otherwise `pg_qsort`. Returns how many leading elements are the sorted
 /// What [`pg_incremental_sort`] tells of each batch it sorts: whether it is
 /// a presorted-prefix batch, its rows, and the bound it sorts under.
 pub(crate) type SortedBatch<'f> =
     dyn FnMut(bool, &[u32], Option<usize>) -> Result<(), SqlError> + 'f;
 
-/// result.
+/// PostgreSQL's in-memory tuplesort of `data` in arrival order. A sort that
+/// kept a bounded heap (`heap_bound` is the limit's row count: the rows
+/// arrived past twice the bound, `make_bounded_heap`, `tuplesort_heap_*`
+/// with the sort reversed) returns them sorted (`sort_bounded_heap`);
+/// otherwise it is `pg_qsort`. Returns how many leading elements are the
+/// sorted result.
 pub(crate) fn pg_tuplesort(
     data: &mut [u32],
-    bound: Option<usize>,
+    heap_bound: Option<usize>,
     compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
 ) -> Result<usize, SqlError> {
-    let Some(bound) = bound.filter(|&bound| data.len() > bound * 2) else {
+    let Some(bound) = heap_bound else {
         pg_qsort(data, compare)?;
         return Ok(data.len());
     };
@@ -332,6 +332,16 @@ enum Incremental {
     ReadPrefix,
 }
 
+/// One batch's tuplesort under the bound its limit gives it: past twice the
+/// bound it keeps a heap.
+fn sort_batch(
+    data: &mut [u32],
+    bound: Option<usize>,
+    compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+) -> Result<usize, SqlError> {
+    pg_tuplesort(data, bound.filter(|&bound| data.len() > bound * 2), compare)
+}
+
 /// PostgreSQL's `ExecIncrementalSort` over `input`, already sorted by the
 /// first keys, which `same_group` compares: batches of at least 32 rows
 /// (`DEFAULT_MIN_GROUP_SIZE`) extended to the end of their group are
@@ -405,7 +415,7 @@ pub(crate) fn pg_incremental_sort(
                 let Some(&slot) = input.get(position) else {
                     outer_done = true;
                     sorted(false, &full[..full_len], sort_bound)?;
-                    full_kept = pg_tuplesort(&mut full[..full_len], sort_bound, compare)?;
+                    full_kept = sort_batch(&mut full[..full_len], sort_bound, compare)?;
                     state.status = Incremental::ReadFull;
                     break;
                 };
@@ -427,14 +437,14 @@ pub(crate) fn pg_incremental_sort(
                         state.bound_done = bound.min(state.bound_done + tuples);
                     }
                     sorted(false, &full[..full_len], sort_bound)?;
-                    full_kept = pg_tuplesort(&mut full[..full_len], sort_bound, compare)?;
+                    full_kept = sort_batch(&mut full[..full_len], sort_bound, compare)?;
                     state.status = Incremental::ReadFull;
                     break;
                 }
                 if tuples > MAX_FULL_SORT_GROUP {
                     state.pivot = None;
                     sorted(false, &full[..full_len], sort_bound)?;
-                    full_kept = pg_tuplesort(&mut full[..full_len], sort_bound, compare)?;
+                    full_kept = sort_batch(&mut full[..full_len], sort_bound, compare)?;
                     if let (Some(sort_bound), Some(current)) = (sort_bound, current)
                         && full_len > sort_bound * 2
                     {
@@ -464,8 +474,7 @@ pub(crate) fn pg_incremental_sort(
                 }
             }
             sorted(true, &prefix[..state.prefix_len], state.prefix_bound)?;
-            prefix_kept =
-                pg_tuplesort(&mut prefix[..state.prefix_len], state.prefix_bound, compare)?;
+            prefix_kept = sort_batch(&mut prefix[..state.prefix_len], state.prefix_bound, compare)?;
             state.status = Incremental::ReadPrefix;
             if let Some(bound) = bound {
                 state.bound_done = bound.min(state.bound_done + tuples);
@@ -548,7 +557,7 @@ impl IncrementalState {
             Ok(0)
         } else {
             sorted(true, &prefix[..self.prefix_len], self.prefix_bound)?;
-            let kept = pg_tuplesort(&mut prefix[..self.prefix_len], self.prefix_bound, compare)?;
+            let kept = sort_batch(&mut prefix[..self.prefix_len], self.prefix_bound, compare)?;
             if let Some(bound) = bound {
                 self.bound_done = bound.min(self.bound_done + tuples);
             }

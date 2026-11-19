@@ -1524,6 +1524,57 @@ fn record_tail_len(bytes: &[u8], at: usize, lengths: RecordLengths) -> usize {
     cursor - at
 }
 
+/// Calls `visit` with each field of the record value whose tag is `tag` at
+/// byte `at` (its type OID, tag and payload offset), without allocating;
+/// `None` when `tag` is not a record's or `visit` returns `None`.
+pub(crate) fn try_each_record_field(
+    bytes: &[u8],
+    tag: u8,
+    at: usize,
+    visit: &mut dyn FnMut(i32, u8, usize) -> Option<()>,
+) -> Option<()> {
+    let (tail, lengths) = match tag {
+        19 | 51 => {
+            let text = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            (
+                at + 4 + text,
+                if tag == 19 {
+                    RecordLengths::Byte
+                } else {
+                    RecordLengths::TwoBytes
+                },
+            )
+        }
+        202 | 204 => {
+            let text = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            (
+                at + 8 + text,
+                if tag == 202 {
+                    RecordLengths::Byte
+                } else {
+                    RecordLengths::TwoBytes
+                },
+            )
+        }
+        _ => return None,
+    };
+    let length_bytes = lengths.bytes();
+    let mut cursor = tail;
+    let fields = lengths.read(bytes, cursor);
+    cursor += length_bytes;
+    for _ in 0..fields {
+        let name = lengths.read(bytes, cursor);
+        cursor += length_bytes + name;
+        let type_oid = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        cursor += 8;
+        let field_tag = bytes[cursor];
+        cursor += 1;
+        visit(type_oid, field_tag, cursor)?;
+        cursor += decode_projected_value(bytes, field_tag, cursor).1;
+    }
+    Some(())
+}
+
 /// Reads column `col` of an encoded row like [`decode_projected_pub`], but
 /// rebuilds a record column into a structural [`Datum::Record`] (fields
 /// arena-allocated, nested records included) instead of its rendered text.

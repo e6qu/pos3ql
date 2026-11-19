@@ -230,6 +230,7 @@ pub(super) fn groups_for_mask<'a>(
             sorter.size_as_postgres(
                 instrument::SortTuples::new(Some(&columns[..n_keys]), 0, false),
                 None,
+                super::postgres_memory::SizeSource { storage, txid },
             );
         }
         // Equal keys keep input order, so each group reports its first input
@@ -438,7 +439,13 @@ pub(super) fn groups_for_mask<'a>(
                 let rows = arena
                     .alloc_slice_with(keys.len(), |at| keys[at].0)
                     .map_err(|_| arena_full())?;
-                instrument::SortSpace::postgres(rows, None, false, false)?
+                instrument::SortSpace::postgres(
+                    super::postgres_memory::SizeSource { storage, txid },
+                    rows,
+                    None,
+                    false,
+                    false,
+                )?
             } else {
                 instrument::SortSpace {
                     method: instrument::SortMethod::Quicksort,
@@ -1366,7 +1373,6 @@ pub(super) fn grouped_rows<'a>(
         // Past twice its limit's bound the sort keeps only a heap of the
         // rows the limit returns, as PostgreSQL's does.
         let bounded = bound.filter(|_| !statement.distinct);
-        let bound = bound.filter(|&bound| !statement.distinct && out_rows.len() > bound * 2);
         let mut columns = [0usize; MAX_PROJ];
         let count = super::postgres_sort_columns(
             width,
@@ -1374,26 +1380,8 @@ pub(super) fn grouped_rows<'a>(
             &order_exprs[..n_order],
             &mut columns,
         );
-        // The memory PostgreSQL's sort reports, from the rows in arrival
-        // order.
-        let space = match bounded {
-            Some(bound) if stages.sort.measured() => instrument::SortSpace::postgres_top_n(
-                out_rows,
-                Some(&columns[..count]),
-                0,
-                bound,
-                arena,
-                compare,
-                super::sole_item_computed(statement.items),
-                None,
-            )?,
-            _ => instrument::SortSpace::postgres(
-                out_rows,
-                Some(&columns[..count]),
-                false,
-                super::sole_item_computed(statement.items),
-            )?,
-        };
+        let source = super::postgres_memory::SizeSource { storage, txid };
+        let computed = super::sole_item_computed(statement.items);
         // The `Sort` over a join's grouping PostgreSQL's planner plans is
         // its tuplesort, over the groups in their grouping's order.
         let modeled = outer.is_none()
@@ -1403,20 +1391,39 @@ pub(super) fn grouped_rows<'a>(
             )?
             .is_some_and(|model| model.group.is_some());
         if modeled {
-            let held = arena.alloc_slice_copy(out_rows).map_err(|_| arena_full())?;
-            let order = arena
-                .alloc_slice_with(held.len(), |at| at as u32)
-                .map_err(|_| arena_full())?;
-            let kept = crate::sql::pg_qsort::pg_tuplesort(order, bounded, &mut |a, b| {
-                compare(&held[a as usize], &held[b as usize])
+            let tuples = instrument::SortTuples::new(Some(&columns[..count]), 0, bounded.is_some())
+                .ok_or_else(instrument::unsized_value)?
+                .computed(computed);
+            let (_, space) = tuples.sort_rows(source, arena, out_rows, bounded, &mut |a, b| {
+                compare(&a, &b)
             })?;
-            for (slot, &at) in out_rows.iter_mut().zip(&order[..kept]) {
-                *slot = held[at as usize];
-            }
             stages.sort.sorted(space);
-            let out_rows = &mut out_rows[..kept];
             return Ok((out_rows, width));
         }
+        // A one-table grouping reaches the sort in sort order, not the hash
+        // order PostgreSQL's planner may give it, so equal groups keep that
+        // order; the figures are the tuplesort's.
+        let space = match bounded {
+            Some(bound) if stages.sort.measured() => instrument::SortSpace::postgres_top_n(
+                source,
+                out_rows,
+                Some(&columns[..count]),
+                0,
+                bound,
+                arena,
+                compare,
+                computed,
+                None,
+            )?,
+            _ => instrument::SortSpace::postgres(
+                source,
+                out_rows,
+                Some(&columns[..count]),
+                false,
+                computed,
+            )?,
+        };
+        let bound = bounded.filter(|&bound| out_rows.len() > bound * 2);
         match bound {
             Some(bound) => {
                 crate::mem::arena::try_stable_top_n_via(arena, out_rows, bound, compare, |_| {
@@ -1867,7 +1874,7 @@ pub(super) fn record_hash_agg_memory(
         let new = if seen.get(group).copied() == Some(false) {
             seen[group] = true;
             let Some(length) =
-                super::postgres_memory::projected_tuple_len(rep_keys[group], Some(columns))
+                super::postgres_memory::projected_tuple_len(None, rep_keys[group], Some(columns))
             else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,

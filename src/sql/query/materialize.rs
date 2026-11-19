@@ -1630,16 +1630,60 @@ fn projected_collations<'a>(
 /// group at its first row), or a `Unique` over the rows sorted by its keys
 /// (`input_sort`: fully, or incrementally after its first keys), each run
 /// of equal rows' first. Returns the rows kept, at the front of `rows`.
-fn modeled_distinct(
+fn modeled_distinct<'a>(
     storage: &Storage,
     txid: u32,
-    arena: &Arena,
-    rows: &mut [&[u8]],
+    arena: &'a Arena,
+    rows: &mut [&'a [u8]],
     collations: &[Collation],
     group: super::index_paths::join_query::ModeledGroup<'_>,
     input_sort: Option<(f64, f64, u8)>,
 ) -> Result<usize, SqlError> {
     let held = arena.alloc_slice_copy(rows).map_err(|_| arena_full())?;
+    // A `Unique` over a full `Sort` of the DISTINCT list: PostgreSQL's
+    // tuplesort of the visible columns, charged as the rows arrive.
+    if !group.hashed && matches!(input_sort, Some((_, _, 0))) {
+        let mut columns = [0usize; MAX_PROJ];
+        for (at, column) in columns.iter_mut().enumerate() {
+            *column = at;
+        }
+        instrument::SortTuples::new(
+            Some(
+                &columns[..held
+                    .first()
+                    .map_or(0, |row| crate::sql::exec::projected_row_width(row))],
+            ),
+            0,
+            false,
+        )
+        .ok_or_else(instrument::unsized_value)?
+        .sort_rows(
+            super::postgres_memory::SizeSource { storage, txid },
+            arena,
+            held,
+            None,
+            &mut |left, right| {
+                for &(position, flags) in group.keys {
+                    let ordering = compare_ordered_key(
+                        storage,
+                        txid,
+                        collations[position],
+                        (
+                            flags & super::index_paths::joins::KEY_DESCENDING != 0,
+                            flags & super::index_paths::joins::KEY_NULLS_FIRST != 0,
+                        ),
+                        crate::sql::exec::ProjectedValue::column(left, position),
+                        crate::sql::exec::ProjectedValue::column(right, position),
+                    )?;
+                    if !ordering.is_eq() {
+                        return Ok(ordering);
+                    }
+                }
+                Ok(core::cmp::Ordering::Equal)
+            },
+        )?;
+    }
+    let held: &[&[u8]] = held;
     let same = |left: u32, right: u32| -> Result<bool, SqlError> {
         for &(position, _) in group.keys {
             if !compare_materialized_key(
@@ -1716,10 +1760,8 @@ fn modeled_distinct(
         .map_err(|_| arena_full())?;
     let order: &[u32] = match input_sort {
         None => input,
-        Some((_, _, 0)) => {
-            crate::sql::pg_qsort::pg_tuplesort(input, None, compare)?;
-            input
-        }
+        // Sorted above, in `held` itself.
+        Some((_, _, 0)) => input,
         Some((_, _, presorted)) => {
             let prefix = &group.keys[..usize::from(presorted)];
             let scratch = arena
@@ -2443,10 +2485,6 @@ pub(crate) fn materialized_rows<'a>(
                 )?;
             }
         }
-        // A limit directly over the sort bounds it: like PostgreSQL's,
-        // past twice the bound it keeps only a heap of the rows the limit
-        // returns.
-        let bound = rank_window.filter(|&bound| sort_bounded && rows.len() > bound * 2);
         let compare = |a: &&[u8], b: &&[u8]| {
             compare_materialized_rows(
                 storage,
@@ -2468,149 +2506,139 @@ pub(crate) fn materialized_rows<'a>(
             &order_exprs[..n_keys],
             &mut columns,
         );
-        // The memory PostgreSQL's sort reports, from the rows in arrival
-        // order.
+        // A limit directly over the sort bounds it: like PostgreSQL's, past
+        // twice the bound it keeps only a heap of the rows the limit
+        // returns.
         let bounded = rank_window.filter(|_| sort_bounded);
-        let space = match bounded {
-            Some(bound) if stages.sort.measured() => instrument::SortSpace::postgres_top_n(
-                rows,
-                Some(&columns[..count]),
-                n_identities,
-                bound,
-                arena,
-                compare,
-                super::sole_item_computed(statement.items),
-                None,
-            )?,
-            _ => instrument::SortSpace::postgres_locking(
-                rows,
-                Some(&columns[..count]),
-                n_identities,
-                rank_window.is_some(),
-                super::sole_item_computed(statement.items),
-                None,
-            )?,
-        };
+        // The tuples PostgreSQL's sort holds: the output columns, the keys
+        // that are not among them and the row identities a lock reads.
+        let tuples =
+            instrument::SortTuples::new(Some(&columns[..count]), n_identities, bounded.is_some())
+                .ok_or_else(instrument::unsized_value)?
+                .computed(super::sole_item_computed(statement.items));
         // An incremental sort's batches, which it reports instead of one
         // sort's method and memory.
         let mut incremental: Option<instrument::IncrementalGroups> = None;
         let incremental_sort = join_sort
             .flatten()
             .is_some_and(|(_, _, presorted)| presorted > 0);
-        match bound {
-            // A join's `Sort` is PostgreSQL's tuplesort, bounded by a limit
-            // directly over it.
-            _ if join_sort.is_some() => {
+        let mut space = None;
+        match join_sort.flatten() {
+            // An incremental sort's input is ordered by the keys
+            // its first sort items order.
+            Some((_, _, presorted)) if presorted > 0 => {
                 let order = arena
                     .alloc_slice_with(rows.len(), |at| at as u32)
                     .map_err(|_| arena_full())?;
                 let held: &[&[u8]] = rows;
-                let mut compare_at = |a: u32, b: u32| compare(&held[a as usize], &held[b as usize]);
-                let kept = match join_sort.flatten() {
-                    // An incremental sort's input is ordered by the keys
-                    // its first sort items order.
-                    Some((_, _, presorted)) if presorted > 0 => {
-                        let model = modeled.as_ref().expect("a modeled join");
-                        let prefix = &model.sort_items[..usize::from(presorted)];
-                        let input = arena
-                            .alloc_slice_with(held.len(), |at| at as u32)
+                let model = modeled.as_ref().expect("a modeled join");
+                let prefix = &model.sort_items[..usize::from(presorted)];
+                let input = arena
+                    .alloc_slice_with(held.len(), |at| at as u32)
+                    .map_err(|_| arena_full())?;
+                let scratch = arena
+                    .alloc_slice_with(held.len() * 2, |_| 0u32)
+                    .map_err(|_| arena_full())?;
+                let kept = crate::sql::pg_qsort::pg_incremental_sort(
+                    input,
+                    scratch,
+                    order,
+                    bounded,
+                    &mut |a, b| {
+                        for &item in prefix {
+                            let key = usize::from(item);
+                            let left = crate::sql::exec::ProjectedValue::column(
+                                held[a as usize],
+                                width + key,
+                            );
+                            let right = crate::sql::exec::ProjectedValue::column(
+                                held[b as usize],
+                                width + key,
+                            );
+                            if !compare_materialized_key(
+                                storage,
+                                txid,
+                                key_collations[key],
+                                left,
+                                right,
+                            )?
+                            .is_eq()
+                            {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    },
+                    &mut |a, b| compare(&held[a as usize], &held[b as usize]),
+                    // Each batch's sort reports the memory it held,
+                    // as a tuplesort of its rows in arrival order.
+                    &mut |prefix, batch, sort_bound| {
+                        if !stages.sort.measured() {
+                            return Ok(());
+                        }
+                        let batch_rows = arena
+                            .alloc_slice_with(batch.len(), |at| held[batch[at] as usize])
                             .map_err(|_| arena_full())?;
-                        let scratch = arena
-                            .alloc_slice_with(held.len() * 2, |_| 0u32)
-                            .map_err(|_| arena_full())?;
-                        crate::sql::pg_qsort::pg_incremental_sort(
-                            input,
-                            scratch,
-                            order,
-                            bounded,
-                            &mut |a, b| {
-                                for &item in prefix {
-                                    let key = usize::from(item);
-                                    let left = crate::sql::exec::ProjectedValue::column(
-                                        held[a as usize],
-                                        width + key,
-                                    );
-                                    let right = crate::sql::exec::ProjectedValue::column(
-                                        held[b as usize],
-                                        width + key,
-                                    );
-                                    if !compare_materialized_key(
-                                        storage,
-                                        txid,
-                                        key_collations[key],
-                                        left,
-                                        right,
-                                    )?
-                                    .is_eq()
-                                    {
-                                        return Ok(false);
-                                    }
-                                }
-                                Ok(true)
-                            },
-                            &mut |a, b| compare(&held[a as usize], &held[b as usize]),
-                            // Each batch's sort reports the memory it held,
-                            // as a tuplesort of its rows in arrival order.
-                            &mut |prefix, batch, sort_bound| {
-                                if !stages.sort.measured() {
-                                    return Ok(());
-                                }
-                                let batch_rows = arena
-                                    .alloc_slice_with(batch.len(), |at| held[batch[at] as usize])
-                                    .map_err(|_| arena_full())?;
-                                let groups: &mut instrument::IncrementalGroups =
-                                    incremental.get_or_insert_with(Default::default);
-                                let kind = if prefix {
-                                    &mut groups.presorted
-                                } else {
-                                    &mut groups.full
-                                };
-                                let space = match sort_bound {
-                                    Some(sort_bound) => instrument::SortSpace::postgres_top_n(
-                                        batch_rows,
-                                        Some(&columns[..count]),
-                                        n_identities,
-                                        sort_bound,
-                                        arena,
-                                        compare,
-                                        super::sole_item_computed(statement.items),
-                                        Some(&mut kind.array_kept),
-                                    )?,
-                                    None => instrument::SortSpace::postgres_locking(
-                                        batch_rows,
-                                        Some(&columns[..count]),
-                                        n_identities,
-                                        bounded.is_some(),
-                                        super::sole_item_computed(statement.items),
-                                        Some(&mut kind.array_kept),
-                                    )?,
-                                };
-                                kind.add_sorted(space);
-                                Ok(())
-                            },
-                        )?
-                        .0
-                    }
-                    _ => crate::sql::pg_qsort::pg_tuplesort(order, bounded, &mut compare_at)?,
-                };
+                        let groups: &mut instrument::IncrementalGroups =
+                            incremental.get_or_insert_with(Default::default);
+                        let kind = if prefix {
+                            &mut groups.presorted
+                        } else {
+                            &mut groups.full
+                        };
+                        let space = match sort_bound {
+                            Some(sort_bound) => instrument::SortSpace::postgres_top_n(
+                                super::postgres_memory::SizeSource { storage, txid },
+                                batch_rows,
+                                Some(&columns[..count]),
+                                n_identities,
+                                sort_bound,
+                                arena,
+                                compare,
+                                super::sole_item_computed(statement.items),
+                                Some(&mut kind.array_kept),
+                            )?,
+                            None => instrument::SortSpace::postgres_locking(
+                                super::postgres_memory::SizeSource { storage, txid },
+                                batch_rows,
+                                Some(&columns[..count]),
+                                n_identities,
+                                bounded.is_some(),
+                                super::sole_item_computed(statement.items),
+                                Some(&mut kind.array_kept),
+                            )?,
+                        };
+                        kind.add_sorted(space);
+                        Ok(())
+                    },
+                )?
+                .0;
                 let sorted = arena
                     .alloc_slice_with(kept, |at| held[order[at] as usize])
                     .map_err(|_| arena_full())?;
                 rows[..kept].copy_from_slice(sorted);
             }
-            Some(bound) => {
-                crate::mem::arena::try_stable_top_n_via(arena, rows, bound, compare, |_| {
-                    arena_full()
-                })?
+            // Every other sort is PostgreSQL's tuplesort, charged tuple by
+            // tuple as the rows arrive.
+            _ => {
+                let (_, sorted) = tuples.sort_rows(
+                    super::postgres_memory::SizeSource { storage, txid },
+                    arena,
+                    rows,
+                    bounded,
+                    &mut |a, b| compare(&a, &b),
+                )?;
+                space = Some(sorted);
             }
-            None => crate::mem::arena::try_stable_sort_via(arena, rows, compare, |_| arena_full())?,
         }
         if incremental_sort {
             stages
                 .sort
                 .incremental_sorted(incremental.unwrap_or_default());
         } else {
-            stages.sort.sorted(space);
+            stages
+                .sort
+                .sorted(space.expect("a sort that is not incremental"));
         }
     }
     // A sort under a DISTINCT returns every row it sorted.
@@ -3115,7 +3143,7 @@ pub(crate) fn external_materialized_into<'a>(
     };
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
-    if stages.sort.measured() {
+    if plan.n_keys > 0 || plan.n_on > 0 {
         let mut columns = [0usize; MAX_PROJ];
         let count = super::postgres_sort_columns(
             plan.width,
@@ -3129,10 +3157,14 @@ pub(crate) fn external_materialized_into<'a>(
             && !statement.distinct
             && plan.n_on == 0;
         sorter.size_as_postgres(
-            instrument::SortTuples::new(Some(&columns[..count]), plan.n_identities, bounded)
-                .map(|tuples| tuples.computed(super::sole_item_computed(statement.items))),
+            Some(
+                instrument::SortTuples::new(Some(&columns[..count]), plan.n_identities, bounded)
+                    .ok_or_else(instrument::unsized_value)?
+                    .computed(super::sole_item_computed(statement.items)),
+            ),
             (bounded && statement.locking.is_empty() && plan.n_order > 0)
                 .then(|| offset.saturating_add(limit).min(usize::MAX as u64) as usize),
+            super::postgres_memory::SizeSource { storage, txid },
         );
     }
     let mut compare = |left: &[u8], right: &[u8]| {

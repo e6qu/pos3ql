@@ -1087,7 +1087,8 @@ a block the RAM cache missed, local for a temporary table, temp for an
 external sort's or spilled store's work files (`differential_exact/936`).
 Remaining: writes' `dirtied` and `written` pages (`0A000` under
 `BUFFERS`), scans on paths that keep no page model (`0A000`), and hash
-joins run in batches (`0A000`: their work files are not sized). Windows over a join the search plans read its plan's rows,
+joins run in batches (`0A000`: their work files are not sized). Windows over a join the search plans read its plan's rows, also when
+the statement spills their input to object storage,
 so `EXPLAIN ANALYZE` counts its nodes (`differential_exact/935`); windows
 over a join it does not plan (a window function in the `ORDER BY`) fail
 `EXPLAIN` with `0A000` rather than print pos3ql's join order, and

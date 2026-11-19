@@ -902,6 +902,27 @@ mod tests {
     }
 
     #[test]
+    fn sorts_past_work_mem_write_tapes() {
+        // 4MB of work_mem: 100000 rows of 100 bytes overflow into runs, each
+        // tape holding its runs' length words, tuples and end markers in
+        // 8176-byte blocks.
+        let space = tuplesort_space(
+            SortTuples::Bump,
+            core::iter::repeat_n((100, 94), 100_000),
+            None,
+            None,
+        );
+        let TuplesortSpace::Disk(bytes) = space else {
+            panic!("expected a spill, got {space:?}");
+        };
+        let payload = 100_000 * 94;
+        assert!(bytes >= payload.div_ceil(8176) * 8192);
+        assert_eq!(bytes % 8192, 0);
+        assert_eq!(tuplesort_merge_order(4 << 20), 15);
+        assert_eq!(tuplesort_merge_order(64 << 10), 6);
+    }
+
+    #[test]
     fn tuplestores_grow_their_array_at_the_last_slot() {
         let mut store = Tuplestore::new();
         for _ in 0..2076 {

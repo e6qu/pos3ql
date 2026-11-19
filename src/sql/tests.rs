@@ -6806,10 +6806,12 @@ fn wide_join_trees_execute_without_allocation() {
                 String::from_utf8_lossy(&output)
             );
 
+            // PostgreSQL plans this many relations genetically (GEQO), which
+            // pos3ql refuses to print rather than show its own join order.
             let explain = format!("EXPLAIN (COSTS OFF) {cross}");
             let output = run_with_fixed_memory(&mut engine, &budget, &explain, 32 << 20);
             assert!(
-                !String::from_utf8_lossy(&output).contains("ERROR"),
+                String::from_utf8_lossy(&output).contains("geqo_threshold"),
                 "{}",
                 String::from_utf8_lossy(&output)
             );
@@ -23650,14 +23652,11 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
             );
         }
 
+        // PostgreSQL plans this many relations genetically (GEQO), which
+        // pos3ql refuses to print rather than show its own join order.
         let join_plan = run_with(engine, budget, &explain_join_query);
-        let join_plan_rows = data_rows(&join_plan);
-        assert_eq!(
-            join_plan_rows
-                .iter()
-                .filter(|line| line.contains("Seq Scan on statement_lock_source source_"))
-                .count(),
-            WIDTH,
+        assert!(
+            String::from_utf8_lossy(&join_plan).contains("geqo_threshold"),
             "{phase} join EXPLAIN: {}",
             String::from_utf8_lossy(&join_plan)
         );
@@ -56031,30 +56030,21 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     // UPDATE FROM and DELETE USING evaluate their auxiliary source once per
     // target row. That source can probe an index with the target row supplied
     // through the executor's outer lookup.
-    let joined_dml_plan = data_rows(&run_with(
-        &mut engine,
-        &mut budget,
+    // PostgreSQL costs that probe against its other joins, which pos3ql's
+    // write join does not, so EXPLAIN refuses the plan.
+    for explain in [
         "EXPLAIN (COSTS OFF) UPDATE probe_keys p SET label = e.payload FROM indexed_events e
-           WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted;
-         EXPLAIN (COSTS OFF) DELETE FROM probe_keys p USING indexed_events e
            WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted",
-    ));
-    assert_eq!(
-        joined_dml_plan
-            .iter()
-            .filter(|row| row.contains("Nested Loop"))
-            .count(),
-        2,
-        "{joined_dml_plan:?}"
-    );
-    assert_eq!(
-        joined_dml_plan
-            .iter()
-            .filter(|row| row.contains("Index Scan using indexed_events_key on indexed_events e"))
-            .count(),
-        2,
-        "joined DML explanation must expose the parameterized source: {joined_dml_plan:?}"
-    );
+        "EXPLAIN (COSTS OFF) DELETE FROM probe_keys p USING indexed_events e
+           WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted",
+    ] {
+        let output = run_with(&mut engine, &mut budget, explain);
+        assert!(
+            String::from_utf8_lossy(&output).contains("joining through an index"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
     assert_eq!(
         data_rows(&run_with(
             &mut engine,

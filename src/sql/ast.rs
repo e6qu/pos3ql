@@ -5434,6 +5434,9 @@ pub struct OnConflict<'a> {
     /// The inference `WHERE` after a column `target`, which selects partial
     /// unique indexes whose predicate it implies.
     pub target_where: Option<&'a Expr<'a>>,
+    /// Where the target's opening parenthesis was written, which PostgreSQL
+    /// reports for a target column that does not exist.
+    pub target_position: SourcePosition,
     /// `None` = DO NOTHING; `Some` = DO UPDATE SET .... Assignments may
     /// reference the target row's columns and `excluded.<col>` (the proposed
     /// row).

@@ -1029,3 +1029,51 @@ fn explain_refuses_scans_postgresql_may_run_in_parallel() {
         ["Seq Scan on pn_t"]
     );
 }
+
+#[test]
+fn explain_refuses_joins_postgresql_plans_unlike_the_join_search() {
+    let (mut session, mut engine) = setup("unsearched-joins");
+    session.success(
+        &mut engine,
+        "CREATE TABLE pn_k (id int PRIMARY KEY, k int, v text); \
+         INSERT INTO pn_k SELECT g, g % 50, 'v' || g FROM generate_series(1, 1000) g; \
+         CREATE TABLE pn_p (id int PRIMARY KEY, k int); \
+         INSERT INTO pn_p SELECT g, g % 30 FROM generate_series(1, 600) g; \
+         ANALYZE pn_k; ANALYZE pn_p",
+        true,
+    );
+    let refused = |session: &mut ConfiguredTransactionSession, engine: &mut Engine, sql: &str| {
+        String::from_utf8_lossy(&session.execute(engine, sql, true)).into_owned()
+    };
+    // PostgreSQL 18 scans `pn_k` once.
+    let self_join = "EXPLAIN (COSTS OFF) SELECT a.v, b.k FROM pn_k a JOIN pn_k b \
+                     ON a.id = b.id WHERE b.k = 3";
+    let error = refused(&mut session, &mut engine, self_join);
+    assert!(error.contains("remove_useless_self_joins"), "{error}");
+    // Without the removal the join search plans it.
+    session.success(&mut engine, "SET enable_self_join_elimination = off", true);
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "COSTS OFF",
+            "SELECT a.v, b.k FROM pn_k a JOIN pn_k b ON a.id = b.id WHERE b.k = 3"
+        ),
+        [
+            "Hash Join",
+            "  Hash Cond: (a.id = b.id)",
+            "  ->  Seq Scan on pn_k a",
+            "  ->  Hash",
+            "        ->  Seq Scan on pn_k b",
+            "              Filter: (k = 3)",
+        ]
+    );
+    // PostgreSQL hashes `pn_p`; pos3ql's write join would loop over its key.
+    let error = refused(
+        &mut session,
+        &mut engine,
+        "EXPLAIN (COSTS OFF) UPDATE pn_k SET v = 'x' FROM pn_p \
+         WHERE pn_k.id = pn_p.id AND pn_p.k = 3",
+    );
+    assert!(error.contains("joining through an index"), "{error}");
+}

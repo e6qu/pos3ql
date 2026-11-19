@@ -2253,9 +2253,9 @@ pub(crate) fn project_window_rows<'a>(
             .alloc_slice_with(total + scope.n, |_| Datum::Null)
             .map_err(|_| arena_full())?;
         for (t, offset) in offs.iter().enumerate().take(scope.n) {
-            let def = scope.defs.get(t).expect("resolved");
             let vals = row.table_values(t).expect("bound");
-            for c in 0..def.n_columns {
+            // A parenthesized join's entry also holds its members' columns.
+            for c in 0..scope.stored_width(t) {
                 flat[offset + c] = if vals.is_empty() {
                     Datum::Null
                 } else {

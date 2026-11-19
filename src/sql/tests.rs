@@ -88785,18 +88785,25 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
             "0|2857", "1|2858", "2|2857", "3|2857", "4|2857", "5|2857", "6|2857",
         ],
     );
-    // A clause above a window function whose result size varies by row has
-    // no sort size before the windows run, which is refused, not guessed.
-    let refused = run_with(
+    // A clause above a window function whose result size varies by row sorts
+    // the real results, so it runs with a spill store attached.
+    partitioned(
         &mut engine,
         &mut budget,
         "SELECT lag(x) OVER (ORDER BY x), lead(x) OVER (ORDER BY x DESC) \
          FROM generate_series(1, 10) AS x",
-    );
-    assert!(
-        String::from_utf8_lossy(&refused).contains("cannot be sized before it runs"),
-        "{}",
-        String::from_utf8_lossy(&refused)
+        &[
+            "NULL|NULL",
+            "1|1",
+            "2|2",
+            "3|3",
+            "4|4",
+            "5|5",
+            "6|6",
+            "7|7",
+            "8|8",
+            "9|9",
+        ],
     );
     // Without ORDER BY, rows leave in the last-evaluated window's order with
     // ties in the earlier windows' order, as PostgreSQL 18.6 returns them.

@@ -168,6 +168,160 @@ pub(crate) fn pg_tuplesort(
     Ok(kept)
 }
 
+/// The scratch memory [`pg_tuplesort_runs`] works in, all sized from the
+/// runs and the merge order: `bounds` holds `2 * (runs + 1)` offsets, `heap`
+/// and `cursor` one slot per tape, `moved` the rows' count.
+pub(crate) struct RunScratch<'s> {
+    pub(crate) moved: &'s mut [u32],
+    pub(crate) bounds: &'s mut [u32],
+    pub(crate) heap: &'s mut [u32],
+    pub(crate) cursor: &'s mut [u32],
+}
+
+/// PostgreSQL's tuplesort of rows that outgrew `work_mem` (`tuplesort.c`):
+/// `dumptuples` sorts each run of `run_lengths` rows (in arrival order) with
+/// `pg_qsort`, and `mergeruns` merges them through a binary heap over the
+/// tapes' heads (`tuplesort_heap_insert`, `tuplesort_heap_replace_top`):
+/// runs are dealt round-robin to `merge_order` tapes, a pass merges one run
+/// of every tape into one run of the next pass's tapes, and the last merge
+/// reads the remaining tapes as they are. Ties come out in that heap's order.
+pub(crate) fn pg_tuplesort_runs(
+    data: &mut [u32],
+    run_lengths: &[u32],
+    merge_order: usize,
+    scratch: RunScratch<'_>,
+    compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+) -> Result<(), SqlError> {
+    let RunScratch {
+        moved,
+        bounds,
+        heap,
+        cursor,
+    } = scratch;
+    let mut runs = run_lengths.len();
+    let (mut from_bounds, mut to_bounds) = bounds.split_at_mut(runs + 1);
+    from_bounds[0] = 0;
+    for (at, &length) in run_lengths.iter().enumerate() {
+        from_bounds[at + 1] = from_bounds[at] + length;
+        let (start, end) = (from_bounds[at] as usize, from_bounds[at + 1] as usize);
+        pg_qsort(&mut data[start..end], compare)?;
+    }
+    let total = data.len();
+    let moved = &mut moved[..total];
+    // Whether the rows are in `data` (else in `moved`).
+    let mut in_data = true;
+    loop {
+        let tapes = runs.min(merge_order);
+        let (source, target): (&[u32], &mut [u32]) = if in_data {
+            (&*data, &mut *moved)
+        } else {
+            (&*moved, &mut *data)
+        };
+        if runs <= tapes {
+            merge_tapes(source, from_bounds, 0, runs, target, heap, cursor, compare)?;
+            if in_data {
+                data.copy_from_slice(moved);
+            }
+            return Ok(());
+        }
+        // `mergeonerun` for each step: one run from every tape.
+        to_bounds[0] = 0;
+        let mut written = 0usize;
+        let mut group = 0usize;
+        let mut first = 0usize;
+        while first < runs {
+            let last = (first + tapes).min(runs);
+            let count = (from_bounds[last] - from_bounds[first]) as usize;
+            merge_tapes(
+                source,
+                from_bounds,
+                first,
+                last,
+                &mut target[written..written + count],
+                heap,
+                cursor,
+                compare,
+            )?;
+            written += count;
+            group += 1;
+            to_bounds[group] = written as u32;
+            first = last;
+        }
+        runs = group;
+        core::mem::swap(&mut from_bounds, &mut to_bounds);
+        in_data = !in_data;
+    }
+}
+
+/// `beginmerge` and the loop of `mergeonerun` over the runs `first..last`
+/// of `source` (each a tape's head run), written to `target`.
+#[allow(clippy::too_many_arguments)]
+fn merge_tapes(
+    source: &[u32],
+    bounds: &[u32],
+    first: usize,
+    last: usize,
+    target: &mut [u32],
+    heap: &mut [u32],
+    cursor: &mut [u32],
+    compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+) -> Result<(), SqlError> {
+    let end = |tape: u32| bounds[first + tape as usize + 1];
+    cursor[..last - first].copy_from_slice(&bounds[first..last]);
+    let head = |cursor: &[u32], tape: u32| source[cursor[tape as usize] as usize];
+    let mut size = 0usize;
+    // `tuplesort_heap_insert`.
+    for tape in 0..(last - first) as u32 {
+        let tuple = tape;
+        let mut j = size;
+        size += 1;
+        while j > 0 {
+            let i = (j - 1) >> 1;
+            if compare(head(cursor, tuple), head(cursor, heap[i]))?.is_ge() {
+                break;
+            }
+            heap[j] = heap[i];
+            j = i;
+        }
+        heap[j] = tuple;
+    }
+    let mut out = 0usize;
+    while size > 0 {
+        let tape = heap[0];
+        target[out] = head(cursor, tape);
+        out += 1;
+        cursor[tape as usize] += 1;
+        // `tuplesort_heap_replace_top` with the tape's next row, or
+        // `tuplesort_heap_delete_top` once its run ended.
+        let tuple = if cursor[tape as usize] < end(tape) {
+            tape
+        } else {
+            size -= 1;
+            if size == 0 {
+                break;
+            }
+            heap[size]
+        };
+        let mut i = 0usize;
+        loop {
+            let mut j = 2 * i + 1;
+            if j >= size {
+                break;
+            }
+            if j + 1 < size && compare(head(cursor, heap[j]), head(cursor, heap[j + 1]))?.is_gt() {
+                j += 1;
+            }
+            if compare(head(cursor, tuple), head(cursor, heap[j]))?.is_le() {
+                break;
+            }
+            heap[i] = heap[j];
+            i = j;
+        }
+        heap[i] = tuple;
+    }
+    Ok(())
+}
+
 /// Where PostgreSQL's incremental sort is in its cycle
 /// (`IncrementalSortExecutionStatus`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -463,8 +617,39 @@ fn swap_runs(data: &mut [u32], a: usize, b: usize, n: usize) {
 
 #[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
+
     use super::*;
 
+    #[test]
+    fn runs_merge_through_tapes_in_the_heaps_order() {
+        // Keys by position; 23 rows in runs of 4, merged over 3 tapes
+        // (two passes: 6 runs, then 2).
+        let keys: Vec<u32> = (0..23u32).map(|at| (at * 7) % 5).collect();
+        let lengths = [4u32, 4, 4, 4, 4, 3];
+        let mut data: Vec<u32> = (0..23).collect();
+        let (mut moved, mut bounds) = (vec![0u32; 23], vec![0u32; 14]);
+        let (mut heap, mut cursor) = (vec![0u32; 3], vec![0u32; 3]);
+        pg_tuplesort_runs(
+            &mut data,
+            &lengths,
+            3,
+            RunScratch {
+                moved: &mut moved,
+                bounds: &mut bounds,
+                heap: &mut heap,
+                cursor: &mut cursor,
+            },
+            &mut |a, b| Ok(keys[a as usize].cmp(&keys[b as usize])),
+        )
+        .unwrap();
+        let mut seen = data.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..23).collect::<Vec<u32>>());
+        assert!(
+            data.windows(2)
+                .all(|pair| keys[pair[0] as usize] <= keys[pair[1] as usize])
+        );
+    }
     /// The comparisons `pg_qsort` makes, recorded as value pairs.
     fn trace(values: &[i64]) -> (Vec<u32>, Vec<(i64, i64)>) {
         let mut order: Vec<u32> = (0..values.len() as u32).collect();

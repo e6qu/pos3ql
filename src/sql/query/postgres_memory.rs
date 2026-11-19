@@ -102,12 +102,6 @@ fn datum_layout(value: &Datum<'_>) -> Option<PhysicalLayout> {
     crate::sql::type_layouts::builtin(oid)
 }
 
-/// Whether the value's type has one fixed stored length, so every non-null
-/// value of the type takes the same space in a tuple.
-pub(crate) fn has_fixed_width(value: &Datum<'_>) -> bool {
-    datum_layout(value).is_some_and(|layout| layout.length > 0)
-}
-
 /// The bytes of a varlena value's data after its header, as PostgreSQL
 /// stores it uncompressed; `None` for types sized differently from pos3ql.
 pub(crate) fn varlena_payload(value: &Datum<'_>) -> Option<usize> {
@@ -405,7 +399,10 @@ impl TuplesortModel {
     /// `tuplesort_puttuple_common` of a row whose copy is `length` bytes (the
     /// minimal tuple's `t_len`, or a datum's size) and whose tape image is
     /// `written` bytes (`writetup_heap`, `writetup_datum`).
-    pub(crate) fn push(&mut self, length: usize, written: usize) {
+    ///
+    /// Returns the row count of the run this row's arrival made
+    /// `dumptuples` write, if it did.
+    pub(crate) fn push(&mut self, length: usize, written: usize) -> Option<usize> {
         let charge = match self.tuples {
             SortTuples::Datum => 0,
             SortTuples::Bump => maxalign(length),
@@ -417,12 +414,12 @@ impl TuplesortModel {
         if self.tapes.is_some() {
             self.count += 1;
             if self.count >= self.slots || self.available < 0 {
-                self.dump();
+                return Some(self.dump());
             }
-            return;
+            return None;
         }
         if self.heap {
-            return;
+            return None;
         }
         if self.count + 1 >= self.slots && self.grows {
             self.grow();
@@ -433,12 +430,30 @@ impl TuplesortModel {
         {
             self.heap = true;
             self.heap_at = self.count;
-            return;
+            return None;
         }
         if self.count >= self.slots || self.available < 0 {
             self.begin_tapes();
-            self.dump();
+            return Some(self.dump());
         }
+        None
+    }
+
+    /// Whether the rows pushed so far outgrew `work_mem`, so the sort writes
+    /// its runs to tapes (`inittapes` ran).
+    pub(crate) fn spilled(&self) -> bool {
+        self.tapes.is_some()
+    }
+
+    /// The tapes a spilled sort merges (`tuplesort_merge_order`).
+    pub(crate) fn merge_order(&self) -> Option<usize> {
+        self.tapes.as_ref().map(|tapes| tapes.max_tapes)
+    }
+
+    /// `tuplesort_performsort`'s last `dumptuples`: the rows still in memory
+    /// become the final run. Returns its row count.
+    pub(crate) fn finish_run(&mut self) -> Option<usize> {
+        (self.tapes.is_some() && self.count > 0).then(|| self.dump())
     }
 
     /// `inittapes` (and `inittapestate`'s tape buffers).
@@ -457,14 +472,16 @@ impl TuplesortModel {
 
     /// `dumptuples`: the rows in memory become one run, on the tape the runs
     /// take in turn, ended by a zero length word.
-    fn dump(&mut self) {
+    fn dump(&mut self) -> usize {
         let tapes = self.tapes.as_mut().expect("tapes begun");
         tapes.tape_bytes[tapes.runs % tapes.max_tapes] += self.run_bytes + 4;
         tapes.runs += 1;
+        let rows = self.count;
         self.run_bytes = 0;
         self.count = 0;
         self.available += self.tuple_memory;
         self.tuple_memory = 0;
+        rows
     }
 
     /// What `tuplesort_get_stats` reports once the input ended

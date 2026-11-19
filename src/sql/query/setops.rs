@@ -2570,11 +2570,11 @@ pub(crate) fn set_rows_tie(
     clippy::too_many_arguments,
     reason = "sort keys and their limit's bound"
 )]
-pub(crate) fn sort_set_rows(
+pub(crate) fn sort_set_rows<'a>(
     storage: &Storage,
     txid: u32,
-    arena: &Arena,
-    rows: &mut [&[u8]],
+    arena: &'a Arena,
+    rows: &mut [&'a [u8]],
     order_by: &[OrderBy],
     columns: &[ColDesc],
     bound: Option<usize>,
@@ -2622,23 +2622,13 @@ pub(crate) fn sort_set_rows(
         nk += 1;
     }
     let keys = &keys[..nk];
-    let compare = |a: &&[u8], b: &&[u8]| compare_set_order(storage, txid, columns, a, b, keys);
-    // Past twice its limit's bound the sort keeps only a heap of the rows
-    // the limit returns, as PostgreSQL's does.
-    // The memory PostgreSQL's sort reports, from the rows in arrival order.
-    let space = match bound {
-        Some(bound) if sort.measured() => instrument::SortSpace::postgres_top_n(
-            rows, None, 0, bound, arena, compare, false, None,
-        )?,
-        _ => instrument::SortSpace::postgres(rows, None, bound.is_some(), false)?,
-    };
-    let bound = bound.filter(|&bound| rows.len() > bound * 2);
-    match bound {
-        Some(bound) => {
-            crate::mem::arena::try_stable_top_n_via(arena, rows, bound, compare, |_| arena_full())?
-        }
-        None => crate::mem::arena::try_stable_sort_via(arena, rows, compare, |_| arena_full())?,
-    }
+    // The sort holds every column of a row; past twice its limit's bound it
+    // keeps only a heap of the rows the limit returns, as PostgreSQL's does.
+    let tuples = instrument::SortTuples::new(None, 0, bound.is_some())
+        .ok_or_else(instrument::unsized_value)?;
+    let (_, space) = tuples.sort_rows(arena, rows, bound, &mut |a, b| {
+        compare_set_order(storage, txid, columns, a, b, keys)
+    })?;
     sort.sorted(space);
     Ok(())
 }

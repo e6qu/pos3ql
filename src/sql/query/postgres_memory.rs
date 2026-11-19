@@ -66,10 +66,18 @@ const fn align_to(offset: usize, alignment: u8) -> usize {
     offset.div_ceil(by) * by
 }
 
-/// The physical layout of a value's type, from the value itself; `None`
-/// for values whose type pos3ql's datum does not determine (a `text`-like
-/// datum may be `name`) or whose stored size it does not model.
+/// A non-null value as a tuple stores it: its type's layout and, for a
+/// varlena, the data bytes after its header.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stored {
+    pub(crate) layout: PhysicalLayout,
+    pub(crate) payload: usize,
+}
+
+/// The layout of the type a value's variant names; `None` for a value whose
+/// type its datum does not determine or whose stored size is not modelled.
 fn datum_layout(value: &Datum<'_>) -> Option<PhysicalLayout> {
+    use crate::sql::types::{ArrElem, ColType, GeometryKind};
     let oid = match value {
         Datum::Bool(_) => 16,
         Datum::Char(_) => 18,
@@ -79,9 +87,19 @@ fn datum_layout(value: &Datum<'_>) -> Option<PhysicalLayout> {
         Datum::Text(_) => 25,
         Datum::Oid(_) => 26,
         Datum::Tid(_) => 27,
+        Datum::Cid(_) => 29,
+        Datum::Int2Vector { .. } => 22,
+        Datum::OidVector { .. } => 30,
+        Datum::Xml(_) => 142,
+        Datum::PgNodeTree(_) => 194,
+        Datum::Json { jsonb: false, .. } => 114,
+        Datum::Json { jsonb: true, .. } => 3802,
+        Datum::JsonPath(_) => 4072,
+        Datum::TsVector(_) => 3614,
         Datum::Float4(_) => 700,
         Datum::Float8(_) => 701,
         Datum::Money(_) => 790,
+        Datum::AclItem(_) => 1033,
         Datum::Bpchar(_) => 1042,
         Datum::Date(_) => 1082,
         Datum::Time(_) => 1083,
@@ -97,6 +115,30 @@ fn datum_layout(value: &Datum<'_>) -> Option<PhysicalLayout> {
         Datum::Macaddr(_) => 829,
         Datum::Inet(_) => 869,
         Datum::PgLsn(_) => 3220,
+        Datum::Xid8(_) => 5069,
+        Datum::Regtype { .. } => 2206,
+        Datum::RegObject { type_oid, .. } => *type_oid,
+        Datum::Bit { varying: false, .. } => 1560,
+        Datum::Bit { varying: true, .. } => 1562,
+        Datum::Geometry { kind, .. } => match kind {
+            GeometryKind::Point => 600,
+            GeometryKind::Lseg => 601,
+            GeometryKind::Path => 602,
+            GeometryKind::Box => 603,
+            GeometryKind::Polygon => 604,
+            GeometryKind::Line => 628,
+            GeometryKind::Circle => 718,
+        },
+        // An enum label is its `oid`.
+        Datum::Enum { .. } => 26,
+        Datum::Array { element, .. } => {
+            if matches!(element, ArrElem::Nested { .. } | ArrElem::Record) {
+                return None;
+            }
+            return Some(ColType::Array(*element).physical_layout());
+        }
+        // A composite datum: `record` or a named composite, `'d'` aligned.
+        Datum::Record(_) | Datum::Composite { .. } => 2249,
         _ => return None,
     };
     crate::sql::type_layouts::builtin(oid)
@@ -105,10 +147,13 @@ fn datum_layout(value: &Datum<'_>) -> Option<PhysicalLayout> {
 /// The bytes of a varlena value's data after its header, as PostgreSQL
 /// stores it uncompressed; `None` for types sized differently from pos3ql.
 pub(crate) fn varlena_payload(value: &Datum<'_>) -> Option<usize> {
+    use super::postgres_values as values;
     use crate::sql::numeric::Sign;
     Some(match value {
         Datum::Text(text) | Datum::Bpchar(text) | Datum::Xml(text) => text.len(),
+        Datum::PgNodeTree(node) => node.as_str().len(),
         Datum::Json { text, jsonb: false } => text.len(),
+        Datum::Json { text, jsonb: true } => values::jsonb_payload(text)?,
         Datum::Bytea(bytes) => bytes.len(),
         // `inet_struct`: family and mask length, then the address bytes.
         Datum::Inet(address) | Datum::Cidr(address) => 2 + address.addr_len(),
@@ -121,26 +166,132 @@ pub(crate) fn varlena_payload(value: &Datum<'_>) -> Option<usize> {
             }
             Sign::NaN | Sign::PosInf | Sign::NegInf => 2,
         },
+        Datum::Array { element, raw } => values::array_payload(*element, raw)?,
+        Datum::TsVector(vector) => {
+            crate::storage::statistics::scalar::tsvector_data_length(vector.as_str())
+        }
+        Datum::Bit { bits, .. } => values::bit_payload(bits),
+        Datum::Geometry { kind, text } => match kind {
+            crate::sql::types::GeometryKind::Path => values::path_payload(text),
+            crate::sql::types::GeometryKind::Polygon => values::polygon_payload(text),
+            _ => return None,
+        },
+        Datum::Int2Vector { raw, .. } => values::vector_payload(raw.len() / 2, 2),
+        Datum::OidVector { raw, .. } => values::vector_payload(raw.len() / 4, 4),
+        Datum::Record(fields) | Datum::Composite { fields, .. } => {
+            composite_length(fields.iter().map(|field| {
+                if field.value.is_null() {
+                    Some(None)
+                } else {
+                    stored(Some(field.type_oid), &field.value).map(Some)
+                }
+            }))? - 4
+        }
         _ => return None,
     })
 }
 
-/// Adds one non-null value of `layout` to a tuple's data of `data` bytes
-/// (`heap_compute_data_size`): a packable varlena short enough takes a
-/// one-byte header and no alignment.
-pub(crate) fn add_value(data: usize, layout: PhysicalLayout, value: &Datum<'_>) -> Option<usize> {
-    if layout.length > 0 {
-        return Some(align_to(data, layout.alignment) + layout.length as usize);
-    }
-    if layout.length != -1 {
-        return None;
-    }
-    let payload = varlena_payload(value)?;
-    Some(if layout.storage != b'p' && payload < SHORT_VARLENA_MAX {
-        data + payload + 1
+/// The stored form of a non-null `value`; `hint` is its type's OID when the
+/// caller knows it (a record's field), which tells a `name` from `text`.
+pub(crate) fn stored(hint: Option<i32>, value: &Datum<'_>) -> Option<Stored> {
+    let layout = hint
+        .and_then(crate::sql::type_layouts::builtin)
+        .filter(|layout| layout.length != -1 || datum_layout(value).is_some())
+        .or_else(|| datum_layout(value))?;
+    let payload = if layout.length == -1 {
+        varlena_payload(value)?
     } else {
-        align_to(data, layout.alignment) + payload + 4
-    })
+        0
+    };
+    Some(Stored { layout, payload })
+}
+
+/// What a tuple's data holds so far (`heap_compute_data_size`).
+#[derive(Default)]
+struct TupleData {
+    data: usize,
+    columns: usize,
+    has_null: bool,
+}
+
+impl TupleData {
+    /// Adds one column: `None` for NULL, which only sets its bitmap bit.
+    fn push(&mut self, value: Option<Stored>) {
+        self.columns += 1;
+        let Some(Stored { layout, payload }) = value else {
+            self.has_null = true;
+            return;
+        };
+        self.data = if layout.length > 0 {
+            align_to(self.data, layout.alignment) + layout.length as usize
+        } else if layout.storage != b'p' && payload < SHORT_VARLENA_MAX {
+            // A packable varlena short enough takes a one-byte header and no
+            // alignment.
+            self.data + payload + 1
+        } else {
+            align_to(self.data, layout.alignment) + payload + 4
+        };
+    }
+
+    /// The tuple's length given its header before the null bitmap.
+    fn length(&self, header: usize) -> usize {
+        let bitmap = if self.has_null {
+            self.columns.div_ceil(8)
+        } else {
+            0
+        };
+        maxalign(header + bitmap) + self.data
+    }
+}
+
+/// `HeapTupleHeaderData` before its null bitmap: the length of a composite
+/// datum (`heap_form_tuple`, then `HeapTupleHeaderSetDatumLength`).
+const COMPOSITE_HEADER: usize = 23;
+
+/// The length of the composite datum of `fields`: a field is `None` when it
+/// has no PostgreSQL size here and `Some(None)` for NULL.
+fn composite_length(fields: impl Iterator<Item = Option<Option<Stored>>>) -> Option<usize> {
+    let mut tuple = TupleData::default();
+    for field in fields {
+        tuple.push(field?);
+    }
+    Some(tuple.length(COMPOSITE_HEADER))
+}
+
+/// The stored form of the value at byte `at` of an encoded row, whose tag is
+/// `tag`: `None` when it has no PostgreSQL size here, `Some(None)` for NULL.
+fn stored_projected(row: &[u8], tag: u8, at: usize, hint: Option<i32>) -> Option<Option<Stored>> {
+    if matches!(tag, 19 | 51 | 202 | 204) {
+        let mut fields = [None::<Stored>; crate::sql::exec::MAX_PROJ];
+        let mut count = 0usize;
+        crate::sql::exec::try_each_record_field(row, tag, at, &mut |type_oid, tag, at| {
+            *fields.get_mut(count)? = stored_projected(row, tag, at, Some(type_oid))?;
+            count += 1;
+            Some(())
+        })?;
+        let length = composite_length(fields[..count].iter().map(|&field| Some(field)))?;
+        return Some(Some(Stored {
+            layout: crate::sql::type_layouts::builtin(2249)?,
+            payload: length - 4,
+        }));
+    }
+    let (value, _) = crate::sql::exec::decode_projected_value(row, tag, at);
+    if value.is_null() {
+        return Some(None);
+    }
+    stored(hint, &value).map(Some)
+}
+
+/// The stored form of column `column` of an encoded row.
+pub(crate) fn stored_column(row: &[u8], column: usize) -> Option<Option<Stored>> {
+    let mut at = 2usize;
+    for _ in 0..column {
+        let tag = row[at];
+        at += 1;
+        at += crate::sql::exec::decode_projected_value(row, tag, at).1;
+    }
+    let tag = row[at];
+    stored_projected(row, tag, at + 1, None)
 }
 
 /// The `t_len` of the minimal tuple (`heap_form_minimal_tuple`) of `values`,
@@ -151,23 +302,32 @@ pub(crate) fn minimal_tuple_len_with_tids<'a>(
     values: impl Iterator<Item = Datum<'a>>,
     tids: usize,
 ) -> Option<usize> {
-    let mut data = 0usize;
-    let mut columns = 0usize;
-    let mut has_null = false;
-    for value in values {
-        columns += 1;
-        if value.is_null() {
-            has_null = true;
-            continue;
-        }
-        data = add_value(data, datum_layout(&value)?, &value)?;
+    minimal_tuple_len(
+        values.map(|value| {
+            if value.is_null() {
+                Some(None)
+            } else {
+                stored(None, &value).map(Some)
+            }
+        }),
+        tids,
+    )
+}
+
+/// [`minimal_tuple_len_with_tids`] of columns already sized.
+fn minimal_tuple_len(
+    columns: impl Iterator<Item = Option<Option<Stored>>>,
+    tids: usize,
+) -> Option<usize> {
+    let mut tuple = TupleData::default();
+    for column in columns {
+        tuple.push(column?);
     }
     for _ in 0..tids {
-        columns += 1;
-        data = align_to(data, b's') + 6;
+        tuple.columns += 1;
+        tuple.data = align_to(tuple.data, b's') + 6;
     }
-    let bitmap = if has_null { columns.div_ceil(8) } else { 0 };
-    Some(maxalign(MINIMAL_TUPLE_HEADER + bitmap) + data)
+    Some(tuple.length(MINIMAL_TUPLE_HEADER))
 }
 
 /// The `t_len` of the minimal tuple of a projected row's values at
@@ -183,32 +343,32 @@ pub(crate) fn projected_tuple_len_with_tids(
     tids: usize,
 ) -> Option<usize> {
     if let Some(columns) = columns {
-        let values = columns
-            .iter()
-            .map(|&column| crate::sql::exec::decode_projected_pub(row, column));
-        return minimal_tuple_len_with_tids(values, tids);
+        return minimal_tuple_len(
+            columns.iter().map(|&column| stored_column(row, column)),
+            tids,
+        );
     }
     let width = crate::sql::exec::projected_row_width(row);
     let mut at = 2usize;
-    let values = (0..width).map(|_| {
-        let tag = row[at];
-        at += 1;
-        let (decoded, size) = crate::sql::exec::decode_projected_value(row, tag, at);
-        at += size;
-        decoded
-    });
-    minimal_tuple_len_with_tids(values, tids)
+    minimal_tuple_len(
+        (0..width).map(|_| {
+            let tag = row[at];
+            at += 1;
+            let size = crate::sql::exec::decode_projected_value(row, tag, at).1;
+            let column = stored_projected(row, tag, at, None);
+            at += size;
+            column
+        }),
+        tids,
+    )
 }
 
 /// `datumGetSize` of the value a datum sort copies: nothing for a null,
 /// a pass-by-value datum's eight bytes, a fixed-width value's length, or a
 /// varlena: with a one-byte header when its data is short enough and it was
 /// read from a stored column (`computed` false), as tuple forming packs it.
-pub(crate) fn datum_written_size(value: &Datum<'_>, computed: bool) -> usize {
-    if value.is_null() {
-        return 0;
-    }
-    let Some(layout) = datum_layout(value) else {
+pub(crate) fn datum_written_size(value: Option<Stored>, computed: bool) -> usize {
+    let Some(Stored { layout, payload }) = value else {
         return 0;
     };
     if layout.by_value {
@@ -217,24 +377,37 @@ pub(crate) fn datum_written_size(value: &Datum<'_>, computed: bool) -> usize {
     if layout.length > 0 {
         return layout.length as usize;
     }
-    match varlena_payload(value) {
-        // A stored column holds a short value with a one-byte header; a
-        // value an expression computed has the four-byte one.
-        Some(payload) if !computed && layout.storage != b'p' && payload < SHORT_VARLENA_MAX => {
-            payload + 1
-        }
-        Some(payload) => payload + 4,
-        None => 0,
+    // A stored column holds a short value with a one-byte header; a value an
+    // expression computed has the four-byte one.
+    if !computed && layout.storage != b'p' && payload < SHORT_VARLENA_MAX {
+        payload + 1
+    } else {
+        payload + 4
     }
 }
 
+/// [`datum_written_size`] of `value`; `None` when it has no PostgreSQL size
+/// here.
+pub(crate) fn value_written_size(value: &Datum<'_>, computed: bool) -> Option<usize> {
+    let stored = if value.is_null() {
+        None
+    } else {
+        Some(stored(None, value)?)
+    };
+    Some(datum_written_size(stored, computed))
+}
+
 /// [`datum_written_size`] of the value at `column` of a projected row (the
-/// first when `None`).
-pub(crate) fn sorted_datum_size(row: &[u8], column: Option<usize>, computed: bool) -> usize {
-    datum_written_size(
-        &crate::sql::exec::decode_projected_pub(row, column.unwrap_or(0)),
+/// first when `None`); `None` when it has no PostgreSQL size here.
+pub(crate) fn sorted_datum_size(
+    row: &[u8],
+    column: Option<usize>,
+    computed: bool,
+) -> Option<usize> {
+    Some(datum_written_size(
+        stored_column(row, column.unwrap_or(0))?,
         computed,
-    )
+    ))
 }
 
 /// `work_mem` in bytes, the memory a sort or tuplestore may use.
@@ -270,7 +443,7 @@ const TAPE_BUFFER_OVERHEAD: i64 = BLOCK_BYTES as i64;
 const MERGE_BUFFER_SIZE: i64 = 32 * BLOCK_BYTES as i64;
 /// `MINORDER` and `MAXORDER`.
 const MIN_MERGE_ORDER: usize = 6;
-const MAX_MERGE_ORDER: usize = 500;
+pub(crate) const MAX_MERGE_ORDER: usize = 500;
 
 /// `tuplesort_merge_order`: the tapes a sort of `allowed` bytes merges.
 pub(crate) fn tuplesort_merge_order(allowed: i64) -> usize {

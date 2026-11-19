@@ -147,6 +147,7 @@ pub(crate) use cte::{
 pub(crate) mod instrument;
 mod outer_joins;
 pub(crate) mod postgres_memory;
+pub(crate) mod postgres_values;
 mod pullup;
 pub(crate) mod write_buffers;
 pub(crate) use cte::expand_dml_ctes_schema;
@@ -16294,8 +16295,6 @@ pub(crate) fn constant_select_resumable<'a>(
             }
             Ok(core::cmp::Ordering::Equal)
         };
-        // Past twice its limit's bound the sort keeps only a heap of the
-        // rows the limit returns, as PostgreSQL's does.
         // The sort holds the output columns and the keys that are not.
         let mut columns = [0usize; MAX_PROJ];
         let mut count = 0;
@@ -16305,49 +16304,18 @@ pub(crate) fn constant_select_resumable<'a>(
             columns[count] = column;
             count += 1;
         }
-        // The memory PostgreSQL's sort reports, from the rows in arrival
-        // order.
+        // Past twice its limit's bound the sort keeps only a heap of the
+        // rows the limit returns, as PostgreSQL's does.
         let bounded = group::sort_bound(statement, limit, offset).filter(|_| !statement.distinct);
-        let space = match bounded {
-            Some(bound) if stages.sort.measured() => {
-                match instrument::SortSpace::postgres_top_n(
-                    out_rows,
-                    Some(&columns[..count]),
-                    0,
-                    bound,
-                    arena,
-                    compare,
-                    sole_item_computed(statement.items),
-                    None,
-                ) {
-                    Ok(space) => space,
-                    Err(error) => return sql_fail(error),
-                }
-            }
-            _ => match instrument::SortSpace::postgres(
-                out_rows,
-                Some(&columns[..count]),
-                false,
-                sole_item_computed(statement.items),
-            ) {
-                Ok(space) => space,
-                Err(error) => return sql_fail(error),
-            },
+        let tuples =
+            match instrument::SortTuples::new(Some(&columns[..count]), 0, bounded.is_some()) {
+                Some(tuples) => tuples.computed(sole_item_computed(statement.items)),
+                None => return sql_fail(instrument::unsized_value()),
+            };
+        let space = match tuples.sort_rows(arena, out_rows, bounded, &mut |a, b| compare(&a, &b)) {
+            Ok((_, space)) => space,
+            Err(error) => return sql_fail(error),
         };
-        let bound = bounded.filter(|&bound| out_rows.len() > bound * 2);
-        let sorted = match bound {
-            Some(bound) => {
-                crate::mem::arena::try_stable_top_n_via(arena, out_rows, bound, compare, |_| {
-                    arena_full()
-                })
-            }
-            None => {
-                crate::mem::arena::try_stable_sort_via(arena, out_rows, compare, |_| arena_full())
-            }
-        };
-        if let Err(error) = sorted {
-            return sql_fail(error);
-        }
         stages.sort.rows(out_rows.len() as u64);
         stages.sort.sorted(space);
     }

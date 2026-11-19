@@ -8,7 +8,7 @@
 //! caches; no provider identity reaches this module.
 
 use crate::sql::query::instrument::{SortMethod, SortSpace};
-use crate::sql::query::postgres_memory::TuplesortSpace;
+use crate::sql::query::postgres_memory::{MAX_MERGE_ORDER, TuplesortSpace};
 use core::cmp::Ordering;
 
 use crate::mem::budget::{Budget, BudgetError};
@@ -205,6 +205,36 @@ impl ExternalRunReader {
     }
 }
 
+/// Scratch for ordering one chunk's rows as `tuplesort.c` does: a chunk
+/// holds at most `ROWS_PER_CHUNK` rows, so every array is sized from that.
+struct ExactScratch {
+    held: Box<[BufferedRow]>,
+    order: Box<[u32]>,
+    moved: Box<[u32]>,
+    bounds: Box<[u32]>,
+    heap: Box<[u32]>,
+    cursor: Box<[u32]>,
+}
+
+impl ExactScratch {
+    fn budget_bytes() -> usize {
+        ROWS_PER_CHUNK * core::mem::size_of::<BufferedRow>()
+            + (2 * ROWS_PER_CHUNK + 2 * (ROWS_PER_CHUNK + 1) + 2 * MAX_MERGE_ORDER)
+                * core::mem::size_of::<u32>()
+    }
+
+    fn new() -> Self {
+        Self {
+            held: vec![EMPTY_BUFFERED_ROW; ROWS_PER_CHUNK].into_boxed_slice(),
+            order: vec![0u32; ROWS_PER_CHUNK].into_boxed_slice(),
+            moved: vec![0u32; ROWS_PER_CHUNK].into_boxed_slice(),
+            bounds: vec![0u32; 2 * (ROWS_PER_CHUNK + 1)].into_boxed_slice(),
+            heap: vec![0u32; MAX_MERGE_ORDER].into_boxed_slice(),
+            cursor: vec![0u32; MAX_MERGE_ORDER].into_boxed_slice(),
+        }
+    }
+}
+
 pub(crate) struct ExternalSorter {
     chunk: Box<[u8]>,
     chunk_len: usize,
@@ -228,8 +258,14 @@ pub(crate) struct ExternalSorter {
     bound: Option<usize>,
     /// PostgreSQL's sort of the rows pushed so far, once one was.
     model: Option<crate::sql::query::postgres_memory::TuplesortModel>,
-    /// A pushed value had no PostgreSQL size, so there is no model.
-    unsized_row: bool,
+    /// The row counts of the runs the model's `dumptuples` wrote, in
+    /// order.
+    pg_runs: Box<[u32]>,
+    pg_run_count: usize,
+    /// The rows were put in PostgreSQL's order already.
+    ordered: bool,
+    /// Scratch for ordering a chunk as PostgreSQL's tuplesort does.
+    exact: ExactScratch,
     /// What the rows of a bounded heap charge, once [`ExternalSorter::keep_least`]
     /// kept them.
     heap_charge: Option<usize>,
@@ -245,6 +281,8 @@ impl ExternalSorter {
             + SstWriter::budget_bytes()
             + MERGE_FAN_IN * 4 * MAX_PAYLOAD
             + ROWS_PER_CHUNK * core::mem::size_of::<usize>()
+            + ROWS_PER_CHUNK * core::mem::size_of::<u32>()
+            + ExactScratch::budget_bytes()
     }
 
     /// Allocates every run/merge buffer at startup.
@@ -266,7 +304,10 @@ impl ExternalSorter {
             postgres: None,
             bound: None,
             model: None,
-            unsized_row: false,
+            pg_runs: vec![0u32; ROWS_PER_CHUNK].into_boxed_slice(),
+            pg_run_count: 0,
+            ordered: false,
+            exact: ExactScratch::new(),
             heap_charge: None,
             heap: vec![0usize; ROWS_PER_CHUNK].into_boxed_slice(),
         })
@@ -285,7 +326,8 @@ impl ExternalSorter {
         self.postgres = None;
         self.bound = None;
         self.model = None;
-        self.unsized_row = false;
+        self.pg_run_count = 0;
+        self.ordered = false;
         self.heap_charge = None;
         for reader in &mut self.readers {
             reader.cursor = None;
@@ -311,24 +353,25 @@ impl ExternalSorter {
     }
 
     /// Feeds the row just buffered at `offset` to PostgreSQL's sort.
-    fn size_row(&mut self, offset: usize, total: usize) {
+    fn size_row(&mut self, offset: usize, total: usize) -> Result<(), SqlError> {
         let Some(tuples) = self.postgres else {
-            return;
+            return Ok(());
         };
-        if self.unsized_row {
-            return;
-        }
         let row = &self.chunk[offset + ORDINAL_BYTES..offset + total];
         let model = self
             .model
             .get_or_insert_with(|| tuples.model(Some(row), self.bound));
-        if !tuples.push(model, Some(row), row) {
-            self.unsized_row = true;
+        if let Some(rows) = tuples.push(model, Some(row), row)?
+            && let Some(slot) = self.pg_runs.get_mut(self.pg_run_count)
+        {
+            *slot = rows as u32;
+            self.pg_run_count += 1;
         }
+        Ok(())
     }
 
-    /// What PostgreSQL's sort of the rows reports, `None` when it is not
-    /// sized.
+    /// What PostgreSQL's sort of the rows reports, `None` when no sort was
+    /// described.
     fn postgres_space(
         &self,
     ) -> Result<Option<crate::sql::query::postgres_memory::TuplesortSpace>, SqlError> {
@@ -336,7 +379,6 @@ impl ExternalSorter {
         let Some(model) = self
             .model
             .or_else(|| self.postgres.map(|tuples| tuples.model(None, self.bound)))
-            .filter(|_| !self.unsized_row)
         else {
             return Ok(None);
         };
@@ -366,7 +408,7 @@ impl ExternalSorter {
             return Err(row_too_large());
         }
         if self.row_count == self.rows.len() || self.chunk_len + total > self.chunk.len() {
-            self.flush_chunk(store, compare)?;
+            self.flush_chunk(store, compare, false)?;
         }
         let offset = self.chunk_len;
         self.chunk[offset..offset + ORDINAL_BYTES]
@@ -395,7 +437,7 @@ impl ExternalSorter {
             return Err(row_too_large());
         }
         if self.row_count == self.rows.len() || self.chunk_len + total > self.chunk.len() {
-            self.flush_chunk(store, compare)?;
+            self.flush_chunk(store, compare, false)?;
         }
         let offset = self.chunk_len;
         self.chunk[offset..offset + ORDINAL_BYTES]
@@ -412,7 +454,7 @@ impl ExternalSorter {
         };
         self.row_count += 1;
         self.chunk_len += total;
-        self.size_row(offset, total);
+        self.size_row(offset, total)?;
         self.next_ordinal = self.next_ordinal.checked_add(1).ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -433,7 +475,7 @@ impl ExternalSorter {
         let chunk_bytes = self.chunk_len + self.row_count * core::mem::size_of::<BufferedRow>();
         let heap = self.model.is_some_and(|model| model.bounded());
         let postgres = self.postgres_space()?;
-        self.flush_chunk(store, compare)?;
+        self.flush_chunk(store, compare, true)?;
         self.space = Some(match postgres {
             Some(TuplesortSpace::Memory(bytes)) => SortSpace {
                 method: if heap {
@@ -502,7 +544,6 @@ impl ExternalSorter {
         // heap charges by.
         if let Some(tuples) = self.postgres
             && let Some(model) = self.model.filter(|model| model.bounded())
-            && !self.unsized_row
         {
             let mut positions = core::mem::take(&mut self.heap);
             let charge = {
@@ -517,6 +558,8 @@ impl ExternalSorter {
             };
             self.heap = positions;
             self.heap_charge = Some(charge?);
+            // A sort that kept a heap returns its rows in the heap's order.
+            return self.order_heap_as_postgres(bound, compare);
         }
         if self.row_count <= bound.saturating_mul(2) {
             return Ok(());
@@ -549,7 +592,7 @@ impl ExternalSorter {
         if self.level_counts.iter().any(|&count| count != 0) {
             return Ok(None);
         }
-        self.sort_chunk(compare)?;
+        self.sort_chunk(compare, true)?;
         Ok(Some(self.row_count))
     }
 
@@ -560,15 +603,18 @@ impl ExternalSorter {
         &self.chunk[start..end]
     }
 
+    /// Sorts the buffered rows and writes them as a run; `last` names the
+    /// input's final chunk.
     fn flush_chunk(
         &mut self,
         store: &mut dyn BlockStore,
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
+        last: bool,
     ) -> Result<(), SqlError> {
         if self.row_count == 0 {
             return Ok(());
         }
-        self.sort_chunk(compare)?;
+        self.sort_chunk(compare, last)?;
         self.writer.reset();
         self.spilled_bytes = self.spilled_bytes.saturating_add(self.chunk_len);
         let rows = self.row_count as u64;
@@ -592,7 +638,16 @@ impl ExternalSorter {
     fn sort_chunk(
         &mut self,
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
+        last: bool,
     ) -> Result<(), SqlError> {
+        if self.ordered {
+            return Ok(());
+        }
+        // The whole input sits in this chunk, so PostgreSQL's order of rows
+        // that compare equal is reproducible.
+        if last && self.model.is_some() && self.spilled_bytes == 0 {
+            return self.order_as_postgres(compare);
+        }
         let chunk = &self.chunk;
         crate::util::try_sort_unstable_by(&mut self.rows[..self.row_count], |a, b| {
             let row = |entry: &BufferedRow| {
@@ -602,6 +657,101 @@ impl ExternalSorter {
             };
             Ok(compare(row(a), row(b))?.then_with(|| a.ordinal.cmp(&b.ordinal)))
         })
+    }
+
+    /// Keeps the `bound` rows PostgreSQL's bounded heap keeps, in its order.
+    fn order_heap_as_postgres(
+        &mut self,
+        bound: usize,
+        compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
+    ) -> Result<(), SqlError> {
+        let count = self.row_count;
+        let Self {
+            chunk, rows, exact, ..
+        } = self;
+        exact.held[..count].copy_from_slice(&rows[..count]);
+        for (at, slot) in exact.order[..count].iter_mut().enumerate() {
+            *slot = at as u32;
+        }
+        let held = &exact.held;
+        let kept = crate::sql::pg_qsort::pg_tuplesort(
+            &mut exact.order[..count],
+            Some(bound),
+            &mut |left: u32, right: u32| {
+                let row = |entry: &BufferedRow| {
+                    let start = entry.offset as usize + ORDINAL_BYTES;
+                    let end = entry.offset as usize + entry.length as usize;
+                    &chunk[start..end]
+                };
+                compare(row(&held[left as usize]), row(&held[right as usize]))
+            },
+        )?;
+        for (slot, &at) in rows[..kept].iter_mut().zip(&exact.order[..kept]) {
+            *slot = exact.held[at as usize];
+        }
+        self.row_count = kept;
+        self.bounded = true;
+        self.ordered = true;
+        Ok(())
+    }
+
+    /// Orders the buffered rows, in arrival order, as PostgreSQL's tuplesort
+    /// does: its runs where `dumptuples` wrote them, merged as `mergeruns`
+    /// does, or one `pg_qsort`.
+    fn order_as_postgres(
+        &mut self,
+        compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
+    ) -> Result<(), SqlError> {
+        let count = self.row_count;
+        let mut model = self.model.expect("sized rows");
+        let mut runs = self.pg_run_count;
+        if let Some(rows) = model.finish_run()
+            && let Some(slot) = self.pg_runs.get_mut(runs)
+        {
+            *slot = rows as u32;
+            runs += 1;
+        }
+        let Self {
+            chunk,
+            rows,
+            exact,
+            pg_runs,
+            ..
+        } = self;
+        exact.held[..count].copy_from_slice(&rows[..count]);
+        for (at, slot) in exact.order[..count].iter_mut().enumerate() {
+            *slot = at as u32;
+        }
+        let held = &exact.held;
+        let mut compare_at = |left: u32, right: u32| {
+            let row = |entry: &BufferedRow| {
+                let start = entry.offset as usize + ORDINAL_BYTES;
+                let end = entry.offset as usize + entry.length as usize;
+                &chunk[start..end]
+            };
+            compare(row(&held[left as usize]), row(&held[right as usize]))
+        };
+        if let Some(merge_order) = model.merge_order() {
+            crate::sql::pg_qsort::pg_tuplesort_runs(
+                &mut exact.order[..count],
+                &pg_runs[..runs],
+                merge_order,
+                crate::sql::pg_qsort::RunScratch {
+                    moved: &mut exact.moved,
+                    bounds: &mut exact.bounds,
+                    heap: &mut exact.heap[..merge_order],
+                    cursor: &mut exact.cursor[..merge_order],
+                },
+                &mut compare_at,
+            )?;
+        } else {
+            crate::sql::pg_qsort::pg_tuplesort(&mut exact.order[..count], None, &mut compare_at)?;
+        }
+        for (slot, &at) in rows[..count].iter_mut().zip(&exact.order[..count]) {
+            *slot = exact.held[at as usize];
+        }
+        self.ordered = true;
+        Ok(())
     }
 
     fn add_run(
@@ -791,7 +941,7 @@ mod tests {
                     &mut compare,
                 )
                 .unwrap();
-            sorter.flush_chunk(&mut store, &mut compare).unwrap();
+            sorter.flush_chunk(&mut store, &mut compare, true).unwrap();
         }
         let run = sorter
             .finish(&mut store, &mut compare)

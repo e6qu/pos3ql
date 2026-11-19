@@ -2126,57 +2126,11 @@ impl<'r, 'a> Runner<'r, 'a> {
             );
             let _sort = sort.start();
             let held = self.hold(id, bound)?;
-            let order = self.sorted(&held, keys, relids)?;
+            let (order, space) = self.sorted(&held, keys, relids, id)?;
             let rows = held.rows.borrowed_slice();
+            // The planner puts a `Materialize` above an inner sort the join
+            // marks, so both sorts are ordinary tuplesorts.
             if super::instrument::active() {
-                let mut fits = true;
-                let mut lengths = ArenaList::new(self.arena);
-                for row in rows {
-                    match self.tuple_len(row, id) {
-                        Ok(length) => lengths.push(length).map_err(|_| arena_full())?,
-                        Err(_) => fits = false,
-                    }
-                }
-                // `ExecInitSort`: a sort of a single column sorts datums.
-                let mut columns = 0;
-                self.model.plan.target_list(relids, &mut |_| columns += 1);
-                let tuples = if columns == 1 {
-                    super::postgres_memory::SortTuples::Datum
-                } else {
-                    super::postgres_memory::SortTuples::Bump
-                };
-                // The planner puts a `Materialize` above an inner sort the join
-                // marks, so both sorts are ordinary tuplesorts.
-                let unsupported = || {
-                    crate::sql_err!(
-                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                        "EXPLAIN ANALYZE of a merge join over a value with no PostgreSQL size here, or whose single-column sort spills, is not supported"
-                    )
-                };
-                if !fits {
-                    return Err(unsupported());
-                }
-                let mut model = super::postgres_memory::TuplesortModel::new(tuples, None);
-                for &length in lengths.borrowed_slice() {
-                    model.push(length, length - 10 + 4);
-                }
-                let space = match model.space(None) {
-                    super::postgres_memory::TuplesortSpace::Memory(bytes) => {
-                        super::instrument::SortSpace {
-                            method: super::instrument::SortMethod::Quicksort,
-                            bytes,
-                        }
-                    }
-                    // A datum sort's tape holds the datums, whose sizes
-                    // this list of tuple lengths lacks.
-                    _ if columns == 1 => return Err(unsupported()),
-                    super::postgres_memory::TuplesortSpace::Disk(bytes) => {
-                        super::instrument::SortSpace {
-                            method: super::instrument::SortMethod::ExternalMerge,
-                            bytes,
-                        }
-                    }
-                };
                 sort.sorted(space);
             }
             let sorted = self
@@ -3340,6 +3294,18 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// The `t_len` of the minimal tuple of path `id`'s target list for
     /// the bound row.
     fn tuple_len(&self, bound: &Bound<'a>, id: u32) -> Result<usize, SqlError> {
+        self.tuple_sizes(bound, id, false).map(|(length, _)| length)
+    }
+
+    /// The `t_len` of a row's tuple under the `id` path and what a sort
+    /// writes of it to a tape (`writetup_heap`, or `writetup_datum` when
+    /// `datum` names a sort of one column).
+    fn tuple_sizes(
+        &self,
+        bound: &Bound<'a>,
+        id: u32,
+        datum: bool,
+    ) -> Result<(usize, usize), SqlError> {
         let mut values = [Datum::Null; 128];
         let mut width = 0;
         let mut fits = true;
@@ -3354,11 +3320,21 @@ impl<'r, 'a> Runner<'r, 'a> {
                     fits = false;
                 }
             });
-        fits.then(|| {
-            super::postgres_memory::minimal_tuple_len_with_tids(values[..width].iter().copied(), 0)
-        })
-        .flatten()
-        .ok_or_else(|| {
+        let sizes = fits
+            .then(|| {
+                let length = super::postgres_memory::minimal_tuple_len_with_tids(
+                    values[..width].iter().copied(),
+                    0,
+                )?;
+                let written = if datum {
+                    4 + super::postgres_memory::value_written_size(&values[0], false)?
+                } else {
+                    length - 10 + 4
+                };
+                Some((length, written))
+            })
+            .flatten();
+        sizes.ok_or_else(|| {
             crate::sql_err!(
                 crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
                 "a join whose rows have no PostgreSQL size here is not supported"
@@ -3539,10 +3515,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         let held = self.hold(input, bound)?;
         let rows = held.rows.borrowed_slice();
         let relids = self.model.plan.path(input).relids;
-        let order = self
-            .arena
-            .alloc_slice_with(rows.len(), |at| at as u32)
-            .map_err(|_| arena_full())?;
         let column = |member: &super::index_paths::joins::Member| {
             (usize::from(member.rel), usize::from(member.column))
         };
@@ -3567,7 +3539,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             }
             Ok(Ordering::Equal)
         };
-        crate::sql::pg_qsort::pg_qsort(order, &mut |a, b| {
+        let (order, _) = self.tuplesort(input, rows, &mut |a, b| {
             compare(&rows[a as usize], &rows[b as usize])
         })?;
         let mut previous: Option<u32> = None;
@@ -3669,17 +3641,16 @@ impl<'r, 'a> Runner<'r, 'a> {
         Ok(true)
     }
 
-    /// The held rows' order after a sort by `keys` (`pg_qsort`, NULLs
-    /// last), or as held without keys.
-    fn sorted(&self, held: &Held<'a>, keys: &Keys, relids: u32) -> Result<&'a [u32], SqlError> {
+    /// The held rows' order after a sort by `keys` (PostgreSQL's tuplesort,
+    /// NULLs last), or as held without keys, and the space the sort reports.
+    fn sorted(
+        &self,
+        held: &Held<'a>,
+        keys: &Keys,
+        relids: u32,
+        id: u32,
+    ) -> Result<(&'a [u32], super::instrument::SortSpace), SqlError> {
         let rows = held.rows.borrowed_slice();
-        let order = self
-            .arena
-            .alloc_slice_with(rows.len(), |at| at as u32)
-            .map_err(|_| arena_full())?;
-        if keys.as_slice().is_empty() {
-            return Ok(order);
-        }
         let mut columns = [((0usize, 0usize), 0u8); 8];
         for (at, &key) in keys.as_slice().iter().enumerate() {
             let class = key & KEY_CLASS;
@@ -3689,7 +3660,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             columns[at] = (self.model.member(class, member as u8), key);
         }
         let columns = &columns[..keys.as_slice().len()];
-        crate::sql::pg_qsort::pg_qsort(order, &mut |a, b| {
+        self.tuplesort(id, rows, &mut |a, b| {
             for &(column, key) in columns {
                 let (one, two) = (
                     self.value(&rows[a as usize], column),
@@ -3722,7 +3693,87 @@ impl<'r, 'a> Runner<'r, 'a> {
                 }
             }
             Ok(Ordering::Equal)
-        })?;
-        Ok(order)
+        })
+    }
+
+    /// PostgreSQL's tuplesort of the `id` path's `rows` in arrival order, as
+    /// `tuplesort.c` runs it: each tuple (the path's target list) is charged
+    /// as it arrives, a sort that outgrows `work_mem` forms its runs where
+    /// `dumptuples` does and merges them as `mergeruns` does, any other is
+    /// one `pg_qsort`. Rows `compare` ranks equal come out in that order.
+    fn tuplesort(
+        &self,
+        id: u32,
+        rows: &[Bound<'a>],
+        compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+    ) -> Result<(&'a [u32], super::instrument::SortSpace), SqlError> {
+        use super::postgres_memory::{SortTuples, TuplesortModel};
+        // `ExecInitSort`: a sort of a single column sorts datums.
+        let mut columns = 0;
+        self.model
+            .plan
+            .target_list(self.model.plan.path(id).relids, &mut |_| columns += 1);
+        let mut model = TuplesortModel::new(
+            if columns == 1 {
+                SortTuples::Datum
+            } else {
+                SortTuples::Bump
+            },
+            None,
+        );
+        // The row counts of the runs `dumptuples` wrote.
+        let runs = self
+            .arena
+            .alloc_slice_with(rows.len() + 1, |_| 0u32)
+            .map_err(|_| arena_full())?;
+        let mut run_count = 0usize;
+        for row in rows {
+            let (length, written) = self.tuple_sizes(row, id, columns == 1)?;
+            if let Some(run) = model.push(length, written) {
+                runs[run_count] = run as u32;
+                run_count += 1;
+            }
+        }
+        if let Some(run) = model.finish_run() {
+            runs[run_count] = run as u32;
+            run_count += 1;
+        }
+        let order = self
+            .arena
+            .alloc_slice_with(rows.len(), |at| at as u32)
+            .map_err(|_| arena_full())?;
+        if let Some(merge_order) = model.merge_order() {
+            let scratch = crate::sql::pg_qsort::RunScratch {
+                moved: self
+                    .arena
+                    .alloc_slice_with(rows.len(), |_| 0u32)
+                    .map_err(|_| arena_full())?,
+                bounds: self
+                    .arena
+                    .alloc_slice_with(2 * (run_count + 1), |_| 0u32)
+                    .map_err(|_| arena_full())?,
+                heap: self
+                    .arena
+                    .alloc_slice_with(merge_order, |_| 0u32)
+                    .map_err(|_| arena_full())?,
+                cursor: self
+                    .arena
+                    .alloc_slice_with(merge_order, |_| 0u32)
+                    .map_err(|_| arena_full())?,
+            };
+            crate::sql::pg_qsort::pg_tuplesort_runs(
+                order,
+                &runs[..run_count],
+                merge_order,
+                scratch,
+                compare,
+            )?;
+        } else {
+            crate::sql::pg_qsort::pg_tuplesort(order, None, compare)?;
+        }
+        Ok((
+            order,
+            super::instrument::SortSpace::from_postgres(model.space(None), false),
+        ))
     }
 }

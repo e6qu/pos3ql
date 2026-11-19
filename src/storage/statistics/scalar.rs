@@ -388,7 +388,7 @@ pub(crate) fn tsvector_entries(text: &str, mut visit: impl FnMut(&[u8], usize)) 
 /// The bytes of a stored `tsvector` after its four-byte varlena header: a
 /// count, a four-byte entry per lexeme, then each lexeme and, when it has
 /// positions, its count and positions at two-byte alignment.
-fn tsvector_data_length(text: &str) -> usize {
+pub(crate) fn tsvector_data_length(text: &str) -> usize {
     let mut entries = 0usize;
     let mut data = 0usize;
     tsvector_entries(text, |lexeme, positions| {

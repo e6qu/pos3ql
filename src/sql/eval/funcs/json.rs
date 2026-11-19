@@ -2447,6 +2447,16 @@ pub(crate) fn dispatch<'a>(
                 }
                 buf.write_char('}').map_err(|_| arena_full())?;
                 let text = buf.as_str();
+                // A jsonb object sorts its keys and keeps the last value of
+                // a repeated key, as jsonb input does.
+                let text = if jsonb {
+                    let tree = json::parse(text, arena)?;
+                    arena
+                        .alloc_str_display(json::JsonWrite(&tree))
+                        .map_err(|_| arena_full())?
+                } else {
+                    text
+                };
                 Ok(Datum::Json { text, jsonb })
             }
             // `json_build_array(v1, v2, ...)` / `jsonb_build_array(...)`.

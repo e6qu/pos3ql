@@ -1366,7 +1366,6 @@ pub(super) fn grouped_rows<'a>(
         // Past twice its limit's bound the sort keeps only a heap of the
         // rows the limit returns, as PostgreSQL's does.
         let bounded = bound.filter(|_| !statement.distinct);
-        let bound = bound.filter(|&bound| !statement.distinct && out_rows.len() > bound * 2);
         let mut columns = [0usize; MAX_PROJ];
         let count = super::postgres_sort_columns(
             width,
@@ -1374,59 +1373,12 @@ pub(super) fn grouped_rows<'a>(
             &order_exprs[..n_order],
             &mut columns,
         );
-        // The memory PostgreSQL's sort reports, from the rows in arrival
-        // order.
-        let space = match bounded {
-            Some(bound) if stages.sort.measured() => instrument::SortSpace::postgres_top_n(
-                out_rows,
-                Some(&columns[..count]),
-                0,
-                bound,
-                arena,
-                compare,
-                super::sole_item_computed(statement.items),
-                None,
-            )?,
-            _ => instrument::SortSpace::postgres(
-                out_rows,
-                Some(&columns[..count]),
-                false,
-                super::sole_item_computed(statement.items),
-            )?,
-        };
-        // The `Sort` over a join's grouping PostgreSQL's planner plans is
-        // its tuplesort, over the groups in their grouping's order.
-        let modeled = outer.is_none()
-            && scope.n > 1
-            && super::index_paths::join_query::modeled_join(
-                storage, txid, statement, scope, params, arena,
-            )?
-            .is_some_and(|model| model.group.is_some());
-        if modeled {
-            let held = arena.alloc_slice_copy(out_rows).map_err(|_| arena_full())?;
-            let order = arena
-                .alloc_slice_with(held.len(), |at| at as u32)
-                .map_err(|_| arena_full())?;
-            let kept = crate::sql::pg_qsort::pg_tuplesort(order, bounded, &mut |a, b| {
-                compare(&held[a as usize], &held[b as usize])
-            })?;
-            for (slot, &at) in out_rows.iter_mut().zip(&order[..kept]) {
-                *slot = held[at as usize];
-            }
-            stages.sort.sorted(space);
-            let out_rows = &mut out_rows[..kept];
-            return Ok((out_rows, width));
-        }
-        match bound {
-            Some(bound) => {
-                crate::mem::arena::try_stable_top_n_via(arena, out_rows, bound, compare, |_| {
-                    arena_full()
-                })?
-            }
-            None => {
-                crate::mem::arena::try_stable_sort_via(arena, out_rows, compare, |_| arena_full())?
-            }
-        }
+        let tuples = instrument::SortTuples::new(Some(&columns[..count]), 0, bounded.is_some())
+            .ok_or_else(instrument::unsized_value)?
+            .computed(super::sole_item_computed(statement.items));
+        // The tuples reach the sort in the grouping's order, which a join's
+        // modeled grouping and a one-table grouping both give.
+        let (_, space) = tuples.sort_rows(arena, out_rows, bounded, &mut |a, b| compare(&a, &b))?;
         stages.sort.sorted(space);
     }
 

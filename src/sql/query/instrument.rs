@@ -714,8 +714,8 @@ impl SortTuples {
         row: &[u8],
         length: usize,
         copies: super::postgres_memory::SortTuples,
-    ) -> usize {
-        match copies {
+    ) -> Option<usize> {
+        Some(match copies {
             // A datum sort of the row identity alone: a `tid` is six bytes.
             super::postgres_memory::SortTuples::Datum if !self.all && self.count == 0 => 4 + 6,
             super::postgres_memory::SortTuples::Datum => {
@@ -723,10 +723,10 @@ impl SortTuples {
                     row,
                     (!self.all).then(|| usize::from(self.columns[0])),
                     self.computed,
-                )
+                )?
             }
             _ => length - 10 + 4,
-        }
+        })
     }
 
     /// A sort's accounting of rows read in arrival order, with the row
@@ -739,20 +739,20 @@ impl SortTuples {
         super::postgres_memory::TuplesortModel::new(self.copies(first), bound)
     }
 
-    /// Feeds one row to `model`; `false` when a value has no PostgreSQL
-    /// size here.
+    /// Feeds one row to `model`: the row count of the run this row's arrival
+    /// made `dumptuples` write, if it did.
     pub(crate) fn push(
         &self,
         model: &mut super::postgres_memory::TuplesortModel,
         copies_of_first: Option<&[u8]>,
         row: &[u8],
-    ) -> bool {
-        let Some(length) = self.length(row) else {
-            return false;
-        };
+    ) -> Result<Option<usize>, crate::sql::SqlError> {
+        let length = self.length(row).ok_or_else(unsized_value)?;
         let copies = self.copies(copies_of_first);
-        model.push(length, self.tape_bytes(row, length, copies));
-        true
+        let written = self
+            .tape_bytes(row, length, copies)
+            .ok_or_else(unsized_value)?;
+        Ok(model.push(length, written))
     }
 
     /// What the rows of a bounded sort charge once its heap took them
@@ -785,15 +785,14 @@ impl SortTuples {
     /// What PostgreSQL's sort of `count` rows (`row_at`, in arrival order)
     /// reports (`tuplesort_get_stats` after the sort); with `heap`, a sort
     /// bounded to its first rows, whose bounded heap `compare` orders in a
-    /// scratch array of the bound's positions. `None` when a value has no
-    /// PostgreSQL size here.
+    /// scratch array of the bound's positions.
     pub(crate) fn space<'r>(
         &self,
         count: usize,
         row_at: &dyn Fn(usize) -> &'r [u8],
         heap: Option<(&mut [usize], SortCompare<'_>)>,
         kept: Option<&mut bool>,
-    ) -> Result<Option<super::postgres_memory::TuplesortSpace>, crate::sql::SqlError> {
+    ) -> Result<super::postgres_memory::TuplesortSpace, crate::sql::SqlError> {
         let first = (count > 0).then(|| row_at(0));
         let bound = heap.as_ref().map(|(positions, _)| positions.len());
         let mut model = self.model(first, bound.filter(|&bound| bound > 0));
@@ -801,9 +800,7 @@ impl SortTuples {
             model = model.reuse_array();
         }
         for row in 0..count {
-            if !self.push(&mut model, first, row_at(row)) {
-                return Ok(None);
-            }
+            self.push(&mut model, first, row_at(row))?;
         }
         let heap_charge = match heap {
             Some((positions, compare)) if model.bounded() => {
@@ -814,14 +811,123 @@ impl SortTuples {
         if let Some(kept) = kept {
             *kept = !model.array_regrown();
         }
-        Ok(Some(model.space(heap_charge)))
+        Ok(model.space(heap_charge))
     }
+
+    /// PostgreSQL's tuplesort of `rows` in arrival order, as `tuplesort.c`
+    /// runs it: the tuples are charged as they arrive, a sort that outgrows
+    /// `work_mem` forms its runs where `dumptuples` does, sorts each with
+    /// `pg_qsort` and merges them as `mergeruns` does, a sort bounded by a
+    /// limit past twice its bound keeps a heap, and any other sort is one
+    /// `pg_qsort`. Rows `compare` ranks equal come out in that order, and
+    /// the figures `EXPLAIN ANALYZE` prints are the machine's own.
+    ///
+    /// `rows` are reordered in place and the count of those a bounded sort
+    /// returns comes back with the space. A value with no PostgreSQL size
+    /// here, which cannot be charged, fails with `0A000`.
+    pub(crate) fn sort_rows<'a>(
+        &self,
+        arena: &'a crate::mem::arena::Arena,
+        rows: &mut [&'a [u8]],
+        bound: Option<usize>,
+        compare: SortCompare<'_>,
+    ) -> Result<(usize, SortSpace), crate::sql::SqlError> {
+        let count = rows.len();
+        let first = rows.first().copied();
+        let mut model = self.model(first, bound.filter(|&bound| bound > 0));
+        let mut runs: &mut [u32] = &mut [];
+        let mut run_count = 0usize;
+        for row in rows.iter() {
+            if let Some(length) = self.push(&mut model, first, row)? {
+                if runs.is_empty() {
+                    runs = arena
+                        .alloc_slice_with(count, |_| 0u32)
+                        .map_err(|_| super::arena_full_pub())?;
+                }
+                runs[run_count] = length as u32;
+                run_count += 1;
+            }
+        }
+        if let Some(length) = model.finish_run() {
+            if runs.is_empty() {
+                runs = arena
+                    .alloc_slice_with(count, |_| 0u32)
+                    .map_err(|_| super::arena_full_pub())?;
+            }
+            runs[run_count] = length as u32;
+            run_count += 1;
+        }
+        let order = arena
+            .alloc_slice_with(count, |at| at as u32)
+            .map_err(|_| super::arena_full_pub())?;
+        let held: &[&'a [u8]] = arena
+            .alloc_slice_copy(rows)
+            .map_err(|_| super::arena_full_pub())?;
+        let mut compare_at =
+            |left: u32, right: u32| compare(held[left as usize], held[right as usize]);
+        let mut kept = count;
+        let mut heap_charge = None;
+        if let Some(merge_order) = model.merge_order() {
+            let scratch = crate::sql::pg_qsort::RunScratch {
+                moved: arena
+                    .alloc_slice_with(count, |_| 0u32)
+                    .map_err(|_| super::arena_full_pub())?,
+                bounds: arena
+                    .alloc_slice_with(2 * (run_count + 1), |_| 0u32)
+                    .map_err(|_| super::arena_full_pub())?,
+                heap: arena
+                    .alloc_slice_with(merge_order, |_| 0u32)
+                    .map_err(|_| super::arena_full_pub())?,
+                cursor: arena
+                    .alloc_slice_with(merge_order, |_| 0u32)
+                    .map_err(|_| super::arena_full_pub())?,
+            };
+            crate::sql::pg_qsort::pg_tuplesort_runs(
+                order,
+                &runs[..run_count],
+                merge_order,
+                scratch,
+                &mut compare_at,
+            )?;
+        } else if model.bounded() {
+            let bound = bound.expect("a bounded sort has a bound");
+            kept = crate::sql::pg_qsort::pg_tuplesort(order, Some(bound), &mut compare_at)?;
+            let positions = arena
+                .alloc_slice_with(bound, |_| 0usize)
+                .map_err(|_| super::arena_full_pub())?;
+            heap_charge = Some(self.heap_charge(
+                count,
+                model.heap_at(),
+                &|row| held[row],
+                positions,
+                compare,
+            )?);
+        } else {
+            crate::sql::pg_qsort::pg_tuplesort(order, None, &mut compare_at)?;
+        }
+        for (slot, &at) in rows.iter_mut().zip(&order[..kept]) {
+            *slot = held[at as usize];
+        }
+        let bounded = model.bounded();
+        Ok((
+            kept,
+            SortSpace::from_postgres(model.space(heap_charge), bounded),
+        ))
+    }
+}
+
+/// The error of a sort over a value PostgreSQL's size of which is not
+/// modelled: charging the sort's tuples against `work_mem` needs it.
+pub(crate) fn unsized_value() -> crate::sql::SqlError {
+    crate::sql_err!(
+        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+        "sorting a value with no PostgreSQL size here is not supported"
+    )
 }
 
 impl SortSpace {
     /// PostgreSQL's sort of `rows` (in arrival order), whose tuples hold the
-    /// values at `columns`; pos3ql's own in-memory figure when a value has
-    /// no PostgreSQL size here.
+    /// values at `columns`.
     pub(crate) fn postgres(
         rows: &[&[u8]],
         columns: Option<&[usize]>,
@@ -841,12 +947,13 @@ impl SortSpace {
         computed: bool,
         kept: Option<&mut bool>,
     ) -> Result<Self, crate::sql::SqlError> {
-        let own = Self::in_memory(rows, false);
-        let space = match SortTuples::new(columns, tids, bounded).map(|t| t.computed(computed)) {
-            Some(tuples) => tuples.space(rows.len(), &|row| rows[row], None, kept)?,
-            None => None,
-        };
-        Self::from_postgres(space, own, false)
+        let tuples = SortTuples::new(columns, tids, bounded)
+            .ok_or_else(unsized_value)?
+            .computed(computed);
+        Ok(Self::from_postgres(
+            tuples.space(rows.len(), &|row| rows[row], None, kept)?,
+            false,
+        ))
     }
 
     /// [`Self::postgres_locking`] of a sort a limit of `bound` rows bounds,
@@ -867,11 +974,9 @@ impl SortSpace {
         kept: Option<&mut bool>,
     ) -> Result<Self, crate::sql::SqlError> {
         let heap = rows.len() > bound * 2 && bound > 0;
-        let own = Self::in_memory(rows, heap);
-        let Some(tuples) = SortTuples::new(columns, tids, true).map(|t| t.computed(computed))
-        else {
-            return Ok(own);
-        };
+        let tuples = SortTuples::new(columns, tids, true)
+            .ok_or_else(unsized_value)?
+            .computed(computed);
         let positions = arena
             .alloc_slice_with(bound, |_| 0usize)
             .map_err(|_| super::arena_full_pub())?;
@@ -882,21 +987,18 @@ impl SortSpace {
             Some((positions, &mut compare)),
             kept,
         )?;
-        Self::from_postgres(space, own, heap)
+        Ok(Self::from_postgres(space, heap))
     }
 
-    /// The figure PostgreSQL's sort reported, or `own` when a value has no
-    /// PostgreSQL size here. `bounded` names a sort that kept only the
-    /// rows its limit returns.
+    /// The figure PostgreSQL's sort reported; `bounded` names a sort that
+    /// kept only the rows its limit returns.
     pub(crate) fn from_postgres(
-        space: Option<super::postgres_memory::TuplesortSpace>,
-        own: Self,
+        space: super::postgres_memory::TuplesortSpace,
         bounded: bool,
-    ) -> Result<Self, crate::sql::SqlError> {
+    ) -> Self {
         use super::postgres_memory::TuplesortSpace;
-        Ok(match space {
-            None => own,
-            Some(TuplesortSpace::Memory(bytes)) => Self {
+        match space {
+            TuplesortSpace::Memory(bytes) => Self {
                 method: if bounded {
                     SortMethod::TopNHeapsort
                 } else {
@@ -904,28 +1006,10 @@ impl SortSpace {
                 },
                 bytes,
             },
-            Some(TuplesortSpace::Disk(bytes)) => Self {
+            TuplesortSpace::Disk(bytes) => Self {
                 method: SortMethod::ExternalMerge,
                 bytes,
             },
-        })
-    }
-
-    /// An in-memory sort of `rows`, which pos3ql holds whole: their bytes
-    /// and the array ordering them. `bounded` names a sort that kept only
-    /// the rows its limit returns in its heap.
-    pub(crate) fn in_memory(rows: &[&[u8]], bounded: bool) -> Self {
-        let mut bytes = core::mem::size_of_val(rows);
-        for row in rows {
-            bytes = bytes.saturating_add(row.len());
-        }
-        Self {
-            method: if bounded {
-                SortMethod::TopNHeapsort
-            } else {
-                SortMethod::Quicksort
-            },
-            bytes,
         }
     }
 }

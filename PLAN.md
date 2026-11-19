@@ -1198,9 +1198,12 @@ parenthesized join whose members join by written conditions (`a LEFT JOIN
 (b JOIN c ON x) ON y`, nested to any depth) is a node of the join tree
 `deconstruct_jointree` reads: its relations join in the same search, and
 each joined row fills the parenthesized join's columns from its members'
-rows (`differential_exact/934`). Remaining there: an aliased one, one
-joined by `USING` or `NATURAL`, and one under grouping, aggregates or
-windows (`0A000` when costs print); a parenthesized join's own
+rows (`differential_exact/934`). Grouping, aggregates and `DISTINCT` over
+such joins are planned by the same search, a hashed grouping over a join
+reporting its memory (`differential_exact/946`). Remaining there: an
+aliased one, one joined by `USING` or `NATURAL`, and one under windows
+(`0A000` when costs print; with `COSTS OFF` such a plan prints pos3ql's
+own join order); a parenthesized join's own
 query runs only when the search does not plan the query, so one nested in
 another (`a LEFT JOIN (b JOIN (c JOIN d ON z) ON x) ON y`) joins its
 members without reading its rows first (`differential_exact/937`). Remaining for that search:

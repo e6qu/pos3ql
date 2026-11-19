@@ -6771,6 +6771,11 @@ fn plan_pulled_select<'a>(
                 width: chosen.width as u32,
                 // A `Unique` names no keys.
                 keys: if unique { PlanKeys::NONE } else { group_keys },
+                hash_agg: group.hash_agg,
+                analyze_unsupported: (group.hashed && !group.distinct && group.hash_agg.is_none())
+                    .then_some(
+                        "EXPLAIN ANALYZE of a hash aggregate whose memory PostgreSQL's figure is not modelled for is not supported",
+                    ),
                 ..PlanNode::EMPTY
             }
             .with_qual(

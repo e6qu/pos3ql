@@ -1029,8 +1029,7 @@ fn run_modeled_sorted<'a>(
         let (table, column) =
             super::index_paths::join_query::column_of(scope, statement.group_by[position])
                 .expect("a modeled grouping key is a column");
-        let collation =
-            scope.defs.stored(table).expect("a plain table").columns()[column].collation;
+        let collation = scope.expression_collation(storage, arena, statement.group_by[position])?;
         *slot = (offsets[table] + column, collation, flags);
     }
     let keys = &keys[..group.keys.len()];

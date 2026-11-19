@@ -83,6 +83,7 @@ impl<'a> TreePath<'a> {
             kind: ScanKind::Seq,
             index_oid: 0,
             index_name: crate::util::StackStr::new(),
+            index_pages: super::IndexPages::NONE,
             keys: &[],
             conditions: &[],
             predicate: &[],

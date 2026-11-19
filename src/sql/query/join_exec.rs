@@ -781,6 +781,18 @@ struct MergeInput<'a> {
     rows: &'a [Bound<'a>],
     sort: super::instrument::Node,
     lazy: Option<super::instrument::Node>,
+    /// The pages the scan read in part reads, when `BUFFERS` counts them.
+    pages: Option<LazyPages<'a>>,
+}
+
+/// What an index scan a merge join reads in part reads per row: an index
+/// entry, and the heap page of relation `rel`'s row.
+#[derive(Clone, Copy)]
+struct LazyPages<'a> {
+    rel: usize,
+    model: super::instrument::PageModel,
+    /// `(row identity, heap page)` sorted by identity.
+    heap: &'a [(u64, u64)],
 }
 
 impl MergeInput<'_> {
@@ -791,6 +803,17 @@ impl MergeInput<'_> {
         if let Some(lazy) = self.lazy {
             let _scan = lazy.start();
             lazy.rows(fetched as u64);
+            if let Some(pages) = self.pages {
+                lazy.page_model(pages.model);
+                for row in &self.rows[..fetched.min(self.rows.len())] {
+                    lazy.index_entry();
+                    if let Some(rowid) = row[pages.rel].and_then(|row| row.rowid)
+                        && let Ok(at) = pages.heap.binary_search_by_key(&rowid, |&(id, _)| id)
+                    {
+                        lazy.heap_page(pages.heap[at].1);
+                    }
+                }
+            }
         }
     }
 }
@@ -2108,15 +2131,19 @@ impl<'r, 'a> Runner<'r, 'a> {
                 rows: sorted,
                 sort,
                 lazy: None,
+                pages: None,
             });
         }
         // An input in index order: read under no count, then counted as far
         // as the join fetched it.
+        let mut pages = None;
         let lazy = match self.model.plan.path(id).kind {
             PathKind::Scan { rel, path } if self.counts_lazily(usize::from(rel), path)? => {
-                let _block = super::instrument::enter_block(
-                    self.block.child(scan_segment(usize::from(rel))),
-                );
+                let rel = usize::from(rel);
+                let _block = super::instrument::enter_block(self.block.child(scan_segment(rel)));
+                if super::instrument::buffers_counted() {
+                    pages = Some(self.lazy_pages(rel, path)?);
+                }
                 Some(super::instrument::node(super::instrument::Role::Scan(0)))
             }
             _ if super::instrument::active() => {
@@ -2135,6 +2162,32 @@ impl<'r, 'a> Runner<'r, 'a> {
             rows: held.rows.as_slice(),
             sort: super::instrument::Node::NONE,
             lazy,
+            pages,
+        })
+    }
+
+    /// How the index scan of `rel` by its path `path`, read in part by a
+    /// merge join, counts its pages.
+    fn lazy_pages(&self, rel: usize, path: u16) -> Result<LazyPages<'a>, SqlError> {
+        let modeled = self.model.rels[rel];
+        let scan = modeled.scan(self.storage, self.txid, path, self.params, self.arena)?;
+        let slot = self.scope.slots[rel];
+        let (heap, relation_pages) = super::instrument::heap_pages(slot, self.arena, |arena| {
+            super::scan::heap_pages_of_rows(self.storage, slot, self.txid, arena)
+                .map(|(rows, pages)| (&*rows, pages))
+        })?;
+        Ok(LazyPages {
+            rel,
+            model: super::instrument::PageModel {
+                local: self.storage.table_def(slot, self.txid).persistence
+                    == crate::storage::RelationPersistence::Temporary,
+                relation_pages,
+                rows: heap.len() as u64,
+                index: Some(scan.path.index_pages),
+                sequential: false,
+                visibility_map: false,
+            },
+            heap,
         })
     }
 

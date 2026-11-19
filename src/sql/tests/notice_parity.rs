@@ -867,7 +867,7 @@ fn folding_errors_follow_earlier_warnings_and_explain_folds() {
             messages(
                 engine,
                 budget,
-                "EXPLAIN (ANALYZE, COSTS OFF) SELECT a FROM folded WHERE a > timestamptypmodin('{7}')"
+                "EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT a FROM folded WHERE a > timestamptypmodin('{7}')"
             ),
             [reduced, "EXPLAIN"]
         );

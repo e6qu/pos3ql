@@ -1,4 +1,8 @@
 -- PostgreSQL 18 privilege targets: language, composite type, and routine kind.
+-- The whole fixture runs in a transaction that rolls back: a language's
+-- privileges never return to the NULL a new cluster holds once granted.
+
+BEGIN;
 
 CREATE ROLE privilege_target_owner;
 CREATE ROLE privilege_target_reader;
@@ -47,3 +51,4 @@ REVOKE USAGE, CREATE ON SCHEMA privilege_target_schema FROM privilege_target_own
 DROP SCHEMA privilege_target_schema;
 DROP ROLE privilege_target_reader;
 DROP ROLE privilege_target_owner;
+ROLLBACK;

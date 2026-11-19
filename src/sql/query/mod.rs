@@ -14893,7 +14893,7 @@ pub(crate) fn select_query_resumable<'a>(
     // Catalog relations (pg_catalog / information_schema) are synthesized and
     // registered as derived tables by resolve_exec, so they flow through the
     // general executor — joins, subqueries, aggregates, and ORDER BY included.
-    let scope = match QueryScope::resolve_exec_pushed(
+    let mut scope = match QueryScope::resolve_exec_pushed(
         storage,
         from,
         statement.where_clause,
@@ -14903,10 +14903,27 @@ pub(crate) fn select_query_resumable<'a>(
         seq,
         None,
         pushed.as_ref(),
+        true,
     ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
+    // A parenthesized join's query runs only when the join search does not
+    // run the query's relations itself.
+    if scope.has_deferred_joins() {
+        let planned =
+            index_paths::join_query::modeled_join(storage, txid, statement, &scope, params, arena);
+        match planned {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = scope.run_deferred_joins(storage, txid, arena, params, seq) {
+                    return sql_fail(error);
+                }
+            }
+            Err(error) => return sql_fail(error),
+        }
+    }
+    let scope = scope;
     // Relation locks are part of planning, before RowDescription. The scan
     // path repeats this idempotently for nested/correlated execution, but a
     // top-level wait must not leak a partial wire response.

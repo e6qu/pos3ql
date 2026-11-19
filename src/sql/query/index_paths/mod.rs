@@ -375,6 +375,7 @@ pub(crate) fn relation_size(storage: &Storage, slot: usize, txid: u32) -> Relati
 pub(crate) struct BtreeSize {
     pub(crate) pages: f64,
     pub(crate) height: u32,
+    pub(crate) leaves: f64,
 }
 
 /// `nulls` of `entries` hold a NULL in a single key column: they sort last
@@ -438,7 +439,11 @@ pub(crate) fn btree_size(
         pages += level;
         height += 1;
     }
-    BtreeSize { pages, height }
+    BtreeSize {
+        pages,
+        height,
+        leaves,
+    }
 }
 
 /// Consecutive index tuples of one size.
@@ -528,11 +533,15 @@ fn deduplicates(ctype: ColType, collation: Collation) -> bool {
     }
 }
 
-/// The pages, height and deduplication of the btree `index` over `entries`
-/// rows, as CREATE INDEX lays it out: its tuples hold every key and
+/// The pages, height, leaf pages and deduplication of the btree `index`
+/// over `entries` rows, as CREATE INDEX lays it out: its tuples hold every key and
 /// included column, each aligned, and equal keys share posting lists when
 /// every key column's class allows it and nothing is included.
-fn btree_layout(planner: &Planner<'_, '_>, info: &IndexInfo, entries: f64) -> (f64, u32, bool) {
+fn btree_layout(
+    planner: &Planner<'_, '_>,
+    info: &IndexInfo,
+    entries: f64,
+) -> (f64, u32, f64, bool) {
     let index = &info.catalog;
     let definition = planner.definition;
     let mut width = 0.0f64;
@@ -653,7 +662,7 @@ fn btree_layout(planner: &Planner<'_, '_>, info: &IndexInfo, entries: f64) -> (f
         0.0
     };
     let size = btree_size(entries, width, distinct, deduplicate, nulls);
-    (size.pages, size.height, deduplicate)
+    (size.pages, size.height, size.leaves, deduplicate)
 }
 
 /// Whether `collation` orders strings byte by byte: the database default
@@ -759,6 +768,8 @@ pub(crate) struct BitmapPlanNode<'a> {
 pub(crate) enum BitmapPlanKind<'a> {
     Index {
         index_name: crate::util::StackStr<64>,
+        /// The pages the scan reads of its index.
+        pages: IndexPages,
         conditions: &'a [IndexCondition<'a>],
         /// A partial index's predicate, which every row it holds meets.
         predicate: &'a [&'a Expr<'a>],
@@ -815,6 +826,8 @@ pub(crate) struct ScanPath<'a> {
     pub(crate) kind: ScanKind,
     pub(crate) index_oid: i32,
     pub(crate) index_name: crate::util::StackStr<64>,
+    /// The pages an index or index-only scan reads of its index.
+    pub(crate) index_pages: IndexPages,
     /// The index's key columns, for an index or index-only scan.
     pub(crate) keys: &'a [IndexKeyOrder],
     /// An index scan's conditions, in index column order.
@@ -929,11 +942,46 @@ pub(super) struct IndexInfo {
     /// The index's pages and tree height as CREATE INDEX lays them out.
     pub(super) pages: f64,
     pub(super) height: u32,
+    /// Its leaf pages, which hold its entries.
+    pub(super) leaves: f64,
     /// Equal keys share posting lists.
     pub(super) deduplicated: bool,
     /// Its entries (`IndexOptInfo.tuples`): the table's rows, or a partial
     /// index's rows that satisfy its predicate.
     pub(super) tuples: f64,
+}
+
+/// The pages a btree search reads, as its modeled layout places them: the
+/// pages of one descent from the root to a leaf, then the further leaf
+/// pages its matching entries fill.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct IndexPages {
+    /// The levels from the root to the leaves, the leaves included.
+    pub(crate) levels: u32,
+    /// The entries one leaf page holds on average.
+    pub(crate) leaf_entries: f64,
+}
+
+impl IndexPages {
+    /// No index: a sequential or bitmap heap scan's.
+    pub(crate) const NONE: Self = Self {
+        levels: 0,
+        leaf_entries: 1.0,
+    };
+
+    pub(super) fn of(info: &IndexInfo) -> Self {
+        Self {
+            levels: info.height + 1,
+            leaf_entries: (info.tuples / info.leaves.max(1.0)).max(1.0),
+        }
+    }
+
+    /// The index pages one search reaching `entries` entries reads: its
+    /// descent, and each further leaf page its entries continue on.
+    pub(crate) fn search(self, entries: u64) -> u64 {
+        let leaves = (entries as f64 / self.leaf_entries).ceil() as u64;
+        u64::from(self.levels) + leaves.saturating_sub(1)
+    }
 }
 
 impl IndexInfo {

@@ -9855,16 +9855,16 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
              IF setting_name IS NULL THEN RAISE EXCEPTION ''SHOW ALL result mismatch''; END IF;
              EXECUTE ''EXPLAIN SELECT value FROM plpgsql_dynamic_session_rows'' INTO STRICT plan;
              IF plan IS NULL THEN RAISE EXCEPTION ''EXPLAIN result mismatch''; END IF;
-             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows'' INTO analyze_plan;
+             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT value FROM plpgsql_dynamic_session_rows'' INTO analyze_plan;
              IF analyze_plan IS NULL OR position(''actual time'' IN analyze_plan) = 0 THEN
                RAISE EXCEPTION ''EXPLAIN ANALYZE result mismatch'';
              END IF;
-             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) INSERT INTO plpgsql_dynamic_session_rows \
+             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) INSERT INTO plpgsql_dynamic_session_rows \
                VALUES (4) RETURNING value'' INTO analyze_plan;
              IF analyze_plan IS NULL OR position(''actual time'' IN analyze_plan) = 0 THEN
                RAISE EXCEPTION ''EXPLAIN ANALYZE DML result mismatch'';
              END IF;
-             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows'';
+             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT value FROM plpgsql_dynamic_session_rows'';
              EXECUTE ''DECLARE plpgsql_dynamic_cursor SCROLL CURSOR FOR \
                SELECT value FROM plpgsql_dynamic_session_rows ORDER BY value'';
              EXECUTE ''MOVE FORWARD 1 FROM plpgsql_dynamic_cursor'';
@@ -9878,19 +9878,19 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
          CREATE FUNCTION plpgsql_dynamic_analyze_json() RETURNS void LANGUAGE plpgsql AS '
            DECLARE plan text;
            BEGIN
-             EXECUTE ''EXPLAIN (ANALYZE, FORMAT JSON) SELECT value FROM plpgsql_dynamic_session_rows''
+             EXECUTE ''EXPLAIN (ANALYZE, BUFFERS OFF, FORMAT JSON) SELECT value FROM plpgsql_dynamic_session_rows''
                INTO STRICT plan;
              IF plan IS NULL THEN RAISE EXCEPTION ''EXPLAIN ANALYZE JSON result mismatch''; END IF;
            END'; \
          CREATE FUNCTION plpgsql_dynamic_analyze_compound() RETURNS void LANGUAGE plpgsql AS '
            DECLARE plan text;
            BEGIN
-             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows \
+             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT value FROM plpgsql_dynamic_session_rows \
                UNION ALL SELECT value FROM plpgsql_dynamic_session_rows'' INTO plan;
              IF plan IS NULL OR position(''actual time'' IN plan) = 0 THEN
                RAISE EXCEPTION ''EXPLAIN ANALYZE set-query result mismatch'';
              END IF;
-             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) WITH inserted AS \
+             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) WITH inserted AS \
                (INSERT INTO plpgsql_dynamic_session_rows VALUES (5) RETURNING value) \
                SELECT value FROM inserted'' INTO plan;
              IF plan IS NULL OR position(''actual time'' IN plan) = 0 THEN
@@ -9947,7 +9947,7 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
         &mut engine,
         &mut budget,
         "DO 'DECLARE plan text; BEGIN \
-           EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) SELECT value \
+           EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT value \
              FROM plpgsql_dynamic_session_rows UNION ALL SELECT value \
              FROM plpgsql_dynamic_session_rows'' INTO STRICT plan; END'",
     );
@@ -55082,10 +55082,31 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         "{rows:?}"
     );
 
+    // PostgreSQL 18 counts buffers under ANALYZE by default: the scan of
+    // the table's one heap page shows it, a plan that did not run none.
+    for explain in [
+        "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) SELECT payload FROM ep WHERE payload = 'b'",
+        "EXPLAIN (ANALYZE, TIMING OFF) SELECT payload FROM ep WHERE payload = 'b'",
+    ] {
+        let counted = data_rows(&run_with(&mut engine, &mut budget, explain));
+        assert!(
+            counted.iter().any(|row| row == "  Buffers: shared hit=1"),
+            "{explain}: {counted:?}"
+        );
+    }
+    let planned = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (BUFFERS) SELECT * FROM ep",
+    ));
+    assert!(
+        !planned.iter().any(|row| row.contains("Buffers:")),
+        "{planned:?}"
+    );
     let analyzed = run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) SELECT payload FROM ep WHERE id = 2",
+        "EXPLAIN (ANALYZE, BUFFERS OFF, TIMING OFF) SELECT payload FROM ep WHERE id = 2",
     );
     let rows = data_rows(&analyzed);
     assert!(
@@ -55093,21 +55114,20 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
             .any(|row| row.contains("(actual rows=1.00 loops=1)")),
         "{rows:?}"
     );
+    let unread = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (ANALYZE, TIMING OFF) SELECT 1",
+    ));
     assert!(
-        !rows.iter().any(|row| row.starts_with("  Buffers:")),
-        "a no-I/O execution must not invent a zero-valued text buffer line: {rows:?}"
+        !unread.iter().any(|row| row.starts_with("  Buffers:")),
+        "a no-I/O execution must not invent a zero-valued text buffer line: {unread:?}"
     );
     assert!(
         rows.iter().any(|row| row.starts_with("Execution Time: ")),
         "{rows:?}"
     );
 
-    let invalid = run_with(
-        &mut engine,
-        &mut budget,
-        "EXPLAIN (BUFFERS) SELECT * FROM ep",
-    );
-    assert!(String::from_utf8_lossy(&invalid).contains("22023"));
     let invalid_timing = run_with(
         &mut engine,
         &mut budget,
@@ -55173,7 +55193,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         &mut engine,
         &mut budget,
         "PREPARE ep_analyze(int) AS SELECT payload FROM ep WHERE id = $1; \
-         EXPLAIN (ANALYZE) EXECUTE ep_analyze(2)",
+         EXPLAIN (ANALYZE, BUFFERS OFF) EXECUTE ep_analyze(2)",
     ));
     assert!(
         analyzed_prepared
@@ -55209,7 +55229,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     let detailed = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN (ANALYZE, VERBOSE, MEMORY, SERIALIZE, TIMING OFF) \
+        "EXPLAIN (ANALYZE, VERBOSE, MEMORY, SERIALIZE, TIMING OFF, BUFFERS OFF) \
          SELECT payload FROM ep WHERE id = 2",
     ));
     assert!(detailed.iter().any(|row| row.contains("Output: payload")));
@@ -55217,7 +55237,8 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     assert!(
         detailed
             .iter()
-            .any(|row| row.starts_with("Serialization: time=")),
+            // `TIMING OFF` leaves the time out, as `ExplainPrintSerialize` does.
+            .any(|row| row.starts_with("Serialization: output=")),
         "{detailed:?}"
     );
     assert!(
@@ -55284,7 +55305,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     let analyzed_insert = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN (ANALYZE, TIMING OFF) INSERT INTO ep VALUES (4, 'd')",
+        "EXPLAIN (ANALYZE, TIMING OFF, BUFFERS OFF) INSERT INTO ep VALUES (4, 'd')",
     ));
     assert!(
         analyzed_insert
@@ -55295,7 +55316,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     let returning_insert = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN (ANALYZE, TIMING OFF) INSERT INTO ep VALUES (5, 'e') RETURNING id",
+        "EXPLAIN (ANALYZE, TIMING OFF, BUFFERS OFF) INSERT INTO ep VALUES (5, 'e') RETURNING id",
     ));
     // ModifyTable returns its RETURNING rows (PostgreSQL 18.6).
     assert!(
@@ -55315,7 +55336,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     let wal_update = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN (ANALYZE, WAL, TIMING OFF) \
+        "EXPLAIN (ANALYZE, WAL, TIMING OFF, BUFFERS OFF) \
          UPDATE ep SET payload = 'updated' WHERE id = 4",
     ));
     assert!(
@@ -55384,7 +55405,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     let xml_runtime = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT XML) SELECT payload FROM ep WHERE id = 2",
+        "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT XML) SELECT 41",
     ));
     assert!(xml_runtime[0].contains("<Actual-Rows>1.00</Actual-Rows>"));
     assert!(xml_runtime[0].contains("<Shared-Dirtied-Blocks>0</Shared-Dirtied-Blocks>"));
@@ -55392,7 +55413,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     let json_runtime = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT JSON) SELECT payload FROM ep WHERE id = 2",
+        "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT JSON) SELECT 41",
     ));
     assert!(json_runtime[0].contains("\"Actual Rows\": 1.00"));
     assert!(json_runtime[0].contains("\"Shared Dirtied Blocks\": 0"));
@@ -55400,7 +55421,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     let yaml_runtime = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT YAML) SELECT payload FROM ep WHERE id = 2",
+        "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT YAML) SELECT 41",
     ));
     assert!(yaml_runtime[0].contains("Actual Rows: 1.00"));
     assert!(yaml_runtime[0].contains("Shared Dirtied Blocks: 0"));

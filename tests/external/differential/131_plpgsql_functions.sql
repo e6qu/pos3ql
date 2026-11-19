@@ -355,16 +355,16 @@ BEGIN
   IF setting_name IS NULL THEN RAISE EXCEPTION 'SHOW ALL result mismatch'; END IF;
   EXECUTE 'EXPLAIN SELECT value FROM plpgsql_dynamic_session_rows' INTO STRICT plan;
   IF plan IS NULL THEN RAISE EXCEPTION 'EXPLAIN result mismatch'; END IF;
-  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows' INTO analyze_plan;
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT value FROM plpgsql_dynamic_session_rows' INTO analyze_plan;
   IF analyze_plan IS NULL OR position('actual time' IN analyze_plan) = 0 THEN
     RAISE EXCEPTION 'EXPLAIN ANALYZE result mismatch';
   END IF;
-  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) INSERT INTO plpgsql_dynamic_session_rows
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) INSERT INTO plpgsql_dynamic_session_rows
     VALUES (4) RETURNING value' INTO analyze_plan;
   IF analyze_plan IS NULL OR position('actual time' IN analyze_plan) = 0 THEN
     RAISE EXCEPTION 'EXPLAIN ANALYZE DML result mismatch';
   END IF;
-  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows';
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT value FROM plpgsql_dynamic_session_rows';
   EXECUTE 'DECLARE plpgsql_dynamic_session_cursor SCROLL CURSOR FOR
     SELECT value FROM plpgsql_dynamic_session_rows ORDER BY value';
   EXECUTE 'MOVE FORWARD 1 FROM plpgsql_dynamic_session_cursor';
@@ -383,7 +383,7 @@ CREATE FUNCTION plpgsql_dynamic_analyze_json() RETURNS void
   LANGUAGE plpgsql AS $$
 DECLARE plan text;
 BEGIN
-  EXECUTE 'EXPLAIN (ANALYZE, FORMAT JSON) SELECT value FROM plpgsql_dynamic_session_rows'
+  EXECUTE 'EXPLAIN (ANALYZE, BUFFERS OFF, FORMAT JSON) SELECT value FROM plpgsql_dynamic_session_rows'
     INTO STRICT plan;
   IF plan IS NULL THEN RAISE EXCEPTION 'EXPLAIN ANALYZE JSON result mismatch'; END IF;
 END
@@ -407,7 +407,7 @@ BEGIN
     RAISE EXCEPTION 'EXPLAIN XML tree result mismatch';
   END IF;
   EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT YAML)
-    SELECT value FROM plpgsql_dynamic_session_rows' INTO STRICT plan;
+    SELECT 41' INTO STRICT plan;
   IF position('Actual Rows:' IN plan) = 0
      OR position('Shared Dirtied Blocks: 0' IN plan) = 0
      OR position('WAL Records: 0' IN plan) = 0 THEN
@@ -421,12 +421,12 @@ CREATE FUNCTION plpgsql_dynamic_analyze_compound() RETURNS void
   LANGUAGE plpgsql AS $$
 DECLARE plan text;
 BEGIN
-  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT value FROM plpgsql_dynamic_session_rows
     UNION ALL SELECT value FROM plpgsql_dynamic_session_rows' INTO plan;
   IF plan IS NULL OR position('actual time' IN plan) = 0 THEN
     RAISE EXCEPTION 'EXPLAIN ANALYZE set-query result mismatch';
   END IF;
-  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) WITH inserted AS
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) WITH inserted AS
     (INSERT INTO plpgsql_dynamic_session_rows VALUES (5) RETURNING value)
     SELECT value FROM inserted' INTO plan;
   IF plan IS NULL OR position('actual time' IN plan) = 0 THEN

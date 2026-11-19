@@ -167,6 +167,9 @@ pub(crate) struct Candidate {
     /// The path's pathkeys are the first this many of the query's.
     pub(super) presorted: usize,
     pub(super) sort: SortKind,
+    /// A sorted grouping by the keys in the order the scan returns them
+    /// rather than the query's.
+    pub(super) reordered: bool,
 }
 
 impl Candidate {
@@ -211,6 +214,9 @@ struct Paths<'p, 's, 'a> {
     usable: &'p [bool],
     /// The query's pathkeys.
     order: &'p [OrderKey],
+    /// The pathkeys are a grouping's, which an index may return in any
+    /// order of its keys.
+    grouping: bool,
     /// Columns an equality with a constant fixes.
     fixed: ColumnSet,
     needed: Option<ColumnSet>,
@@ -790,6 +796,49 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
                     }
             })
             .count()
+    }
+
+    /// How many pathkeys of the query the index scan in this direction
+    /// returns, in the query's order or, for a grouping, any
+    /// (`pathkeys_useful_for_grouping`).
+    fn useful_prefix(&self, index: usize, backward: bool) -> usize {
+        if self.grouping {
+            self.group_prefix(index, backward).1
+        } else {
+            self.presorted(index, backward)
+        }
+    }
+
+    /// The leading pathkeys of the index scan in this direction that are
+    /// among the query's, in any order (`pathkeys_useful_for_grouping`).
+    fn group_prefix(
+        &self,
+        index: usize,
+        backward: bool,
+    ) -> ([usize; crate::storage::MAX_INDEX_COLS], usize) {
+        let info = &self.index(index).catalog;
+        let mut seen = [usize::MAX; crate::storage::MAX_INDEX_COLS];
+        let mut count = 0;
+        for position in 0..info.n_cols {
+            if info.pattern_keys[position] || !info.column_collation[position] {
+                break;
+            }
+            let column = usize::from(info.columns[position]);
+            if self.fixed.contains(column) || seen[..count].contains(&column) {
+                continue;
+            }
+            let wanted = OrderKey::Column {
+                column,
+                descending: info.descending[position] != backward,
+                nulls_first: info.nulls_first[position] != backward,
+            };
+            if !self.order.contains(&wanted) {
+                break;
+            }
+            seen[count] = column;
+            count += 1;
+        }
+        (seen, count)
     }
 
     /// `build_index_pathkeys` of `index` scanned `backward`, a constant's
@@ -1951,8 +2000,8 @@ impl<'a> Paths<'_, '_, 'a> {
             if !self.usable[index] {
                 continue;
             }
-            if self.presorted(index, false) > 0
-                || self.presorted(index, true) > 0
+            if self.useful_prefix(index, false) > 0
+                || self.useful_prefix(index, true) > 0
                 || self.index_only(index)
             {
                 return Ok(Ok(true));
@@ -2757,6 +2806,7 @@ pub(crate) fn scan_path<'a>(
         restrictions,
         usable,
         order,
+        grouping: shape.grouping.is_some() && matches!(shape.member, super::Member::No),
         fixed,
         needed,
         rows: f64::NAN,
@@ -3112,53 +3162,165 @@ fn grouped<'a>(
     let planner = paths.planner;
     let costs = planner.costs;
     let methods = crate::sql::guc::planner_methods();
-    let columns = &grouping.columns[..grouping.len];
-    // An index ordered by a grouping column gives PostgreSQL presorted
-    // input paths, which the model leaves out.
-    for (index, info) in planner.indexes.iter().enumerate() {
-        let catalog = &info.catalog;
-        if paths.usable[index]
-            && catalog.n_cols > 0
-            && columns.contains(&usize::from(catalog.columns[0]))
-        {
-            return Ok(Err("a grouping column an index orders"));
+    // A column an equality with a constant fixes is no grouping key: its
+    // pathkey is redundant, and `processed_groupClause` leaves it out.
+    let mut group_columns = [0usize; super::MAX_ORDER_KEYS];
+    let mut group_count = 0;
+    for &column in &grouping.columns[..grouping.len] {
+        if !paths.fixed.contains(column) {
+            group_columns[group_count] = column;
+            group_count += 1;
         }
     }
+    if group_count == 0 {
+        return Ok(Err("a grouping of columns that conditions fix"));
+    }
+    let columns = &group_columns[..group_count];
     let kept_options = paths
         .arena
         .alloc_slice_with(kept.len(), |at| Some(kept[at]))
         .map_err(|_| crate::sql::eval::arena_full())?;
     let cheapest = cheapest_total(kept_options).expect("the relation keeps a path");
     let groups = estimate_groups(planner, columns, rows);
-    // The sorted strategy over the cheapest path, sorted.
-    let (sort_startup, sort_run) = tuplesort_cost(rows, width, None, costs);
-    let input_sort = (
-        cheapest.total + sort_startup,
-        cheapest.total + sort_startup + sort_run,
-    );
-    let sorted_input = AggInput {
-        startup: input_sort.0,
-        total: input_sort.1,
-        rows,
-        width,
+    // The sorted strategy over each path sorted by the grouping keys: as it
+    // is, incrementally after its leading keys, or the cheapest path in
+    // full (`add_paths_to_grouping_rel`). A sort over no key is no sort.
+    let sort_len = paths.order.len();
+    let mut order_columns = [0usize; super::MAX_ORDER_KEYS];
+    for (at, key) in paths.order.iter().enumerate() {
+        if let OrderKey::Column { column, .. } = key {
+            order_columns[at] = *column;
+        }
+    }
+    // The grouping keys in the order the sorted strategy over `input` uses
+    // and how many of them it returns sorted (`group_keys_reorder_by_pathkeys`
+    // moves the keys an index returns to the front).
+    let arrangement = |input: &Candidate, reordered: bool| {
+        // The sort keys, and every grouping column in the order its
+        // `Group Key` prints.
+        let mut lead = order_columns;
+        let mut keys = [0usize; super::MAX_ORDER_KEYS];
+        keys[..columns.len()].copy_from_slice(columns);
+        let mut presorted = input.presorted;
+        if !reordered && matches!(input.kind, ScanKind::Index | ScanKind::IndexOnly) {
+            let index_path = paths.index_paths.items[input.path];
+            presorted = paths.presorted(index_path.index, index_path.backward);
+        }
+        if reordered && matches!(input.kind, ScanKind::Index | ScanKind::IndexOnly) {
+            let index_path = paths.index_paths.items[input.path];
+            let (matched, count) = paths.group_prefix(index_path.index, index_path.backward);
+            lead[..count].copy_from_slice(&matched[..count]);
+            let mut at = count;
+            for column in &order_columns[..sort_len] {
+                if !matched[..count].contains(column) {
+                    lead[at] = *column;
+                    at += 1;
+                }
+            }
+            keys[..count].copy_from_slice(&matched[..count]);
+            let mut at = count;
+            for column in columns {
+                if !matched[..count].contains(column) {
+                    keys[at] = *column;
+                    at += 1;
+                }
+            }
+            presorted = count;
+        }
+        (keys, lead, presorted)
     };
-    let (startup, total, _) = super::aggregate::with_having(
-        cost_agg(
-            AggStrategy::Sorted,
-            &grouping.aggregates,
-            columns.len(),
-            groups,
-            sorted_input,
-        ),
-        grouping.having,
-    );
-    let sorted = Candidate {
-        startup,
-        total,
-        presorted: columns.len(),
-        disabled: cheapest.disabled + u32::from(!methods.sort),
-        ..cheapest
+    let sort_input = |input: &Candidate, reordered: bool| -> Option<SortedInput> {
+        let (_, keys, presorted) = arrangement(input, reordered);
+        if sort_len == 0 || presorted >= sort_len {
+            return Some((*input, None));
+        }
+        let incremental = presorted > 0 && methods.incremental_sort;
+        if !input.same_scan(&cheapest) && !incremental {
+            return None;
+        }
+        Some(if incremental {
+            let (startup, total) = incremental_sort_cost(
+                input,
+                rows,
+                width,
+                None,
+                estimate_groups(planner, &keys[..presorted], rows),
+                costs,
+            );
+            (
+                Candidate {
+                    startup,
+                    total,
+                    ..*input
+                },
+                Some((startup, total, presorted as u8)),
+            )
+        } else {
+            let (startup, run) = tuplesort_cost(rows, width, None, costs);
+            let startup = startup + input.total;
+            (
+                Candidate {
+                    startup,
+                    total: startup + run,
+                    disabled: input.disabled + u32::from(!methods.sort),
+                    ..*input
+                },
+                Some((startup, startup + run, 0)),
+            )
+        })
     };
+    let mut sorted_paths = [None::<Candidate>; MAX_CANDIDATES];
+    let mut sorted_count = 0;
+    for input in kept {
+        // `get_useful_group_keys_orderings`: the query's order, and the
+        // scan's when its leading keys are among the grouping keys in
+        // another order.
+        let reorders = {
+            let (_, keys, presorted) = arrangement(input, true);
+            presorted > 0
+                && (methods.incremental_sort || presorted == sort_len)
+                && keys != order_columns
+        };
+        for reordered in [false, true] {
+            if reordered && !reorders {
+                continue;
+            }
+            let Some((sorted_input, sort)) = sort_input(input, reordered) else {
+                continue;
+            };
+            let (startup, total, _) = super::aggregate::with_having(
+                cost_agg(
+                    AggStrategy::Sorted,
+                    &grouping.aggregates,
+                    columns.len(),
+                    groups,
+                    AggInput {
+                        startup: sorted_input.startup,
+                        total: sorted_input.total,
+                        rows,
+                        width,
+                    },
+                ),
+                grouping.having,
+            );
+            if sorted_count + 1 == MAX_CANDIDATES {
+                return Ok(Err("more than 66 grouped paths"));
+            }
+            sorted_paths[sorted_count] = Some(Candidate {
+                startup,
+                total,
+                presorted: columns.len(),
+                sort: match sort {
+                    Some((_, _, 0)) => SortKind::Full,
+                    Some((_, _, presorted)) => SortKind::Incremental(usize::from(presorted)),
+                    None => SortKind::None,
+                },
+                reordered,
+                ..sorted_input
+            });
+            sorted_count += 1;
+        }
+    }
     let hashed_input = AggInput {
         startup: cheapest.startup,
         total: cheapest.total,
@@ -3183,7 +3345,14 @@ fn grouped<'a>(
         ..cheapest
     };
     let mut grouped_paths = [None::<Candidate>; MAX_CANDIDATES];
-    let grouped_count = add_paths(&[sorted, hashed], false, &mut grouped_paths);
+    sorted_paths[sorted_count] = Some(hashed);
+    let grouped_inputs = paths
+        .arena
+        .alloc_slice_with(sorted_count + 1, |at| {
+            sorted_paths[at].expect("dense paths")
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let grouped_count = add_paths(grouped_inputs, false, &mut grouped_paths);
     let grouped_paths = &grouped_paths[..grouped_count];
     let cheapest_grouped = cheapest_total(grouped_paths).expect("a grouped path is kept");
     // `create_ordered_paths`: a path in the `ORDER BY` order as it is, the
@@ -3249,18 +3418,43 @@ fn grouped<'a>(
     let final_count = add_paths(limited, consider_startup, &mut final_paths);
     let chosen = cheapest_total(&final_paths[..final_count]).expect("an ordered path is kept");
     let hashed_chosen = chosen.presorted == 0;
-    let aggregate = if hashed_chosen { hashed } else { sorted };
+    let aggregate = grouped_paths
+        .iter()
+        .flatten()
+        .find(|path| {
+            path.same_scan(&chosen)
+                && path.sort == chosen.sort
+                && path.presorted == chosen.presorted
+                && path.reordered == chosen.reordered
+        })
+        .copied()
+        .expect("the chosen path is a grouped path");
     let output_sort = (grouping.order != super::GroupOrder::None
         && (hashed_chosen || grouping.order == super::GroupOrder::Other))
         .then_some((
             aggregate.total + sort_startup,
             aggregate.total + sort_startup + sort_run,
         ));
+    // The scan below the grouping, and the sort of its rows when the
+    // grouping is sorted.
+    let scan = *kept
+        .iter()
+        .find(|path| path.same_scan(&chosen))
+        .expect("the chosen path reads a kept path");
+    let input_sort = if hashed_chosen {
+        None
+    } else {
+        sort_input(&scan, chosen.reordered).and_then(|(_, sort)| sort)
+    };
+    let keys = arrangement(&scan, chosen.reordered).0;
     let mut path = outside!(describe(
-        paths, &cheapest, &cheapest, shape, definition, needed, rows
+        paths, &chosen, &scan, shape, definition, needed, rows
     )?);
     path.grouped = Some(super::GroupedPath {
-        input_sort: (!hashed_chosen).then_some(input_sort),
+        hashed: hashed_chosen,
+        keys,
+        key_count: columns.len(),
+        input_sort,
         planned_partitions: hashed_chosen
             .then(|| super::aggregate::planned_partitions(&grouping.aggregates, groups, width)),
         hash_agg: hashed_chosen
@@ -3281,7 +3475,16 @@ fn grouped<'a>(
             let (_, _, rows) = adjust_limit_rows_costs(0.0, 0.0, kept_groups, count, offset);
             (chosen.startup, chosen.total, rows)
         }),
-        input: hashed_input,
+        input: if hashed_chosen {
+            hashed_input
+        } else {
+            AggInput {
+                startup: scan.startup,
+                total: scan.total,
+                rows,
+                width,
+            }
+        },
     });
     Ok(Ok(Planned::Chosen(path)))
 }
@@ -3327,6 +3530,7 @@ fn rel_candidates<'a>(
         disabled: u32::from(!methods.seqscan),
         presorted: 0,
         sort: SortKind::None,
+        reordered: false,
     });
     candidate_count += 1;
     // `create_index_paths`.
@@ -3350,7 +3554,7 @@ fn rel_candidates<'a>(
         }
         let clauses = outside!(paths.index_clauses(index, &[&own[..own_count]])?);
         let index_only = paths.index_only(index);
-        let forward = paths.presorted(index, false);
+        let forward = paths.useful_prefix(index, false);
         let mut built = [usize::MAX; 2];
         let mut built_count = 0;
         if !clauses.is_empty() || forward > 0 || index_only || partial {
@@ -3359,7 +3563,7 @@ fn rel_candidates<'a>(
             built_count += 1;
         }
         if order_len > 0 {
-            let backward = paths.presorted(index, true);
+            let backward = paths.useful_prefix(index, true);
             if backward > 0 {
                 built[built_count] =
                     outside!(paths.index_path(index, clauses, true, index_only, backward)?);
@@ -3383,6 +3587,7 @@ fn rel_candidates<'a>(
                 disabled: u32::from(!methods.indexscan),
                 presorted: index_path.presorted,
                 sort: SortKind::None,
+                reordered: false,
             });
             candidate_count += 1;
             if index_path.presorted == 0 || index_path.selectivity < 1.0 {
@@ -3411,6 +3616,7 @@ fn rel_candidates<'a>(
             disabled: u32::from(!methods.bitmapscan),
             presorted: 0,
             sort: SortKind::None,
+            reordered: false,
         });
         candidate_count += 1;
     }
@@ -3569,6 +3775,7 @@ fn join_candidates<'a>(
             disabled: u32::from(!methods.seqscan),
             presorted: 0,
             sort: SortKind::None,
+            reordered: false,
         },
         0,
         super::joins::Keys::NONE
@@ -3701,6 +3908,7 @@ fn join_candidates<'a>(
                 disabled: u32::from(!methods.bitmapscan),
                 presorted: 0,
                 sort: SortKind::None,
+                reordered: false,
             },
             0,
             super::joins::Keys::NONE
@@ -3746,6 +3954,7 @@ fn join_candidates<'a>(
                 disabled: u32::from(!methods.bitmapscan),
                 presorted: 0,
                 sort: SortKind::None,
+                reordered: false,
             },
             tree.param,
             super::joins::Keys::NONE
@@ -3864,6 +4073,7 @@ fn join_index_paths<'a>(
                 disabled: u32::from(!methods.indexscan),
                 presorted: 0,
                 sort: SortKind::None,
+                reordered: false,
             },
             param: index_path.param,
             keys: held,
@@ -3911,6 +4121,35 @@ pub(super) struct Upper {
     pub(super) limit_cost: Option<(f64, f64, f64)>,
 }
 
+/// A grouping's input path with the sort it needs: the sorted path, and the
+/// sort's startup and total cost with the leading keys the path presorts.
+type SortedInput = (Candidate, Option<(f64, f64, u8)>);
+
+/// `cost_incremental_sort` of `path`'s `rows` rows of `width` bytes sorted
+/// in `groups` groups of equal presorted keys, `limit_tuples` of them
+/// wanted: the sort's startup and total cost.
+fn incremental_sort_cost(
+    path: &Candidate,
+    rows: f64,
+    width: f64,
+    limit_tuples: Option<f64>,
+    groups: f64,
+    costs: super::Costs,
+) -> (f64, f64) {
+    let input_tuples = rows.max(2.0);
+    let group_tuples = input_tuples / groups;
+    let input_run = path.total - path.startup;
+    let group_input_run = input_run / groups;
+    let (group_startup, group_run) = tuplesort_cost(group_tuples, width, limit_tuples, costs);
+    let startup = group_startup + path.startup + group_input_run;
+    let mut run =
+        group_run + (group_run + group_startup) * (groups - 1.0) + group_input_run * (groups - 1.0);
+    // `create_incremental_sort_path` passes no comparison cost.
+    run += costs.cpu_tuple * input_tuples;
+    run += 2.0 * costs.cpu_tuple * groups;
+    (startup, startup + run)
+}
+
 /// `create_ordered_paths` and `create_limit_path` over the relation's
 /// `kept` paths of `rows` rows of `width` bytes, then the cheapest
 /// (`get_cheapest_fractional_path` as `add_path` leaves it); `groups` is
@@ -3946,23 +4185,17 @@ pub(super) fn upper_paths(
                 continue;
             }
             if incremental {
-                let groups = groups(path.presorted);
-                let input_tuples = rows.max(2.0);
-                let group_tuples = input_tuples / groups;
-                let input_run = path.total - path.startup;
-                let group_input_run = input_run / groups;
-                let (group_startup, group_run) =
-                    tuplesort_cost(group_tuples, width, limit_tuples, costs);
-                let startup = group_startup + path.startup + group_input_run;
-                let mut run = group_run
-                    + (group_run + group_startup) * (groups - 1.0)
-                    + group_input_run * (groups - 1.0);
-                // `create_incremental_sort_path` passes no comparison cost.
-                run += costs.cpu_tuple * input_tuples;
-                run += 2.0 * costs.cpu_tuple * groups;
+                let (startup, total) = incremental_sort_cost(
+                    &path,
+                    rows,
+                    width,
+                    limit_tuples,
+                    groups(path.presorted),
+                    costs,
+                );
                 path = Candidate {
                     startup,
-                    total: startup + run,
+                    total,
                     presorted: order_len,
                     sort: SortKind::Incremental(path.presorted),
                     ..path
@@ -4547,6 +4780,7 @@ mod tests {
             disabled: 0,
             presorted,
             sort: SortKind::None,
+            reordered: false,
         }
     }
 

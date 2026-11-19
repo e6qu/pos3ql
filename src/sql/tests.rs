@@ -103119,3 +103119,100 @@ fn a_write_that_finds_the_memtable_full_waits_for_a_checkpoint_to_spill_committe
     drop(engine);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
+
+#[test]
+fn a_statement_rerun_after_the_memtable_wait_repeats_no_sequence_value_or_notice() {
+    let mut config = test_config("memtable-wait-effects");
+    config.object_store_on = true;
+    config.wal_bytes = 16 << 20;
+    config.wal_buffer_bytes = 4 << 20;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("memtable-wait-effects-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session =
+        ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE spill_seq; CREATE TABLE spill_fill(id integer, note text); \
+         CREATE TABLE spill_out(id bigint, note text); \
+         CREATE FUNCTION spill_notice(i integer) RETURNS integer LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE NOTICE 'row %', i; RETURN i; END $$",
+        true,
+    );
+    let run =
+        |engine: &mut Engine, session: &mut ConfiguredTransactionSession, sql: &'static str| {
+            if session.transaction.suspended_statement_deadline().is_none() {
+                session.arena.reset();
+            }
+            let mut responder = Responder::new(&mut session.send);
+            engine
+                .execute_simple_from(
+                    sql,
+                    0,
+                    &session.arena,
+                    &mut session.transaction,
+                    &mut session.pool,
+                    &mut session.cursors,
+                    &session.guc,
+                    &mut responder,
+                    session.connection_id,
+                    false,
+                )
+                .unwrap()
+        };
+    const FILL: &str =
+        "INSERT INTO spill_fill SELECT i, repeat('x', 8192) FROM generate_series(1, 20) AS g(i)";
+    const SEQUENCE: &str = "INSERT INTO spill_out SELECT nextval('spill_seq'), repeat('x', 8192) \
+                            FROM generate_series(1, 100) AS g(i)";
+    const NOTICE: &str = "INSERT INTO spill_out SELECT spill_notice(i), repeat('x', 8192) \
+                          FROM generate_series(1, 100) AS g(i)";
+    for (statement, notices) in [(SEQUENCE, 0), (NOTICE, 100)] {
+        for _ in 0..2 {
+            // A write that waits for room runs again once a checkpoint has made it.
+            while run(&mut engine, &mut session, FILL) != ExecutionStatus::Complete {
+                assert!(engine.checkpoint().unwrap());
+            }
+        }
+        session.send.clear();
+        // The connection discards a waiting statement's output.
+        assert!(matches!(
+            run(&mut engine, &mut session, statement),
+            ExecutionStatus::Blocked {
+                wait: StatementWait::ObjectIo,
+                ..
+            }
+        ));
+        session.send.clear();
+        assert!(engine.checkpoint().unwrap());
+        assert_eq!(
+            run(&mut engine, &mut session, statement),
+            ExecutionStatus::Complete
+        );
+        assert!(error_sqlstates(session.send.readable()).is_empty());
+        assert_eq!(
+            message_types(session.send.readable())
+                .iter()
+                .filter(|kind| **kind == b'N')
+                .count(),
+            notices
+        );
+        session.success(&mut engine, "TRUNCATE spill_fill", true);
+        assert!(engine.checkpoint().unwrap());
+    }
+    // The sequence handed out each value once, with no gap.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*), min(id), max(id) FROM spill_out WHERE id <= 100; \
+             SELECT last_value FROM spill_seq",
+            true
+        )),
+        ["200|1|100", "100"]
+    );
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}

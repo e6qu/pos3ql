@@ -817,9 +817,7 @@ correlation as a table column's, at most 16 KiB each; a larger one fails
 ANALYZE with a named error), pg_stats_ext_exprs shows it, and a condition on
 an expression the object holds is estimated from it as `examine_variable`
 does, alone or with the object's other keys through its MCV list and
-dependencies (`differential_exact/899`, `900`, `901`). pg_stats_ext_exprs
-leaves the array-element columns (`most_common_elems` and the two after it)
-NULL.
+dependencies (`differential_exact/899`, `900`, `901`).
 An index key or predicate may call a PL/pgSQL function
 A `DROP TABLE ... CASCADE` drops every foreign key that references the table in one statement and changes each referencing relation once (`differential_exact/898`); a transaction that changes one relation in more than `max_catalog_versions_per_object` statements fails with that named capacity error.
 (`differential_exact/755`): a utility statement that evaluates outside a
@@ -1120,16 +1118,40 @@ subquery scan below), and `EXPLAIN ANALYZE` of windows over an index scan,
 under a limit directly above them or over a join's groups (`0A000`:
 execution reads the input by its own scan); for presorted aggregates:
 `EXPLAIN ANALYZE` of their sort (`0A000`: its tuples' memory is not modeled).
-Remaining for that search: an equality whose side reads several
-relations (`a.x + b.y = c.z`, an equivalence class member PostgreSQL hashes
-and merges by) and other conditions comparing expressions of several
-relations with each other (`COALESCE(a.id, 0) < b.id`), an `OR`
+An equality whose side reads several relations (`a.x + b.y = c.z`) makes
+that expression a class member read at the join of its relations, which
+evaluates it over their rows: it hashes or merges that join with the other
+side (a sort above the join computing it), estimated without statistics
+(`DEFAULT_NUM_DISTINCT`, `estimate_hash_bucket_stats`' default, the
+expression's columns counted per relation for groups,
+`differential_exact/932`). Such an expression also parameterizes an
+index scan of its class's other member, run by a nested loop over the
+join of its relations (`generate_implied_equalities_for_column`), filters
+that join when its class holds a constant
+(`generate_base_implied_equalities_const`), and keys an `ORDER BY`, window
+or ordered aggregate (`differential_exact/933`). A nested loop's
+parameterized scan reads only the rows an index finds for the outer row's
+keys, except under `EXPLAIN ANALYZE`, which reads the relation's every
+row per loop to count the path's own reads, so many loops over a large
+relation exhaust the statement arena (`54000`). An unaliased
+parenthesized join whose members join by written conditions (`a LEFT JOIN
+(b JOIN c ON x) ON y`, nested to any depth) is a node of the join tree
+`deconstruct_jointree` reads: its relations join in the same search, and
+each joined row fills the parenthesized join's columns from its members'
+rows (`differential_exact/934`). Remaining there: an aliased one, one
+joined by `USING` or `NATURAL`, and one under grouping, aggregates or
+windows (`0A000` when costs print); the parenthesized join's rows are
+still read once before the plan runs, and one nested in another
+(`a LEFT JOIN (b JOIN (c JOIN d ON z) ON x) ON y`) exhausts the statement
+arena reading them (`54000`). Remaining for that search:
+`GROUP BY` of an expression (`0A000` when costs print), conditions
+comparing expressions of several relations other than by a mergeable
+equality (`COALESCE(a.id, 0) < b.id`), an `OR`
 of join conditions that a semi or anti join evaluates
 (`clauselist_selectivity_or` under `eqjoinsel_semi`), an `OR` join clause
 that an indexed relation's parameterized scan evaluates (as a filter, or
 as a `BitmapOr` of parameterized index scans), a merge join over a partly sorted outer input (`Incremental
-Sort`), a right-nested outer join (`a LEFT JOIN (b JOIN c) ON ...`) and
-derived tables kept as subqueries (`SubqueryScan`), self-join removal
+Sort`), derived tables kept as subqueries (`SubqueryScan`), self-join removal
 (`remove_useless_self_joins`), a constant equated with an outer join's
 column another outer join nulls, `UPDATE ... FROM` and `DELETE ...
 USING` through the same search, more relations than
@@ -1999,7 +2021,7 @@ domain and composite values, and an array column's values as an array of
 arrays. Range, multirange and `tsvector` columns count every value distinct
 and a type without equality leaves `n_distinct` unknown, as PostgreSQL's
 `compute_range_stats`, `compute_tsvector_stats` and `compute_trivial_stats`
-do. Remaining: the element statistics of arrays and `tsvector` columns, range
+do. An array column's (and a statistics expression's) ANALYZE also keeps the most common elements, their frequencies and the histogram of distinct element counts (`compute_array_stats`'s lossy counting, `differential_exact/903`), and an array's `avg_width` is its on-disk size. A `tsvector` column keeps its most common lexemes (`compute_tsvector_stats`, sorted by length then bytes) and its width is its stored size, and an array-valued index expression's element statistics show in `pg_stats` (`differential_exact/904`). When more elements pass the cutoff than the statistics target allows, PostgreSQL keeps the most frequent in the order its hash table iterates them (a `dynahash` seq scan over `hash_bytes` buckets, `qsort` unstable among equal frequencies), which depends on that table's growth history and cannot be reproduced without porting `dynahash`; pos3ql keeps ties in first-seen order. Remaining: range
 and multirange histograms, `compute_distinct_stats` for types without an
 ordering, the widths of values PostgreSQL compresses, and the binary form
 of a composite value inside a statistics array, which pos3ql sends as

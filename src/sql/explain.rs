@@ -15,6 +15,7 @@ use crate::sql::ast::{
 };
 use crate::sql::eval::{ColumnLookup, SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
+use crate::sql::query::index_paths::clamp_row_est;
 use crate::sql::query::index_paths::joins::Relids;
 use crate::sql::query::instrument::{
     BlockId, BufferUsage, HashColumns, NodeCounters, NodeKey, Role, Segment, Slot,
@@ -941,7 +942,7 @@ fn subplan_cost(
 ) -> (f64, f64) {
     use crate::sql::catalog::deparse::SublinkPlan;
     let operator = crate::sql::guc::planner_value("cpu_operator_cost");
-    let rows = crate::sql::query::index_paths::clamp_row_est(top.rows as f64);
+    let rows = clamp_row_est(top.rows);
     // `cost_qual_eval` of the test expression: one operator per compared
     // column.
     let compared = match node {
@@ -957,13 +958,13 @@ fn subplan_cost(
     let mut per_tuple = compared * operator;
     match plan {
         SublinkPlan::InitPlan(_) => return (0.0, 0.0),
-        SublinkPlan::HashedSubPlan(_) => startup += top.total_cost + operator * top.rows as f64,
+        SublinkPlan::HashedSubPlan(_) => startup += top.total_cost + operator * top.rows,
         SublinkPlan::SubPlan(_) => {
             let run = top.total_cost - top.startup_cost;
             per_tuple += match node {
                 Expr::Exists(_) => run / rows,
                 Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } => {
-                    0.5 * run + 0.5 * top.rows as f64 * operator
+                    0.5 * run + 0.5 * top.rows * operator
                 }
                 _ => run,
             };
@@ -5033,7 +5034,6 @@ fn expression_statistics_selectivity(
 const CPU_TUPLE_COST: f64 = 0.01;
 const CPU_OPERATOR_COST: f64 = 0.0025;
 
-
 /// The operators and function calls PostgreSQL's `cost_qual_eval` charges
 /// `cpu_operator_cost` each for when it evaluates `expression`.
 fn qual_operators(expression: Option<&Expr<'_>>) -> f64 {
@@ -5133,7 +5133,7 @@ fn costed_relation<'a>(
         let tuples = storage.planning_row_estimate(slot) as f64;
         // The rows a condition keeps, which PostgreSQL's statistics
         // estimate closely for an analyzed table.
-        let rows = crate::sql::query::index_paths::clamp_row_est(match condition {
+        let rows = clamp_row_est(match condition {
             None => tuples,
             Some(condition) => {
                 match crate::sql::exec::relation_rows_kept(
@@ -5164,11 +5164,11 @@ fn costed_relation<'a>(
             // statistics: the relation's rows when fewer than
             // `DEFAULT_NUM_DISTINCT`, otherwise that default.
             let Some(column) = column else {
-                let values = (tuples < 200.0).then(|| crate::sql::query::index_paths::clamp_row_est(tuples));
+                let values = (tuples < 200.0).then(|| clamp_row_est(tuples));
                 *distinct = match (*distinct, values) {
                     (Some(sum), Some(values)) => Some(
                         sum + if tuples > 0.0 && rows < tuples {
-                            crate::sql::query::index_paths::clamp_row_est(values * rows / tuples)
+                            clamp_row_est(values * rows / tuples)
                         } else {
                             values
                         },
@@ -5195,7 +5195,7 @@ fn costed_relation<'a>(
             // `estimate_hash_bucketsize` scales the distinct values by the
             // fraction of rows the scan keeps.
             let scaled = if tuples > 0.0 && rows < tuples {
-                crate::sql::query::index_paths::clamp_row_est(values * rows / tuples)
+                clamp_row_est(values * rows / tuples)
             } else {
                 values
             };
@@ -5315,12 +5315,8 @@ pub(crate) fn joined_write_shape<'a>(
         let total = startup
             + outer.total
             + CPU_OPERATOR_COST * keys * outer.rows
-            + CPU_OPERATOR_COST
-                * keys
-                * outer.rows
-                * crate::sql::query::index_paths::clamp_row_est(inner.rows * fraction)
-                * 0.5
-            + (CPU_TUPLE_COST + filter) * crate::sql::query::index_paths::clamp_row_est(matches);
+            + CPU_OPERATOR_COST * keys * outer.rows * clamp_row_est(inner.rows * fraction) * 0.5
+            + (CPU_TUPLE_COST + filter) * clamp_row_est(matches);
         (startup, total)
     };
     // The paths in the order `add_paths_to_joinrel` generates them: the
@@ -5927,8 +5923,7 @@ impl Sublink<'_> {
     fn initplan_cost(&self) -> f64 {
         let top = &self.nodes[0];
         if self.exists {
-            top.startup_cost
-                + (top.total_cost - top.startup_cost) / crate::sql::query::index_paths::clamp_row_est(top.rows as f64)
+            top.startup_cost + (top.total_cost - top.startup_cost) / clamp_row_est(top.rows)
         } else {
             top.total_cost
         }
@@ -6178,7 +6173,7 @@ fn plan_sublinks<'a>(
                         total_cost: nodes[0].total_cost
                             + 2.0
                                 * crate::sql::guc::planner_value("cpu_operator_cost")
-                                * nodes[0].rows as f64,
+                                * nodes[0].rows,
                         rows: nodes[0].rows,
                         width: nodes[0].width,
                         output: nodes[0].output,
@@ -8162,7 +8157,7 @@ fn plan_pulled_select<'a>(
                     key: key(Role::Limit),
                     startup_cost: startup,
                     total_cost: total,
-                    rows: rows,
+                    rows,
                     width,
                     object_requests,
                     cache_blocks,
@@ -11404,7 +11399,7 @@ fn push_set_tree(
                 output: left.output,
                 depth,
                 startup_cost: 0.0,
-                total_cost: left.total_cost + right.total_cost + rows as f64 * 0.01,
+                total_cost: left.total_cost + right.total_cost + rows * 0.01,
                 rows,
                 width: left.width.max(right.width),
                 object_requests: left.object_requests.saturating_add(right.object_requests),
@@ -14834,7 +14829,11 @@ impl PostgresHashTable {
         let memory_limit = crate::sql::guc::hash_memory_bytes().min(u64::MAX as f64) as u64;
         let pointers = (memory_limit / 8).clamp(1, MAX_ALLOC_POINTERS);
         let max_pointers = (1u64 << pointers.ilog2()).min(i32::MAX as u64 / 2 + 1);
-        let estimated = if node.rows <= 0.0 { 1000 } else { node.rows as u64 };
+        let estimated = if node.rows <= 0.0 {
+            1000
+        } else {
+            node.rows as u64
+        };
         let original = estimated.min(max_pointers).max(1024).next_power_of_two();
         let mut buckets = original;
         // A row inserted while the rows before it outnumber the buckets
@@ -16422,7 +16421,10 @@ fn structured_node(
             "Startup Cost",
             stack_format!(NUMBER_BYTES, "{:.2}", node.startup_cost),
         );
-        document.number("Total Cost", stack_format!(NUMBER_BYTES, "{:.2}", node.total_cost));
+        document.number(
+            "Total Cost",
+            stack_format!(NUMBER_BYTES, "{:.2}", node.total_cost),
+        );
         document.number("Plan Rows", stack_format!(NUMBER_BYTES, "{:.0}", node.rows));
         document.number("Plan Width", node.width);
     }

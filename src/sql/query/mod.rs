@@ -1022,6 +1022,7 @@ pub(crate) use subquery::{
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
 
+mod material_store;
 mod window;
 mod window_figures;
 mod window_store;

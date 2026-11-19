@@ -888,11 +888,14 @@ pub(crate) fn external_set_body_into<'a>(
         let mut reader = storage.external_run_reader()?;
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
-        sorter.size_as_postgres(instrument::SortTuples::new(
-            None,
-            0,
-            set_sort_bound(limit_written, with_ties, limit, offset).is_some(),
-        ));
+        sorter.size_as_postgres(
+            instrument::SortTuples::new(
+                None,
+                0,
+                set_sort_bound(limit_written, with_ties, limit, offset).is_some(),
+            ),
+            set_sort_bound(limit_written, with_ties, limit, offset),
+        );
         let mut compare = |left: &[u8], right: &[u8]| {
             compare_set_order(
                 storage,
@@ -1034,11 +1037,14 @@ fn external_set_query<'a>(
             Err(error) => return sql_fail(error),
         };
         sorter.reset();
-        sorter.size_as_postgres(instrument::SortTuples::new(
-            None,
-            0,
-            set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset).is_some(),
-        ));
+        sorter.size_as_postgres(
+            instrument::SortTuples::new(
+                None,
+                0,
+                set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset).is_some(),
+            ),
+            set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset),
+        );
         let mut compare = |left: &[u8], right: &[u8]| {
             compare_set_order(storage, txid, columns, left, right, &keys[..key_count])
         };
@@ -2624,7 +2630,7 @@ pub(crate) fn sort_set_rows(
         Some(bound) if sort.measured() => {
             instrument::SortSpace::postgres_top_n(rows, None, 0, bound, arena, compare)?
         }
-        _ => instrument::SortSpace::postgres(rows, None, bound.is_some()),
+        _ => instrument::SortSpace::postgres(rows, None, bound.is_some())?,
     };
     let bound = bound.filter(|&bound| rows.len() > bound * 2);
     match bound {

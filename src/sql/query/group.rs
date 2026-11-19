@@ -218,11 +218,10 @@ pub(super) fn groups_for_mask<'a>(
         if input_sort.measured() && grouping_sort_is_keys(statement, agg_nodes, mask) {
             let columns: [usize; crate::sql::parser::MAX_GROUP_TERMS] =
                 core::array::from_fn(|column| column);
-            sorter.size_as_postgres(instrument::SortTuples::new(
-                Some(&columns[..n_keys]),
-                0,
-                false,
-            ));
+            sorter.size_as_postgres(
+                instrument::SortTuples::new(Some(&columns[..n_keys]), 0, false),
+                None,
+            );
         }
         // Equal keys keep input order, so each group reports its first input
         // row's key, as PostgreSQL's hashed grouping does.
@@ -430,7 +429,7 @@ pub(super) fn groups_for_mask<'a>(
                 let rows = arena
                     .alloc_slice_with(keys.len(), |at| keys[at].0)
                     .map_err(|_| arena_full())?;
-                instrument::SortSpace::postgres(rows, None, false)
+                instrument::SortSpace::postgres(rows, None, false)?
             } else {
                 instrument::SortSpace {
                     method: instrument::SortMethod::Quicksort,
@@ -1296,7 +1295,7 @@ pub(super) fn grouped_rows<'a>(
                 arena,
                 compare,
             )?,
-            _ => instrument::SortSpace::postgres(out_rows, Some(&columns[..count]), false),
+            _ => instrument::SortSpace::postgres(out_rows, Some(&columns[..count]), false)?,
         };
         // The `Sort` over a join's grouping PostgreSQL's planner plans is
         // its tuplesort, over the groups in their grouping's order.

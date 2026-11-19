@@ -1529,9 +1529,17 @@ or an `Incremental Sort` when the rows already follow a prefix of its keys;
 a query `ORDER BY` the last window's rows follow needs no sort. Under
 `ANALYZE` a window prints its `Storage:` line, and the query's `Incremental
 Sort` over a window prints its `Full-sort Groups` and `Pre-sorted Groups`
-lines, batched as `nodeIncrementalSort.c` batches its input. Remaining: the
+lines, batched as `nodeIncrementalSort.c` batches its input. A sort that outgrows `work_mem` reports `external merge` with
+PostgreSQL's `Disk` size: the model follows `tuplesort.c` (`grow_memtuples`,
+`LACKMEM`, `inittapes`' buffers, `dumptuples`' runs round-robin over
+`tuplesort_merge_order` tapes) and counts each tape's 8176-byte blocks, which a
+multi-pass merge never exceeds because each pass reads a block before it
+writes its replacement; a bounded sort keeps its heap from the row count its
+heap began at (`differential_exact/906`). An incremental sort's batches
+report `Average Disk` and the space its one tuplesort remembers across
+`tuplesort_reset`. A merge join's sort that spills (random-access tapes) stays `0A000`. Remaining: the
 window's storage, the sorts under windows and the incremental sort's group
-memory are pos3ql's own figures; PostgreSQL's need the window's
+memory over windows are pos3ql's own figures; PostgreSQL's need the window's
 `tuplestore_trim` points (its read and mark pointers per frame) and each
 batch's tuplesort reuse, which `differential_exact/472` and `564` still
 mask. A

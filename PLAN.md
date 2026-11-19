@@ -1258,8 +1258,15 @@ PostgreSQL runs a bounded top-N sort; the join's rows must feed the
 spilling sort instead. A join estimated past 2^64 rows refuses
 `EXPLAIN` with costs (`0A000`), since plan rows are kept as integers where
 PostgreSQL prints its double in full. Joins of never-analyzed tables keep
-pos3ql's join order: modeling them matches PostgreSQL on probe joins but moves 24 lib
-tests (streaming of cold joins, hash-plan expectations) off their plans. A parameterized index scan's cost reads its index's pages:
+Joins of never-analyzed tables keep
+pos3ql's join order. Modeling them matches PostgreSQL on probe joins but
+needs, first: the join executor yielding on cold reads as the old executor
+does (the `result_streams` and `result_output_tests` streaming tests);
+GEQO finding a plan for the wide explicit-join trees of
+`wide_join_trees_execute_without_allocation` (it fails with `XX000 geqo
+failed to make a valid plan`); and EXPLAIN of the widest statement fitting
+the statement arena (`54000` today). The hash/merge plan tests then take
+PostgreSQL's plans. A parameterized index scan's cost reads its index's pages:
 an index built over loaded rows is sized as `_bt_buildadd` fills its
 pages (a page closes when its free space and its last tuple's posting
 list fall under the fill factor's reserve, that tuple moving on), but one

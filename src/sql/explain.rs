@@ -6034,8 +6034,12 @@ fn plan_sublinks<'a>(
             let columns = mentions_column(operand);
             // `convert_ANY_sublink_to_join` joins the subquery; a test of no
             // column gates the query from a `Result` (`One-Time Filter`).
-            if !columns
-                || (any && !query::expression_contains_volatile(operand, storage, txid, false))
+            // A query without FROM evaluates its conditions in its
+            // `Result` already.
+            if (!columns && statement.from.is_some())
+                || (columns
+                    && any
+                    && !query::expression_contains_volatile(operand, storage, txid, false))
             {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,

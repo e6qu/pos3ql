@@ -14924,6 +14924,14 @@ pub(super) fn visit_text_rows<E>(
                         kind.peak_kb
                     );
                 }
+                if kind.peak_disk_kb > 0 {
+                    let _ = write!(
+                        line,
+                        "  Average Disk: {}kB  Peak Disk: {}kB",
+                        kind.average_disk_kb(),
+                        kind.peak_disk_kb
+                    );
+                }
                 emit(line.as_str())?;
             }
         }
@@ -16282,10 +16290,18 @@ fn structured_node(
             document.open_group("Incremental Sort Groups", Some(label), true);
             document.number("Group Count", kind.count);
             document.list("Sort Methods Used", kind.methods());
-            document.open_group("Sort Space", Some("Sort Space Memory"), true);
-            document.number("Average Sort Space Used", kind.average_kb());
-            document.number("Peak Sort Space Used", kind.peak_kb);
-            document.close_group("Sort Space", true);
+            if kind.peak_kb > 0 {
+                document.open_group("Sort Space", Some("Sort Space Memory"), true);
+                document.number("Average Sort Space Used", kind.average_kb());
+                document.number("Peak Sort Space Used", kind.peak_kb);
+                document.close_group("Sort Space", true);
+            }
+            if kind.peak_disk_kb > 0 {
+                document.open_group("Sort Space", Some("Sort Space Disk"), true);
+                document.number("Average Sort Space Used", kind.average_disk_kb());
+                document.number("Peak Sort Space Used", kind.peak_disk_kb);
+                document.close_group("Sort Space", true);
+            }
             document.close_group("Incremental Sort Groups", true);
         }
     }

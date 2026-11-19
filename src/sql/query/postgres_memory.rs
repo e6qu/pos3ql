@@ -495,6 +495,7 @@ impl TuplesortModel {
 
 /// The report of a sort whose rows (`input`: each one's copy length and tape
 /// image bytes, in arrival order) a sort of `bound` rows (if any) read.
+#[cfg(test)]
 pub(crate) fn tuplesort_space(
     tuples: SortTuples,
     input: impl Iterator<Item = (usize, usize)>,

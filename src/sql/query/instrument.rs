@@ -852,6 +852,10 @@ impl SortSpace {
     /// [`Self::postgres_locking`] of a sort a limit of `bound` rows bounds,
     /// over `rows` in arrival order: past twice the bound its heap keeps
     /// the rows `compare` puts first, as `make_bounded_heap` charges them.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the sort's tuple, bound, comparison and tuplesort reuse"
+    )]
     pub(crate) fn postgres_top_n(
         rows: &[&[u8]],
         columns: Option<&[usize]>,

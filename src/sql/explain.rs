@@ -543,6 +543,8 @@ struct Conflict {
     update: bool,
     arbiters: [StackStr<64>; MAX_ARBITERS],
     count: usize,
+    /// A `DO UPDATE ... WHERE`, as `show_upper_qual` prints it.
+    filter: Option<StackStr<512>>,
 }
 
 impl Conflict {
@@ -553,6 +555,12 @@ impl Conflict {
     /// The conflict's analyzed outcome: the rows the insertion path
     /// inserted and those that conflicted, from the rows the write's input
     /// returned.
+    /// The rows the `Conflict Filter` removed, when analyzed.
+    fn filtered(&self, plan: &Plan<'_>) -> Option<u64> {
+        self.filter?;
+        Some(plan.measured?[0].filtered)
+    }
+
     fn tuples(plan: &Plan<'_>) -> Option<(u64, u64)> {
         let measured = plan.measured?;
         let input = (1..plan.count).find(|&at| !plan.nodes[at].target_member)?;
@@ -6610,6 +6618,38 @@ fn plan_pulled_select<'a>(
         )?,
         _ => None,
     };
+    // A parenthesized join the join search does not plan would print
+    // pos3ql's own join order, as would a join PostgreSQL searches
+    // genetically (GEQO) or splits into several join problems past the
+    // collapse limits.
+    let relations = statement
+        .from
+        .as_ref()
+        .map_or(0, |from| 1 + from.joins.len());
+    let value = crate::sql::guc::planner_value;
+    if modeled.is_none()
+        && relations > 1
+        && ((value("geqo") != 0.0 && relations as f64 >= value("geqo_threshold"))
+            || relations as f64 > value("join_collapse_limit")
+            || relations as f64 > value("from_collapse_limit"))
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a join of more relations than PostgreSQL's join search plans at once (geqo_threshold, join_collapse_limit, from_collapse_limit) is not supported"
+        ));
+    }
+    if modeled.is_none()
+        && statement.from.as_ref().is_some_and(|from| {
+            core::iter::once(&from.base)
+                .chain(from.joins.iter().map(|join| &join.table))
+                .any(|table| table.join_members.is_some())
+        })
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a parenthesized join PostgreSQL's join search does not plan here is not supported"
+        ));
+    }
     // Windows over a join the join search does not plan would print
     // pos3ql's own join order and sorts.
     if modeled.is_none() && scope.as_ref().is_some_and(|scope| scope.n > 1) && has_window(statement)
@@ -11831,12 +11871,17 @@ fn write_initplans<'a, 'e>(
 }
 
 /// The resolution of `on_conflict` on the table in `slot`: the unique
-/// indexes `infer_arbiter_indexes` picks, in OID order.
+/// indexes `infer_arbiter_indexes` picks, in OID order. An index arbitrates
+/// a target whose plain columns are its key columns and whose expressions
+/// hold each of its key expressions; a partial one only when the target's
+/// `WHERE` implies its predicate.
 fn conflict_resolution(
     storage: &Storage,
     txid: u32,
     slot: usize,
+    exposed: &str,
     on_conflict: &crate::sql::ast::OnConflict<'_>,
+    arena: &Arena,
 ) -> Result<Conflict, SqlError> {
     let unsupported = |what: &str| {
         sql_err!(
@@ -11845,51 +11890,156 @@ fn conflict_resolution(
             what
         )
     };
-    if on_conflict.target_where.is_some() {
-        return Err(unsupported("a WHERE on its conflict target"));
-    }
-    if on_conflict.update_where.is_some() {
-        return Err(unsupported("a WHERE on DO UPDATE"));
-    }
-    if on_conflict
-        .target
-        .iter()
-        .any(|target| target.column.is_none())
-    {
-        return Err(unsupported("an expression in its conflict target"));
-    }
     let definition = storage.table_def(slot, txid);
+    // Its columns and the proposed row's (`excluded`), each qualified.
+    let filter =
+        match on_conflict.update_where {
+            Some(condition) => {
+                let joined = [
+                    crate::sql::catalog::deparse::Joined::new(exposed, &*definition),
+                    crate::sql::catalog::deparse::Joined::new("excluded", &*definition),
+                ];
+                let context = crate::sql::catalog::deparse::Context {
+                    storage,
+                    txid,
+                    arena,
+                    dependencies: None,
+                    table: None,
+                    parameters: &[],
+                    joined: &joined,
+                    pretty: false,
+                    qualify: true,
+                    bare: None,
+                    domain_value: None,
+                    sublinks: None,
+                    references: None,
+                    folded: true,
+                };
+                Some(deparse_qual(&context, &[condition], arena)?.ok_or_else(|| {
+                    unsupported("a WHERE on DO UPDATE the deparser does not print")
+                })?)
+            }
+            None => None,
+        };
     let mut wanted = 0u64;
     for target in on_conflict.target {
-        let column = target
-            .column
-            .and_then(|name| definition.column_index(name))
+        let Some(name) = target.column else {
+            continue;
+        };
+        let column = definition
+            .column_index(name)
             .filter(|&column| column < 64)
             .ok_or_else(|| unsupported("a conflict target column past the 64th"))?;
         wanted |= 1 << column;
     }
-    drop(definition);
+    let (schema, table) = (definition.schema, definition.name);
+    // The key expressions and predicate of each unique index, by name.
+    let stored = |name: &str| {
+        storage
+            .unique_indexes_for(schema.as_str(), table.as_str(), txid)
+            .find(|index| index.name.as_str() == name)
+    };
     let mut found = [(0i32, StackStr::<64>::new()); MAX_ARBITERS];
     let mut count = 0;
     let mut overflow = false;
+    let mut failure = None;
     crate::sql::catalog::planner_indexes(storage, txid, slot, &mut |index| {
+        if failure.is_some() {
+            return;
+        }
         let keys = &index.columns[..index.n_cols];
         let mut columns = 0u64;
-        for &column in keys {
-            if column < 64 {
+        for (&column, &expression) in keys.iter().zip(&index.expression_keys) {
+            if !expression && column < 64 {
                 columns |= 1 << column;
             }
         }
         let arbitrates = match on_conflict.constraint {
             Some(name) => index.name.as_str() == name,
+            None if on_conflict.target.is_empty()
+                || !index.unique
+                || !index.immediate
+                || columns != wanted =>
+            {
+                false
+            }
             None => {
-                !on_conflict.target.is_empty()
-                    && index.unique
-                    && index.immediate
-                    && !index.partial
-                    && !index.expression_keys[..index.n_cols].iter().any(|&key| key)
-                    && keys.len() == on_conflict.target.len()
-                    && columns == wanted
+                let held = (index.partial
+                    || index.expression_keys[..index.n_cols].iter().any(|&key| key))
+                .then(|| stored(index.name.as_str()));
+                match held {
+                    None => !on_conflict
+                        .target
+                        .iter()
+                        .any(|target| target.column.is_none()),
+                    Some(None) => false,
+                    Some(Some(held)) => {
+                        let expressions = &held.expressions[..held.n_cols];
+                        // Each target expression is a key expression, and
+                        // each key expression is in the target.
+                        let covered = on_conflict
+                            .target
+                            .iter()
+                            .filter(|target| target.column.is_none())
+                            .all(|target| {
+                                expressions.iter().flatten().any(|stored| {
+                                    crate::sql::exec::same_index_expression(
+                                        stored.as_str(),
+                                        target.expression_text,
+                                    )
+                                })
+                            })
+                            && expressions.iter().flatten().all(|stored| {
+                                on_conflict.target.iter().any(|target| {
+                                    target.column.is_none()
+                                        && crate::sql::exec::same_index_expression(
+                                            stored.as_str(),
+                                            target.expression_text,
+                                        )
+                                })
+                            });
+                        covered
+                            && match (held.predicate, on_conflict.target_where) {
+                                (None, _) => true,
+                                (Some(_), None) => false,
+                                (Some(source), Some(target_where)) => {
+                                    match arena
+                                        .alloc_str(source.as_str())
+                                        .map_err(|_| arena_full())
+                                        .and_then(|text| {
+                                            crate::sql::parser::parse_expr(text, arena).map_err(
+                                                |_| {
+                                                    sql_err!(
+                                                        sqlstate::INTERNAL_ERROR,
+                                                        "stored index predicate does not parse"
+                                                    )
+                                                },
+                                            )
+                                        }) {
+                                        Ok(predicate) => {
+                                            let mut resolve =
+                                                |expression: &Expr<'_>| match expression {
+                                                    Expr::Column { name, .. } => {
+                                                        definition.column_index(name)
+                                                    }
+                                                    _ => None,
+                                                };
+                                            query::predicate_is_implied(
+                                                predicate,
+                                                &[Some(target_where)],
+                                                &definition,
+                                                &mut resolve,
+                                            )
+                                        }
+                                        Err(error) => {
+                                            failure = Some(error);
+                                            false
+                                        }
+                                    }
+                                }
+                            }
+                    }
+                }
             }
         };
         if arbitrates {
@@ -11900,6 +12050,10 @@ fn conflict_resolution(
             count += 1;
         }
     });
+    drop(definition);
+    if let Some(error) = failure {
+        return Err(error);
+    }
     if overflow {
         return Err(unsupported("more than 8 arbiter indexes"));
     }
@@ -11913,6 +12067,7 @@ fn conflict_resolution(
         update: on_conflict.update.is_some(),
         arbiters,
         count,
+        filter,
     })
 }
 
@@ -12016,7 +12171,14 @@ fn plan_write<'a>(
         && let Some(on_conflict) = &insert.on_conflict
         && let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
     {
-        let conflict = conflict_resolution(storage, txid, slot, on_conflict)?;
+        let conflict = conflict_resolution(
+            storage,
+            txid,
+            slot,
+            alias.unwrap_or(target.name),
+            on_conflict,
+            arena,
+        )?;
         plan.conflict = Some(&*arena.alloc(conflict).map_err(|_| arena_full())?);
     }
     let mut name = StackStr::new();
@@ -14725,6 +14887,12 @@ fn write_tail_text<E>(
             }
             emit(line(format_args!("Conflict Arbiter Indexes: {}", names.as_str())).as_str())?;
         }
+        if let Some(filter) = &conflict.filter {
+            emit(line(format_args!("Conflict Filter: {}", filter.as_str())).as_str())?;
+        }
+        if let Some(removed) = conflict.filtered(plan).filter(|&removed| removed > 0) {
+            emit(line(format_args!("Rows Removed by Conflict Filter: {removed}")).as_str())?;
+        }
         if let Some((inserted, conflicting)) = Conflict::tuples(plan) {
             emit(line(format_args!("Tuples Inserted: {inserted}")).as_str())?;
             emit(line(format_args!("Conflicting Tuples: {conflicting}")).as_str())?;
@@ -16201,6 +16369,12 @@ fn structured_node(
         );
         if conflict.count > 0 {
             document.list("Conflict Arbiter Indexes", conflict.arbiters());
+        }
+        if let Some(filter) = &conflict.filter {
+            document.text("Conflict Filter", filter.as_str());
+        }
+        if let Some(removed) = conflict.filtered(plan) {
+            document.number("Rows Removed by Conflict Filter", removed);
         }
         if let Some((inserted, conflicting)) = Conflict::tuples(plan) {
             document.number("Tuples Inserted", inserted);

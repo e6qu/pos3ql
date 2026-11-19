@@ -8100,28 +8100,70 @@ fn next_auto_value<'x>(
     ))
 }
 
-/// The unique constraint or index an `ON CONFLICT` clause arbitrates on.
+/// The unique constraints or indexes an `ON CONFLICT` clause arbitrates on.
 /// `Any` (no target, DO NOTHING) treats a violation of *any* unique constraint
-/// as the conflict; `Keys` restricts the conflict to rows equal on exactly
-/// this column set, so a violation of a *different* unique falls through to a
-/// normal 23505 — matching PostgreSQL, which uses the arbiter index alone.
+/// as the conflict; `Keys` restricts the conflict to rows equal on one of
+/// its arbiters' keys, so a violation of a *different* unique falls through
+/// to a normal 23505, as PostgreSQL checks only its arbiter indexes.
 #[expect(
     clippy::large_enum_variant,
-    reason = "the fixed index-column array is bounded and cannot allocate after startup"
+    reason = "the fixed arbiter array is bounded and cannot allocate after startup"
 )]
 enum Arbiter<'a> {
     Any,
     /// `ON CONSTRAINT` naming an immediate exclusion constraint (DO NOTHING
     /// only), by position in the definition's exclusions.
     Exclusion(usize),
-    Keys {
-        columns: [u16; crate::storage::MAX_INDEX_COLS],
-        expressions: [Option<&'a Expr<'a>>; crate::storage::MAX_INDEX_COLS],
-        n_columns: usize,
-        nulls_not_distinct: bool,
-        /// A partial index's predicate: only rows it admits conflict.
-        predicate: Option<&'a Expr<'a>>,
-    },
+    Keys(KeyArbiters<'a>),
+}
+
+/// The most unique indexes one `ON CONFLICT` target infers.
+const MAX_KEY_ARBITERS: usize = 8;
+
+/// One unique key an `ON CONFLICT` arbitrates on.
+#[derive(Clone, Copy)]
+struct KeyArbiter<'a> {
+    columns: [u16; crate::storage::MAX_INDEX_COLS],
+    expressions: [Option<&'a Expr<'a>>; crate::storage::MAX_INDEX_COLS],
+    n_columns: usize,
+    nulls_not_distinct: bool,
+    /// A partial index's predicate: only rows it admits conflict.
+    predicate: Option<&'a Expr<'a>>,
+}
+
+/// Every unique key `infer_arbiter_indexes` infers for a target: a row
+/// conflicts when it equals another on any of them.
+#[derive(Clone, Copy)]
+struct KeyArbiters<'a> {
+    keys: [Option<KeyArbiter<'a>>; MAX_KEY_ARBITERS],
+}
+
+impl<'a> KeyArbiters<'a> {
+    fn one(key: KeyArbiter<'a>) -> Self {
+        let mut keys = [None; MAX_KEY_ARBITERS];
+        keys[0] = Some(key);
+        Self { keys }
+    }
+
+    fn push(&mut self, key: KeyArbiter<'a>) -> Result<(), SqlError> {
+        let free = self
+            .keys
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "ON CONFLICT target infers more than {} unique indexes",
+                    MAX_KEY_ARBITERS
+                )
+            })?;
+        *free = Some(key);
+        Ok(())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &KeyArbiter<'a>> {
+        self.keys.iter().flatten()
+    }
 }
 
 impl<'a> Arbiter<'a> {
@@ -8154,24 +8196,23 @@ impl<'a> Arbiter<'a> {
                         })?,
                 )
             }
-            Self::Keys {
-                columns,
-                expressions,
-                n_columns,
-                nulls_not_distinct,
-                predicate,
-            } => Self::Keys {
-                columns: remap_columns(physical, logical, &columns[..*n_columns])?,
-                expressions: *expressions,
-                n_columns: *n_columns,
-                nulls_not_distinct: *nulls_not_distinct,
-                predicate: *predicate,
-            },
+            Self::Keys(arbiters) => {
+                let mut mapped = KeyArbiters {
+                    keys: [None; MAX_KEY_ARBITERS],
+                };
+                for key in arbiters.iter() {
+                    mapped.push(KeyArbiter {
+                        columns: remap_columns(physical, logical, &key.columns[..key.n_columns])?,
+                        ..*key
+                    })?;
+                }
+                Self::Keys(mapped)
+            }
         })
     }
 }
 
-fn same_index_expression(stored: &str, target: &str) -> bool {
+pub(crate) fn same_index_expression(stored: &str, target: &str) -> bool {
     let target = target.trim();
     stored == target
         || (target.starts_with('(')
@@ -8197,114 +8238,139 @@ struct PartialArbiter<'a> {
     predicate: Option<&'a Expr<'a>>,
 }
 
-/// Does some unique constraint/index on `def` cover exactly `want` (as a set,
-/// order-independent)? Validates an `ON CONFLICT (columns)` inference target.
-fn unique_arbiter_matches<Definition0: crate::storage::DefinitionBacking>(
-    storage: &Storage,
-    def: &crate::storage::TableDefinition<Definition0>,
-    want: &[u16],
-    txid: u32,
-) -> Option<bool> {
-    let same = |cols: &[u16]| cols.len() == want.len() && want.iter().all(|w| cols.contains(w));
-    let mut matched = false;
-    for (i, c) in def.columns().iter().enumerate() {
-        if c.unique && same(&[i as u16]) {
-            matched = true;
-        }
-    }
-    for uk in def.uniques() {
-        if !uk.timing.is_deferrable() && same(uk.columns()) {
-            matched = true;
-            if uk.kind.nulls_not_distinct() {
-                return Some(true);
-            }
-        }
-    }
-    for index in storage
-        .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
-        .filter(|index| index.mutable_for(txid).immediate)
-    {
-        if index.predicate.is_none() && same(&index.columns[..index.n_cols]) {
-            matched = true;
-            if index.nulls_not_distinct {
-                return Some(true);
-            }
-        }
-    }
-    matched.then_some(false)
-}
-
-/// The partial unique index an `ON CONFLICT (...) WHERE ...` target infers:
-/// its keys are the target's columns and the target's `WHERE` implies its
-/// predicate, as PostgreSQL's `infer_arbiter_indexes` requires.
-fn partial_index_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
+/// The unique keys an `ON CONFLICT (...) [WHERE ...]` target infers, as
+/// PostgreSQL's `infer_arbiter_indexes` does: each immediate unique
+/// constraint or index whose plain key columns are the target's columns and
+/// whose key expressions are the target's expressions, both as sets, a
+/// partial index only when the target's `WHERE` implies its predicate.
+fn inferred_arbiters<'a, Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     def: &crate::storage::TableDefinition<Definition0>,
     oc: &super::ast::OnConflict<'a>,
+    columns: &[u16],
     txid: u32,
     arena: &'a Arena,
-) -> Result<Option<Arbiter<'a>>, SqlError> {
-    let Some(target_where) = oc.target_where else {
-        return Ok(None);
+) -> Result<KeyArbiters<'a>, SqlError> {
+    let mut arbiters = KeyArbiters {
+        keys: [None; MAX_KEY_ARBITERS],
     };
-    let Some(table) = storage.find_visible(def.schema.as_str(), def.name.as_str(), txid) else {
-        return Ok(None);
+    let expression_targets = || oc.target.iter().filter(|target| target.column.is_none());
+    let same = |keys: &[u16]| {
+        keys.iter().all(|key| columns.contains(key)) && columns.iter().all(|key| keys.contains(key))
     };
-    let table_definition = storage.table_def(table, txid);
+    let plain = |keys: &[u16], nulls_not_distinct: bool| {
+        let mut held = [0u16; crate::storage::MAX_INDEX_COLS];
+        held[..keys.len()].copy_from_slice(keys);
+        KeyArbiter {
+            columns: held,
+            expressions: [None; crate::storage::MAX_INDEX_COLS],
+            n_columns: keys.len(),
+            nulls_not_distinct,
+            predicate: None,
+        }
+    };
+    if expression_targets().next().is_none() {
+        for (column, metadata) in def.columns().iter().enumerate() {
+            if metadata.unique && same(&[column as u16]) {
+                arbiters.push(plain(&[column as u16], false))?;
+            }
+        }
+        for key in def.uniques() {
+            if !key.timing.is_deferrable() && same(key.columns()) {
+                arbiters.push(plain(key.columns(), key.kind.nulls_not_distinct()))?;
+            }
+        }
+    }
+    let table = storage.find_visible(def.schema.as_str(), def.name.as_str(), txid);
     for index in storage
         .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
         .filter(|index| index.mutable_for(txid).immediate)
     {
-        let Some(source) = index.predicate else {
-            continue;
-        };
-        if index.n_cols != oc.target.len()
-            || index.expressions[..index.n_cols]
+        let keys = &index.columns[..index.n_cols];
+        let expressions = &index.expressions[..index.n_cols];
+        let plain_keys = keys
+            .iter()
+            .zip(expressions)
+            .filter(|(_, expression)| expression.is_none())
+            .map(|(&key, _)| key);
+        if !(plain_keys.clone().all(|key| columns.contains(&key))
+            && columns
                 .iter()
-                .any(Option::is_some)
-            || !oc.target.iter().all(|target| {
-                target
-                    .column
-                    .and_then(|name| def.column_index(name))
-                    .is_some_and(|column| index.columns[..index.n_cols].contains(&(column as u16)))
-            })
+                .all(|key| plain_keys.clone().any(|plain| plain == *key)))
         {
             continue;
         }
-        let stored = crate::sql::parser::parse_expr(source.as_str(), arena).map_err(|_| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "stored index predicate does not parse"
-            )
-        })?;
-        let mut resolve = |expression: &Expr<'a>| match expression {
-            Expr::Column { name, .. } => def.column_index(name),
-            _ => None,
-        };
-        if !crate::sql::query::predicate_is_implied(
-            stored,
-            &[Some(target_where)],
-            &table_definition,
-            &mut resolve,
-        ) {
+        let covered = expression_targets().all(|target| {
+            expressions
+                .iter()
+                .flatten()
+                .any(|stored| same_index_expression(stored.as_str(), target.expression_text))
+        }) && expressions.iter().flatten().all(|stored| {
+            expression_targets()
+                .any(|target| same_index_expression(stored.as_str(), target.expression_text))
+        });
+        if !covered {
             continue;
         }
-        return Ok(Some(Arbiter::Keys {
+        let predicate = match (index.predicate, oc.target_where) {
+            (None, _) => None,
+            (Some(_), None) => continue,
+            (Some(source), Some(target_where)) => {
+                let Some(table) = table else {
+                    continue;
+                };
+                let stored =
+                    crate::sql::parser::parse_expr(source.as_str(), arena).map_err(|_| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "stored index predicate does not parse"
+                        )
+                    })?;
+                let table_definition = storage.table_def(table, txid);
+                let mut resolve = |expression: &Expr<'a>| match expression {
+                    Expr::Column { name, .. } => def.column_index(name),
+                    _ => None,
+                };
+                if !crate::sql::query::predicate_is_implied(
+                    stored,
+                    &[Some(target_where)],
+                    &table_definition,
+                    &mut resolve,
+                ) {
+                    continue;
+                }
+                Some(expression_bindings::bound_index_expression(
+                    source.as_str(),
+                    storage,
+                    &index,
+                    crate::storage::ExpressionOwner::IndexPredicate,
+                    txid,
+                    arena,
+                )?)
+            }
+        };
+        let mut bound = [None; crate::storage::MAX_INDEX_COLS];
+        for (position, source) in expressions.iter().enumerate() {
+            if let Some(source) = source {
+                bound[position] = Some(expression_bindings::bound_index_expression(
+                    source.as_str(),
+                    storage,
+                    &index,
+                    crate::storage::ExpressionOwner::IndexKey(position as u8),
+                    txid,
+                    arena,
+                )?);
+            }
+        }
+        arbiters.push(KeyArbiter {
             columns: index.columns,
-            expressions: [None; crate::storage::MAX_INDEX_COLS],
+            expressions: bound,
             n_columns: index.n_cols,
             nulls_not_distinct: index.nulls_not_distinct,
-            predicate: Some(expression_bindings::bound_index_expression(
-                source.as_str(),
-                storage,
-                &index,
-                crate::storage::ExpressionOwner::IndexPredicate,
-                txid,
-                arena,
-            )?),
-        }));
+            predicate,
+        })?;
     }
-    Ok(None)
+    Ok(arbiters)
 }
 
 /// Resolves `ON CONSTRAINT name` to the named immediate UNIQUE/PRIMARY KEY.
@@ -8381,62 +8447,27 @@ fn resolve_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
         }
     }
     if !oc.target.is_empty() {
-        if let Some(arbiter) = partial_index_arbiter(storage, def, oc, txid, arena)? {
-            return Ok(arbiter);
-        }
-        if oc.target.iter().any(|target| target.column.is_none()) {
-            for index in storage
-                .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
-                .filter(|index| index.mutable_for(txid).immediate)
-            {
-                if index.predicate.is_some() || index.n_cols != oc.target.len() {
-                    continue;
-                }
-                let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
-                let matches = oc.target.iter().enumerate().all(|(position, target)| {
-                    expressions[position] = target.column.map_or(Some(target.expression), |_| None);
-                    match (target.column, index.expressions[position]) {
-                        (Some(column), None) => {
-                            def.column_index(column) == Some(index.columns[position] as usize)
-                        }
-                        (None, Some(source)) => {
-                            same_index_expression(source.as_str(), target.expression_text)
-                        }
-                        _ => false,
-                    }
-                });
-                if matches {
-                    return Ok(Arbiter::Keys {
-                        columns: index.columns,
-                        expressions,
-                        n_columns: index.n_cols,
-                        nulls_not_distinct: index.nulls_not_distinct,
-                        predicate: None,
-                    });
-                }
-            }
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "there is no unique or exclusion constraint matching the ON CONFLICT specification"
-            ));
-        }
         let mut want = [0u16; crate::storage::MAX_INDEX_COLS];
         let mut n = 0;
-        let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
         for target in oc.target {
             let Some(name) = target.column else {
-                return Err(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    "there is no unique or exclusion constraint matching the ON CONFLICT specification"
-                ));
+                continue;
             };
             let Some(index) = def.column_index(name) else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
+                // `resolve_unique_index_expr` reads a plain column at the
+                // target's position.
+                return Err(crate::sql::error_position::at_source_position(
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    ),
+                    oc.target_position,
                 ));
             };
+            if want[..n].contains(&(index as u16)) {
+                continue;
+            }
             if n == crate::storage::MAX_INDEX_COLS {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -8444,22 +8475,16 @@ fn resolve_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
                 ));
             }
             want[n] = index as u16;
-            expressions[n] = None;
             n += 1;
         }
-        if let Some(nulls_not_distinct) = unique_arbiter_matches(storage, def, &want[..n], txid) {
-            return Ok(Arbiter::Keys {
-                columns: want,
-                expressions,
-                n_columns: n,
-                nulls_not_distinct,
-                predicate: None,
-            });
+        let arbiters = inferred_arbiters(storage, def, oc, &want[..n], txid, arena)?;
+        if arbiters.iter().next().is_none() {
+            return Err(sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+            ));
         }
-        return Err(sql_err!(
-            sqlstate::INVALID_COLUMN_REFERENCE,
-            "there is no unique or exclusion constraint matching the ON CONFLICT specification"
-        ));
+        return Ok(Arbiter::Keys(arbiters));
     }
     if let Some(cname) = oc.constraint {
         if let Some(position) = def
@@ -8480,13 +8505,13 @@ fn resolve_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
             return Ok(Arbiter::Exclusion(position));
         }
         if let Some((cols, n, nulls_not_distinct)) = arbiter_by_name(def, cname)? {
-            return Ok(Arbiter::Keys {
+            return Ok(Arbiter::Keys(KeyArbiters::one(KeyArbiter {
                 columns: cols,
                 expressions: [None; crate::storage::MAX_INDEX_COLS],
                 n_columns: n,
                 nulls_not_distinct,
                 predicate: None,
-            });
+            })));
         }
         return Err(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -8722,60 +8747,68 @@ fn find_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
                     };
                     match arbiter {
                         // A named/inferred arbiter conflicts on its own columns only.
-                        Arbiter::Keys {
-                            columns,
-                            expressions,
-                            n_columns,
-                            nulls_not_distinct,
-                            predicate,
-                        } => {
-                            if let Some(predicate) = predicate
-                                && !(crate::sql::exec::constraints::index_predicate_matches(
-                                    storage, txid, def, values, predicate, arena,
-                                )? && crate::sql::exec::constraints::index_predicate_matches(
-                                    storage, txid, def, &other, predicate, arena,
-                                )?)
+                        Arbiter::Keys(arbiters) => {
+                            for KeyArbiter {
+                                columns,
+                                expressions,
+                                n_columns,
+                                nulls_not_distinct,
+                                predicate,
+                            } in arbiters.iter()
                             {
-                                Ok(false)
-                            } else if expressions[..*n_columns].iter().all(Option::is_none) {
-                                key_hit(&columns[..*n_columns], *nulls_not_distinct)
-                            } else {
-                                let keys = crate::sql::exec::constraints::index_key_values(
-                                    storage,
-                                    txid,
-                                    def,
-                                    values,
-                                    &columns[..*n_columns],
-                                    &expressions[..*n_columns],
-                                    arena,
-                                )?;
-                                let other_keys = crate::sql::exec::constraints::index_key_values(
-                                    storage,
-                                    txid,
-                                    def,
-                                    &other,
-                                    &columns[..*n_columns],
-                                    &expressions[..*n_columns],
-                                    arena,
-                                )?;
-                                let collations =
-                                    crate::sql::exec::constraints::index_key_collations(
+                                let hit = if let Some(predicate) = predicate
+                                    && !(crate::sql::exec::constraints::index_predicate_matches(
+                                        storage, txid, def, values, predicate, arena,
+                                    )?
+                                        && crate::sql::exec::constraints::index_predicate_matches(
+                                            storage, txid, def, &other, predicate, arena,
+                                        )?) {
+                                    false
+                                } else if expressions[..*n_columns].iter().all(Option::is_none) {
+                                    key_hit(&columns[..*n_columns], *nulls_not_distinct)?
+                                } else {
+                                    let keys = crate::sql::exec::constraints::index_key_values(
                                         storage,
                                         txid,
                                         def,
+                                        values,
                                         &columns[..*n_columns],
                                         &expressions[..*n_columns],
                                         arena,
                                     )?;
-                                crate::sql::exec::constraints::key_values_equal(
-                                    storage,
-                                    txid,
-                                    &collations[..*n_columns],
-                                    &keys[..*n_columns],
-                                    &other_keys[..*n_columns],
-                                    *nulls_not_distinct,
-                                )
+                                    let other_keys =
+                                        crate::sql::exec::constraints::index_key_values(
+                                            storage,
+                                            txid,
+                                            def,
+                                            &other,
+                                            &columns[..*n_columns],
+                                            &expressions[..*n_columns],
+                                            arena,
+                                        )?;
+                                    let collations =
+                                        crate::sql::exec::constraints::index_key_collations(
+                                            storage,
+                                            txid,
+                                            def,
+                                            &columns[..*n_columns],
+                                            &expressions[..*n_columns],
+                                            arena,
+                                        )?;
+                                    crate::sql::exec::constraints::key_values_equal(
+                                        storage,
+                                        txid,
+                                        &collations[..*n_columns],
+                                        &keys[..*n_columns],
+                                        &other_keys[..*n_columns],
+                                        *nulls_not_distinct,
+                                    )?
+                                };
+                                if hit {
+                                    return Ok(true);
+                                }
                             }
+                            Ok(false)
                         }
                         Arbiter::Exclusion(_) => exclusion_hit(&other),
                         // No target (DO NOTHING): any unique violation is a conflict.
@@ -9333,7 +9366,11 @@ where
                 Datum::Bool(true)
             )
         {
-            return Ok(ConflictOutcome::Skip); // WHERE excluded this row
+            // `DO UPDATE ... WHERE` excluded this row: its `Conflict Filter`
+            // removed it.
+            crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Modify)
+                .filtered();
+            return Ok(ConflictOutcome::Skip);
         }
         if let Some(plan) = row_security_using {
             let policy_row = RowCtx {

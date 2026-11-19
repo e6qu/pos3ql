@@ -9309,6 +9309,7 @@ impl<'a> Parser<'a> {
         let mut target = ArenaList::new(self.arena);
         let mut constraint = None;
         let mut target_where = None;
+        let target_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
         if self.eat_op("(")? {
             loop {
                 let start = self.peek_at;
@@ -9359,6 +9360,7 @@ impl<'a> Parser<'a> {
             target: target.as_slice(),
             constraint,
             target_where,
+            target_position,
             update,
             update_where,
         }))

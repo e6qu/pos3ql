@@ -1101,9 +1101,12 @@ Remaining: scans of the old multi-relation executor and of subplans that keep
 no page model (`0A000`), and hash joins run in batches (`0A000`: their work
 files are not sized). An `INSERT ... ON CONFLICT` prints its resolution,
 arbiter indexes and, analyzed, its inserted and conflicting tuples
-(`differential_exact/940`); a conflict target's `WHERE`, a `DO UPDATE ...
-WHERE` (`Conflict Filter`) and an expression target fail `EXPLAIN` with
-`0A000`. A `LIMIT` directly over a sorted grouping stops reading its
+(`differential_exact/940`). A conflict target infers every unique index
+`infer_arbiter_indexes` picks (plain key columns and key expressions equal
+to the target's as sets, a partial index only when the target's `WHERE`
+implies its predicate), a row conflicting when it equals another on any of
+them, and `EXPLAIN` lists them (`differential_exact/948`); a `DO UPDATE ...
+WHERE` (`Conflict Filter`) fails `EXPLAIN` with `0A000`. A `LIMIT` directly over a sorted grouping stops reading its
 input at the first row of the group after the last one it takes (a
 `GroupAggregate` reads that group's rows, a `Group` of a `GROUP BY`
 without aggregates, costed by `cost_group`, only its first row), and only
@@ -1174,7 +1177,10 @@ a join clause (`differential_exact/889`). Remaining for windows: window function
 expressions or the `ORDER BY`, windows over one relation's groups, the
 merging of window clauses equal once `optimize_window_clauses` frees their
 frames, run conditions (`find_window_run_conditions`, which needs the
-subquery scan below), and `EXPLAIN ANALYZE` of windows over an index scan,
+subquery scan below), the `Memory` of a window's sort and the `Maximum
+Storage` of its tuplestore under `EXPLAIN ANALYZE`, which print pos3ql's
+own row sizes rather than `tuplesort.c`'s and `nodeWindowAgg.c`'s spooled and
+trimmed partitions (fixtures mask them), and `EXPLAIN ANALYZE` of windows over an index scan,
 under a limit directly above them or over a join's groups (`0A000`:
 execution reads the input by its own scan); for presorted aggregates:
 `EXPLAIN ANALYZE` of their sort (`0A000`: its tuples' memory is not modeled).
@@ -1200,10 +1206,21 @@ parenthesized join whose members join by written conditions (`a LEFT JOIN
 each joined row fills the parenthesized join's columns from its members'
 rows (`differential_exact/934`). Grouping, aggregates and `DISTINCT` over
 such joins are planned by the same search, a hashed grouping over a join
-reporting its memory (`differential_exact/946`). Remaining there: an
-aliased one, one joined by `USING` or `NATURAL`, and one under windows
-(`0A000` when costs print; with `COSTS OFF` such a plan prints pos3ql's
-own join order); a parenthesized join's own
+reporting its memory (`differential_exact/946`). So are an aliased one, one
+of `USING` or `NATURAL` joins and one under window functions: a column of
+the join reads its member's column, a merged column the left member's
+(inner and `LEFT` joins), the right one's (`RIGHT`) or their `COALESCE`
+(`FULL`), as `flatten_join_alias_vars` reads `buildMergedJoinVar`'s
+variables, and a member named as an earlier FROM item prints PostgreSQL's
+suffix (`nb nb_1`); windows read each joined row's member columns
+(`differential_exact/947`). Remaining there: a merged column that needs a
+coercion (`int` with `bigint`) or merges more than two columns, a member
+named as a later FROM item, a whole-row reference to the join, an outer
+`USING` join of a parenthesized one, and nested aliased joins; `EXPLAIN` of
+any parenthesized join the search does not plan fails with `0A000`. A
+query of a parenthesized join that the search does not plan runs the old
+executor's nested loop over the join's rows, resolving names per row (a
+three-table join of 400 rows takes 50 seconds). A parenthesized join's own
 query runs only when the search does not plan the query, so one nested in
 another (`a LEFT JOIN (b JOIN (c JOIN d ON z) ON x) ON y`) joins its
 members without reading its rows first (`differential_exact/937`). Remaining for that search:
@@ -1219,8 +1236,8 @@ Sort`), derived tables kept as subqueries (`SubqueryScan`), self-join removal
 column another outer join nulls, `UPDATE ... FROM` and `DELETE ...
 USING` through the same search, more relations than
 `join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,
-not ported; such queries keep pos3ql's join order and refuse cost output
-with `0A000`). A parameterized index scan's cost reads its index's pages:
+not ported; such queries run pos3ql's join order, and `EXPLAIN` of them
+fails with `0A000`). A parameterized index scan's cost reads its index's pages:
 an index built over loaded rows is sized as `_bt_buildadd` fills its
 pages (a page closes when its free space and its last tuple's posting
 list fall under the fill factor's reserve, that tuple moving on), but one

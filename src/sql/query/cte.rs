@@ -8918,6 +8918,7 @@ fn subst_insert<'a>(
             target: subst_on_conflict_targets(conflict.target, context, arena)?,
             constraint: conflict.constraint,
             target_where: opt_subst(conflict.target_where, context, arena)?,
+            target_position: conflict.target_position,
             update: match conflict.update {
                 Some(assignments) => Some(subst_assignments(assignments, context, arena)?),
                 None => None,

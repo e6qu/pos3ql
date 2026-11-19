@@ -1629,10 +1629,6 @@ pub(crate) fn modeled_join<'a>(
     else {
         return Ok(None);
     };
-    // Windows read the written entries.
-    if !model.windows.is_empty() {
-        return Ok(None);
-    }
     model.nested = Some(NestedMembers {
         scope: members,
         entries,

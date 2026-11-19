@@ -1509,8 +1509,7 @@ multi-pass merge never exceeds because each pass reads a block before it
 writes its replacement; a bounded sort keeps its heap from the row count its
 heap began at (`differential_exact/906`). An incremental sort's batches
 report `Average Disk` and the space its one tuplesort remembers across
-`tuplesort_reset`. A merge join's sort that spills (random-access tapes),
-and the sort of a spilling hash aggregate, stay `0A000`. Remaining: the
+`tuplesort_reset`. A merge join's sort that spills (random-access tapes) stays `0A000`. Remaining: the
 window's storage, the sorts under windows and the incremental sort's group
 memory over windows are pos3ql's own figures; PostgreSQL's need the window's
 `tuplestore_trim` points (its read and mark pointers per frame) and each

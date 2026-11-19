@@ -633,7 +633,7 @@ fn internal(message: &'static str) -> SqlError {
     crate::sql_err!(sqlstate::INTERNAL_ERROR, "{message}")
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 

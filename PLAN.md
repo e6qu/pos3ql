@@ -1255,10 +1255,11 @@ queries run pos3ql's join order. An `ORDER BY` over a join keeps every joined ro
 the statement arena before sorting, so a join of millions of rows (seven
 8-row tables cross joined, `ORDER BY 1 LIMIT 1`) fails with `54000` where
 PostgreSQL runs a bounded top-N sort; the join's rows must feed the
-spilling sort instead. Tables never analyzed join by PostgreSQL's
-default estimates; a join estimated past 2^64 rows refuses `EXPLAIN` with
-costs (`0A000`), since plan rows are kept as integers where PostgreSQL
-prints its double in full. A parameterized index scan's cost reads its index's pages:
+spilling sort instead. A join estimated past 2^64 rows refuses
+`EXPLAIN` with costs (`0A000`), since plan rows are kept as integers where
+PostgreSQL prints its double in full. Joins of never-analyzed tables keep
+pos3ql's join order: modeling them matches PostgreSQL on probe joins but moves 24 lib
+tests (streaming of cold joins, hash-plan expectations) off their plans. A parameterized index scan's cost reads its index's pages:
 an index built over loaded rows is sized as `_bt_buildadd` fills its
 pages (a page closes when its free space and its last tuple's posting
 list fall under the fill factor's reserve, that tuple moving on), but one

@@ -1,6 +1,6 @@
 //! The queries whose joins PostgreSQL's join search ([`super::joins`])
-//! plans in pos3ql: a `SELECT` of plain columns from two to 128 plain
-//! local tables joined by inner, left, right and full joins on
+//! plans in pos3ql: a `SELECT` of plain columns from two to 128 plain,
+//! analyzed local tables joined by inner, left, right and full joins on
 //! equalities of their columns and other conditions. Their join tree is
 //! prepared as PostgreSQL prepares it ([`super::join_tree`]); EXPLAIN prints
 //! the plan the search chooses and execution runs it
@@ -5064,6 +5064,7 @@ fn plain_table(
     definition.kind == crate::storage::TableKind::Local
         && !definition.partition.is_partitioned()
         && !storage.relation_has_descendants(slot, txid)
+        && storage.table_statistics(slot, txid).valid
         && !definition.row_level_security.enabled
 }
 

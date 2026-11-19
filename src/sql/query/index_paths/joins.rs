@@ -53,6 +53,10 @@ pub(crate) struct Member {
     pub(crate) rel: u8,
     pub(crate) column: u16,
     pub(crate) nulling: Relids,
+    /// The other base relations an expression member of several
+    /// relations reads (`a.x + b.y`, `rel` its first): the join of them
+    /// all computes it.
+    pub(crate) reads: Relids,
 }
 
 impl Member {
@@ -62,6 +66,19 @@ impl Member {
             rel,
             column,
             nulling: 0,
+            reads: 0,
+        }
+    }
+
+    /// Expression `id` reading the base relations `relids`, several of
+    /// them, which their join computes.
+    pub(crate) const fn several(relids: Relids, id: u16) -> Self {
+        let rel = relids.trailing_zeros() as u8;
+        Self {
+            rel,
+            column: EXPRESSION_COLUMN | id,
+            nulling: 0,
+            reads: relids & !(1 << rel),
         }
     }
 
@@ -82,7 +99,12 @@ impl Member {
 
     /// `em_relids`.
     pub(crate) const fn relids(&self) -> Relids {
-        1 << self.rel | self.nulling
+        1 << self.rel | self.reads | self.nulling
+    }
+
+    /// The base relations it reads.
+    pub(crate) const fn base_relids(&self) -> Relids {
+        1 << self.rel | self.reads
     }
 }
 
@@ -114,14 +136,11 @@ impl EquivalenceClass {
     /// target list, else the first expression it can compute.
     pub(crate) fn sort_member(&self, relids: Relids) -> Option<usize> {
         let members = self.members();
+        let within = |member: &Member| member.base_relids() & !relids == 0;
         members
             .iter()
-            .position(|member| relids & 1 << member.rel != 0 && member.expression_id().is_none())
-            .or_else(|| {
-                members
-                    .iter()
-                    .position(|member| relids & 1 << member.rel != 0)
-            })
+            .position(|member| within(member) && member.expression_id().is_none())
+            .or_else(|| members.iter().position(within))
     }
 
     /// `ec_relids`.

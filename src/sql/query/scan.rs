@@ -27,8 +27,8 @@ use crate::util::StackStr;
 const _: () = assert!(MAX_INDEX_COLS <= u32::BITS as usize);
 
 use super::plan::{
-    MAX_CONJUNCTS, conjunct_passes, expr_tables, fill_join_order, flatten_and, fold_null,
-    is_error_safe,
+    MAX_CONJUNCTS, conjunct_passes, expr_tables, expr_tables_with, fill_join_order, flatten_and,
+    fold_null, is_error_safe,
 };
 use super::{
     MAX_OPTIMIZED_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full, check_timeout, instrument,
@@ -1120,6 +1120,16 @@ pub(crate) struct IndexedCandidates<'a> {
 }
 
 impl<'a> IndexedCandidates<'a> {
+    /// The candidates as a set: they neither order the scan's rows nor
+    /// supply their columns.
+    fn unordered(self) -> Self {
+        Self {
+            preserves_order: false,
+            keys: None,
+            ..self
+        }
+    }
+
     pub(crate) fn statistics(&self) -> &crate::storage::IndexStatisticsCapture<'a> {
         &self.statistics
     }
@@ -3006,6 +3016,19 @@ pub(crate) fn index_access_plan<'a>(
     where_clause: Option<&'a Expr<'a>>,
     arena: &'a Arena,
 ) -> Result<Option<IndexAccessPlan<'a>>, SqlError> {
+    index_access_plan_reading(storage, scope, txid, where_clause, arena, false)
+}
+
+/// [`index_access_plan`], where an operand may also read columns outside
+/// the scope (`outer`): an outer row fixed for the scan supplies them.
+fn index_access_plan_reading<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    outer: bool,
+) -> Result<Option<IndexAccessPlan<'a>>, SqlError> {
     if scope.n != 1
         || scope.derived[0].is_some()
         || scope.lateral[0]
@@ -3030,7 +3053,9 @@ pub(crate) fn index_access_plan<'a>(
         // Parameters and pure casts around them are statement-invariant even
         // though they are not compile-time constants. Calls and subqueries can
         // change between candidate selection and recheck.
-        expr_tables(operand, scope) == Some(0)
+        expr_tables_with(operand, scope, &|column| {
+            outer && matches!(column, Expr::Column { .. })
+        }) == Some(0)
             && !operand.calls_routine()
             && !operand.contains_subquery()
     };
@@ -3813,6 +3838,10 @@ pub(crate) fn dml_index_access_plan<'a>(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the outer row a join's scan reads its keys from is explicit"
+)]
 fn indexed_candidates<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
@@ -3821,15 +3850,23 @@ fn indexed_candidates<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
-    let Some(plan) = index_access_plan(storage, scope, txid, where_clause, arena)? else {
+    let Some(plan) =
+        index_access_plan_reading(storage, scope, txid, where_clause, arena, outer.is_some())?
+    else {
         return Ok(None);
     };
     let slot = scope.slots[0];
     let definition = scope.defs.stored(0).expect("physical table has definition");
-    indexed_candidates_for_plan(
-        storage, 0, slot, definition, txid, plan, None, None, arena, params, &NoColumns, hooks,
-    )
+    match outer {
+        Some(outer) => indexed_candidates_for_plan(
+            storage, 0, slot, definition, txid, plan, None, None, arena, params, &outer, hooks,
+        ),
+        None => indexed_candidates_for_plan(
+            storage, 0, slot, definition, txid, plan, None, None, arena, params, &NoColumns, hooks,
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6405,14 +6442,15 @@ pub(super) fn scan_source_with_pax_columns<'a>(
         pax_demand,
         None,
         true,
+        None,
         f,
     )
 }
 
-/// The scan of one relation by the path the running query's shape
-/// describes (a join's base relation, [`super::join_exec`]): pos3ql's own
-/// lookups of an outer row's key never replace that path, whose order and
-/// counts are PostgreSQL's.
+/// The scan of one relation by `planned`, the path the running query's
+/// shape describes (a join's base relation, [`super::join_exec`]), planned
+/// once for every rescan: pos3ql's own lookups of an outer row's key never
+/// replace that path, whose order and counts are PostgreSQL's.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_described_path<'a>(
     storage: &'a Storage,
@@ -6425,6 +6463,7 @@ pub(super) fn scan_described_path<'a>(
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
     pax_demand: PaxReadDemand,
+    planned: super::index_paths::ScanPath<'a>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     scan_source_mode(
@@ -6442,6 +6481,7 @@ pub(super) fn scan_described_path<'a>(
         pax_demand,
         None,
         false,
+        Some(planned),
         f,
     )
 }
@@ -6477,6 +6517,7 @@ pub(super) fn scan_source_recycling_with_pax_columns<'a>(
         pax_demand,
         None,
         true,
+        None,
         f,
     )
 }
@@ -6513,6 +6554,7 @@ pub(super) fn scan_source_recycling_retaining_match_with_pax_columns<'a>(
         pax_demand,
         None,
         true,
+        None,
         f,
     )
 }
@@ -6551,6 +6593,7 @@ pub(super) fn scan_source_recycling_with_indexed_candidates<'a>(
         pax_demand,
         Some(indexed),
         false,
+        None,
         f,
     )
 }
@@ -8999,6 +9042,7 @@ fn scan_source_mode<'a>(
     pax_demand: PaxReadDemand,
     indexed_override: Option<&IndexedCandidates<'a>>,
     automatic_index: bool,
+    planned: Option<super::index_paths::ScanPath<'a>>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     let current_role = admit_sources(storage, scope, txid, pax_demand)?;
@@ -10358,6 +10402,7 @@ fn scan_source_mode<'a>(
         recycle_rows: bool,
         retain_match: Option<&core::cell::Cell<bool>>,
         pax_demand: PaxReadDemand,
+        planned: Option<super::index_paths::ScanPath<'a>>,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
@@ -10500,6 +10545,7 @@ fn scan_source_mode<'a>(
                                 recycle_rows,
                                 retain_match,
                                 pax_demand,
+                                planned,
                                 f,
                             )?,
                         );
@@ -10536,6 +10582,7 @@ fn scan_source_mode<'a>(
                         recycle_rows,
                         retain_match,
                         pax_demand,
+                        planned,
                         f,
                     )
                     .map(|keep| filter_join_resumed(depth + 1, keep))
@@ -11277,8 +11324,12 @@ fn scan_source_mode<'a>(
                     && hashed.is_none()
                     && access.is_none_or(|access| !access.preserves_order)
                 {
-                    match super::index_paths::running_query(slot, where_clause) {
-                        Some((shape, needed)) => super::index_paths::scan_path(
+                    match (
+                        planned,
+                        super::index_paths::running_query(slot, where_clause),
+                    ) {
+                        (Some(path), _) => Some(path),
+                        (None, Some((shape, needed))) => super::index_paths::scan_path(
                             storage,
                             scope,
                             txid,
@@ -11289,7 +11340,7 @@ fn scan_source_mode<'a>(
                             shape,
                         )?
                         .chosen(),
-                        None => None,
+                        (None, None) => None,
                     }
                 } else {
                     None
@@ -11624,6 +11675,7 @@ fn scan_source_mode<'a>(
                     recycle_rows,
                     retain_match,
                     pax_demand,
+                    planned,
                     f,
                 )?,
             ) {
@@ -11812,10 +11864,41 @@ fn scan_source_mode<'a>(
     // Each join runs once per execution of the scan.
     let _join_loops = instrument::Loops::start(join_nodes);
 
-    let automatic_indexed = if !automatic_index || sample_plans.iter().any(Option::is_some) {
+    let automatic_indexed = if sample_plans.iter().any(Option::is_some) {
         None
+    } else if planned.is_some() {
+        // A join's described scan reads only the rows an index finds for
+        // its outer row's keys, a superset its conditions filter, in the
+        // order its path gives them; `EXPLAIN ANALYZE` counts the path's
+        // own reads.
+        if instrument::active() {
+            None
+        } else {
+            indexed_candidates(
+                storage,
+                scope,
+                txid,
+                where_clause,
+                arena,
+                params,
+                hooks,
+                outer,
+            )?
+            .map(IndexedCandidates::unordered)
+        }
+    } else if automatic_index {
+        indexed_candidates(
+            storage,
+            scope,
+            txid,
+            where_clause,
+            arena,
+            params,
+            hooks,
+            None,
+        )?
     } else {
-        indexed_candidates(storage, scope, txid, where_clause, arena, params, hooks)?
+        None
     };
     let indexed = indexed_override.or(automatic_indexed.as_ref());
     let parameterized_plans = arena
@@ -12092,6 +12175,7 @@ fn scan_source_mode<'a>(
             recycle_rows,
             retain_match,
             pax_demand,
+            planned,
             f,
         )?;
     }
@@ -12214,6 +12298,7 @@ fn scan_source_mode<'a>(
                     recycle_rows,
                     retain_match,
                     pax_demand,
+                    planned,
                     f,
                 )
             };

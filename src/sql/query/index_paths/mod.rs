@@ -2206,9 +2206,10 @@ pub(crate) struct JoinScan {
     /// `joininfo` (`match_join_clauses_to_index`), each applied on its own,
     /// rather than equalities a class implies, of which a scan applies one.
     pub(crate) clause_params: u16,
-    /// The outer joins that null each parameter's other side, which a
-    /// path applying it is parameterized by too.
-    pub(crate) param_nulling: [u32; MAX_JOIN_PARAMS],
+    /// The other relations each parameter reads beyond its first (an
+    /// expression of several relations') and the outer joins that null
+    /// them, which a path applying it is parameterized by too.
+    pub(crate) param_others: [u32; MAX_JOIN_PARAMS],
     /// Each column's equivalence class when it has a member in another
     /// relation (`eclass_useful_for_merging`) or the query orders by it,
     /// else [`NO_CLASS`].

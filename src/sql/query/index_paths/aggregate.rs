@@ -358,8 +358,10 @@ pub(crate) fn hash_agg_sizing(
     }
     let entry_size =
         hash_agg_entry_size(aggregates.transitions, width, aggregates.transition_space);
-    let (memory, _, _) = hash_agg_set_limits(entry_size, groups);
+    let (memory, groups_limit, _) = hash_agg_set_limits(entry_size, groups);
     Some(crate::sql::query::postgres_memory::HashAggSizing {
+        memory_limit: memory,
+        groups_limit: groups_limit as u64,
         buckets: crate::sql::query::postgres_memory::HashAggSizing::buckets(
             entry_size,
             groups,

@@ -734,8 +734,12 @@ const PER_GROUP_STATE: usize = 16;
 pub(crate) const MAX_SIZED_STATES: usize = 8;
 
 /// What sizes a hash aggregate's memory, decided when it is planned.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct HashAggSizing {
+    /// `hash_agg_set_limits`: the memory and groups a table holds before
+    /// the aggregate spills (`hash_agg_check_limits`).
+    pub(crate) memory_limit: f64,
+    pub(crate) groups_limit: u64,
     /// The buckets `build_hash_table` asks for.
     pub(crate) buckets: usize,
     /// The grouping columns the table hashes.
@@ -794,6 +798,9 @@ pub(crate) struct HashAggMemory {
     meta: AllocSetBlocks,
     /// The transition values' context.
     transition: AllocSetBlocks,
+    /// A new group put the table past its limits, so PostgreSQL's aggregate
+    /// spills the groups after it to partitions.
+    spilled: bool,
 }
 
 /// The blocks an aset.c context with the default first block size
@@ -879,6 +886,7 @@ impl HashAggMemory {
             entry_max_block: work_mem_block(),
             meta: AllocSetBlocks::new(DEFAULT_MAX_BLOCK),
             transition: AllocSetBlocks::new(work_mem_block()),
+            spilled: false,
         };
         memory.meta.take(META_HEADERS);
         memory.allocate_buckets(simplehash_size(sizing.buckets));
@@ -935,6 +943,17 @@ impl HashAggMemory {
         for &bytes in &self.sizing.per_group[..self.sizing.per_group_count] {
             self.transition.alloc(usize::from(bytes));
         }
+        // `hash_agg_check_limits` after each new group.
+        if self.peak() as f64 > self.sizing.memory_limit
+            || self.entries as u64 > self.sizing.groups_limit
+        {
+            self.spilled = true;
+        }
+    }
+
+    /// Whether the aggregate spilled (`hash_agg_enter_spill_mode`).
+    pub(crate) fn spilled(&self) -> bool {
+        self.spilled
     }
 
     /// The bytes `hash_mem_peak` holds once the input ended: the meta

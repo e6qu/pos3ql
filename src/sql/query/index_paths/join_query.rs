@@ -304,6 +304,8 @@ pub(crate) struct ModeledGroup<'a> {
     pub(crate) keys: &'a [(usize, u8)],
     /// The buckets the hash table starts with (`build_hash_table`).
     pub(crate) buckets: usize,
+    /// What sizes the table's memory, when the model covers it.
+    pub(crate) sizing: Option<crate::sql::query::postgres_memory::HashAggSizing>,
     /// A `DISTINCT`'s `Unique` or `HashAggregate`, whose keys are select
     /// list positions.
     pub(crate) distinct: bool,
@@ -4739,9 +4741,18 @@ fn modeled_join_over<'a>(
             let buckets = problem_group_aggregates.map_or(0, |aggregates| {
                 super::aggregate::hash_agg_buckets(&aggregates, chosen.groups, output_width)
             });
+            let sizing = problem_group_aggregates.and_then(|aggregates| {
+                super::aggregate::hash_agg_sizing(
+                    &aggregates,
+                    chosen.groups,
+                    output_width,
+                    usize::from(group_columns_count),
+                )
+            });
             Some(ModeledGroup {
                 hashed: chosen.hashed,
                 distinct,
+                sizing,
                 keys,
                 presorted: arena
                     .alloc_slice_copy(&presort_tail[..presort_count])

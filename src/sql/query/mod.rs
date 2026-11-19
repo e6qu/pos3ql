@@ -10990,6 +10990,12 @@ pub(super) struct ResolvedSortKey<'a> {
     source: SortKeySource,
 }
 
+/// Whether a one-column select list computes its value (an expression, not
+/// a column read from a stored row), which sizes a datum sort's copy.
+pub(super) fn sole_item_computed(items: &[SelectItem<'_>]) -> bool {
+    matches!(items.first(), Some(SelectItem::Expr { expression, .. }) if !matches!(expression, Expr::Column { .. }))
+}
+
 /// The columns of a projected row of `width` output columns followed by
 /// `keys`' values that PostgreSQL's sort holds: the output columns and a
 /// junk column for each key that is not one of them or an earlier key
@@ -16286,13 +16292,19 @@ pub(crate) fn constant_select_resumable<'a>(
                     bound,
                     arena,
                     compare,
+                    sole_item_computed(statement.items),
                     None,
                 ) {
                     Ok(space) => space,
                     Err(error) => return sql_fail(error),
                 }
             }
-            _ => match instrument::SortSpace::postgres(out_rows, Some(&columns[..count]), false) {
+            _ => match instrument::SortSpace::postgres(
+                out_rows,
+                Some(&columns[..count]),
+                false,
+                sole_item_computed(statement.items),
+            ) {
                 Ok(space) => space,
                 Err(error) => return sql_fail(error),
             },

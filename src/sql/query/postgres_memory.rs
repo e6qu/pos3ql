@@ -202,9 +202,9 @@ pub(crate) fn projected_tuple_len_with_tids(
 
 /// `datumGetSize` of the value a datum sort copies: nothing for a null,
 /// a pass-by-value datum's eight bytes, a fixed-width value's length, or a
-/// varlena with a one-byte header when its data is short enough, as tuple
-/// forming packs it and a stored column holds it.
-pub(crate) fn datum_written_size(value: &Datum<'_>) -> usize {
+/// varlena: with a one-byte header when its data is short enough and it was
+/// read from a stored column (`computed` false), as tuple forming packs it.
+pub(crate) fn datum_written_size(value: &Datum<'_>, computed: bool) -> usize {
     if value.is_null() {
         return 0;
     }
@@ -218,7 +218,11 @@ pub(crate) fn datum_written_size(value: &Datum<'_>) -> usize {
         return layout.length as usize;
     }
     match varlena_payload(value) {
-        Some(payload) if layout.storage != b'p' && payload < SHORT_VARLENA_MAX => payload + 1,
+        // A stored column holds a short value with a one-byte header; a
+        // value an expression computed has the four-byte one.
+        Some(payload) if !computed && layout.storage != b'p' && payload < SHORT_VARLENA_MAX => {
+            payload + 1
+        }
         Some(payload) => payload + 4,
         None => 0,
     }
@@ -226,11 +230,11 @@ pub(crate) fn datum_written_size(value: &Datum<'_>) -> usize {
 
 /// [`datum_written_size`] of the value at `column` of a projected row (the
 /// first when `None`).
-pub(crate) fn sorted_datum_size(row: &[u8], column: Option<usize>) -> usize {
-    datum_written_size(&crate::sql::exec::decode_projected_pub(
-        row,
-        column.unwrap_or(0),
-    ))
+pub(crate) fn sorted_datum_size(row: &[u8], column: Option<usize>, computed: bool) -> usize {
+    datum_written_size(
+        &crate::sql::exec::decode_projected_pub(row, column.unwrap_or(0)),
+        computed,
+    )
 }
 
 /// `work_mem` in bytes, the memory a sort or tuplestore may use.

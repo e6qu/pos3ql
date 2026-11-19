@@ -685,27 +685,34 @@ fn window_keys_equal<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<bool, SqlError> {
-    for expression in expressions {
-        let left_row = window_row(scope, rows[left], offsets);
-        let left_value = eval_full(expression, arena, params, &left_row, hooks)?;
-        let right_row = window_row(scope, rows[right], offsets);
-        let right_value = eval_full(expression, arena, params, &right_row, hooks)?;
-        if !matches!((left_value.is_null(), right_value.is_null()), (true, true))
-            && (left_value.is_null()
-                || right_value.is_null()
-                || !compare_datums_collated(
-                    storage,
-                    txid,
-                    scope.expression_collation(storage, arena, expression)?,
-                    &left_value,
-                    &right_value,
-                )?
-                .is_eq())
-        {
-            return Ok(false);
+    // The key values a comparison computes die with it.
+    let mark = arena.mark();
+    let equal = (|| {
+        for expression in expressions {
+            let left_row = window_row(scope, rows[left], offsets);
+            let left_value = eval_full(expression, arena, params, &left_row, hooks)?;
+            let right_row = window_row(scope, rows[right], offsets);
+            let right_value = eval_full(expression, arena, params, &right_row, hooks)?;
+            if !matches!((left_value.is_null(), right_value.is_null()), (true, true))
+                && (left_value.is_null()
+                    || right_value.is_null()
+                    || !compare_datums_collated(
+                        storage,
+                        txid,
+                        scope.expression_collation(storage, arena, expression)?,
+                        &left_value,
+                        &right_value,
+                    )?
+                    .is_eq())
+            {
+                return Ok(false);
+            }
         }
-    }
-    Ok(true)
+        Ok(true)
+    })();
+    // SAFETY: only the boolean escapes the values allocated since `mark`.
+    unsafe { arena.rewind_to(mark) };
+    equal
 }
 
 /// The current row's peer-group bounds (sorted-partition indices) under the
@@ -1602,24 +1609,31 @@ fn cmp_order<'a>(
     txid: u32,
 ) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
-    for o in ord {
-        let ra = window_row(scope, rows[a], offs);
-        let va = eval_full(o.expression, arena, params, &ra, hooks)?;
-        let rb = window_row(scope, rows[b], offs);
-        let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
-        let c = order_by_key(
-            storage,
-            txid,
-            scope.expression_collation(storage, arena, o.expression)?,
-            &va,
-            &vb,
-            o,
-        )?;
-        if c != Ordering::Equal {
-            return Ok(c);
+    // The key values a comparison computes die with it.
+    let mark = arena.mark();
+    let compared = (|| {
+        for o in ord {
+            let ra = window_row(scope, rows[a], offs);
+            let va = eval_full(o.expression, arena, params, &ra, hooks)?;
+            let rb = window_row(scope, rows[b], offs);
+            let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
+            let c = order_by_key(
+                storage,
+                txid,
+                scope.expression_collation(storage, arena, o.expression)?,
+                &va,
+                &vb,
+                o,
+            )?;
+            if c != Ordering::Equal {
+                return Ok(c);
+            }
         }
-    }
-    Ok(Ordering::Equal)
+        Ok(Ordering::Equal)
+    })();
+    // SAFETY: only the ordering escapes the values allocated since `mark`.
+    unsafe { arena.rewind_to(mark) };
+    compared
 }
 
 /// One window's row order: its PARTITION BY keys, then its ORDER BY keys, a
@@ -2022,6 +2036,7 @@ fn window_figures<'a>(
         let window = figures::shape(members.as_slice(), arena)?;
         let mut sort = figures::InputSort::new(tuple);
         for &row in order.iter() {
+            let mark = arena.mark();
             let size = figures::row_size(tuple, arena, |column| match *column {
                 figures::InputColumn::Column(table, index) => Ok(rows[row][offs[table] + index]),
                 figures::InputColumn::Expression(expression) => {
@@ -2029,7 +2044,10 @@ fn window_figures<'a>(
                     eval_full(expression, arena, params, &lookup, hooks)
                 }
                 figures::InputColumn::Result(node) => Ok(win_vals[node][row]),
-            })?;
+            });
+            // SAFETY: only the sizes escape the values allocated since `mark`.
+            unsafe { arena.rewind_to(mark) };
+            let size = size?;
             sort.push(&size);
             lengths[row] = size.length;
         }
@@ -2372,6 +2390,7 @@ pub(crate) fn project_window_rows<'a>(
         sort_keys,
         collations,
         tuple_columns,
+        sole_computed: super::sole_item_computed(statement.items),
     })
 }
 
@@ -2385,6 +2404,8 @@ pub(crate) struct WindowRows<'a> {
     /// then each key it adds as a junk column, as positions in a row
     /// followed by its keys.
     tuple_columns: &'a [usize],
+    /// The sort's one column is computed, not read from a stored row.
+    sole_computed: bool,
 }
 
 impl<'a> WindowRows<'a> {
@@ -2436,6 +2457,7 @@ impl<'a> WindowRows<'a> {
             sort_keys,
             collations: self.collations,
             tuple_columns: self.tuple_columns,
+            sole_computed: self.sole_computed,
         })
     }
 
@@ -2489,7 +2511,7 @@ impl<'a> WindowRows<'a> {
                 )
             })?;
             let written = match self.tuple_columns {
-                [only] => 4 + datum_written_size(&value(row, *only)),
+                [only] => 4 + datum_written_size(&value(row, *only), self.sole_computed),
                 _ => *length - 10 + 4,
             };
             model.push(*length, written);

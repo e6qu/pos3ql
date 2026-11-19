@@ -335,7 +335,7 @@ pub(crate) fn row_size<'a>(
     let length = minimal_tuple_len_with_tids(values.iter().copied(), 0)
         .ok_or_else(|| unsupported("a window over a value with no PostgreSQL size here"))?;
     let written = if let [only] = values {
-        4 + datum_written_size(only)
+        4 + datum_written_size(only, matches!(target[0], InputColumn::Expression(_)))
     } else {
         length - 10 + 4
     };

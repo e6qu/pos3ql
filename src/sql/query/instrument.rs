@@ -639,6 +639,8 @@ pub(crate) struct SortTuples {
     all: bool,
     tids: usize,
     bounded: bool,
+    /// A datum sort's value is computed, not read from a stored column.
+    computed: bool,
 }
 
 impl SortTuples {
@@ -650,12 +652,19 @@ impl SortTuples {
             all: columns.is_none(),
             tids,
             bounded,
+            computed: false,
         };
         for &column in columns.unwrap_or(&[]) {
             *tuples.columns.get_mut(tuples.count)? = u16::try_from(column).ok()?;
             tuples.count += 1;
         }
         Some(tuples)
+    }
+
+    /// Marks the value of a one-column sort as computed by an expression.
+    pub(crate) fn computed(mut self, computed: bool) -> Self {
+        self.computed = computed;
+        self
     }
 
     fn length(&self, row: &[u8]) -> Option<usize> {
@@ -709,6 +718,7 @@ impl SortTuples {
                 4 + super::postgres_memory::sorted_datum_size(
                     row,
                     (!self.all).then(|| usize::from(self.columns[0])),
+                    self.computed,
                 )
             }
             _ => length - 10 + 4,
@@ -812,8 +822,9 @@ impl SortSpace {
         rows: &[&[u8]],
         columns: Option<&[usize]>,
         bounded: bool,
+        computed: bool,
     ) -> Result<Self, crate::sql::SqlError> {
-        Self::postgres_locking(rows, columns, 0, bounded, None)
+        Self::postgres_locking(rows, columns, 0, bounded, computed, None)
     }
 
     /// [`Self::postgres`] of rows that also carry `tids` row identities a
@@ -823,10 +834,11 @@ impl SortSpace {
         columns: Option<&[usize]>,
         tids: usize,
         bounded: bool,
+        computed: bool,
         kept: Option<&mut bool>,
     ) -> Result<Self, crate::sql::SqlError> {
         let own = Self::in_memory(rows, false);
-        let space = match SortTuples::new(columns, tids, bounded) {
+        let space = match SortTuples::new(columns, tids, bounded).map(|t| t.computed(computed)) {
             Some(tuples) => tuples.space(rows.len(), &|row| rows[row], None, kept)?,
             None => None,
         };
@@ -843,11 +855,13 @@ impl SortSpace {
         bound: usize,
         arena: &crate::mem::arena::Arena,
         mut compare: impl FnMut(&&[u8], &&[u8]) -> Result<core::cmp::Ordering, crate::sql::SqlError>,
+        computed: bool,
         kept: Option<&mut bool>,
     ) -> Result<Self, crate::sql::SqlError> {
         let heap = rows.len() > bound * 2 && bound > 0;
         let own = Self::in_memory(rows, heap);
-        let Some(tuples) = SortTuples::new(columns, tids, true) else {
+        let Some(tuples) = SortTuples::new(columns, tids, true).map(|t| t.computed(computed))
+        else {
             return Ok(own);
         };
         let positions = arena

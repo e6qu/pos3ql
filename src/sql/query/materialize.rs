@@ -2479,6 +2479,7 @@ pub(crate) fn materialized_rows<'a>(
                 bound,
                 arena,
                 compare,
+                super::sole_item_computed(statement.items),
                 None,
             )?,
             _ => instrument::SortSpace::postgres_locking(
@@ -2486,6 +2487,7 @@ pub(crate) fn materialized_rows<'a>(
                 Some(&columns[..count]),
                 n_identities,
                 rank_window.is_some(),
+                super::sole_item_computed(statement.items),
                 None,
             )?,
         };
@@ -2571,6 +2573,7 @@ pub(crate) fn materialized_rows<'a>(
                                         sort_bound,
                                         arena,
                                         compare,
+                                        super::sole_item_computed(statement.items),
                                         Some(&mut kind.array_kept),
                                     )?,
                                     None => instrument::SortSpace::postgres_locking(
@@ -2578,6 +2581,7 @@ pub(crate) fn materialized_rows<'a>(
                                         Some(&columns[..count]),
                                         n_identities,
                                         bounded.is_some(),
+                                        super::sole_item_computed(statement.items),
                                         Some(&mut kind.array_kept),
                                     )?,
                                 };
@@ -3125,7 +3129,8 @@ pub(crate) fn external_materialized_into<'a>(
             && !statement.distinct
             && plan.n_on == 0;
         sorter.size_as_postgres(
-            instrument::SortTuples::new(Some(&columns[..count]), plan.n_identities, bounded),
+            instrument::SortTuples::new(Some(&columns[..count]), plan.n_identities, bounded)
+                .map(|tuples| tuples.computed(super::sole_item_computed(statement.items))),
             (bounded && statement.locking.is_empty() && plan.n_order > 0)
                 .then(|| offset.saturating_add(limit).min(usize::MAX as u64) as usize),
         );

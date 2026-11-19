@@ -3164,7 +3164,7 @@ pub(crate) fn external_materialized_into<'a>(
             ),
             (bounded && statement.locking.is_empty() && plan.n_order > 0)
                 .then(|| offset.saturating_add(limit).min(usize::MAX as u64) as usize),
-            super::postgres_memory::SizeSource { storage, txid },
+            txid,
         );
     }
     let mut compare = |left: &[u8], right: &[u8]| {
@@ -3251,7 +3251,7 @@ pub(crate) fn external_materialized_into<'a>(
                     locked += 1;
                     return storage
                         .with_block_store(|blocks| {
-                            sorter.push_encoded(blocks, encoded, &mut compare)
+                            sorter.push_encoded(storage, blocks, encoded, &mut compare)
                         })
                         .expect("spill-attached block store");
                 }
@@ -3280,6 +3280,7 @@ pub(crate) fn external_materialized_into<'a>(
                 storage
                     .with_block_store(|blocks| {
                         sorter.push_projected_by(
+                            storage,
                             blocks,
                             plan.width + plan.n_keys + plan.n_raw + plan.n_identities,
                             |index| {
@@ -3359,6 +3360,7 @@ pub(crate) fn external_materialized_into<'a>(
         && plan.n_order > 0
     {
         sorter.keep_least(
+            storage,
             offset.saturating_add(limit).min(usize::MAX as u64) as usize,
             &mut compare,
         )?;

@@ -230,7 +230,7 @@ pub(super) fn groups_for_mask<'a>(
             sorter.size_as_postgres(
                 instrument::SortTuples::new(Some(&columns[..n_keys]), 0, false),
                 None,
-                super::postgres_memory::SizeSource { storage, txid },
+                txid,
             );
         }
         // Equal keys keep input order, so each group reports its first input
@@ -297,6 +297,7 @@ pub(super) fn groups_for_mask<'a>(
                 storage
                     .with_block_store(|blocks| {
                         sorter.push_projected_by(
+                            storage,
                             blocks,
                             n_keys + 1,
                             |i| {

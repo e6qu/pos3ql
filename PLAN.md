@@ -1620,7 +1620,9 @@ the join alias variable's columns and `(expr).*` reads the record's own.
 With a spill store attached, a sort whose rows fit the external sorter's one
 256 KiB chunk is ordered as PostgreSQL does; rows beyond that chunk still
 merge in arrival order for ties (PostgreSQL's order needs work_mem sized run
-buffers and a streaming merge over up to 500 tapes). Not yet done: the
+buffers and a streaming merge over up to 500 tapes). The sorter holds no
+pointer to the storage: each push and `keep_least` takes the `&Storage` that
+sizes its rows. Not yet done: the
 modeled-join grouping sort and an incremental sort's batches are not charged
 against `work_mem`; a one-table `GROUP BY` and a hashed `DISTINCT` return
 groups in sort order, not `simplehash` order; the arrival order of a table

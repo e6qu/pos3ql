@@ -1251,7 +1251,14 @@ one the search does not plan fails with `0A000` while `enable_memoize` is
 on), a correlated subplan in an `OR` or compared with a column (`0A000`),
 `BUFFERS` of a scan or InitPlan running a subplan (`0A000`), and more than
 128 relations in one query, past which the search holds no plan and such
-queries run pos3ql's join order. A parameterized index scan's cost reads its index's pages:
+queries run pos3ql's join order. An `ORDER BY` over a join keeps every joined row in
+the statement arena before sorting, so a join of millions of rows (seven
+8-row tables cross joined, `ORDER BY 1 LIMIT 1`) fails with `54000` where
+PostgreSQL runs a bounded top-N sort; the join's rows must feed the
+spilling sort instead. Tables never analyzed join by PostgreSQL's
+default estimates; a join estimated past 2^64 rows refuses `EXPLAIN` with
+costs (`0A000`), since plan rows are kept as integers where PostgreSQL
+prints its double in full. A parameterized index scan's cost reads its index's pages:
 an index built over loaded rows is sized as `_bt_buildadd` fills its
 pages (a page closes when its free space and its last tuple's posting
 list fall under the fill factor's reserve, that tuple moving on), but one

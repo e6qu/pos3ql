@@ -15,6 +15,7 @@ use crate::sql::ast::{
 };
 use crate::sql::eval::{ColumnLookup, SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
+use crate::sql::query::index_paths::joins::Relids;
 use crate::sql::query::instrument::{
     BlockId, BufferUsage, HashColumns, NodeCounters, NodeKey, Role, Segment, Slot,
 };
@@ -25,7 +26,6 @@ use crate::stack_format;
 use crate::storage::{ColumnSet, Storage};
 use crate::store::BlockIoStats;
 use crate::util::StackStr;
-use crate::sql::query::index_paths::joins::Relids;
 
 mod joins;
 mod rewrite;

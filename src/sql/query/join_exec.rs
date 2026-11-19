@@ -1318,11 +1318,11 @@ impl<'r, 'a> Runner<'r, 'a> {
             } => match method {
                 super::index_paths::joins::UniqueMethod::Noop => self.exec(input, bound, sink),
                 super::index_paths::joins::UniqueMethod::Sort => {
-                    self.unique(input, &keys[..usize::from(key_count)], bound, sink)
+                    self.unique(input, self.model.plan.keys(keys, key_count), bound, sink)
                 }
                 super::index_paths::joins::UniqueMethod::Hash => self.unique_hashed(
                     input,
-                    &keys[..usize::from(key_count)],
+                    self.model.plan.keys(keys, key_count),
                     path.rows,
                     bound,
                     sink,
@@ -1337,7 +1337,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             } => self.memoize(
                 id,
                 input,
-                &keys[..usize::from(key_count)],
+                self.model.plan.keys(keys, key_count),
                 (single_row, binary),
                 bound,
                 sink,

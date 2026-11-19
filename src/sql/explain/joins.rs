@@ -30,7 +30,9 @@ pub(super) fn join_plan<'a>(
     block: query::instrument::BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
-    let mut plan = Plan::new(arena, model.plan.paths.len() * 3 + 6)?;
+    // Each path of the chosen plan prints as at most three nodes (a join
+    // with its `Hash` or a `Sort` of each input).
+    let mut plan = Plan::new(arena, plan_paths(&model.plan, model.plan.top) * 3 + 6)?;
     let mut writer = Writer {
         storage,
         txid,
@@ -75,6 +77,7 @@ pub(super) fn join_plan<'a>(
             startup_cost: startup,
             total_cost: total,
             rows: rows as u64,
+            unmodeled_costs: unprintable_rows(rows),
             width,
             output_unprintable: stage_output(stages).is_none(),
             output: stage_output(stages).unwrap_or_default(),
@@ -97,6 +100,7 @@ pub(super) fn join_plan<'a>(
             startup_cost: startup,
             total_cost: total,
             rows: rows as u64,
+            unmodeled_costs: unprintable_rows(rows),
             width,
             keys: sort_keys,
             output_unprintable: stage_output(sort_stage).is_none(),
@@ -159,6 +163,27 @@ struct Writer<'w, 'm, 's, 'a> {
     targets: Option<&'w BlockTargets<'w>>,
 }
 
+/// An estimate past `u64`, which PostgreSQL prints in full from its
+/// double and EXPLAIN here cannot: its costs are refused, not clamped.
+fn unprintable_rows(rows: f64) -> bool {
+    rows >= u64::MAX as f64
+}
+
+/// The paths of the plan under path `id`.
+fn plan_paths(plan: &query::index_paths::joins::JoinPlan<'_>, id: u32) -> usize {
+    1 + match plan.path(id).kind {
+        PathKind::Dummy | PathKind::Scan { .. } => 0,
+        PathKind::Material { input }
+        | PathKind::Unique { input, .. }
+        | PathKind::Memoize { input, .. } => plan_paths(plan, input),
+        PathKind::NestLoop { outer, inner, .. }
+        | PathKind::HashJoin { outer, inner, .. }
+        | PathKind::MergeJoin { outer, inner, .. } => {
+            plan_paths(plan, outer) + plan_paths(plan, inner)
+        }
+    }
+}
+
 /// The base relations the plan under path `id` scans.
 pub(super) fn scanned_rels(plan: &query::index_paths::joins::JoinPlan<'_>, id: u32) -> Relids {
     match plan.path(id).kind {
@@ -189,6 +214,7 @@ impl Writer<'_, '_, '_, '_> {
                 path.total
             },
             rows: path.rows as u64,
+            unmodeled_costs: unprintable_rows(path.rows),
             // The top relation's paths carry the query's output
             // (`apply_scanjoin_target_to_paths`).
             width: if depth == self.top_depth {
@@ -306,7 +332,7 @@ impl Writer<'_, '_, '_, '_> {
                     label: KeyLabel::Group,
                     ..PlanKeys::NONE
                 };
-                for member in &keys[..usize::from(key_count)] {
+                for member in self.model.plan.keys(keys, key_count) {
                     let mut text = StackStr::<512>::new();
                     self.operand(
                         (usize::from(member.rel), usize::from(member.column)),
@@ -320,7 +346,7 @@ impl Writer<'_, '_, '_, '_> {
                     }
                 }
                 node.keys = shown;
-                let keys = &keys[..usize::from(key_count)];
+                let keys = self.model.plan.keys(keys, key_count);
                 let input_relids = self.model.plan.path(input).relids;
                 node.set_output(self.columns_output(input_relids)?);
                 plan.push(node)?;
@@ -347,7 +373,7 @@ impl Writer<'_, '_, '_, '_> {
                 // expressions it computes.
                 const UNSUPPORTED: Option<&str> =
                     Some("EXPLAIN ANALYZE of a semi join's unique-ified relation is not supported");
-                let keys = &keys[..usize::from(key_count)];
+                let keys = self.model.plan.keys(keys, key_count);
                 let input_relids = self.model.plan.path(input).relids;
                 let above = self
                     .unique_input(input_relids, keys, true)?
@@ -406,7 +432,7 @@ impl Writer<'_, '_, '_, '_> {
                 ..
             } => {
                 let mut key = StackStr::<512>::new();
-                for (at, member) in keys[..usize::from(key_count)].iter().enumerate() {
+                for (at, member) in self.model.plan.keys(keys, key_count).iter().enumerate() {
                     if at > 0 {
                         let _ = write!(key, ", ");
                     }
@@ -1101,7 +1127,9 @@ impl Writer<'_, '_, '_, '_> {
                     self.scope.defs.stored(table).expect("a plain table"),
                 );
                 // A relation no node scans prints its columns unqualified.
-                if self.scanned != Relids::EMPTY && self.scanned & Relids::of(table) == Relids::EMPTY {
+                if self.scanned != Relids::EMPTY
+                    && self.scanned & Relids::of(table) == Relids::EMPTY
+                {
                     joined.printed = "";
                 }
                 joined

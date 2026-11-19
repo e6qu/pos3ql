@@ -14,9 +14,9 @@ use crate::sql::eval::SqlError;
 use crate::sql::types::{ColType, Datum};
 use crate::storage::{ColumnSet, Storage};
 
-use super::joins::Relids;
 use super::super::scope::QueryScope;
 use super::clauses::{self, Analyzer, Clause, QualCost, Restriction, narrow_mask};
+use super::joins::Relids;
 use super::predicate::{self, Prop};
 use super::{
     BitmapPlanKind, BitmapPlanNode, Comparison, Costs, IndexCondition, IndexInfo, IndexKeyOrder,
@@ -4009,7 +4009,9 @@ fn join_index_paths_for<'a>(
         // Every join clause of the relations, then one class equality.
         let mut class_taken = false;
         for &at in &by_column[position][..column_count[position]] {
-            if paths.join_rel(at) & !relids != Relids::EMPTY || (class_taken && !paths.clause_param(at)) {
+            if paths.join_rel(at) & !relids != Relids::EMPTY
+                || (class_taken && !paths.clause_param(at))
+            {
                 continue;
             }
             class_taken |= !paths.clause_param(at);

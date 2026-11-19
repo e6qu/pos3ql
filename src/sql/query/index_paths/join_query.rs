@@ -1,6 +1,6 @@
 //! The queries whose joins PostgreSQL's join search ([`super::joins`])
-//! plans in pos3ql: a `SELECT` of plain columns from two to eight plain,
-//! analyzed local tables joined by inner, left, right and full joins on
+//! plans in pos3ql: a `SELECT` of plain columns from two to 128 plain
+//! local tables joined by inner, left, right and full joins on
 //! equalities of their columns and other conditions. Their join tree is
 //! prepared as PostgreSQL prepares it ([`super::join_tree`]); EXPLAIN prints
 //! the plan the search chooses and execution runs it
@@ -797,7 +797,9 @@ impl<'a> Expressions<'a> {
         self.held[..self.count]
             .iter()
             .flatten()
-            .position(|held| held.rel == rel && held.reads == Relids::EMPTY && *held.canonical == *canonical)
+            .position(|held| {
+                held.rel == rel && held.reads == Relids::EMPTY && *held.canonical == *canonical
+            })
             .map(|id| Member::expression(rel, id as u16))
     }
 
@@ -903,7 +905,9 @@ impl<'a> Expressions<'a> {
             return Ok(None);
         };
         let found = self.held[..self.count].iter().flatten().position(|held| {
-            usize::from(held.rel) == table && held.reads == Relids::EMPTY && *held.canonical == *canonical
+            usize::from(held.rel) == table
+                && held.reads == Relids::EMPTY
+                && *held.canonical == *canonical
         });
         let id = match found {
             Some(id) => id,
@@ -1073,7 +1077,9 @@ fn analyze_qual<'a>(
                 }
                 // A constant equated with an expression of several
                 // relations filters their join.
-                (Some((member, ..)), None) | (None, Some((member, ..))) if member.reads != Relids::EMPTY => {
+                (Some((member, ..)), None) | (None, Some((member, ..)))
+                    if member.reads != Relids::EMPTY =>
+                {
                     Shape::Other
                 }
                 (Some((member, ctype, _)), None) | (None, Some((member, ctype, _))) => {
@@ -2510,7 +2516,9 @@ fn modeled_join_over<'a>(
     let member_nulling = |relids: Relids| {
         (0..n)
             .filter(|&table| relids & Relids::of(table) != Relids::EMPTY)
-            .fold(Relids::EMPTY, |nulling, table| nulling | nulling_relids[table])
+            .fold(Relids::EMPTY, |nulling, table| {
+                nulling | nulling_relids[table]
+            })
             & !BASE_RELIDS
     };
     // The query's pathkeys (`make_pathkeys_for_sortclauses`): each `ORDER
@@ -3488,7 +3496,9 @@ fn modeled_join_over<'a>(
         }
         for (class_id, class) in classes.iter().enumerate() {
             let Some(own) = class.members().iter().find(|member| {
-                usize::from(member.rel) == table && member.nulling == Relids::EMPTY && member.reads == Relids::EMPTY
+                usize::from(member.rel) == table
+                    && member.nulling == Relids::EMPTY
+                    && member.reads == Relids::EMPTY
             }) else {
                 continue;
             };
@@ -3711,7 +3721,8 @@ fn modeled_join_over<'a>(
                     } else {
                         f64::from(super::column_width(storage, txid, slot, column))
                     },
-                    needed_by: prepared.needed_by((table as u8, column as u16)) & !Relids::of(table),
+                    needed_by: prepared.needed_by((table as u8, column as u16))
+                        & !Relids::of(table),
                     output: output[table] & 1 << column != 0,
                 };
                 needed_count += 1;
@@ -3815,7 +3826,8 @@ fn modeled_join_over<'a>(
             }
             let first = |side: Relids| {
                 held.members().iter().position(|member| {
-                    member.relids() & !joined == Relids::EMPTY && member.relids() & !side == Relids::EMPTY
+                    member.relids() & !joined == Relids::EMPTY
+                        && member.relids() & !side == Relids::EMPTY
                 })
             };
             if let (Some(outer), Some(within)) = (first(special.min_left), first(inner))
@@ -3940,7 +3952,8 @@ fn modeled_join_over<'a>(
                 }
             }
             for (at, candidate) in paths.candidates.iter().enumerate() {
-                if usize::from(candidate.describe.index) == index_at && !candidate.param.is_empty() {
+                if usize::from(candidate.describe.index) == index_at && !candidate.param.is_empty()
+                {
                     let Some(list) = moved(candidate.param, &mut derive) else {
                         return Ok(None);
                     };
@@ -4026,7 +4039,9 @@ fn modeled_join_over<'a>(
             let members = classes[usize::from(class)].members();
             let own = members
                 .iter()
-                .position(|member| usize::from(member.rel) == table && member.reads == Relids::EMPTY)
+                .position(|member| {
+                    usize::from(member.rel) == table && member.reads == Relids::EMPTY
+                })
                 .expect("a member of the relation") as u8;
             let reads = rel.scan.param_others[at] & BASE_RELIDS;
             let other = members
@@ -4853,7 +4868,9 @@ fn join_is_removable(
     if output != 0
         || prepared.needed[..prepared.needed_count]
             .iter()
-            .any(|&((rel, _), relids, _)| usize::from(rel) == table && relids & !inputs != Relids::EMPTY)
+            .any(|&((rel, _), relids, _)| {
+                usize::from(rel) == table && relids & !inputs != Relids::EMPTY
+            })
     {
         return false;
     }
@@ -4861,7 +4878,10 @@ fn join_is_removable(
     for class in prepared.classes() {
         if class.has_const {
             for member in class.members() {
-                if usize::from(member.rel) == table && member.nulling == Relids::EMPTY && member.column < 64 {
+                if usize::from(member.rel) == table
+                    && member.nulling == Relids::EMPTY
+                    && member.column < 64
+                {
                     matched |= 1 << member.column;
                 }
             }
@@ -4926,15 +4946,19 @@ fn removable_self_join(
     let n = scope.n.min(MAX_JOIN_RELS);
     for r in 0..n {
         for k in r + 1..n {
-            if removed & (Relids::of(r) | Relids::of(k)) != Relids::EMPTY || scope.slots[r] != scope.slots[k] {
+            if removed & (Relids::of(r) | Relids::of(k)) != Relids::EMPTY
+                || scope.slots[r] != scope.slots[k]
+            {
                 continue;
             }
             let (r_bit, k_bit): (Relids, Relids) = (Relids::of(r), Relids::of(k));
             if prepared.specials[..prepared.special_count]
                 .iter()
                 .any(|info| {
-                    (info.syn_left & r_bit != Relids::EMPTY) != (info.syn_left & k_bit != Relids::EMPTY)
-                        || (info.syn_right & r_bit != Relids::EMPTY) != (info.syn_right & k_bit != Relids::EMPTY)
+                    (info.syn_left & r_bit != Relids::EMPTY)
+                        != (info.syn_left & k_bit != Relids::EMPTY)
+                        || (info.syn_right & r_bit != Relids::EMPTY)
+                            != (info.syn_right & k_bit != Relids::EMPTY)
                 })
             {
                 continue;
@@ -5040,7 +5064,6 @@ fn plain_table(
     definition.kind == crate::storage::TableKind::Local
         && !definition.partition.is_partitioned()
         && !storage.relation_has_descendants(slot, txid)
-        && storage.table_statistics(slot, txid).valid
         && !definition.row_level_security.enabled
 }
 
@@ -5105,7 +5128,10 @@ impl RelStatistics<'_, '_, '_> {
             }
         };
         // An expression of several relations: its columns of this one.
-        for member in members.iter().filter(|member| member.reads != Relids::EMPTY) {
+        for member in members
+            .iter()
+            .filter(|member| member.reads != Relids::EMPTY)
+        {
             let id = member.expression_id().expect("an expression");
             for &(held, var) in self.expression_vars[id].as_slice() {
                 if held == rel {
@@ -5576,7 +5602,7 @@ fn reaches_hashed_unique(plan: &JoinPlan<'_>, hashable: &dyn Fn(&Member) -> bool
                 key_count,
             } => {
                 (method == super::joins::UniqueMethod::Hash
-                    && !keys[..usize::from(key_count)].iter().all(hashable))
+                    && !plan.keys(keys, key_count).iter().all(hashable))
                     || reaches(plan, input, hashable)
             }
             PathKind::Scan { .. } | PathKind::Dummy => false,

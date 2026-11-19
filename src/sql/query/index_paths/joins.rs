@@ -145,7 +145,9 @@ impl Relids {
     /// A hash of the set for the join relation table.
     fn hash(self) -> u64 {
         self.0.iter().fold(0u64, |hash, &word| {
-            (hash ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29)
+            (hash ^ word)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left(29)
         })
     }
 }
@@ -702,7 +704,8 @@ pub(crate) enum PathKind {
     /// unique by an index (`UNIQUE_PATH_NOOP`, which plans no node).
     Unique {
         input: u32,
-        keys: [Member; MAX_KEYS],
+        /// The compared members, `JoinPlan::member_keys`' entry.
+        keys: u32,
         key_count: u8,
         method: UniqueMethod,
     },
@@ -719,7 +722,8 @@ pub(crate) enum PathKind {
     /// values (`Memoize`): `keys` are the outer columns, as class members.
     Memoize {
         input: u32,
-        keys: [Member; MAX_KEYS],
+        /// The cache keys, `JoinPlan::member_keys`' entry.
+        keys: u32,
         key_count: u8,
         /// `singlerow`: the join's inner relation is unique, so an entry
         /// is complete at its first row.
@@ -822,6 +826,8 @@ fn rel_bucket(relids: Relids) -> usize {
 /// relation joining them all.
 pub(crate) struct JoinPlan<'a> {
     pub(crate) paths: &'a [Path],
+    /// The members of each Unique and Memoize path.
+    pub(crate) member_keys: &'a [[Member; MAX_KEYS]],
     pub(crate) clauses: &'a [Clause],
     pub(crate) classes: &'a [EquivalenceClass],
     /// The join's chosen path, below [`Self::upper`].
@@ -839,6 +845,11 @@ pub(crate) struct JoinPlan<'a> {
 impl JoinPlan<'_> {
     pub(crate) fn path(&self, id: u32) -> &Path {
         &self.paths[id as usize]
+    }
+
+    /// The `count` members of a Unique or Memoize path's `keys` entry.
+    pub(crate) fn keys(&self, keys: u32, count: u8) -> &[Member] {
+        &self.member_keys[keys as usize][..usize::from(count)]
     }
 
     /// The columns of `relids`' target list in its order: each relation's
@@ -1149,6 +1160,9 @@ struct Search<'p, 'a, 's> {
     arena: &'a Arena,
     clauses: ArenaList<'a, Clause>,
     paths: ArenaList<'a, Path>,
+    /// The members of Unique and Memoize paths, kept apart so a path stays
+    /// small.
+    member_keys: ArenaList<'a, [Member; MAX_KEYS]>,
     /// The relations built (`join_rel_list`), base ones first.
     rels: ArenaList<'a, Rel>,
     /// The newest relation of each hash chain of [`Self::rels`].
@@ -1207,6 +1221,7 @@ pub(crate) fn search<'a>(
         arena,
         clauses: ArenaList::new(arena),
         paths: ArenaList::new(arena),
+        member_keys: ArenaList::new(arena),
         rels: ArenaList::new(arena),
         rel_buckets: arena_slice(arena, REL_BUCKETS, |_| NO_REL)?,
         levels: core::array::from_fn(|_| ArenaList::new(arena)),
@@ -1352,6 +1367,7 @@ pub(crate) fn search<'a>(
     let rels = search.rels.borrowed_slice();
     Ok(Ok(JoinPlan {
         paths: search.paths.as_slice(),
+        member_keys: search.member_keys.as_slice(),
         clauses: search.clauses.as_slice(),
         classes: arena
             .alloc_slice_copy(problem.classes)
@@ -1360,7 +1376,9 @@ pub(crate) fn search<'a>(
         upper,
         settings: problem.settings,
         firsts: arena
-            .alloc_slice_with(rels.len(), |at| (rels[at].relids & BASE_RELIDS, rels[at].first))
+            .alloc_slice_with(rels.len(), |at| {
+                (rels[at].relids & BASE_RELIDS, rels[at].first)
+            })
             .map_err(|_| arena_full())?,
         needed: arena
             .alloc_slice_copy(problem.needed)
@@ -1386,6 +1404,7 @@ fn arena_slice<T: Copy>(
 struct SavedJoins {
     rels: usize,
     paths: usize,
+    member_keys: usize,
     memoize_rescans: usize,
     param_rows: usize,
 }
@@ -1438,6 +1457,13 @@ enum Selectivity {
 }
 
 impl<'p, 'a, 's> Search<'p, 'a, 's> {
+    /// Keeps a Unique or Memoize path's members, returning their entry.
+    fn push_member_keys(&mut self, keys: [Member; MAX_KEYS]) -> Result<u32, SqlError> {
+        let id = self.member_keys.len() as u32;
+        self.member_keys.push(keys).map_err(|_| arena_full())?;
+        Ok(id)
+    }
+
     fn push_path(&mut self, path: Path) -> Result<u32, SqlError> {
         let id = self.paths.len() as u32;
         self.paths.push(path).map_err(|_| arena_full())?;
@@ -1502,6 +1528,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         SavedJoins {
             rels: self.rels.len(),
             paths: self.paths.len(),
+            member_keys: self.member_keys.len(),
             memoize_rescans: self.memoize_rescans.len(),
             param_rows: self.param_rows.len(),
         }
@@ -1517,21 +1544,33 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             self.rel_buckets[bucket] = rel.next;
         }
         self.rels.truncate(saved.rels);
-        let mut kept = [(0usize, None::<Path>); 2 * MAX_JOIN_RELS];
+        let mut kept = [(0usize, None::<(Path, [Member; MAX_KEYS])>); 2 * MAX_JOIN_RELS];
         let mut kept_count = 0;
         for (at, rel) in self.rels.borrowed_slice().iter().enumerate() {
             if let Some(Some(id)) = rel.unique
                 && id as usize >= saved.paths
             {
-                *kept.get_mut(kept_count).ok_or_else(too_many)? = (at, Some(self.path(id)));
+                let path = self.path(id);
+                let keys = match path.kind {
+                    PathKind::Unique { keys, .. } => {
+                        self.member_keys.borrowed_slice()[keys as usize]
+                    }
+                    _ => unreachable!("a unique-ified path"),
+                };
+                *kept.get_mut(kept_count).ok_or_else(too_many)? = (at, Some((path, keys)));
                 kept_count += 1;
             }
         }
         self.paths.truncate(saved.paths);
+        self.member_keys.truncate(saved.member_keys);
         self.memoize_rescans.truncate(saved.memoize_rescans);
         self.param_rows.truncate(saved.param_rows);
-        for &(at, path) in &kept[..kept_count] {
-            let id = self.push_path(path.expect("a kept path"))?;
+        for &(at, held) in &kept[..kept_count] {
+            let (mut path, members) = held.expect("a kept path");
+            if let PathKind::Unique { keys, .. } = &mut path.kind {
+                *keys = self.push_member_keys(members)?;
+            }
+            let id = self.push_path(path)?;
             self.rels.as_mut_slice().map_err(|_| arena_full())?[at].unique = Some(Some(id));
         }
         Ok(())
@@ -1570,7 +1609,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let (left, right, ..) = self.sides(id)?;
         if left.relids() & !outer == Relids::EMPTY && right.relids() & !inner == Relids::EMPTY {
             Some(true)
-        } else if right.relids() & !outer == Relids::EMPTY && left.relids() & !inner == Relids::EMPTY {
+        } else if right.relids() & !outer == Relids::EMPTY
+            && left.relids() & !inner == Relids::EMPTY
+        {
             Some(false)
         } else {
             None
@@ -1615,7 +1656,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                         let members = class.members();
                         let first = |side: Relids| {
                             members.iter().position(|member| {
-                                member.relids() & !joined == Relids::EMPTY && member.relids() & !side == Relids::EMPTY
+                                member.relids() & !joined == Relids::EMPTY
+                                    && member.relids() & !side == Relids::EMPTY
                             })
                         };
                         if let (Some(outer), Some(within)) = (first(special.min_left), first(inner))
@@ -1685,8 +1727,10 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     fn has_join_restriction(&self, relids: Relids) -> bool {
         self.specials.iter().any(|special| {
             special.kind != SpecialKind::Full
-                && !(special.min_left & !relids == Relids::EMPTY && special.min_right & !relids == Relids::EMPTY)
-                && (special.min_left & relids != Relids::EMPTY || special.min_right & relids != Relids::EMPTY)
+                && !(special.min_left & !relids == Relids::EMPTY
+                    && special.min_right & !relids == Relids::EMPTY)
+                && (special.min_left & relids != Relids::EMPTY
+                    || special.min_right & relids != Relids::EMPTY)
         })
     }
 
@@ -1694,10 +1738,14 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     fn order_restriction(&mut self, left: Relids, right: Relids) -> Result<bool, SqlError> {
         let restricted = self.specials.iter().any(|special| {
             special.kind != SpecialKind::Full
-                && ((special.min_left & !left == Relids::EMPTY && special.min_right & !right == Relids::EMPTY)
-                    || (special.min_left & !right == Relids::EMPTY && special.min_right & !left == Relids::EMPTY)
-                    || (special.min_right & left != Relids::EMPTY && special.min_right & right != Relids::EMPTY)
-                    || (special.min_left & left != Relids::EMPTY && special.min_left & right != Relids::EMPTY))
+                && ((special.min_left & !left == Relids::EMPTY
+                    && special.min_right & !right == Relids::EMPTY)
+                    || (special.min_left & !right == Relids::EMPTY
+                        && special.min_right & !left == Relids::EMPTY)
+                    || (special.min_right & left != Relids::EMPTY
+                        && special.min_right & right != Relids::EMPTY)
+                    || (special.min_left & left != Relids::EMPTY
+                        && special.min_left & right != Relids::EMPTY))
         });
         if !restricted {
             return Ok(false);
@@ -1780,7 +1828,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 matched = Some(id);
                 reversed = true;
             } else {
-                if special.min_right & rel1 != Relids::EMPTY && special.min_right & rel2 != Relids::EMPTY {
+                if special.min_right & rel1 != Relids::EMPTY
+                    && special.min_right & rel2 != Relids::EMPTY
+                {
                     continue;
                 }
                 if special.kind != SpecialKind::Left || joined & special.min_left != Relids::EMPTY {
@@ -1852,6 +1902,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let input = self.path(rel.cheapest_total);
         let mut held = [Member::plain(0, 0); MAX_KEYS];
         held[..keys.len()].copy_from_slice(keys);
+        let held = self.push_member_keys(held)?;
         let unique = |method: UniqueMethod| PathKind::Unique {
             input: rel.cheapest_total,
             keys: held,
@@ -1961,7 +2012,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         if special.commute_above_l != Relids::EMPTY {
             let mut above = special.commute_above_l;
             for other in self.specials {
-                if core::ptr::eq(other, special) || other.oj == Relids::EMPTY || other.kind != SpecialKind::Left
+                if core::ptr::eq(other, special)
+                    || other.oj == Relids::EMPTY
+                    || other.kind != SpecialKind::Left
                 {
                     continue;
                 }
@@ -2052,7 +2105,10 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let joined = self.add_outer_joins(rel1 | rel2, special);
         let (rel1, rel2) = if reversed { (rel2, rel1) } else { (rel1, rel2) };
         let restrict = self.restrictlist(rel1, rel2, joined)?;
-        match self.find_rel(joined).map(|at| self.rels.borrowed_slice()[at]) {
+        match self
+            .find_rel(joined)
+            .map(|at| self.rels.borrowed_slice()[at])
+        {
             None => {
                 let (outer, inner) = (self.rel(rel1), self.rel(rel2));
                 let rows = self.join_size(
@@ -2135,7 +2191,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             Some(SpecialKind::Semi) => {
                 let id = special.expect("a semi join");
                 let info = *self.special(id);
-                if info.min_left & !rel1 == Relids::EMPTY && info.min_right & !rel2 == Relids::EMPTY {
+                if info.min_left & !rel1 == Relids::EMPTY && info.min_right & !rel2 == Relids::EMPTY
+                {
                     self.add_paths(joined, rel1, rel2, JoinType::Semi, special, restrict)?;
                     self.add_paths(joined, rel2, rel1, JoinType::RightSemi, special, restrict)?;
                 }
@@ -2212,7 +2269,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 // order of the joins, which this pair's inputs must not
                 // already have performed.
                 if clause.clone != CloneKind::None
-                    && (clause.required & !both != Relids::EMPTY || clause.incompatible & both != Relids::EMPTY)
+                    && (clause.required & !both != Relids::EMPTY
+                        || clause.incompatible & both != Relids::EMPTY)
                 {
                     continue;
                 }
@@ -2240,11 +2298,17 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             };
             let outer_member = members
                 .iter()
-                .position(|member| member.relids() & !joined == Relids::EMPTY && member.relids() & !outer == Relids::EMPTY)
+                .position(|member| {
+                    member.relids() & !joined == Relids::EMPTY
+                        && member.relids() & !outer == Relids::EMPTY
+                })
                 .expect("found");
             let inner_member = members
                 .iter()
-                .position(|member| member.relids() & !joined == Relids::EMPTY && member.relids() & !inner == Relids::EMPTY)
+                .position(|member| {
+                    member.relids() & !joined == Relids::EMPTY
+                        && member.relids() & !inner == Relids::EMPTY
+                })
                 .expect("found");
             let id = self.class_clause(class_id as u8, outer_member as u8, inner_member as u8)?;
             list.push(id).ok_or_else(too_many)?;
@@ -2350,11 +2414,12 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     unreachable!("a semi join's estimate");
                 };
                 let special = *self.special(special);
-                let (outer, inner) = if left.relids() & !special.syn_right & BASE_RELIDS == Relids::EMPTY {
-                    (right, left)
-                } else {
-                    (left, right)
-                };
+                let (outer, inner) =
+                    if left.relids() & !special.syn_right & BASE_RELIDS == Relids::EMPTY {
+                        (right, left)
+                    } else {
+                        (left, right)
+                    };
                 let Some(inner_rel) = self
                     .find_rel(special.min_right)
                     .map(|at| self.rels.borrowed_slice()[at])
@@ -2448,7 +2513,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             .needed
             .iter()
             .filter(|column| {
-                relids & Relids::of(column.rel) != Relids::EMPTY && (column.output || column.needed_by & !relids != Relids::EMPTY)
+                relids & Relids::of(column.rel) != Relids::EMPTY
+                    && (column.output || column.needed_by & !relids != Relids::EMPTY)
             })
             .map(|column| column.width)
             .sum()
@@ -3471,7 +3537,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             };
         let mut param_source = Relids::EMPTY;
         for other in self.specials {
-            if joined & other.min_right != Relids::EMPTY && joined & other.min_left == Relids::EMPTY {
+            if joined & other.min_right != Relids::EMPTY && joined & other.min_left == Relids::EMPTY
+            {
                 param_source |= self.all_baserels & !other.min_right;
             }
             if other.kind == SpecialKind::Full
@@ -3811,8 +3878,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     ) -> f64 {
         let mut selectivity = 1.0;
         for key in self.problem.foreign_keys {
-            let (referencing, referenced) = (Relids::of(key.referencing), Relids::of(key.referenced));
-            let referenced_outer = if outer & referencing != Relids::EMPTY && inner & referenced != Relids::EMPTY {
+            let (referencing, referenced) =
+                (Relids::of(key.referencing), Relids::of(key.referenced));
+            let referenced_outer = if outer & referencing != Relids::EMPTY
+                && inner & referenced != Relids::EMPTY
+            {
                 false
             } else if outer & referenced != Relids::EMPTY && inner & referencing != Relids::EMPTY {
                 true
@@ -3966,9 +4036,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             else {
                 return Ok(None);
             };
-            let key = if left.relids() & !inputs.outer == Relids::EMPTY && right.relids() & !inputs.inner == Relids::EMPTY {
+            let key = if left.relids() & !inputs.outer == Relids::EMPTY
+                && right.relids() & !inputs.inner == Relids::EMPTY
+            {
                 left
-            } else if right.relids() & !inputs.outer == Relids::EMPTY && left.relids() & !inputs.inner == Relids::EMPTY {
+            } else if right.relids() & !inputs.outer == Relids::EMPTY
+                && left.relids() & !inputs.inner == Relids::EMPTY
+            {
                 right
             } else {
                 return Ok(None);
@@ -3999,6 +4073,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         rescan_total += costs.cpu_operator / 10.0 * evict_ratio * tuples;
         rescan_total += costs.cpu_tuple + costs.cpu_operator * tuples;
         let rescan_startup = inner_path.startup * (1.0 - hit_ratio) + costs.cpu_tuple;
+        let keys = self.push_member_keys(keys)?;
         let id = self.push_path(Path {
             kind: PathKind::Memoize {
                 input: inner,
@@ -4104,7 +4179,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let movable =
             |relids: Relids, outer_relids: Relids, current: Relids, available: Option<Relids>| {
                 available.is_some_and(|available| {
-                    relids & !available == Relids::EMPTY && relids & current != Relids::EMPTY && outer_relids & current == Relids::EMPTY
+                    relids & !available == Relids::EMPTY
+                        && relids & current != Relids::EMPTY
+                        && outer_relids & current == Relids::EMPTY
                 })
             };
         let join_and_req = Some(joined | required);
@@ -4360,8 +4437,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let required = (outer_path.param | inner_path.param) & !inputs.outer;
         let mut moved = ClauseList::EMPTY;
         if required != Relids::EMPTY {
-            let star =
-                inner_path.param & inputs.outer != Relids::EMPTY && inner_path.param & !inputs.outer != Relids::EMPTY;
+            let star = inner_path.param & inputs.outer != Relids::EMPTY
+                && inner_path.param & !inputs.outer != Relids::EMPTY;
             if required & inputs.param_source == Relids::EMPTY && !star {
                 return Ok(());
             }
@@ -5163,11 +5240,22 @@ fn add_to_pathlist(
         let mut remove_old = false;
         let costs = compare_fuzzily(&new, &old, FUZZ, consider_startup);
         if costs != CostOrder::Different {
-            let new_keys = if new.param != Relids::EMPTY { Keys::NONE } else { new.keys };
-            let old_keys = if old.param != Relids::EMPTY { Keys::NONE } else { old.keys };
+            let new_keys = if new.param != Relids::EMPTY {
+                Keys::NONE
+            } else {
+                new.keys
+            };
+            let old_keys = if old.param != Relids::EMPTY {
+                Keys::NONE
+            } else {
+                old.keys
+            };
             let keys = compare_keys(&new_keys, &old_keys);
             // `bms_subset_compare` of the parameterizations.
-            let outer = match (new.param & !old.param == Relids::EMPTY, old.param & !new.param == Relids::EMPTY) {
+            let outer = match (
+                new.param & !old.param == Relids::EMPTY,
+                old.param & !new.param == Relids::EMPTY,
+            ) {
                 (true, true) => Subset::Equal,
                 (true, false) => Subset::Subset1,
                 (false, true) => Subset::Subset2,

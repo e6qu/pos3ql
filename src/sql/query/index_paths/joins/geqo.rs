@@ -8,8 +8,8 @@
 //! seed always gives the same plan.
 //! <https://github.com/postgres/postgres/tree/REL_18_6/src/backend/optimizer/geqo>
 
-use core::cell::Cell;
 use crate::mem::mutex::Mutex;
+use core::cell::Cell;
 
 use crate::sql::eval::SqlError;
 use crate::sql::eval::sqlstate;
@@ -299,7 +299,9 @@ impl Search<'_, '_, '_> {
         let saved = self.save_joins();
         let joinrel = self.gimme_tree(tour)?;
         let fitness = match joinrel {
-            Some(relids) if self.outside.is_none() => self.path(self.rel(relids).cheapest_total).total,
+            Some(relids) if self.outside.is_none() => {
+                self.path(self.rel(relids).cheapest_total).total
+            }
             _ => f64::MAX,
         };
         self.restore_joins(saved)?;
@@ -380,10 +382,7 @@ impl Search<'_, '_, '_> {
 }
 
 fn failed() -> SqlError {
-    crate::sql_err!(
-        sqlstate::INTERNAL_ERROR,
-        "geqo failed to make a valid plan"
-    )
+    crate::sql_err!(sqlstate::INTERNAL_ERROR, "geqo failed to make a valid plan")
 }
 
 /// `init_tour`: a random permutation of `1..=n` by the inside-out

@@ -342,13 +342,21 @@ impl Prepared {
         for index in 0..self.placed_count {
             let mut entry = self.placed[index];
             let keep = match &mut entry {
-                Placed::Restriction { rel, .. } => Relids::of(*rel) & info.min_right == Relids::EMPTY,
+                Placed::Restriction { rel, .. } => {
+                    Relids::of(*rel) & info.min_right == Relids::EMPTY
+                }
                 Placed::Implied { member, .. } => member.relids() & gone == Relids::EMPTY,
                 Placed::Equated { left, .. } => left.relids() & gone == Relids::EMPTY,
-                Placed::Join(join) if join.required & gone == Relids::EMPTY && join.relids & gone == Relids::EMPTY => true,
+                Placed::Join(join)
+                    if join.required & gone == Relids::EMPTY
+                        && join.relids & gone == Relids::EMPTY =>
+                {
+                    true
+                }
                 Placed::Join(join) => {
                     if join.relids & info.min_right != Relids::EMPTY
-                        || !(join.pushed_down || join.required & !join_plus_commute != Relids::EMPTY)
+                        || !(join.pushed_down
+                            || join.required & !join_plus_commute != Relids::EMPTY)
                     {
                         dropped_quals[usize::from(join.qual)] = true;
                         false
@@ -728,10 +736,17 @@ impl Prep<'_> {
                 let (left_rels, right_rels) = (tree.base_rels(left), tree.base_rels(right));
                 let mut kind = self.kinds[at].expect("a join");
                 match kind {
-                    TreeJoin::Left if nonnullable & right_rels != Relids::EMPTY => kind = TreeJoin::Inner,
-                    TreeJoin::Right if nonnullable & left_rels != Relids::EMPTY => kind = TreeJoin::Inner,
+                    TreeJoin::Left if nonnullable & right_rels != Relids::EMPTY => {
+                        kind = TreeJoin::Inner
+                    }
+                    TreeJoin::Right if nonnullable & left_rels != Relids::EMPTY => {
+                        kind = TreeJoin::Inner
+                    }
                     TreeJoin::Full => {
-                        kind = match (nonnullable & left_rels != Relids::EMPTY, nonnullable & right_rels != Relids::EMPTY) {
+                        kind = match (
+                            nonnullable & left_rels != Relids::EMPTY,
+                            nonnullable & right_rels != Relids::EMPTY,
+                        ) {
                             (true, true) => TreeJoin::Inner,
                             (true, false) => TreeJoin::Left,
                             (false, true) => TreeJoin::Right,
@@ -976,7 +991,11 @@ impl Prep<'_> {
                     // A side of one element joins as itself, not as a
                     // one-element sublist.
                     let part = |list: usize, len: usize, lists: &[[i16; MAX_JOIN_RELS]]| {
-                        if len == 1 { lists[list][0] } else { nested(list) }
+                        if len == 1 {
+                            lists[list][0]
+                        } else {
+                            nested(list)
+                        }
                     };
                     self.push_list(&[
                         part(left_list, left_len, &self.lists),
@@ -1021,7 +1040,9 @@ impl Prep<'_> {
             count: items.len() as u16,
         };
         out.count += 1;
-        Ok(items.iter().fold(Relids::EMPTY, |relids, &item| relids | item))
+        Ok(items
+            .iter()
+            .fold(Relids::EMPTY, |relids, &item| relids | item))
     }
 
     /// The outer joins below `node` nulling relation `rel`
@@ -1522,12 +1543,16 @@ impl Prep<'_> {
                     let left_relids = left_member.relids();
                     let right_relids = right_member.relids();
                     let pending = Pending { join };
-                    if left_relids & !nonnullable == Relids::EMPTY && right_relids & nonnullable == Relids::EMPTY {
+                    if left_relids & !nonnullable == Relids::EMPTY
+                        && right_relids & nonnullable == Relids::EMPTY
+                    {
                         *self.left_join.get_mut(self.left_count).ok_or(FULL)? = pending;
                         self.left_count += 1;
                         return Ok(());
                     }
-                    if right_relids & !nonnullable == Relids::EMPTY && left_relids & nonnullable == Relids::EMPTY {
+                    if right_relids & !nonnullable == Relids::EMPTY
+                        && left_relids & nonnullable == Relids::EMPTY
+                    {
                         *self.right_join.get_mut(self.right_count).ok_or(FULL)? = pending;
                         self.right_count += 1;
                         return Ok(());
@@ -1578,14 +1603,15 @@ impl Prep<'_> {
 
     /// `distribute_restrictinfo_to_rels`.
     fn distribute_restrictinfo(&mut self, join: JoinQual) -> Result<(), Outside> {
-        let placed = if join.required.count_ones() == 1 && join.required & BASE_RELIDS != Relids::EMPTY {
-            Placed::Restriction {
-                rel: join.required.trailing_zeros() as u8,
-                qual: join.qual,
-            }
-        } else {
-            Placed::Join(join)
-        };
+        let placed =
+            if join.required.count_ones() == 1 && join.required & BASE_RELIDS != Relids::EMPTY {
+                Placed::Restriction {
+                    rel: join.required.trailing_zeros() as u8,
+                    qual: join.qual,
+                }
+            } else {
+                Placed::Join(join)
+            };
         self.place(placed)
     }
 
@@ -1609,9 +1635,9 @@ impl Prep<'_> {
         };
         let nulled = nulling[usize::from(rel)];
         nulled != Relids::EMPTY
-            && self.specials[..self.special_count]
-                .iter()
-                .any(|special| special.kind == SpecialKind::Anti && special.oj & nulled != Relids::EMPTY)
+            && self.specials[..self.special_count].iter().any(|special| {
+                special.kind == SpecialKind::Anti && special.oj & nulled != Relids::EMPTY
+            })
     }
 
     fn canonical(&self, mut class: u8) -> u8 {
@@ -1780,7 +1806,9 @@ impl Prep<'_> {
             return Err("an equivalence class of two constants in a full join's condition");
         };
         let relids = self.min_rels(root)?;
-        if relids == Relids::EMPTY || (self.false_relids != Relids::EMPTY && self.false_relids != relids) {
+        if relids == Relids::EMPTY
+            || (self.false_relids != Relids::EMPTY && self.false_relids != relids)
+        {
             return Err("equivalence classes of two constants inside different outer joins");
         }
         self.false_relids = relids;

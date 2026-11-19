@@ -1513,9 +1513,18 @@ the context of by-reference transition states (array initial values and the
 `Int128AggState` of integer averages and sums are modelled). `EXPLAIN
 ANALYZE` of a hash aggregate with another by-reference state (`numeric`
 sums, text `min`/`max`, collecting aggregates) or more than seven grouping
-columns fails with `0A000`; a table that would spill (`Batches` above 1) is
-not modelled, and outside the cost model the bucket array is sized from
-pos3ql's group estimate. A `CTE Scan` prints its query's tuplestore
+columns fails with `0A000`, as does a table that spills
+(`hash_agg_check_limits`'s memory or group limit, from `hash_agg_set_limits`;
+its `Batches`, `Disk Usage` and partitions need the tapes' block allocation,
+`hash_bytes_uint32` hashes and the hyperloglog cardinalities of
+`nodeAgg.c`'s spill batches) and a hash aggregate whose group estimate lies
+outside the cost model (an expression key, a join pos3ql does not plan).
+Aggregates over a join and a `DISTINCT` over one table size their tables
+from the planner's group estimate (`differential_exact/908`). A `Materialize`
+above a merge join's inner sort replays its mark, restore and
+`tuplestore_trim` (`differential_exact/910`); rows with equal window keys
+reach a window's sort and number in `pg_qsort` order
+(`differential_exact/909`). A `CTE Scan` prints its query's tuplestore
 (`tuplestore_get_stats`: 2048 row pointers, doubled when a row reaches the
 last free slot, and each row's generation chunk), also when it never ran;
 a `Recursive Union` the sum of its working and intermediate tables, each

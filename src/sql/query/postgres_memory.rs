@@ -915,7 +915,7 @@ mod tests {
         let TuplesortSpace::Disk(bytes) = space else {
             panic!("expected a spill, got {space:?}");
         };
-        let payload = 100_000 * 94;
+        let payload: usize = 100_000 * 94;
         assert!(bytes >= payload.div_ceil(8176) * 8192);
         assert_eq!(bytes % 8192, 0);
         assert_eq!(tuplesort_merge_order(4 << 20), 15);

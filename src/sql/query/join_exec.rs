@@ -2123,32 +2123,39 @@ impl<'r, 'a> Runner<'r, 'a> {
                 } else {
                     super::postgres_memory::SortTuples::Bump
                 };
-                // A merge join's inner sort reads backwards and marks
-                // (`EXEC_FLAG_MARK`), so a sort that spills materializes a
-                // tape whose size depends on the merge order.
-                let bytes = fits
-                    .then(|| {
-                        super::postgres_memory::tuplesort_space(
-                            tuples,
-                            lengths.borrowed_slice().iter().map(|&length| (length, 0)),
-                            None,
-                            None,
-                        )
-                    })
-                    .and_then(|space| match space {
-                        super::postgres_memory::TuplesortSpace::Memory(bytes) => Some(bytes),
-                        _ => None,
-                    })
-                    .ok_or_else(|| {
-                        crate::sql_err!(
-                            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                            "EXPLAIN ANALYZE of a merge join whose sort spills is not supported"
-                        )
-                    })?;
-                sort.sorted(super::instrument::SortSpace {
-                    method: super::instrument::SortMethod::Quicksort,
-                    bytes,
-                });
+                // The planner puts a `Materialize` above an inner sort the join
+                // marks, so both sorts are ordinary tuplesorts.
+                let unsupported = || {
+                    crate::sql_err!(
+                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN ANALYZE of a merge join over a value with no PostgreSQL size here, or whose single-column sort spills, is not supported"
+                    )
+                };
+                if !fits {
+                    return Err(unsupported());
+                }
+                let mut model = super::postgres_memory::TuplesortModel::new(tuples, None);
+                for &length in lengths.borrowed_slice() {
+                    model.push(length, length - 10 + 4);
+                }
+                let space = match model.space(None) {
+                    super::postgres_memory::TuplesortSpace::Memory(bytes) => {
+                        super::instrument::SortSpace {
+                            method: super::instrument::SortMethod::Quicksort,
+                            bytes,
+                        }
+                    }
+                    // A datum sort's tape holds the datums, whose sizes
+                    // this list of tuple lengths lacks.
+                    _ if columns == 1 => return Err(unsupported()),
+                    super::postgres_memory::TuplesortSpace::Disk(bytes) => {
+                        super::instrument::SortSpace {
+                            method: super::instrument::SortMethod::ExternalMerge,
+                            bytes,
+                        }
+                    }
+                };
+                sort.sorted(space);
             }
             let sorted = self
                 .arena

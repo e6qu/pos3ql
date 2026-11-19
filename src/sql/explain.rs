@@ -15000,6 +15000,7 @@ pub(super) fn visit_text_rows<E>(
         }
         if let NodeActual::Ran(NodeCounters {
             stored: Some(bytes),
+            stored_disk,
             ..
         }) = node_actual
         {
@@ -15009,7 +15010,8 @@ pub(super) fn visit_text_rows<E>(
             }
             let _ = write!(
                 line,
-                "Storage: Memory  Maximum Storage: {}kB",
+                "Storage: {}  Maximum Storage: {}kB",
+                if stored_disk { "Disk" } else { "Memory" },
                 bytes.div_ceil(1024)
             );
             emit(line.as_str())?;
@@ -16370,10 +16372,11 @@ fn structured_node(
     }
     if let NodeActual::Ran(NodeCounters {
         stored: Some(bytes),
+        stored_disk,
         ..
     }) = node_actual
     {
-        document.text("Storage", "Memory");
+        document.text("Storage", if stored_disk { "Disk" } else { "Memory" });
         document.number("Maximum Storage", bytes.div_ceil(1024));
     }
     if actual.is_some()

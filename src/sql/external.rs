@@ -332,7 +332,12 @@ impl ExternalSorter {
     fn postgres_space(
         &self,
     ) -> Result<Option<crate::sql::query::postgres_memory::TuplesortSpace>, SqlError> {
-        let Some(model) = self.model.filter(|_| !self.unsized_row) else {
+        // A sort that read no row still holds its initial array.
+        let Some(model) = self
+            .model
+            .or_else(|| self.postgres.map(|tuples| tuples.model(None, self.bound)))
+            .filter(|_| !self.unsized_row)
+        else {
             return Ok(None);
         };
         if model.bounded() && self.heap_charge.is_none() {

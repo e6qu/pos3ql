@@ -438,7 +438,7 @@ pub(super) fn groups_for_mask<'a>(
                 let rows = arena
                     .alloc_slice_with(keys.len(), |at| keys[at].0)
                     .map_err(|_| arena_full())?;
-                instrument::SortSpace::postgres(rows, None, false)?
+                instrument::SortSpace::postgres(rows, None, false, false)?
             } else {
                 instrument::SortSpace {
                     method: instrument::SortMethod::Quicksort,
@@ -1384,8 +1384,15 @@ pub(super) fn grouped_rows<'a>(
                 bound,
                 arena,
                 compare,
+                super::sole_item_computed(statement.items),
+                None,
             )?,
-            _ => instrument::SortSpace::postgres(out_rows, Some(&columns[..count]), false)?,
+            _ => instrument::SortSpace::postgres(
+                out_rows,
+                Some(&columns[..count]),
+                false,
+                super::sole_item_computed(statement.items),
+            )?,
         };
         // The `Sort` over a join's grouping PostgreSQL's planner plans is
         // its tuplesort, over the groups in their grouping's order.

@@ -4745,16 +4745,17 @@ fn modeled_join_over<'a>(
             let buckets = problem_group_aggregates.map_or(0, |aggregates| {
                 super::aggregate::hash_agg_buckets(&aggregates, chosen.groups, output_width)
             });
-            let hash_agg = problem_group_aggregates
-                .filter(|_| chosen.hashed && !distinct)
-                .and_then(|aggregates| {
-                    super::aggregate::hash_agg_sizing(
-                        &aggregates,
-                        chosen.groups,
-                        output_width,
-                        usize::from(group_columns_count),
-                    )
-                });
+            let hash_agg =
+                problem_group_aggregates
+                    .filter(|_| chosen.hashed)
+                    .and_then(|aggregates| {
+                        super::aggregate::hash_agg_sizing(
+                            &aggregates,
+                            chosen.groups,
+                            output_width,
+                            usize::from(group_columns_count),
+                        )
+                    });
             Some(ModeledGroup {
                 hashed: chosen.hashed,
                 aggregated: problem_group_aggregates

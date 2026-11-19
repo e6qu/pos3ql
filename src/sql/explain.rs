@@ -6749,7 +6749,6 @@ fn plan_pulled_select<'a>(
                 arena,
             )?;
             let unique = group.distinct && !group.hashed;
-            let hash_agg = group.sizing.filter(|_| group.hashed);
             group_nodes[0] = PlanNode {
                 name: StackStr::from_str(if group.hashed {
                     "HashAggregate"
@@ -6777,7 +6776,7 @@ fn plan_pulled_select<'a>(
                 // A `Unique` names no keys.
                 keys: if unique { PlanKeys::NONE } else { group_keys },
                 hash_agg: group.hash_agg,
-                analyze_unsupported: (group.hashed && !group.distinct && group.hash_agg.is_none())
+                analyze_unsupported: (group.hashed && group.hash_agg.is_none())
                     .then_some(
                         "EXPLAIN ANALYZE of a hash aggregate whose memory PostgreSQL's figure is not modelled for is not supported",
                     ),

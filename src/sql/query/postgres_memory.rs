@@ -399,7 +399,10 @@ impl TuplesortModel {
     /// `tuplesort_puttuple_common` of a row whose copy is `length` bytes (the
     /// minimal tuple's `t_len`, or a datum's size) and whose tape image is
     /// `written` bytes (`writetup_heap`, `writetup_datum`).
-    pub(crate) fn push(&mut self, length: usize, written: usize) {
+    ///
+    /// Returns the row count of the run this row's arrival made
+    /// `dumptuples` write, if it did.
+    pub(crate) fn push(&mut self, length: usize, written: usize) -> Option<usize> {
         let charge = match self.tuples {
             SortTuples::Datum => 0,
             SortTuples::Bump => maxalign(length),
@@ -411,12 +414,12 @@ impl TuplesortModel {
         if self.tapes.is_some() {
             self.count += 1;
             if self.count >= self.slots || self.available < 0 {
-                self.dump();
+                return Some(self.dump());
             }
-            return;
+            return None;
         }
         if self.heap {
-            return;
+            return None;
         }
         if self.count + 1 >= self.slots && self.grows {
             self.grow();
@@ -427,12 +430,30 @@ impl TuplesortModel {
         {
             self.heap = true;
             self.heap_at = self.count;
-            return;
+            return None;
         }
         if self.count >= self.slots || self.available < 0 {
             self.begin_tapes();
-            self.dump();
+            return Some(self.dump());
         }
+        None
+    }
+
+    /// Whether the rows pushed so far outgrew `work_mem`, so the sort writes
+    /// its runs to tapes (`inittapes` ran).
+    pub(crate) fn spilled(&self) -> bool {
+        self.tapes.is_some()
+    }
+
+    /// The tapes a spilled sort merges (`tuplesort_merge_order`).
+    pub(crate) fn merge_order(&self) -> Option<usize> {
+        self.tapes.as_ref().map(|tapes| tapes.max_tapes)
+    }
+
+    /// `tuplesort_performsort`'s last `dumptuples`: the rows still in memory
+    /// become the final run. Returns its row count.
+    pub(crate) fn finish_run(&mut self) -> Option<usize> {
+        (self.tapes.is_some() && self.count > 0).then(|| self.dump())
     }
 
     /// `inittapes` (and `inittapestate`'s tape buffers).
@@ -451,14 +472,16 @@ impl TuplesortModel {
 
     /// `dumptuples`: the rows in memory become one run, on the tape the runs
     /// take in turn, ended by a zero length word.
-    fn dump(&mut self) {
+    fn dump(&mut self) -> usize {
         let tapes = self.tapes.as_mut().expect("tapes begun");
         tapes.tape_bytes[tapes.runs % tapes.max_tapes] += self.run_bytes + 4;
         tapes.runs += 1;
+        let rows = self.count;
         self.run_bytes = 0;
         self.count = 0;
         self.available += self.tuple_memory;
         self.tuple_memory = 0;
+        rows
     }
 
     /// What `tuplesort_get_stats` reports once the input ended
@@ -734,8 +757,12 @@ const PER_GROUP_STATE: usize = 16;
 pub(crate) const MAX_SIZED_STATES: usize = 8;
 
 /// What sizes a hash aggregate's memory, decided when it is planned.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct HashAggSizing {
+    /// `hash_agg_set_limits`: the memory and groups a table holds before
+    /// the aggregate spills (`hash_agg_check_limits`).
+    pub(crate) memory_limit: f64,
+    pub(crate) groups_limit: u64,
     /// The buckets `build_hash_table` asks for.
     pub(crate) buckets: usize,
     /// The grouping columns the table hashes.
@@ -794,6 +821,9 @@ pub(crate) struct HashAggMemory {
     meta: AllocSetBlocks,
     /// The transition values' context.
     transition: AllocSetBlocks,
+    /// A new group put the table past its limits, so PostgreSQL's aggregate
+    /// spills the groups after it to partitions.
+    spilled: bool,
 }
 
 /// The blocks an aset.c context with the default first block size
@@ -879,6 +909,7 @@ impl HashAggMemory {
             entry_max_block: work_mem_block(),
             meta: AllocSetBlocks::new(DEFAULT_MAX_BLOCK),
             transition: AllocSetBlocks::new(work_mem_block()),
+            spilled: false,
         };
         memory.meta.take(META_HEADERS);
         memory.allocate_buckets(simplehash_size(sizing.buckets));
@@ -935,6 +966,17 @@ impl HashAggMemory {
         for &bytes in &self.sizing.per_group[..self.sizing.per_group_count] {
             self.transition.alloc(usize::from(bytes));
         }
+        // `hash_agg_check_limits` after each new group.
+        if self.peak() as f64 > self.sizing.memory_limit
+            || self.entries as u64 > self.sizing.groups_limit
+        {
+            self.spilled = true;
+        }
+    }
+
+    /// Whether the aggregate spilled (`hash_agg_enter_spill_mode`).
+    pub(crate) fn spilled(&self) -> bool {
+        self.spilled
     }
 
     /// The bytes `hash_mem_peak` holds once the input ended: the meta

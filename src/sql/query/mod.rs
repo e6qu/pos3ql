@@ -1025,6 +1025,7 @@ pub(crate) use subquery::{
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
 
+mod material_store;
 mod window;
 mod window_figures;
 mod window_store;
@@ -17230,7 +17231,23 @@ fn select_into_rows_mode<'a>(
                 emit,
             );
         }
-        if storage.spill_attached() && !instrument::active() {
+        // The first window clause's sort outgrowing `work_mem` streams the
+        // windows through external runs.
+        let Some(mut rows) = project_window_rows(
+            storage,
+            txid,
+            statement,
+            from,
+            &scope,
+            win_nodes.as_slice(),
+            &hooks,
+            correlated,
+            &outer_subs.base,
+            arena,
+            params,
+            outer,
+        )?
+        else {
             external_window_into(
                 storage,
                 txid,
@@ -17252,21 +17269,7 @@ fn select_into_rows_mode<'a>(
                 },
             )?;
             return Ok(());
-        }
-        let mut rows = project_window_rows(
-            storage,
-            txid,
-            statement,
-            from,
-            &scope,
-            win_nodes.as_slice(),
-            &hooks,
-            correlated,
-            &outer_subs.base,
-            arena,
-            params,
-            outer,
-        )?;
+        };
         // DISTINCT dedups on the projected values; ORDER BY and LIMIT/OFFSET
         // apply here too (a derived table keeps its inner LIMIT).
         if statement.distinct {

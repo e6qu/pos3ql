@@ -801,6 +801,10 @@ fn compute_window<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
+    // The rows in the order the window's sort returned them, ties as
+    // PostgreSQL's tuplesort left them; without it the rows are in the
+    // window's order only by their keys.
+    sequence: Option<&[usize]>,
 ) -> Result<&'a [Datum<'a>], SqlError> {
     // Outer references, such as PL/pgSQL variables, read the caller's row.
     // Aggregate arguments type their subqueries through the catalog.
@@ -882,14 +886,15 @@ fn compute_window<'a>(
     for g in 0..n_groups {
         // Collect this partition's row indices, then sort by ORDER BY.
         let mut m = 0usize;
-        for i in 0..n {
+        for k in 0..n {
+            let i = sequence.map_or(k, |sequence| sequence[k]);
             if group_of[i] == g {
                 part[m] = i;
                 m += 1;
             }
         }
         let ord = &spec.order_by;
-        if !ord.is_empty() {
+        if !ord.is_empty() && sequence.is_none() {
             // Insertion sort (stable) by the ORDER BY keys — partitions are
             // small and this avoids a fallible comparator.
             for x in 1..m {
@@ -1636,6 +1641,27 @@ fn cmp_order<'a>(
     compared
 }
 
+/// Sorts row positions as PostgreSQL's tuplesort does in memory
+/// (`pg_qsort`, or a bounded heap past twice `bound` rows), so rows with
+/// equal keys come back in its order. Returns how many rows the sort kept.
+fn pg_sort_positions(
+    arena: &Arena,
+    order: &mut [usize],
+    bound: Option<usize>,
+    compare: &mut dyn FnMut(usize, usize) -> Result<core::cmp::Ordering, SqlError>,
+) -> Result<usize, SqlError> {
+    let positions = arena
+        .alloc_slice_with(order.len(), |at| order[at] as u32)
+        .map_err(|_| arena_full())?;
+    let kept = crate::sql::pg_qsort::pg_tuplesort(positions, bound, &mut |left, right| {
+        compare(left as usize, right as usize)
+    })?;
+    for (slot, &position) in order.iter_mut().zip(positions.iter()).take(kept) {
+        *slot = position as usize;
+    }
+    Ok(kept)
+}
+
 /// One window's row order: its PARTITION BY keys, then its ORDER BY keys, a
 /// repeated key kept once. A partition key the window's `ORDER BY` also names
 /// takes that key's direction (`transformGroupClause` reuses the ordering
@@ -1953,6 +1979,187 @@ pub(crate) fn window_clauses<'a>(
     Ok(WindowClauses { clauses, of_node })
 }
 
+/// The tuple of one window clause's input sort: the window input target and
+/// the results of the clauses below it.
+fn clause_input_tuple<'a>(
+    clauses: &WindowClauses<'a>,
+    target: &[super::window_figures::InputColumn<'a>],
+    clause: usize,
+    arena: &'a Arena,
+) -> Result<&'a [super::window_figures::InputColumn<'a>], SqlError> {
+    use super::window_figures::InputColumn;
+    let below = clauses
+        .of_node
+        .iter()
+        .filter(|&&held| held < clause)
+        .count();
+    let tuple = arena
+        .alloc_slice_with(target.len() + below, |_| InputColumn::Result(0))
+        .map_err(|_| arena_full())?;
+    tuple[..target.len()].copy_from_slice(target);
+    let mut at = target.len();
+    for lower in 0..clause {
+        for (node, _) in clauses
+            .of_node
+            .iter()
+            .enumerate()
+            .filter(|&(_, &held)| held == lower)
+        {
+            tuple[at] = InputColumn::Result(node);
+            at += 1;
+        }
+    }
+    Ok(tuple)
+}
+
+/// The accounting of the first window clause's input sort and the tuple it
+/// holds, or `None` when that clause has no keys to sort by.
+fn first_clause_sort<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    win_nodes: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<
+    Option<(
+        &'a [super::window_figures::InputColumn<'a>],
+        super::window_figures::InputSort,
+    )>,
+    SqlError,
+> {
+    use super::window_figures as figures;
+    let chain = window_sort_chain(statement, win_nodes, arena)?;
+    let Some(&first) = chain.first() else {
+        return Ok(None);
+    };
+    if window_sort_keys(window_spec(win_nodes[first])?, arena)?.is_empty() {
+        return Ok(None);
+    }
+    let Ok(target) = figures::input_target(scope, statement, win_nodes, arena)? else {
+        return Ok(None);
+    };
+    let clauses = window_clauses(statement, win_nodes, arena)?;
+    let tuple = clause_input_tuple(&clauses, target, 0, arena)?;
+    Ok(Some((tuple, figures::InputSort::new(tuple))))
+}
+
+/// Orders `order`, the rows in the order they reach a window clause's sort,
+/// by `keys` as PostgreSQL's tuplesort does. Each row's tuple (the window
+/// input target and the results of the clauses below) is charged as it
+/// arrives; a sort that outgrows `work_mem` forms its runs where
+/// `dumptuples` does and merges them as `mergeruns` does, which is where
+/// rows with equal keys come out in PostgreSQL's order. A tuple with a
+/// value of no PostgreSQL size here, or a select list whose tuple is not
+/// modelled, leaves the sort unaccounted: quicksort.
+#[allow(clippy::too_many_arguments)]
+fn sort_clause_input<'a>(
+    order: &mut [usize],
+    keys: &[OrderBy<'a>],
+    tuple: Option<&[super::window_figures::InputColumn<'a>]>,
+    scope: &QueryScope<'a>,
+    rows: &[&'a [Datum<'a>]],
+    offs: &[usize],
+    win_vals: &[&'a [Datum<'a>]],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    use super::window_figures as figures;
+    let start = arena.mark();
+    let runs = arena
+        .alloc_slice_with(order.len(), |_| 0u32)
+        .map_err(|_| arena_full())?;
+    let mut run_count = 0usize;
+    let tuple = tuple.unwrap_or(&[]);
+    let mut sort = figures::InputSort::new(tuple);
+    // A select list whose tuple is not modelled leaves the sort unaccounted.
+    let mut sized = !tuple.is_empty();
+    for &row in order.iter().take_while(|_| sized) {
+        let mark = arena.mark();
+        let size = figures::row_size(tuple, arena, |column| match *column {
+            figures::InputColumn::Column(table, index) => Ok(rows[row][offs[table] + index]),
+            figures::InputColumn::Expression(expression) => {
+                let lookup = window_row(scope, rows[row], offs);
+                eval_full(expression, arena, params, &lookup, hooks)
+            }
+            figures::InputColumn::Result(node) => match win_vals[node].get(row) {
+                Some(&value) => Ok(value),
+                None => Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a window clause sorts before the clause below it ran"
+                )),
+            },
+        });
+        // SAFETY: only the size escapes the values allocated since `mark`.
+        unsafe { arena.rewind_to(mark) };
+        let Some(size) = size? else {
+            sized = false;
+            break;
+        };
+        if let Some(rows) = sort.push_run(&size) {
+            runs[run_count] = rows as u32;
+            run_count += 1;
+        }
+    }
+    if sized && let Some(rows) = sort.finish_run() {
+        runs[run_count] = rows as u32;
+        run_count += 1;
+    }
+    let positions = arena
+        .alloc_slice_with(order.len(), |at| order[at] as u32)
+        .map_err(|_| arena_full())?;
+    let mut compare = |left: u32, right: u32| {
+        cmp_order(
+            keys,
+            scope,
+            rows,
+            offs,
+            left as usize,
+            right as usize,
+            arena,
+            params,
+            hooks,
+            storage,
+            txid,
+        )
+    };
+    match sort.merge_order().filter(|_| sized) {
+        Some(merge_order) => {
+            let scratch = crate::sql::pg_qsort::RunScratch {
+                moved: arena
+                    .alloc_slice_with(order.len(), |_| 0u32)
+                    .map_err(|_| arena_full())?,
+                bounds: arena
+                    .alloc_slice_with(2 * (run_count + 1), |_| 0u32)
+                    .map_err(|_| arena_full())?,
+                heap: arena
+                    .alloc_slice_with(merge_order, |_| 0u32)
+                    .map_err(|_| arena_full())?,
+                cursor: arena
+                    .alloc_slice_with(merge_order, |_| 0u32)
+                    .map_err(|_| arena_full())?,
+            };
+            crate::sql::pg_qsort::pg_tuplesort_runs(
+                positions,
+                &runs[..run_count],
+                merge_order,
+                scratch,
+                &mut compare,
+            )?;
+        }
+        None => {
+            crate::sql::pg_qsort::pg_tuplesort(positions, None, &mut compare)?;
+        }
+    }
+    for (slot, &position) in order.iter_mut().zip(positions.iter()) {
+        *slot = position as usize;
+    }
+    // SAFETY: nothing allocated since `start` outlives the sort.
+    unsafe { arena.rewind_to(start) };
+    Ok(())
+}
+
 /// PostgreSQL's figures for each window clause of the query, bottom first:
 /// the sort of its input (which reads the rows in the order the clause below
 /// returns them) and its partition buffer (which reads them sorted). Each
@@ -1967,6 +2174,7 @@ fn window_figures<'a>(
     win_nodes: &[&'a Expr<'a>],
     rows: &[&'a [Datum<'a>]],
     win_vals: &[&'a [Datum<'a>]],
+    sequences: &[&[usize]],
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
@@ -1974,7 +2182,7 @@ fn window_figures<'a>(
     use super::window_figures as figures;
     let count = rows.len();
     let clauses = window_clauses(statement, win_nodes, arena)?;
-    let target = figures::input_target(scope, statement, win_nodes, arena)?;
+    let target = figures::explain_target(scope, statement, win_nodes, arena)?;
     let results = arena
         .alloc_slice_with(clauses.clauses.len(), |_| {
             (
@@ -2001,29 +2209,7 @@ fn window_figures<'a>(
         .alloc_slice_with(count, |_| 0i64)
         .map_err(|_| arena_full())?;
     for (clause, &(spec, _)) in clauses.clauses.iter().enumerate() {
-        // The tuple of the clause's input: the window input target and the
-        // functions of the clauses below.
-        let below = clauses
-            .of_node
-            .iter()
-            .filter(|&&held| held < clause)
-            .count();
-        let tuple = arena
-            .alloc_slice_with(target.len() + below, |_| figures::InputColumn::Result(0))
-            .map_err(|_| arena_full())?;
-        tuple[..target.len()].copy_from_slice(target);
-        let mut at = target.len();
-        for lower in 0..clause {
-            for (node, _) in clauses
-                .of_node
-                .iter()
-                .enumerate()
-                .filter(|&(_, &held)| held == lower)
-            {
-                tuple[at] = figures::InputColumn::Result(node);
-                at += 1;
-            }
-        }
+        let tuple = clause_input_tuple(&clauses, target, clause, arena)?;
         let mut members = ArenaList::new(arena);
         for (node, _) in clauses
             .of_node
@@ -2047,23 +2233,17 @@ fn window_figures<'a>(
             });
             // SAFETY: only the sizes escape the values allocated since `mark`.
             unsafe { arena.rewind_to(mark) };
-            let size = size?;
+            let size = size?.ok_or_else(figures::unsized_row)?;
             sort.push(&size);
             lengths[row] = size.length;
         }
-        let keys = window_sort_keys(spec, arena)?;
-        if !keys.is_empty() {
-            crate::mem::arena::try_stable_sort_via(
-                arena,
-                order,
-                |&a, &b| {
-                    cmp_order(
-                        keys, scope, rows, offs, a, b, arena, params, hooks, storage, txid,
-                    )
-                },
-                |_| arena_full(),
-            )?;
-        }
+        // The order the clause's sort returned when the query ran.
+        let sorted = clauses
+            .of_node
+            .iter()
+            .position(|&held| held == clause)
+            .expect("a clause has a window function");
+        order.copy_from_slice(sequences[sorted]);
         let order_keys = arena
             .alloc_slice_with(spec.order_by.len(), |at| spec.order_by[at].expression)
             .map_err(|_| arena_full())?;
@@ -2140,7 +2320,8 @@ pub(crate) fn project_window_rows<'a>(
     // Enclosing query's row, when this window query is a correlated subquery's
     // body; its columns resolve after this query's own.
     outer: Option<&dyn ColumnLookup<'a>>,
-) -> Result<WindowRows<'a>, SqlError> {
+) -> Result<Option<WindowRows<'a>>, SqlError> {
+    let start = arena.mark();
     let (scan_where, where_correlated) = window_scan_where(statement, correlated, arena)?;
     let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
     // Flat-row column offsets per table.
@@ -2155,7 +2336,9 @@ pub(crate) fn project_window_rows<'a>(
 
     // Pass 1: count source rows. Sizing the rows is not one of the plan's
     // scans; the materializing pass is.
+    use super::window_figures as figures;
     let mut count = 0usize;
+    let measured = instrument::active();
     let sizing = instrument::suspend();
     // A join PostgreSQL's join search plans runs that plan, so its rows
     // reach the windows in its order and `EXPLAIN ANALYZE` counts its nodes;
@@ -2194,6 +2377,16 @@ pub(crate) fn project_window_rows<'a>(
                 )
             }
         };
+    // With a spill store attached, the first window clause's sort is sized
+    // as the rows arrive, as `tuplesort.c` charges them: once its tuples
+    // outgrow `work_mem` PostgreSQL moves to tapes, and the windows stream
+    // through external runs instead of the arena.
+    let mut first_sort = if storage.spill_attached() && !measured {
+        first_clause_sort(statement, scope, win_nodes, arena)?
+    } else {
+        None
+    };
+    let mut spills = false;
     scan(&mut |row| {
         if !row_passes_correlated_where(
             where_correlated,
@@ -2207,9 +2400,47 @@ pub(crate) fn project_window_rows<'a>(
             return Ok(true);
         }
         count += 1;
+        if let Some((tuple, sort)) = first_sort.as_mut() {
+            let mark = arena.mark();
+            let size = figures::row_size(tuple, arena, |column| match *column {
+                figures::InputColumn::Column(table, index) => {
+                    let values = row.table_values(table).expect("bound");
+                    Ok(if values.is_empty() {
+                        Datum::Null
+                    } else {
+                        values[index]
+                    })
+                }
+                figures::InputColumn::Expression(expression) => {
+                    eval_full(expression, arena, params, row, hooks)
+                }
+                figures::InputColumn::Result(_) => Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "the first window clause's sort holds no window result"
+                )),
+            });
+            // SAFETY: only the size escapes the values allocated since `mark`.
+            unsafe { arena.rewind_to(mark) };
+            match size? {
+                Some(size) => {
+                    sort.push(&size);
+                    if sort.spilled() {
+                        spills = true;
+                        return Ok(false);
+                    }
+                }
+                // No PostgreSQL size: the sort is not accounted.
+                None => first_sort = None,
+            }
+        }
         Ok(true)
     })?;
     drop(sizing);
+    if spills {
+        // SAFETY: nothing allocated since `start` outlives this return.
+        unsafe { arena.rewind_to(start) };
+        return Ok(None);
+    }
     // Pass 2: materialize each row's columns flat in the arena.
     let empty: &[Datum] = &[];
     let rows: &mut [&[Datum]] = arena
@@ -2253,38 +2484,69 @@ pub(crate) fn project_window_rows<'a>(
     let win_vals: &mut [&[Datum]] = arena
         .alloc_slice_with(win_nodes.len(), |_| empty)
         .map_err(|_| arena_full())?;
-    for (wi, &node) in win_nodes.iter().enumerate() {
-        win_vals[wi] = compute_window(
-            storage, txid, node, rows, scope, offs, arena, params, hooks, outer,
+    // Rows leave the windows in their evaluation order (see
+    // `window_sort_chain`); each window computes over the rows as its sort
+    // returned them, and a query ORDER BY sorts them from there as
+    // tuplesort does.
+    let row_order = arena
+        .alloc_slice_with(count, |index| index)
+        .map_err(|_| arena_full())?;
+    let sequences: &mut [&[usize]] = arena
+        .alloc_slice_with(win_nodes.len(), |_| &[][..])
+        .map_err(|_| arena_full())?;
+    let clauses = window_clauses(statement, win_nodes, arena)?;
+    let target = figures::input_target(scope, statement, win_nodes, arena)?.ok();
+    let clause_orders: &mut [Option<&[usize]>] = arena
+        .alloc_slice_with(clauses.clauses.len(), |_| None)
+        .map_err(|_| arena_full())?;
+    // The keys the rows last left a sort in: a clause ordered by a prefix of
+    // them needs no sort (`pathkeys_contained_in`).
+    let mut ordered_by: &[OrderBy] = &[];
+    for &window in window_sort_chain(statement, win_nodes, arena)? {
+        let clause = clauses.of_node[window];
+        sequences[window] = match clause_orders[clause] {
+            Some(order) => order,
+            None => {
+                let keys = window_sort_keys(window_spec(win_nodes[window])?, arena)?;
+                if !keys.is_empty() && !ordered_by.starts_with(keys) {
+                    let tuple = match target {
+                        Some(target) => Some(clause_input_tuple(&clauses, target, clause, arena)?),
+                        None => None,
+                    };
+                    sort_clause_input(
+                        row_order, keys, tuple, scope, rows, offs, win_vals, arena, params, hooks,
+                        storage, txid,
+                    )?;
+                    ordered_by = keys;
+                }
+                let order = &*arena
+                    .alloc_slice_copy(row_order)
+                    .map_err(|_| arena_full())?;
+                clause_orders[clause] = Some(order);
+                order
+            }
+        };
+        win_vals[window] = compute_window(
+            storage,
+            txid,
+            win_nodes[window],
+            rows,
+            scope,
+            offs,
+            arena,
+            params,
+            hooks,
+            outer,
+            Some(sequences[window]),
         )?;
     }
     let win_ptrs: &[*const Expr] = arena
         .alloc_slice_with(win_nodes.len(), |i| win_nodes[i] as *const Expr)
         .map_err(|_| arena_full())?;
-    // Rows leave the windows in their evaluation order (see
-    // `window_sort_chain`); a query ORDER BY sorts them stably from there.
-    let row_order = arena
-        .alloc_slice_with(count, |index| index)
-        .map_err(|_| arena_full())?;
-    for &window in window_sort_chain(statement, win_nodes, arena)? {
-        let keys = window_sort_keys(window_spec(win_nodes[window])?, arena)?;
-        if keys.is_empty() {
-            continue;
-        }
-        crate::mem::arena::try_stable_sort_via(
-            arena,
-            row_order,
-            |&a, &b| {
-                cmp_order(
-                    keys, scope, rows, offs, a, b, arena, params, hooks, storage, txid,
-                )
-            },
-            |_| arena_full(),
-        )?;
-    }
     if instrument::active() {
         let measured = window_figures(
-            storage, txid, statement, scope, offs, win_nodes, rows, win_vals, arena, params, hooks,
+            storage, txid, statement, scope, offs, win_nodes, rows, win_vals, sequences, arena,
+            params, hooks,
         )?;
         count_window_clauses(statement, win_nodes, count as u64, measured, arena)?;
     }
@@ -2385,13 +2647,13 @@ pub(crate) fn project_window_rows<'a>(
     let tuple_columns = arena
         .alloc_slice_copy(&tuple_columns[..tuple_count])
         .map_err(|_| arena_full())?;
-    Ok(WindowRows {
+    Ok(Some(WindowRows {
         rows: proj_rows,
         sort_keys,
         collations,
         tuple_columns,
         sole_computed: super::sole_item_computed(statement.items),
-    })
+    }))
 }
 
 /// Window-projected output rows with each row's ORDER BY key values and the
@@ -2578,16 +2840,7 @@ impl<'a> WindowRows<'a> {
             // rows the limit returns, as PostgreSQL's does.
             let original_bound = bound;
             let bound = bound.filter(|&bound| order.len() > bound * 2);
-            match bound {
-                Some(bound) => {
-                    crate::mem::arena::try_stable_top_n_via(arena, order, bound, compare, |_| {
-                        arena_full()
-                    })?
-                }
-                None => {
-                    crate::mem::arena::try_stable_sort_via(arena, order, compare, |_| arena_full())?
-                }
-            }
+            pg_sort_positions(arena, order, bound, &mut |a, b| compare(&a, &b))?;
             if sort.measured() {
                 sort.sorted(
                     self.sort_space(0..self.rows.len(), original_bound, false, &compare, arena)?
@@ -3064,7 +3317,7 @@ pub(crate) fn external_window_into<'a>(
                                         rank_of: &[i64]|
              -> Result<(), SqlError> {
                 let out = compute_window(
-                    storage, txid, node, rows, scope, offs, arena, params, hooks, outer,
+                    storage, txid, node, rows, scope, offs, arena, params, hooks, outer, None,
                 )?;
                 for (r, &pos) in pos_of.iter().enumerate() {
                     storage
@@ -3512,66 +3765,66 @@ pub(crate) fn window_select<'a>(
             }
         }
     }
-    // `EXPLAIN ANALYZE` of a window replays PostgreSQL's sort and partition
-    // buffer over the materialized rows.
-    if storage.spill_attached() && !instrument::active() {
-        let mut wire_full = false;
-        let emitted = match external_window_into(
-            storage,
-            txid,
-            statement,
-            from,
-            scope,
-            win_nodes,
-            hooks,
-            correlated,
-            base,
-            arena,
-            params,
-            None,
-            limit,
-            offset,
-            &mut |values| match super::emit_data_row(storage, txid, arena, responder, values) {
-                Ok(Ok(())) => Ok(true),
-                Ok(Err(error)) => Err(error),
-                Err(_) => {
-                    wire_full = true;
-                    Ok(false)
-                }
-            },
-        ) {
-            Ok(emitted) => emitted,
-            Err(error) => return sql_fail(error),
-        };
-        if wire_full {
-            return Err(crate::pg::wire::WireFull);
-        }
-        let tag = stack_format!(48, "SELECT {}", emitted);
-        responder.command_complete(tag.as_str())?;
-        return sql_ok();
-    }
     let stages = super::materialize::materialized_stages(limit != u64::MAX);
     let _stages = stages.start();
-    let rows = match project_window_rows(
+    let projected = project_window_rows(
         // The top-level query has no enclosing row to resolve against.
         storage, txid, statement, from, scope, win_nodes, hooks, correlated, base, arena, params,
         None,
-    )
-    // A sort or distinct above the window reads every row it computes.
-    .inspect(|rows| {
-        if stages.sort.measured() || stages.unique.measured() {
-            stages.window.rows(rows.rows.len() as u64);
+    );
+    let rows = match projected {
+        // The first window clause's sort outgrew `work_mem`: the windows
+        // stream through external runs.
+        Ok(None) => {
+            let mut wire_full = false;
+            let emitted = match external_window_into(
+                storage,
+                txid,
+                statement,
+                from,
+                scope,
+                win_nodes,
+                hooks,
+                correlated,
+                base,
+                arena,
+                params,
+                None,
+                limit,
+                offset,
+                &mut |values| match super::emit_data_row(storage, txid, arena, responder, values) {
+                    Ok(Ok(())) => Ok(true),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => {
+                        wire_full = true;
+                        Ok(false)
+                    }
+                },
+            ) {
+                Ok(emitted) => emitted,
+                Err(error) => return sql_fail(error),
+            };
+            if wire_full {
+                return Err(crate::pg::wire::WireFull);
+            }
+            let tag = stack_format!(48, "SELECT {}", emitted);
+            responder.command_complete(tag.as_str())?;
+            return sql_ok();
         }
-    })
-    .and_then(|rows| {
-        if statement.distinct {
-            rows.distinct(storage, txid, arena)
-        } else {
-            Ok(rows)
-        }
-    }) {
-        Ok(rows) => rows,
+        Ok(Some(rows)) => rows,
         Err(e) => return sql_fail(e),
+    };
+    // A sort or distinct above the window reads every row it computes.
+    if stages.sort.measured() || stages.unique.measured() {
+        stages.window.rows(rows.rows.len() as u64);
+    }
+    let rows = if statement.distinct {
+        match rows.distinct(storage, txid, arena) {
+            Ok(rows) => rows,
+            Err(e) => return sql_fail(e),
+        }
+    } else {
+        rows
     };
     let proj_rows = rows.rows;
     let order = match rows.ordered(

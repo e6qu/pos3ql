@@ -6898,7 +6898,7 @@ fn plan_pulled_select<'a>(
                 // A `Unique` names no keys.
                 keys: if unique { PlanKeys::NONE } else { group_keys },
                 hash_agg: group.hash_agg,
-                analyze_unsupported: (group.hashed && !group.distinct && group.hash_agg.is_none())
+                analyze_unsupported: (group.hashed && group.hash_agg.is_none())
                     .then_some(
                         "EXPLAIN ANALYZE of a hash aggregate whose memory PostgreSQL's figure is not modelled for is not supported",
                     ),
@@ -7695,32 +7695,10 @@ fn plan_pulled_select<'a>(
             estimated_rows = path.rows as u64;
             width = grouped.width;
         }
-        // A hash table's memory, sized from pos3ql's own estimates outside
-        // the cost model.
+        // A hash table's memory, sized from the planner's group estimate;
+        // a grouping outside the cost model has none and fails under ANALYZE.
         let hash_agg = if aggregate_name == "HashAggregate" && sets_keys.is_none() {
-            match hash_agg_sizing {
-                Some(sizing) => sizing,
-                None => {
-                    let expressions = arena
-                        .alloc_slice_with(statement.items.len() + 1, |at| {
-                            match statement.items.get(at) {
-                                Some(SelectItem::Expr { expression, .. }) => *expression,
-                                _ => statement.having.unwrap_or(&Expr::Null),
-                            }
-                        })
-                        .map_err(|_| arena_full())?;
-                    query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
-                        .filter(|aggregates| !aggregates.ordered)
-                        .and_then(|aggregates| {
-                            query::index_paths::hash_agg_sizing(
-                                &aggregates,
-                                estimated_rows as f64,
-                                f64::from(width),
-                                statement.group_by.len(),
-                            )
-                        })
-                }
-            }
+            hash_agg_sizing.flatten()
         } else {
             None
         };
@@ -7728,7 +7706,7 @@ fn plan_pulled_select<'a>(
             && sets_keys.is_none()
             && hash_agg.is_none())
         .then_some(
-            "EXPLAIN ANALYZE of a hash aggregate whose transition states or grouping columns PostgreSQL's memory figure is not modelled for is not supported",
+            "EXPLAIN ANALYZE of a hash aggregate whose transition states, grouping keys or group estimate PostgreSQL's memory figure is not modelled for is not supported",
         );
         add_stage(
             &mut stages,
@@ -8055,6 +8033,38 @@ fn plan_pulled_select<'a>(
             },
         )?;
     } else if statement.distinct || !statement.distinct_on.is_empty() {
+        // The groups `estimate_num_groups` counts for the distinct columns
+        // of one table, as its grouping over them would plan.
+        let distinct_groups = if statement.distinct
+            && statement.distinct_on.is_empty()
+            && statement.group_by.is_empty()
+            && statement.having.is_none()
+            && let (Some(scope), Some(from)) = (scope.as_ref(), statement.from.as_ref())
+            && statement
+                .items
+                .iter()
+                .all(|item| matches!(item, SelectItem::Expr { .. }))
+        {
+            let keys = arena
+                .alloc_slice_with(statement.items.len(), |at| match statement.items[at] {
+                    SelectItem::Expr { expression, .. } => expression,
+                    _ => &Expr::Null,
+                })
+                .map_err(|_| arena_full())?;
+            let derived = &*arena
+                .alloc(Select {
+                    group_by: keys,
+                    distinct: false,
+                    ..*statement
+                })
+                .map_err(|_| arena_full())?;
+            grouped_scan_path(storage, txid, derived, scope, from, columns, width, arena)?
+                .and_then(|grouped| grouped.path.grouped)
+                .map(|grouped| grouped.rows)
+        } else {
+            None
+        };
+        let groups_estimate = distinct_groups.map(|rows| rows as u64);
         estimated_rows = estimated_rows.div_ceil(2);
         total_cost += estimated_rows as f64 * 0.01;
         add_stage(
@@ -8097,7 +8107,7 @@ fn plan_pulled_select<'a>(
                 cache_blocks,
                 ..PlanNode::EMPTY
             }
-            .with_distinct_hash(estimated_rows, width),
+            .with_distinct_hash(groups_estimate.unwrap_or(estimated_rows), width),
         )?;
     }
     // A locking clause locks each row below the limit, as PostgreSQL's

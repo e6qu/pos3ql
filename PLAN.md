@@ -1563,9 +1563,36 @@ the context of by-reference transition states (array initial values and the
 `Int128AggState` of integer averages and sums are modelled). `EXPLAIN
 ANALYZE` of a hash aggregate with another by-reference state (`numeric`
 sums, text `min`/`max`, collecting aggregates) or more than seven grouping
-columns fails with `0A000`; a table that would spill (`Batches` above 1) is
-not modelled, and outside the cost model the bucket array is sized from
-pos3ql's group estimate. A `CTE Scan` prints its query's tuplestore
+columns fails with `0A000`, as does a table that spills
+(`hash_agg_check_limits`'s memory or group limit, from `hash_agg_set_limits`;
+its `Batches`, `Disk Usage` and partitions need the tapes' block allocation,
+`hash_bytes_uint32` hashes and the hyperloglog cardinalities of
+`nodeAgg.c`'s spill batches) and a hash aggregate whose group estimate lies
+outside the cost model (an expression key, a join pos3ql does not plan).
+Aggregates over a join and a `DISTINCT` over one table size their tables
+from the planner's group estimate (`differential_exact/908`). A `Materialize`
+above a merge join's inner sort replays its mark, restore and
+`tuplestore_trim` (`differential_exact/910`); rows with equal window keys
+reach a window's sort and number in `pg_qsort` order
+(`differential_exact/909`). Each window clause's sort charges the tuples it
+really holds, the window input target and the results of the clauses below,
+as `tuplesort.c` does (`TuplesortModel`): a sort that outgrows `work_mem` forms
+its runs where `dumptuples` does, sorts each with `pg_qsort` and merges them
+through `pg_tuplesort_runs` (`mergeruns`' tape numbering and binary heap), so
+rows with equal keys come out in PostgreSQL's order and an upper clause needs
+no size prediction (`differential_exact/911`, `912`). With a spill store
+attached, the first clause's sort is charged while the source is counted, and
+when it outgrows `work_mem` the windows stream through external runs instead
+of the arena; arena exhaustion is the named error, never a switch of path.
+Not yet done: the external window path (each clause sorted from a fresh scan
+of the source, tied rows restitched by rank) does not return tied rows in
+`tuplesort.c`'s run and merge order, and its sorts carry no lower clause's
+results; a clause whose tuples hold a value of no PostgreSQL size here
+(`jsonb`, arrays, records) is not accounted and sorts as one quicksort; and
+`ORDER BY` and the other sorts still sort in one quicksort when PostgreSQL's
+would spill, where tied rows come out in a different order. A bounded sort
+(`LIMIT`) that outgrows its heap in `EXPLAIN ANALYZE` still fails with `0A000`.
+A `CTE Scan` prints its query's tuplestore
 (`tuplestore_get_stats`: 2048 row pointers, doubled when a row reaches the
 last free slot, and each row's generation chunk), also when it never ran;
 a `Recursive Union` the sum of its working and intermediate tables, each

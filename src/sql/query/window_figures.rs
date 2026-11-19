@@ -52,6 +52,7 @@ fn pull_columns<'a>(
     scope: &QueryScope<'_>,
     expression: &'a Expr<'a>,
     out: &mut ArenaList<'a, (usize, usize)>,
+    unmodeled: &mut Option<&'static str>,
 ) -> Result<(), SqlError> {
     match expression {
         Expr::Column { .. } => {
@@ -62,7 +63,10 @@ fn pull_columns<'a>(
             }
             Ok(())
         }
-        Expr::WholeRow(_) => Err(unsupported("a window over a whole-row reference")),
+        Expr::WholeRow(_) => {
+            *unmodeled = Some("a window over a whole-row reference");
+            Ok(())
+        }
         Expr::Call {
             args,
             order_by,
@@ -71,19 +75,19 @@ fn pull_columns<'a>(
             ..
         } => {
             for argument in *args {
-                pull_columns(scope, argument, out)?;
+                pull_columns(scope, argument, out, unmodeled)?;
             }
             for order in *order_by {
-                pull_columns(scope, order.expression, out)?;
+                pull_columns(scope, order.expression, out, unmodeled)?;
             }
             if let Some(filter) = filter {
-                pull_columns(scope, filter, out)?;
+                pull_columns(scope, filter, out, unmodeled)?;
             }
             Ok(())
         }
-        _ => {
-            super::subquery::walk_children(expression, &mut |child| pull_columns(scope, child, out))
-        }
+        _ => super::subquery::walk_children(expression, &mut |child| {
+            pull_columns(scope, child, out, unmodeled)
+        }),
     }
 }
 
@@ -94,18 +98,30 @@ struct Target<'a> {
     window: bool,
 }
 
-/// The tuple of a window's input (`make_window_input_target`): the entries
-/// of the processed target list that are window keys, then the columns the
-/// others read, each once.
-pub(crate) fn input_target<'a>(
+/// [`input_target`] for `EXPLAIN ANALYZE`, which fails where the tuple is
+/// not modelled.
+pub(crate) fn explain_target<'a>(
     scope: &QueryScope<'a>,
     statement: &'a Select<'a>,
     win_nodes: &[&'a Expr<'a>],
     arena: &'a Arena,
 ) -> Result<&'a [InputColumn<'a>], SqlError> {
+    input_target(scope, statement, win_nodes, arena)?.map_err(unsupported)
+}
+
+/// The tuple of a window's input (`make_window_input_target`): the entries
+/// of the processed target list that are window keys, then the columns the
+/// others read, each once; or why a select list's tuple is not modelled.
+pub(crate) fn input_target<'a>(
+    scope: &QueryScope<'a>,
+    statement: &'a Select<'a>,
+    win_nodes: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<Result<&'a [InputColumn<'a>], &'static str>, SqlError> {
     if !statement.locking.is_empty() {
-        return Err(unsupported("a window under row locks"));
+        return Ok(Err("a window under row locks"));
     }
+    let mut unmodeled = None;
     let mut targets = ArenaList::new(arena);
     for item in statement.items {
         match item {
@@ -119,7 +135,7 @@ pub(crate) fn input_target<'a>(
             SelectItem::Wildcard(_) => {
                 for index in 0..scope.star_columns() {
                     let ResolvedColumn::Table(table, column) = scope.star_entry(index) else {
-                        return Err(unsupported("a window over a derived column list"));
+                        return Ok(Err("a window over a derived column list"));
                     };
                     targets
                         .push(Target {
@@ -130,7 +146,7 @@ pub(crate) fn input_target<'a>(
                         .map_err(|_| arena_full())?;
                 }
             }
-            _ => return Err(unsupported("a window under this select list")),
+            _ => return Ok(Err("a window under this select list")),
         }
     }
     let item_count = targets.len();
@@ -223,7 +239,9 @@ pub(crate) fn input_target<'a>(
                     columns.push(column).map_err(|_| arena_full())?;
                 }
             }
-            (None, Some(expression)) => pull_columns(scope, expression, &mut columns)?,
+            (None, Some(expression)) => {
+                pull_columns(scope, expression, &mut columns, &mut unmodeled)?
+            }
             (None, None) => unreachable!("a target is a column or an expression"),
         }
     }
@@ -238,7 +256,10 @@ pub(crate) fn input_target<'a>(
                 .map_err(|_| arena_full())?;
         }
     }
-    Ok(input.as_slice())
+    Ok(match unmodeled {
+        Some(reason) => Err(reason),
+        None => Ok(input.as_slice()),
+    })
 }
 
 /// The window PostgreSQL runs for the query's one window clause, or why its
@@ -320,29 +341,36 @@ pub(crate) struct RowSize {
 }
 
 /// Sizes the input row `value` yields the columns of, as the sort and the
-/// window's buffer hold it.
+/// window's buffer hold it; `None` when a value has no PostgreSQL size here.
 pub(crate) fn row_size<'a>(
     target: &[InputColumn<'a>],
     arena: &'a Arena,
     mut value: impl FnMut(&InputColumn<'a>) -> Result<Datum<'a>, SqlError>,
-) -> Result<RowSize, SqlError> {
+) -> Result<Option<RowSize>, SqlError> {
     let values = arena
         .alloc_slice_with(target.len(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
     for (slot, column) in values.iter_mut().zip(target) {
         *slot = value(column)?;
     }
-    let length = minimal_tuple_len_with_tids(values.iter().copied(), 0)
-        .ok_or_else(|| unsupported("a window over a value with no PostgreSQL size here"))?;
+    let Some(length) = minimal_tuple_len_with_tids(values.iter().copied(), 0) else {
+        return Ok(None);
+    };
     let written = if let [only] = values {
         4 + datum_written_size(only, matches!(target[0], InputColumn::Expression(_)))
     } else {
         length - 10 + 4
     };
-    Ok(RowSize { length, written })
+    Ok(Some(RowSize { length, written }))
+}
+
+/// The error of `EXPLAIN ANALYZE` over a row with no PostgreSQL size here.
+pub(crate) fn unsized_row() -> SqlError {
+    unsupported("a window over a value with no PostgreSQL size here")
 }
 
 /// A sort's accounting of a window's input, fed in the scan's order.
+#[derive(Clone, Copy)]
 pub(crate) struct InputSort {
     model: TuplesortModel,
 }
@@ -363,6 +391,26 @@ impl InputSort {
 
     pub(crate) fn push(&mut self, size: &RowSize) {
         self.model.push(size.length, size.written);
+    }
+
+    /// Feeds one row; the row count of the run it made `dumptuples` write.
+    pub(crate) fn push_run(&mut self, size: &RowSize) -> Option<usize> {
+        self.model.push(size.length, size.written)
+    }
+
+    /// The last run the sort writes when its input ends.
+    pub(crate) fn finish_run(&mut self) -> Option<usize> {
+        self.model.finish_run()
+    }
+
+    /// Whether the rows outgrew `work_mem`.
+    pub(crate) fn spilled(&self) -> bool {
+        self.model.spilled()
+    }
+
+    /// The tapes the spilled sort merges.
+    pub(crate) fn merge_order(&self) -> Option<usize> {
+        self.model.merge_order()
     }
 
     /// The method and space the sort reports.

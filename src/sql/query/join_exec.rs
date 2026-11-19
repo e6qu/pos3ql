@@ -1733,6 +1733,8 @@ impl<'r, 'a> Runner<'r, 'a> {
         let mut inner_at: Option<usize> = None;
         let mut inner_next = 0usize;
         let mut marked: Option<usize> = None;
+        // The tuplestore of a `Materialize` over the inner input.
+        let mut material_store: Option<super::material_store::MaterialStore<'_>> = None;
         let mut matched_outer = false;
         let mut matched_inner = false;
         let mut state = MergeState::InitializeOuter;
@@ -1769,6 +1771,19 @@ impl<'r, 'a> Runner<'r, 'a> {
                     inner_reached = inner_reached.max(inner_next);
                 } else {
                     inner_at = None;
+                }
+                if materialize_inner && super::instrument::active() {
+                    if material_store.is_none() {
+                        let lengths = self
+                            .arena
+                            .alloc_slice_with(rows.len(), |_| 0usize)
+                            .map_err(|_| arena_full())?;
+                        for (length, row) in lengths.iter_mut().zip(rows) {
+                            *length = self.tuple_len(row, inner)?;
+                        }
+                        material_store = Some(super::material_store::MaterialStore::new(lengths));
+                    }
+                    material_store.as_mut().expect("opened").next()?;
                 }
             }};
         }
@@ -1971,6 +1986,9 @@ impl<'r, 'a> Runner<'r, 'a> {
                                 // `ExecRestrPos`: the next fetch follows the mark.
                                 inner_at = Some(mark);
                                 inner_next = mark + 1;
+                                if let Some(store) = material_store.as_mut() {
+                                    store.restore();
+                                }
                             }
                             state = MergeState::JoinTuples;
                         }
@@ -2001,6 +2019,9 @@ impl<'r, 'a> Runner<'r, 'a> {
                     )? {
                         Ordering::Equal => {
                             marked = inner_at;
+                            if !skip_mark_restore && let Some(store) = material_store.as_mut() {
+                                store.mark();
+                            }
                             MergeState::JoinTuples
                         }
                         Ordering::Less => MergeState::SkipOuterAdvance,
@@ -2073,10 +2094,11 @@ impl<'r, 'a> Runner<'r, 'a> {
                 let material = node(super::instrument::Role::Materialize, id);
                 let _material = material.start();
                 material.rows(inner_fetches as u64);
-                // Its tuplestore holds each row it read from its input.
+                // Its tuplestore holds the rows it read from its input that
+                // the mark still needs.
                 material.store_opened();
-                for row in &input.rows[..inner_reached] {
-                    material.store_row(self.tuple_len(row, inner).ok());
+                if let Some(store) = material_store.take() {
+                    material.stored_space(false, store.finish());
                 }
                 input.counted(inner_reached);
             } else {

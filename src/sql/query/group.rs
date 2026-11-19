@@ -1880,6 +1880,12 @@ pub(super) fn record_hash_agg_memory(
         };
         memory.lookup(new);
     }
+    if memory.spilled() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN ANALYZE of a hash aggregate that spills is not supported"
+        ));
+    }
     aggregate.hash_agg_peak(memory.peak());
     Ok(())
 }

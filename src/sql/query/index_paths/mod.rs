@@ -2196,6 +2196,9 @@ pub(crate) enum GroupOrder {
 pub(crate) struct GroupedPath {
     /// A `HashAggregate`, rather than a `GroupAggregate`.
     pub(crate) hashed: bool,
+    /// The query calls an aggregate: a sorted grouping without one is a
+    /// `Group`.
+    pub(crate) aggregated: bool,
     /// The grouping columns in the order a sorted aggregate keys them.
     pub(crate) keys: [usize; MAX_ORDER_KEYS],
     /// How many of them are keys: the others a condition fixes to a
@@ -2706,7 +2709,15 @@ fn target_entry<'a>(
             Some(column),
         ));
     }
-    if expression.contains_subquery() {
+    // An uncorrelated scalar subquery is its InitPlan's output parameter,
+    // which costs nothing to read (`cost_qual_eval_walker`).
+    let subquery_parameter = match expression {
+        Expr::Subquery(select) => {
+            !crate::sql::query::select_correlated(select, storage, txid, arena).ok()?
+        }
+        _ => false,
+    };
+    if expression.contains_subquery() && !subquery_parameter {
         return None;
     }
     let (type_oid, type_mod) =
@@ -2723,8 +2734,12 @@ fn target_entry<'a>(
     };
     Some((
         type_average_width(ctype, i32::from(type_mod)) as u32,
-        super::plan::qual_cost(expression, &columns, storage, txid, arena) / 2.0
-            * costs.cpu_operator,
+        if subquery_parameter {
+            0.0
+        } else {
+            super::plan::qual_cost(expression, &columns, storage, txid, arena) / 2.0
+                * costs.cpu_operator
+        },
         None,
     ))
 }

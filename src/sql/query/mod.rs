@@ -1014,7 +1014,7 @@ use subquery::{
     prepare_outer_subqueries,
 };
 pub(crate) use subquery::{
-    enter_sublink_of, subquery_node_correlated, type_witness, walk_children,
+    enter_sublink_of, select_correlated, subquery_node_correlated, type_witness, walk_children,
 };
 pub(crate) use subquery::{
     expression_has_correlated_subquery, subquery_hooks_outer, subquery_hooks_with_outer,
@@ -14663,6 +14663,29 @@ fn enter_scan_context<'a>(
     resolved_columns: &dyn super::exec::ColTypeResolver,
     arena: &'a Arena,
 ) -> Result<Option<index_paths::ScanContextScope>, SqlError> {
+    // A grouping of one table's columns scans by the path its plan reads.
+    if scope.n == 1
+        && !statement.group_by.is_empty()
+        && statement
+            .where_clause
+            .is_none_or(|condition| !condition.contains_subquery())
+        && let Some((shape, needed)) = crate::sql::explain::grouped_scan_context(
+            storage,
+            txid,
+            statement,
+            scope,
+            from,
+            resolved_columns,
+            arena,
+        )?
+    {
+        return Ok(Some(index_paths::enter_query(
+            scope.slots[0],
+            statement.where_clause,
+            needed,
+            Some(shape),
+        )));
+    }
     Ok(
         if scope.n == 1
             && statement
@@ -16522,8 +16545,9 @@ fn select_into_rows_mode<'a>(
     let statement = expand_select_record_calls(statement, storage, txid, arena, outer)?;
     let statement = pullup::pull_up_subqueries(statement, storage, txid, arena, outer)?;
     // `min` and `max` of a local table read the first row of each ordered
-    // index scan when the planner prefers those InitPlans.
-    if outer.is_none()
+    // index scan when the planner prefers those InitPlans, also in a
+    // subquery reading no enclosing query's names.
+    if (outer.is_none() || !subquery::select_correlated(statement, storage, txid, arena)?)
         && let Some(rewritten) = local_minmax_subquery(storage, txid, statement, arena)?
     {
         return select_into_rows_mode(

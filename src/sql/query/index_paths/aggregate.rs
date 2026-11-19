@@ -41,6 +41,14 @@ pub(crate) struct AggregateCosts {
     pub(crate) ordered: bool,
 }
 
+impl AggregateCosts {
+    /// The query calls an aggregate (`parse->hasAggs`): every aggregate has
+    /// a transition state, shared or its own.
+    pub(crate) const fn aggregated(&self) -> bool {
+        self.transitions > 0
+    }
+}
+
 use crate::sql::query::postgres_memory::MAX_SIZED_STATES;
 
 /// The bytes a transition state of transition function `function` allocates
@@ -490,6 +498,14 @@ pub(crate) fn with_having(
         total + quals.startup + rows * quals.per_tuple,
         super::clamp_row_est(rows * quals.selectivity),
     )
+}
+
+/// `cost_group`'s startup and total costs and its output rows, before any
+/// `HAVING` qualification: the `Group` node of a sorted `GROUP BY` without
+/// aggregates compares its columns on every input row.
+pub(crate) fn cost_group(group_columns: usize, groups: f64, input: AggInput) -> (f64, f64, f64) {
+    let total = input.total + Costs::current().cpu_operator * input.rows * group_columns as f64;
+    (input.startup, total, groups)
 }
 
 /// `cost_agg`'s startup and total costs and its output rows, before any

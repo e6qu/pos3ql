@@ -3297,19 +3297,25 @@ fn grouped<'a>(
             let Some((sorted_input, sort)) = sort_input(input, reordered) else {
                 continue;
             };
+            let sorted_input_costs = AggInput {
+                startup: sorted_input.startup,
+                total: sorted_input.total,
+                rows,
+                width,
+            };
+            // Without aggregates the sorted grouping is a `Group`.
             let (startup, total, _) = super::aggregate::with_having(
-                cost_agg(
-                    AggStrategy::Sorted,
-                    &grouping.aggregates,
-                    columns.len(),
-                    groups,
-                    AggInput {
-                        startup: sorted_input.startup,
-                        total: sorted_input.total,
-                        rows,
-                        width,
-                    },
-                ),
+                if grouping.aggregates.aggregated() {
+                    cost_agg(
+                        AggStrategy::Sorted,
+                        &grouping.aggregates,
+                        columns.len(),
+                        groups,
+                        sorted_input_costs,
+                    )
+                } else {
+                    super::aggregate::cost_group(columns.len(), groups, sorted_input_costs)
+                },
                 grouping.having,
             );
             if sorted_count + 1 == MAX_CANDIDATES {
@@ -3461,6 +3467,7 @@ fn grouped<'a>(
     )?);
     path.grouped = Some(super::GroupedPath {
         hashed: hashed_chosen,
+        aggregated: grouping.aggregates.aggregated(),
         keys,
         key_count: columns.len(),
         input_sort,

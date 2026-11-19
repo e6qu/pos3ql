@@ -194,13 +194,22 @@ pub(super) fn groups_for_mask<'a>(
     width: usize,
     n_order: usize,
     pax_demand: super::PaxReadDemand,
+    group_bound: Option<usize>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
     let aggregate = instrument::node(instrument::Role::Aggregate);
     // A `GroupAggregate` reads its input from a sort by the grouping keys,
-    // which this pass's key sort is: it returns every input row.
+    // which this pass's key sort is.
     let input_sort = instrument::node(instrument::Role::GroupSort);
     let input_sort_loop = input_sort.start();
+    // A sorted grouping under a limit stops reading its input at the first
+    // row of the group after the last one the limit takes, so the plan's
+    // scans are counted by a pass reading only those rows; so are a
+    // grouping's without aggregates, which need no aggregate pass.
+    let sorted_grouping =
+        n_keys > 0 && aggregate.measured() && aggregate.hash_agg_sizing().is_none();
+    let measure_pass = (sorted_grouping && group_bound.is_some() && !input_sort.measured())
+        || (agg_nodes.is_empty() && instrument::active());
 
     // Pass 2: encode group keys per row (columns outside this set → NULL),
     // sort them, and compute group assignments. When durable object storage
@@ -490,9 +499,6 @@ pub(super) fn groups_for_mask<'a>(
         }
         (ng, &rep_keys_buf[..ng])
     };
-    if n_keys > 0 {
-        input_sort.rows(row_count as u64);
-    }
     if n_keys > 0
         && let Some(sizing) = aggregate.hash_agg_sizing()
     {
@@ -697,6 +703,7 @@ pub(super) fn groups_for_mask<'a>(
         };
         // A plain aggregate's join PostgreSQL's join search plans runs that
         // plan.
+        let _measured_later = measure_pass.then(instrument::suspend);
         super::join_exec::scan_statement_source(
             statement,
             recycling_safe || hold_values,
@@ -738,8 +745,31 @@ pub(super) fn groups_for_mask<'a>(
     let per_group: &mut [&[&[u8]]] = arena
         .alloc_slice_with(n_groups, |_| empty_group)
         .map_err(|_| arena_full())?;
+    // The groups in the order the plan returns them; a limit directly
+    // above takes the first ones, and PostgreSQL never finishes, filters
+    // or projects the others.
+    let order = match outer {
+        None if statement.grouping_sets.is_empty() => modeled_group_order(
+            storage,
+            scope,
+            txid,
+            statement,
+            params,
+            arena,
+            group_of,
+            rep_keys,
+            group_collations,
+        )?,
+        _ => None,
+    };
     let mut output_count = 0usize;
-    for g in 0..n_groups {
+    let mut consumed = 0usize;
+    for at in 0..n_groups {
+        if group_bound.is_some_and(|bound| output_count >= bound) {
+            break;
+        }
+        consumed = at + 1;
+        let g = order.map_or(at, |order| order[at] as usize);
         let mut key_vals = [Datum::Null; crate::sql::parser::MAX_GROUP_TERMS];
         for (k, slot) in key_vals.iter_mut().enumerate().take(n_keys) {
             *slot = crate::sql::exec::decode_projected_col_record(rep_keys[g], k, arena)?;
@@ -872,25 +902,79 @@ pub(super) fn groups_for_mask<'a>(
             )
         })?;
     }
+    // Once the limit has its rows, a `GroupAggregate` has read its last
+    // group's rows and the first row of the next one, a `Group` (no
+    // aggregates) only its last group's first row; a hashed grouping read
+    // every row.
+    let stopped = group_bound.is_some_and(|bound| output_count >= bound);
+    let whole_groups = if agg_nodes.is_empty() {
+        consumed.saturating_sub(1)
+    } else {
+        consumed
+    };
+    let rows_read = if n_keys == 0 || !sorted_grouping || !stopped || whole_groups == n_groups {
+        row_count
+    } else {
+        let taken = arena
+            .alloc_slice_with(n_groups, |_| false)
+            .map_err(|_| arena_full())?;
+        for at in 0..whole_groups {
+            taken[order.map_or(at, |order| order[at] as usize)] = true;
+        }
+        group_of[..row_count]
+            .iter()
+            .filter(|&&group| taken[group as usize])
+            .count()
+            + 1
+    };
+    if n_keys > 0 {
+        input_sort.rows(rows_read as u64);
+    }
+    if measure_pass {
+        // Below a sort the scans return every row.
+        let wanted = if input_sort.measured() {
+            row_count
+        } else {
+            rows_read
+        };
+        let mut read = 0usize;
+        if wanted > 0 {
+            super::join_exec::scan_statement_source(
+                statement,
+                true,
+                storage,
+                scope,
+                from,
+                txid,
+                scan_where,
+                arena,
+                params,
+                hooks,
+                outer,
+                pax_demand,
+                &mut |row| {
+                    if !row_passes_correlated_where(
+                        where_correlated,
+                        statement.where_clause,
+                        arena,
+                        params,
+                        hooks,
+                        row,
+                        outer,
+                    )? {
+                        return Ok(true);
+                    }
+                    read += 1;
+                    Ok(read < wanted)
+                },
+            )?;
+        }
+    }
     let out_rows = arena
         .alloc_slice_with(output_count, |_| empty)
         .map_err(|_| arena_full())?;
-    let order = match outer {
-        None if statement.grouping_sets.is_empty() => modeled_group_order(
-            storage,
-            scope,
-            txid,
-            statement,
-            params,
-            arena,
-            group_of,
-            rep_keys,
-            group_collations,
-        )?,
-        _ => None,
-    };
     let mut output = 0usize;
-    for at in 0..n_groups {
+    for at in 0..consumed {
         let rows = per_group[order.map_or(at, |order| order[at] as usize)];
         out_rows[output..output + rows.len()].copy_from_slice(rows);
         output += rows.len();
@@ -1172,6 +1256,11 @@ pub(super) fn grouped_rows<'a>(
         masks = &distinct_masks[..count];
     }
 
+    // A limit reads the groups' rows directly, without a sort or `DISTINCT`
+    // over them, for one grouping set.
+    let group_bound = bound.filter(|&bound| {
+        bound > 0 && statement.order_by.is_empty() && !statement.distinct && masks.len() == 1
+    });
     // Each set's scans, keys, and aggregate states are temporary. Preserve its
     // self-contained encoded rows in the persistent tail, then recycle front
     // scratch before the next set so 4,096 sets do not multiply workspace.
@@ -1200,6 +1289,7 @@ pub(super) fn grouped_rows<'a>(
             width,
             n_order,
             pax_columns,
+            group_bound,
         )?;
         for &row in rows {
             let saved = arena

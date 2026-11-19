@@ -1564,7 +1564,9 @@ from the planner's group estimate (`differential_exact/908`). A `Materialize`
 above a merge join's inner sort replays its mark, restore and
 `tuplestore_trim` (`differential_exact/910`); rows with equal window keys
 reach a window's sort and number in `pg_qsort` order
-(`differential_exact/909`). Each window clause's sort charges the tuples it
+(`differential_exact/909`). An integer in a window's `PARTITION BY` or `ORDER BY` is a
+constant, never an output position, with or without a `FROM`
+(`differential_exact/914`). Each window clause's sort charges the tuples it
 really holds, the window input target and the results of the clauses below,
 as `tuplesort.c` does (`TuplesortModel`): a sort that outgrows `work_mem` forms
 its runs where `dumptuples` does, sorts each with `pg_qsort` and merges them

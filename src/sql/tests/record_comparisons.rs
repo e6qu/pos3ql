@@ -307,3 +307,27 @@ fn named_composite_arrays_compare_catalog_fields_not_element_text() {
         );
     });
 }
+
+#[test]
+fn integers_in_window_keys_are_constants_not_output_positions() {
+    with_engine("window-constant-keys", |engine, budget| {
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "SELECT sum(1) OVER (PARTITION BY 1 ORDER BY 1 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"
+            ),
+            ["1"]
+        );
+        run_with(engine, budget, "CREATE TABLE wk(a int, b int)");
+        run_with(engine, budget, "INSERT INTO wk VALUES (1, 10), (2, 20)");
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "SELECT a, sum(b) OVER (PARTITION BY 1 ORDER BY 2) FROM wk ORDER BY 1"
+            ),
+            ["1|30", "2|30"]
+        );
+    });
+}

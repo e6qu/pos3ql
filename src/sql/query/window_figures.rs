@@ -158,10 +158,12 @@ pub(crate) fn input_target<'a>(
     // else a new one the list lacks.
     let keyed = |targets: &mut ArenaList<'a, Target<'a>>,
                  key: &'a Expr<'a>,
-                 by_alias: bool|
+                 by_alias: bool,
+                 positional: bool|
      -> Result<usize, SqlError> {
         let found = match key {
-            Expr::Int(position) if *position >= 1 => {
+            // An integer in a window's keys is a constant, not a position.
+            Expr::Int(position) if positional && *position >= 1 => {
                 let position = *position as usize - 1;
                 (position < item_count).then_some(position)
             }
@@ -190,10 +192,10 @@ pub(crate) fn input_target<'a>(
         Ok(targets.len() - 1)
     };
     for order in statement.order_by {
-        keyed(&mut targets, order.expression, true)?;
+        keyed(&mut targets, order.expression, true, true)?;
     }
     for key in statement.distinct_on {
-        keyed(&mut targets, key, false)?;
+        keyed(&mut targets, key, false, true)?;
     }
     let specs = statement
         .windows
@@ -215,7 +217,7 @@ pub(crate) fn input_target<'a>(
             .map(|order| order.expression)
             .chain(spec.partition_by.iter().copied())
         {
-            let at = keyed(&mut targets, key, false)?;
+            let at = keyed(&mut targets, key, false, false)?;
             if active && let Ok(slice) = targets.as_mut_slice() {
                 slice[at].window = true;
             }

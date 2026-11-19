@@ -58,7 +58,7 @@ jobs:
       - name: Install native debugger for library and protocol failure diagnostics
         if: startsWith(matrix.shards, 'lib:') || matrix.name == 'protocol' || matrix.name == 'durability' || matrix.name == 'result-streams'
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
           sudo apt-get install --yes --no-install-recommends gdb
           gdb --version
       - name: Expose PostgreSQL 18 psql for protocol coverage
@@ -230,10 +230,12 @@ jobs:
           - { name: d, corpus_shard: "3-of-6", auxiliary: none }
           - { name: e, corpus_shard: "4-of-6", auxiliary: none }
           - { name: f, corpus_shard: "5-of-6", auxiliary: none }
-          - { name: exact-a, corpus_shard: "none", auxiliary: exact, exact_shard: "0", exact_shards: "4" }
-          - { name: exact-b, corpus_shard: "none", auxiliary: exact, exact_shard: "1", exact_shards: "4" }
-          - { name: exact-c, corpus_shard: "none", auxiliary: exact, exact_shard: "2", exact_shards: "4" }
-          - { name: exact-d, corpus_shard: "none", auxiliary: exact, exact_shard: "3", exact_shards: "4" }
+          - { name: exact-a, corpus_shard: "none", auxiliary: exact, exact_shard: "0", exact_shards: "6" }
+          - { name: exact-b, corpus_shard: "none", auxiliary: exact, exact_shard: "1", exact_shards: "6" }
+          - { name: exact-c, corpus_shard: "none", auxiliary: exact, exact_shard: "2", exact_shards: "6" }
+          - { name: exact-d, corpus_shard: "none", auxiliary: exact, exact_shard: "3", exact_shards: "6" }
+          - { name: exact-e, corpus_shard: "none", auxiliary: exact, exact_shard: "4", exact_shards: "6" }
+          - { name: exact-f, corpus_shard: "none", auxiliary: exact, exact_shard: "5", exact_shards: "6" }
           - { name: copy, corpus_shard: "none", auxiliary: copy }
           - { name: types, corpus_shard: "none", auxiliary: types }
           - { name: grouping, corpus_shard: "none", auxiliary: grouping }

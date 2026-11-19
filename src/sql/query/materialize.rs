@@ -1647,33 +1647,41 @@ fn modeled_distinct<'a>(
         for (at, column) in columns.iter_mut().enumerate() {
             *column = at;
         }
-        instrument::SortTuples::new(Some(&columns[..collations.len()]), 0, false)
-            .ok_or_else(instrument::unsized_value)?
-            .sort_rows(
-                super::postgres_memory::SizeSource { storage, txid },
-                arena,
-                held,
-                None,
-                &mut |left, right| {
-                    for &(position, flags) in group.keys {
-                        let ordering = compare_ordered_key(
-                            storage,
-                            txid,
-                            collations[position],
-                            (
-                                flags & super::index_paths::joins::KEY_DESCENDING != 0,
-                                flags & super::index_paths::joins::KEY_NULLS_FIRST != 0,
-                            ),
-                            crate::sql::exec::ProjectedValue::column(left, position),
-                            crate::sql::exec::ProjectedValue::column(right, position),
-                        )?;
-                        if !ordering.is_eq() {
-                            return Ok(ordering);
-                        }
+        instrument::SortTuples::new(
+            Some(
+                &columns[..held
+                    .first()
+                    .map_or(0, |row| crate::sql::exec::projected_row_width(row))],
+            ),
+            0,
+            false,
+        )
+        .ok_or_else(instrument::unsized_value)?
+        .sort_rows(
+            super::postgres_memory::SizeSource { storage, txid },
+            arena,
+            held,
+            None,
+            &mut |left, right| {
+                for &(position, flags) in group.keys {
+                    let ordering = compare_ordered_key(
+                        storage,
+                        txid,
+                        collations[position],
+                        (
+                            flags & super::index_paths::joins::KEY_DESCENDING != 0,
+                            flags & super::index_paths::joins::KEY_NULLS_FIRST != 0,
+                        ),
+                        crate::sql::exec::ProjectedValue::column(left, position),
+                        crate::sql::exec::ProjectedValue::column(right, position),
+                    )?;
+                    if !ordering.is_eq() {
+                        return Ok(ordering);
                     }
-                    Ok(core::cmp::Ordering::Equal)
-                },
-            )?;
+                }
+                Ok(core::cmp::Ordering::Equal)
+            },
+        )?;
     }
     let held: &[&[u8]] = held;
     let same = |left: u32, right: u32| -> Result<bool, SqlError> {

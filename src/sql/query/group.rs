@@ -1380,18 +1380,60 @@ pub(super) fn grouped_rows<'a>(
             &order_exprs[..n_order],
             &mut columns,
         );
-        let tuples = instrument::SortTuples::new(Some(&columns[..count]), 0, bounded.is_some())
-            .ok_or_else(instrument::unsized_value)?
-            .computed(super::sole_item_computed(statement.items));
-        // The tuples reach the sort in the grouping's order, which a join's
-        // modeled grouping and a one-table grouping both give.
-        let (_, space) = tuples.sort_rows(
-            super::postgres_memory::SizeSource { storage, txid },
-            arena,
-            out_rows,
-            bounded,
-            &mut |a, b| compare(&a, &b),
-        )?;
+        let source = super::postgres_memory::SizeSource { storage, txid };
+        let computed = super::sole_item_computed(statement.items);
+        // The `Sort` over a join's grouping PostgreSQL's planner plans is
+        // its tuplesort, over the groups in their grouping's order.
+        let modeled = outer.is_none()
+            && scope.n > 1
+            && super::index_paths::join_query::modeled_join(
+                storage, txid, statement, scope, params, arena,
+            )?
+            .is_some_and(|model| model.group.is_some());
+        if modeled {
+            let tuples = instrument::SortTuples::new(Some(&columns[..count]), 0, bounded.is_some())
+                .ok_or_else(instrument::unsized_value)?
+                .computed(computed);
+            let (_, space) = tuples.sort_rows(source, arena, out_rows, bounded, &mut |a, b| {
+                compare(&a, &b)
+            })?;
+            stages.sort.sorted(space);
+            return Ok((out_rows, width));
+        }
+        // A one-table grouping reaches the sort in sort order, not the hash
+        // order PostgreSQL's planner may give it, so equal groups keep that
+        // order; the figures are the tuplesort's.
+        let space = match bounded {
+            Some(bound) if stages.sort.measured() => instrument::SortSpace::postgres_top_n(
+                source,
+                out_rows,
+                Some(&columns[..count]),
+                0,
+                bound,
+                arena,
+                compare,
+                computed,
+                None,
+            )?,
+            _ => instrument::SortSpace::postgres(
+                source,
+                out_rows,
+                Some(&columns[..count]),
+                false,
+                computed,
+            )?,
+        };
+        let bound = bounded.filter(|&bound| out_rows.len() > bound * 2);
+        match bound {
+            Some(bound) => {
+                crate::mem::arena::try_stable_top_n_via(arena, out_rows, bound, compare, |_| {
+                    arena_full()
+                })?
+            }
+            None => {
+                crate::mem::arena::try_stable_sort_via(arena, out_rows, compare, |_| arena_full())?
+            }
+        }
         stages.sort.sorted(space);
     }
 

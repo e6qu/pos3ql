@@ -611,11 +611,23 @@ pub(crate) fn array_payload(
     element: ArrElem,
     raw: &[u8],
 ) -> Option<usize> {
-    if matches!(element, ArrElem::Nested { .. }) {
-        return None;
-    }
-    let layout = crate::sql::types::ColType::Array(element).physical_layout();
-    let element_layout = element.to_coltype().physical_layout();
+    // A statistics column's array of arrays: its members are varlenas.
+    let nested = matches!(element, ArrElem::Nested { .. });
+    let layout = if nested {
+        crate::sql::type_layouts::builtin(2277)?
+    } else {
+        crate::sql::types::ColType::Array(element).physical_layout()
+    };
+    let element_layout = if nested {
+        crate::sql::type_layouts::PhysicalLayout {
+            length: -1,
+            by_value: false,
+            alignment: b'i',
+            storage: b'x',
+        }
+    } else {
+        element.to_coltype().physical_layout()
+    };
     let align = match element_layout.alignment {
         b'd' => 8,
         b'i' => 4,

@@ -162,7 +162,7 @@ fn datum_layout(value: &Datum<'_>) -> Option<PhysicalLayout> {
         Datum::Enum { .. } => 26,
         Datum::Array { element, .. } => {
             if matches!(element, ArrElem::Nested { .. }) {
-                return None;
+                return crate::sql::type_layouts::builtin(2277);
             }
             return Some(ColType::Array(*element).physical_layout());
         }

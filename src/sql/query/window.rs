@@ -3356,6 +3356,7 @@ pub(crate) fn external_window_into<'a>(
                 storage
                     .with_block_store(|blocks| {
                         spec_sorter.push_projected_by(
+                            storage,
                             blocks,
                             n_keys + total + scope.n + 1,
                             |index| {
@@ -3428,6 +3429,7 @@ pub(crate) fn external_window_into<'a>(
                     storage
                         .with_block_store(|blocks| {
                             win_sorter.push_projected_by(
+                                storage,
                                 blocks,
                                 4,
                                 |index| match index {
@@ -3727,6 +3729,7 @@ pub(crate) fn external_window_into<'a>(
             storage
                 .with_block_store(|blocks| {
                     out_sorter.push_projected_by(
+                        storage,
                         blocks,
                         width + n_order + chain.len(),
                         |index| {
@@ -3754,7 +3757,7 @@ pub(crate) fn external_window_into<'a>(
         && !statement.distinct
         && let Some(bound) = super::group::sort_bound(statement, limit, offset)
     {
-        out_sorter.keep_least(bound, &mut out_compare)?;
+        out_sorter.keep_least(storage, bound, &mut out_compare)?;
     }
     let out_run = storage
         .with_block_store(|blocks| out_sorter.finish(blocks, &mut out_compare))

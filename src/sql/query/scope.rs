@@ -2651,6 +2651,7 @@ impl<'d> QueryScope<'d> {
                     storage
                         .with_block_store(|blocks| {
                             sorter.push_projected_by(
+                                storage,
                                 blocks,
                                 values.len(),
                                 |column| values[column],

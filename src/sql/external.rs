@@ -205,15 +205,6 @@ impl ExternalRunReader {
     }
 }
 
-/// The storage that owns a sorter, which only reads it while sizing rows.
-#[derive(Clone, Copy)]
-struct StorageRef(core::ptr::NonNull<crate::storage::Storage>);
-
-// SAFETY: a shared reference to the storage, which is `Sync`, and the storage
-// outlives the sorter it owns.
-unsafe impl Send for StorageRef {}
-unsafe impl Sync for StorageRef {}
-
 /// Scratch for ordering one chunk's rows as `tuplesort.c` does: a chunk
 /// holds at most `ROWS_PER_CHUNK` rows, so every array is sized from that.
 struct ExactScratch {
@@ -265,10 +256,10 @@ pub(crate) struct ExternalSorter {
     postgres: Option<crate::sql::query::instrument::SortTuples>,
     /// The limit's row count a bounded sort keeps.
     bound: Option<usize>,
-    /// The storage whose catalog sizes the rows' values, and the
-    /// transaction. Set by [`ExternalSorter::size_as_postgres`]; the storage
-    /// owns this sorter, so it outlives every use.
-    source: Option<(StorageRef, u32)>,
+    /// The transaction whose catalog sizes the rows' values. Set by
+    /// [`ExternalSorter::size_as_postgres`]; every push and
+    /// [`ExternalSorter::keep_least`] names the storage it reads.
+    txid: u32,
     /// PostgreSQL's sort of the rows pushed so far, once one was.
     model: Option<crate::sql::query::postgres_memory::TuplesortModel>,
     /// The row counts of the runs the model's `dumptuples` wrote, in
@@ -316,7 +307,7 @@ impl ExternalSorter {
             bounded: false,
             postgres: None,
             bound: None,
-            source: None,
+            txid: 0,
             model: None,
             pg_runs: vec![0u32; ROWS_PER_CHUNK].into_boxed_slice(),
             pg_run_count: 0,
@@ -339,7 +330,7 @@ impl ExternalSorter {
         self.bounded = false;
         self.postgres = None;
         self.bound = None;
-        self.source = None;
+        self.txid = 0;
         self.model = None;
         self.pg_run_count = 0;
         self.ordered = false;
@@ -357,14 +348,11 @@ impl ExternalSorter {
         &mut self,
         tuples: Option<crate::sql::query::instrument::SortTuples>,
         bound: Option<usize>,
-        source: crate::sql::query::postgres_memory::SizeSource<'_>,
+        txid: u32,
     ) {
         self.postgres = tuples;
         self.bound = bound;
-        self.source = Some((
-            StorageRef(core::ptr::NonNull::from(source.storage)),
-            source.txid,
-        ));
+        self.txid = txid;
     }
 
     fn buffered_row(&self, position: usize) -> &[u8] {
@@ -373,7 +361,12 @@ impl ExternalSorter {
     }
 
     /// Feeds the row just buffered at `offset` to PostgreSQL's sort.
-    fn size_row(&mut self, offset: usize, total: usize) -> Result<(), SqlError> {
+    fn size_row(
+        &mut self,
+        storage: &crate::storage::Storage,
+        offset: usize,
+        total: usize,
+    ) -> Result<(), SqlError> {
         let Some(tuples) = self.postgres else {
             return Ok(());
         };
@@ -381,11 +374,9 @@ impl ExternalSorter {
         let model = self
             .model
             .get_or_insert_with(|| tuples.model(Some(row), self.bound));
-        let (storage, txid) = self.source.expect("sized rows name their catalog");
-        // SAFETY: the storage owns this sorter and outlives it.
         let source = crate::sql::query::postgres_memory::SizeSource {
-            storage: unsafe { storage.0.as_ref() },
-            txid,
+            storage,
+            txid: self.txid,
         };
         if let Some(rows) = tuples.push(source, model, Some(row), row)?
             && let Some(slot) = self.pg_runs.get_mut(self.pg_run_count)
@@ -425,6 +416,7 @@ impl ExternalSorter {
     /// the statement arena.
     pub(crate) fn push_projected_by<'a>(
         &mut self,
+        storage: &crate::storage::Storage,
         store: &mut dyn BlockStore,
         columns: usize,
         mut value_at: impl FnMut(usize) -> Datum<'a>,
@@ -448,7 +440,7 @@ impl ExternalSorter {
             &mut value_at,
             &mut self.chunk[offset + ORDINAL_BYTES..offset + total],
         )?;
-        self.finish_push(offset, total)
+        self.finish_push(storage, offset, total)
     }
 
     /// Appends one already-encoded projected row. This is the common spool
@@ -456,6 +448,7 @@ impl ExternalSorter {
     /// window partitions, and outer-join match identifiers.
     pub(crate) fn push_encoded(
         &mut self,
+        storage: &crate::storage::Storage,
         store: &mut dyn BlockStore,
         row: &[u8],
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
@@ -473,10 +466,15 @@ impl ExternalSorter {
         self.chunk[offset..offset + ORDINAL_BYTES]
             .copy_from_slice(&self.next_ordinal.to_le_bytes());
         self.chunk[offset + ORDINAL_BYTES..offset + total].copy_from_slice(row);
-        self.finish_push(offset, total)
+        self.finish_push(storage, offset, total)
     }
 
-    fn finish_push(&mut self, offset: usize, total: usize) -> Result<(), SqlError> {
+    fn finish_push(
+        &mut self,
+        storage: &crate::storage::Storage,
+        offset: usize,
+        total: usize,
+    ) -> Result<(), SqlError> {
         self.rows[self.row_count] = BufferedRow {
             offset: offset as u32,
             length: total as u32,
@@ -484,7 +482,7 @@ impl ExternalSorter {
         };
         self.row_count += 1;
         self.chunk_len += total;
-        self.size_row(offset, total)?;
+        self.size_row(storage, offset, total)?;
         self.next_ordinal = self.next_ordinal.checked_add(1).ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -564,6 +562,7 @@ impl ExternalSorter {
     /// top-N heapsort does.
     pub(crate) fn keep_least(
         &mut self,
+        storage: &crate::storage::Storage,
         bound: usize,
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
     ) -> Result<(), SqlError> {
@@ -579,10 +578,9 @@ impl ExternalSorter {
             let charge = {
                 let this = &*self;
                 tuples.heap_charge(
-                    // SAFETY: the storage owns this sorter and outlives it.
                     crate::sql::query::postgres_memory::SizeSource {
-                        storage: unsafe { this.source.expect("sized rows").0.0.as_ref() },
-                        txid: this.source.expect("sized rows").1,
+                        storage,
+                        txid: this.txid,
                     },
                     this.row_count,
                     model.heap_at(),
@@ -916,13 +914,18 @@ mod tests {
 
     #[test]
     fn bounded_rows_sort_without_publishing_a_run() {
+        let config = crate::storage::tests::test_config();
+        let mut storage_budget = crate::storage::tests::test_budget(&config);
+        let storage = crate::storage::Storage::new(&config, &mut storage_budget, 0).unwrap();
         let mut budget = Budget::new(96 << 20);
         let mut store =
             MemoryBlockStore::new(&mut budget, "external test blocks", 32 << 20, 4096).unwrap();
         let mut sorter = ExternalSorter::new(&mut budget).unwrap();
         let mut compare = |left: &[u8], right: &[u8]| Ok(left.cmp(right));
         for row in [b"b".as_slice(), b"a", b"b", b"c"] {
-            sorter.push_encoded(&mut store, row, &mut compare).unwrap();
+            sorter
+                .push_encoded(&storage, &mut store, row, &mut compare)
+                .unwrap();
         }
         assert_eq!(sorter.in_memory_rows(&mut compare).unwrap(), Some(4));
         assert_eq!(store.len(), 0);
@@ -935,7 +938,9 @@ mod tests {
 
         sorter.reset();
         for _ in 0..ROWS_PER_CHUNK + 1 {
-            sorter.push_encoded(&mut store, b"x", &mut compare).unwrap();
+            sorter
+                .push_encoded(&storage, &mut store, b"x", &mut compare)
+                .unwrap();
         }
         assert_eq!(sorter.in_memory_rows(&mut compare).unwrap(), None);
         assert!(store.len() > 0);
@@ -951,6 +956,9 @@ mod tests {
 
     #[test]
     fn fan_in_carry_preserves_stable_order() {
+        let config = crate::storage::tests::test_config();
+        let mut storage_budget = crate::storage::tests::test_budget(&config);
+        let storage = crate::storage::Storage::new(&config, &mut storage_budget, 0).unwrap();
         let mut budget = Budget::new(96 << 20);
         let mut store =
             MemoryBlockStore::new(&mut budget, "external test blocks", 32 << 20, 4096).unwrap();
@@ -968,6 +976,7 @@ mod tests {
         for &(key, ordinal) in &input {
             sorter
                 .push_projected_by(
+                    &storage,
                     &mut store,
                     2,
                     |column| {
@@ -1006,7 +1015,13 @@ mod tests {
         let oversized = "x".repeat(MAX_INLINE_ROW);
         assert!(
             sorter
-                .push_projected_by(&mut store, 1, |_| Datum::Text(&oversized), &mut compare,)
+                .push_projected_by(
+                    &storage,
+                    &mut store,
+                    1,
+                    |_| Datum::Text(&oversized),
+                    &mut compare,
+                )
                 .is_err(),
             "a run row that would require an SST overflow chain must fail loudly"
         );

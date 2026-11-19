@@ -504,7 +504,7 @@ fn push_run(
         .expect("spill-attached block store")?;
     while let Some(row) = reader.row() {
         storage
-            .with_block_store(|blocks| sorter.push_encoded(blocks, row, compare))
+            .with_block_store(|blocks| sorter.push_encoded(storage, blocks, row, compare))
             .expect("spill-attached block store")?;
         storage
             .with_block_store(|blocks| reader.advance(blocks))
@@ -551,6 +551,7 @@ fn external_set_leaf<'a>(
                 .storage
                 .with_block_store(|blocks| {
                     sorter.push_projected_by(
+                        context.storage,
                         blocks,
                         target.len(),
                         |column| coerced[column],
@@ -709,6 +710,7 @@ fn external_set_tree<'a>(
                         .storage
                         .with_block_store(|blocks| {
                             sorter.push_encoded(
+                                context.storage,
                                 blocks,
                                 right_reader.output(right_length),
                                 &mut output_compare,
@@ -743,7 +745,7 @@ fn external_set_tree<'a>(
                 context
                     .storage
                     .with_block_store(|blocks| {
-                        sorter.push_encoded(blocks, left_row, &mut output_compare)
+                        sorter.push_encoded(context.storage, blocks, left_row, &mut output_compare)
                     })
                     .expect("spill-attached block store")?;
             }
@@ -755,6 +757,7 @@ fn external_set_tree<'a>(
                     .storage
                     .with_block_store(|blocks| {
                         sorter.push_encoded(
+                            context.storage,
                             blocks,
                             right_reader.output(right_length),
                             &mut output_compare,
@@ -782,6 +785,7 @@ fn external_set_tree<'a>(
                     .storage
                     .with_block_store(|blocks| {
                         sorter.push_encoded(
+                            context.storage,
                             blocks,
                             reader.output(right_length),
                             &mut output_compare,
@@ -895,7 +899,7 @@ pub(crate) fn external_set_body_into<'a>(
                 set_sort_bound(limit_written, with_ties, limit, offset).is_some(),
             ),
             set_sort_bound(limit_written, with_ties, limit, offset),
-            super::postgres_memory::SizeSource { storage, txid },
+            txid,
         );
         let mut compare = |left: &[u8], right: &[u8]| {
             compare_set_order(
@@ -909,7 +913,7 @@ pub(crate) fn external_set_body_into<'a>(
         };
         push_run(storage, &mut reader, run, &mut sorter, &mut compare)?;
         if let Some(bound) = set_sort_bound(limit_written, with_ties, limit, offset) {
-            sorter.keep_least(bound, &mut compare)?;
+            sorter.keep_least(storage, bound, &mut compare)?;
         }
         let sorted = storage
             .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
@@ -1045,7 +1049,7 @@ fn external_set_query<'a>(
                 set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset).is_some(),
             ),
             set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset),
-            super::postgres_memory::SizeSource { storage, txid },
+            txid,
         );
         let mut compare = |left: &[u8], right: &[u8]| {
             compare_set_order(storage, txid, columns, left, right, &keys[..key_count])
@@ -1054,7 +1058,7 @@ fn external_set_query<'a>(
             return sql_fail(error);
         }
         if let Some(bound) = set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset)
-            && let Err(error) = sorter.keep_least(bound, &mut compare)
+            && let Err(error) = sorter.keep_least(storage, bound, &mut compare)
         {
             return sql_fail(error);
         }

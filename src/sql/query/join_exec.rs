@@ -865,7 +865,7 @@ struct Probe<'k> {
     keys: &'k KeySides,
     quals: (&'k ClauseList, &'k ClauseList),
     jointype: JoinType,
-    inner_relids: u32,
+    inner_relids: Relids,
     join: super::instrument::Node,
 }
 
@@ -1223,7 +1223,7 @@ pub(super) fn run_modeled<'a>(
             let start = offsets[table];
             let columns = scope.stored_width(table);
             // A removed join's relation reads as NULLs, which nothing reads.
-            if model.plan.removed & 1 << table != 0 {
+            if model.plan.removed & Relids::of(table) != Relids::EMPTY {
                 values[start..start + columns].copy_from_slice(&nulls[table][..columns]);
                 rowids[table] = None;
                 continue;
@@ -1251,7 +1251,7 @@ pub(super) fn run_modeled<'a>(
             let mut at = written_offsets[table];
             let members = leaf..leaf + count;
             leaf += count;
-            if nested.joined & 1 << table == 0 {
+            if !nested.joined.contains(table as u32) {
                 let width = scope.stored_width(members.start);
                 written_values[at..at + width]
                     .copy_from_slice(&values[offsets[members.start]..][..width]);
@@ -1514,7 +1514,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 // An inner input reading the values of an outer row above
                 // changes at each rescan, which builds the table again
                 // (`ExecReScanHashJoin` with the inner plan's `chgParam`).
-                if self.model.plan.path(inner).param != 0 {
+                if self.model.plan.path(inner).param != Relids::EMPTY {
                     self.built[id as usize].set(None);
                     self.frozen[id as usize].set(None);
                 }
@@ -2670,7 +2670,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         &self,
         rows: &[Bound<'a>],
         probe: &Probe<'_>,
-        outer_relids: u32,
+        outer_relids: Relids,
         bound: &mut Bound<'a>,
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
@@ -2962,7 +2962,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         // The bound rows of the relations the scan's join clauses read.
         let outer_values;
         let outer_row;
-        let outer: Option<&dyn ColumnLookup<'a>> = if scan.param != 0 {
+        let outer: Option<&dyn ColumnLookup<'a>> = if scan.param != Relids::EMPTY {
             let n = self.scope.n;
             let offsets = self
                 .arena
@@ -2979,7 +2979,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 .map_err(|_| arena_full())?;
             for table in 0..n {
                 if let Some(row) = bound[table]
-                    && scan.param & 1 << table != 0
+                    && scan.param.contains(table as u32)
                 {
                     let columns = self.columns_of(row.values);
                     values[offsets[table]..offsets[table] + columns.len()].copy_from_slice(columns);
@@ -3064,9 +3064,9 @@ impl<'r, 'a> Runner<'r, 'a> {
         Ok(Held { rows })
     }
 
-    fn bind(&self, bound: &mut Bound<'a>, row: &Bound<'a>, relids: u32) {
+    fn bind(&self, bound: &mut Bound<'a>, row: &Bound<'a>, relids: Relids) {
         for table in 0..self.scope.n {
-            if relids & 1 << table != 0 {
+            if relids.contains(table as u32) {
                 bound[table] = row[table];
             }
         }
@@ -3086,7 +3086,7 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// relations evaluated over their bound rows.
     fn value(&self, row: &Bound<'a>, (table, column): (usize, usize)) -> Datum<'a> {
         if let Some(id) = Member::plain(0, column as u16).expression_id()
-            && self.model.expressions[id].reads != 0
+            && self.model.expressions[id].reads != Relids::EMPTY
         {
             return match self.evaluate(row, self.model.expressions[id].expression) {
                 Ok(value) => value,
@@ -3143,7 +3143,7 @@ impl<'r, 'a> Runner<'r, 'a> {
     }
 
     /// Each clause's (outer, inner) columns.
-    fn sides(&self, clauses: &ClauseList, outer: u32) -> KeySides {
+    fn sides(&self, clauses: &ClauseList, outer: Relids) -> KeySides {
         let mut sides =
             [((usize::MAX, 0), (usize::MAX, 0)); super::index_paths::joins::MAX_JOIN_CLAUSES];
         for (at, &id) in clauses.as_slice().iter().enumerate() {
@@ -3151,7 +3151,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 .model
                 .clause_columns(&self.model.plan.clauses[usize::from(id)])
                 .expect("a hash or merge clause equates columns");
-            sides[at] = if outer & 1 << left.0 != 0 {
+            sides[at] = if outer.contains(left.0 as u32) {
                 (left, right)
             } else {
                 (right, left)
@@ -3182,9 +3182,9 @@ impl<'r, 'a> Runner<'r, 'a> {
     }
 
     /// Binds a row of NULLs to the relations of `relids`.
-    fn null_extend(&self, bound: &mut Bound<'a>, relids: u32) {
+    fn null_extend(&self, bound: &mut Bound<'a>, relids: Relids) {
         for (table, (slot, nulls)) in bound.iter_mut().zip(self.nulls).enumerate() {
-            if relids & 1 << table != 0 {
+            if relids.contains(table as u32) {
                 *slot = Some(BaseRow {
                     values: nulls,
                     rowid: None,
@@ -3649,7 +3649,7 @@ impl<'r, 'a> Runner<'r, 'a> {
 
     /// The held rows' order after a sort by `keys` (`pg_qsort`, NULLs
     /// last), or as held without keys.
-    fn sorted(&self, held: &Held<'a>, keys: &Keys, relids: u32) -> Result<&'a [u32], SqlError> {
+    fn sorted(&self, held: &Held<'a>, keys: &Keys, relids: Relids) -> Result<&'a [u32], SqlError> {
         let rows = held.rows.borrowed_slice();
         let order = self
             .arena

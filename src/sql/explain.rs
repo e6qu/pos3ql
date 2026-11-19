@@ -25,6 +25,7 @@ use crate::stack_format;
 use crate::storage::{ColumnSet, Storage};
 use crate::store::BlockIoStats;
 use crate::util::StackStr;
+use crate::sql::query::index_paths::joins::Relids;
 
 mod joins;
 mod rewrite;
@@ -5964,12 +5965,12 @@ thread_local! {
 
 /// Pushes the relations of `mask` in `scope` as the ones whose values a
 /// join's parameterized scan reads, returning how many it pushed.
-fn push_outer_mask(scope: &QueryScope<'_>, mask: u32) -> usize {
+fn push_outer_mask(scope: &QueryScope<'_>, mask: Relids) -> usize {
     OUTER_RELATIONS.with(|outer| {
         let mut outer = outer.borrow_mut();
         let mut pushed = 0;
-        for table in 0..scope.n.min(32) {
-            if mask & 1 << table == 0 {
+        for table in 0..scope.n {
+            if !mask.contains(table as u32) {
                 continue;
             }
             let count = outer.1;
@@ -6702,25 +6703,7 @@ fn plan_pulled_select<'a>(
         ));
     }
     // A parenthesized join the join search does not plan would print
-    // pos3ql's own join order, as would a join PostgreSQL searches
-    // genetically (GEQO) or splits into several join problems past the
-    // collapse limits.
-    let relations = statement
-        .from
-        .as_ref()
-        .map_or(0, |from| 1 + from.joins.len());
-    let value = crate::sql::guc::planner_value;
-    if modeled.is_none()
-        && relations > 1
-        && ((value("geqo") != 0.0 && relations as f64 >= value("geqo_threshold"))
-            || relations as f64 > value("join_collapse_limit")
-            || relations as f64 > value("from_collapse_limit"))
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "EXPLAIN of a join of more relations than PostgreSQL's join search plans at once (geqo_threshold, join_collapse_limit, from_collapse_limit) is not supported"
-        ));
-    }
+    // pos3ql's own join order.
     if modeled.is_none()
         && statement.from.as_ref().is_some_and(|from| {
             core::iter::once(&from.base)
@@ -6804,7 +6787,11 @@ fn plan_pulled_select<'a>(
                 .map_err(|_| arena_full())?;
         }
         let sorted: &[KeyItem<'_>] = sorted;
-        let unscanned = if scanned == 0 { 0 } else { !u64::from(scanned) };
+        let unscanned = if scanned.is_empty() {
+            Relids::EMPTY
+        } else {
+            !scanned
+        };
         let sort_keys = plan_keys_unscanned(
             storage,
             txid,
@@ -10732,7 +10719,16 @@ fn plan_keys(
     keys: &[KeyItem<'_>],
     arena: &Arena,
 ) -> Result<PlanKeys, SqlError> {
-    plan_keys_unscanned(storage, txid, scope, statement, label, keys, 0, arena)
+    plan_keys_unscanned(
+        storage,
+        txid,
+        scope,
+        statement,
+        label,
+        keys,
+        Relids::EMPTY,
+        arena,
+    )
 }
 
 /// [`plan_keys`] of a plan that does not scan the relations of
@@ -10745,7 +10741,7 @@ fn plan_keys_unscanned(
     statement: &Select<'_>,
     label: KeyLabel,
     keys: &[KeyItem<'_>],
-    unscanned: u64,
+    unscanned: Relids,
     arena: &Arena,
 ) -> Result<PlanKeys, SqlError> {
     // A query without FROM reads no relation.
@@ -10756,13 +10752,13 @@ fn plan_keys_unscanned(
     let Some(joined) = key_relations(scope, statement, arena)? else {
         return Ok(PlanKeys::NONE);
     };
-    let joined = if unscanned == 0 {
+    let joined = if unscanned.is_empty() {
         joined
     } else {
         &*arena
             .alloc_slice_with(joined.len(), |table| {
                 let mut relation = joined[table];
-                if unscanned & 1 << table != 0 {
+                if unscanned.contains(table as u32) {
                     relation.printed = "";
                 }
                 relation

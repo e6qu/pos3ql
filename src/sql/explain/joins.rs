@@ -162,8 +162,8 @@ struct Writer<'w, 'm, 's, 'a> {
 /// The base relations the plan under path `id` scans.
 pub(super) fn scanned_rels(plan: &query::index_paths::joins::JoinPlan<'_>, id: u32) -> Relids {
     match plan.path(id).kind {
-        PathKind::Dummy => 0,
-        PathKind::Scan { rel, .. } => 1 << rel,
+        PathKind::Dummy => Relids::EMPTY,
+        PathKind::Scan { rel, .. } => Relids::of(rel),
         PathKind::Material { input }
         | PathKind::Unique { input, .. }
         | PathKind::Memoize { input, .. } => scanned_rels(plan, input),
@@ -892,7 +892,7 @@ impl Writer<'_, '_, '_, '_> {
         if depth == self.top_depth {
             return targets.scan_join().map(Some);
         }
-        let needed = self.columns_output(1 << rel)?;
+        let needed = self.columns_output(Relids::of(rel))?;
         if demand != Demand::Any {
             return Ok(needed);
         }
@@ -943,7 +943,7 @@ impl Writer<'_, '_, '_, '_> {
         let definition = self.scope.defs.stored(table).expect("a plain table");
         // A plan scanning nothing names every relation (`set_rtable_names`
         // with no relations used).
-        if self.scanned != 0 && self.scanned & 1 << table == 0 {
+        if self.scanned != Relids::EMPTY && self.scanned & Relids::of(table) == Relids::EMPTY {
             let _ = write!(
                 text,
                 "{}",
@@ -1047,7 +1047,7 @@ impl Writer<'_, '_, '_, '_> {
                 continue;
             };
             if let Some(outer) = outer
-                && outer & 1 << right.0 != 0
+                && outer & Relids::of(right.0) != Relids::EMPTY
             {
                 core::mem::swap(&mut left, &mut right);
             }
@@ -1101,7 +1101,7 @@ impl Writer<'_, '_, '_, '_> {
                     self.scope.defs.stored(table).expect("a plain table"),
                 );
                 // A relation no node scans prints its columns unqualified.
-                if self.scanned != 0 && self.scanned & 1 << table == 0 {
+                if self.scanned != Relids::EMPTY && self.scanned & Relids::of(table) == Relids::EMPTY {
                     joined.printed = "";
                 }
                 joined

@@ -1249,10 +1249,9 @@ index fails with `0A000`, and its join's costs refuse to print), a
 `LATERAL` subquery (PostgreSQL may cache it in a `Memoize`; `EXPLAIN` of
 one the search does not plan fails with `0A000` while `enable_memoize` is
 on), a correlated subplan in an `OR` or compared with a column (`0A000`),
-`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), more relations than
-`join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,
-not ported; such queries run pos3ql's join order, and `EXPLAIN` of them
-fails with `0A000`). A parameterized index scan's cost reads its index's pages:
+`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), and more than
+128 relations in one query, past which the search holds no plan and such
+queries run pos3ql's join order. A parameterized index scan's cost reads its index's pages:
 an index built over loaded rows is sized as `_bt_buildadd` fills its
 pages (a page closes when its free space and its last tuple's posting
 list fall under the fill factor's reserve, that tuple moving on), but one

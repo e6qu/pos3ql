@@ -58,7 +58,7 @@ pub(crate) struct RelScan<'a> {
     pub(crate) read: u64,
     /// The relations whose values the condition reads, and the outer
     /// joins that null them.
-    pub(crate) param: u32,
+    pub(crate) param: Relids,
 }
 
 impl<'a> ModeledRel<'a> {
@@ -85,7 +85,7 @@ impl<'a> ModeledRel<'a> {
             .iter()
             .enumerate()
         {
-            if (1 << rel | self.scan.param_others[at]) & !candidate.param == 0 {
+            if (Relids::of(rel) | self.scan.param_others[at]) & !candidate.param == Relids::EMPTY {
                 if self.scan.clause_params & 1 << at != 0 {
                     scan.clause_params |= 1 << scan.param_count;
                 }
@@ -285,7 +285,7 @@ pub(crate) struct NestedMembers<'a> {
     /// The written entries that are parenthesized joins, by bit: each
     /// one's row holds its members' columns in order, each member's again
     /// (`member.*`), then each member's `num_nulls` of its whole row.
-    pub(crate) joined: u32,
+    pub(crate) joined: Relids,
 }
 
 impl<'a> ModeledJoin<'a> {
@@ -469,7 +469,7 @@ fn or_reads_one_relation_each(scope: &QueryScope<'_>, expression: &Expr<'_>) -> 
                 qual_vars(scope, conjunct).is_some_and(|vars| {
                     vars.as_slice()
                         .iter()
-                        .fold(0u32, |relids, &(rel, _)| relids | 1 << rel)
+                        .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel))
                         .count_ones()
                         == 1
                 })
@@ -719,7 +719,7 @@ impl JoinExpression<'_> {
     /// Whether relation `table`'s scan computes it: it reads that
     /// relation alone.
     pub(crate) fn of(&self, table: usize) -> bool {
-        usize::from(self.rel) == table && self.reads == 0
+        usize::from(self.rel) == table && self.reads == Relids::EMPTY
     }
 }
 
@@ -797,7 +797,7 @@ impl<'a> Expressions<'a> {
         self.held[..self.count]
             .iter()
             .flatten()
-            .position(|held| held.rel == rel && held.reads == 0 && *held.canonical == *canonical)
+            .position(|held| held.rel == rel && held.reads == Relids::EMPTY && *held.canonical == *canonical)
             .map(|id| Member::expression(rel, id as u16))
     }
 
@@ -823,8 +823,8 @@ impl<'a> Expressions<'a> {
         let rels = vars
             .as_slice()
             .iter()
-            .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
-        if rels == 0
+            .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel));
+        if rels.is_empty()
             || expression.contains_volatile_function().is_some()
             || crate::sql::query::expr_has_window(expression)
             || crate::sql::query::expression_has_project_set(expression, self.storage, self.txid)
@@ -855,8 +855,8 @@ impl<'a> Expressions<'a> {
             return Ok(None);
         }
         let collation = scope.expression_collation(self.storage, self.arena, expression)?;
-        let reads = rels & !(1 << table);
-        if reads != 0 {
+        let reads = rels & !Relids::of(table);
+        if !reads.is_empty() {
             // Equal expressions of several relations are equal as written.
             let found = self.held[..self.count].iter().flatten().position(|held| {
                 held.rel == table as u8 && held.reads == reads && *held.expression == *expression
@@ -903,7 +903,7 @@ impl<'a> Expressions<'a> {
             return Ok(None);
         };
         let found = self.held[..self.count].iter().flatten().position(|held| {
-            usize::from(held.rel) == table && held.reads == 0 && *held.canonical == *canonical
+            usize::from(held.rel) == table && held.reads == Relids::EMPTY && *held.canonical == *canonical
         });
         let id = match found {
             Some(id) => id,
@@ -913,7 +913,7 @@ impl<'a> Expressions<'a> {
                 }
                 self.held[self.count] = Some(JoinExpression {
                     rel: table as u8,
-                    reads: 0,
+                    reads: Relids::EMPTY,
                     expression,
                     canonical,
                     ctype,
@@ -1004,10 +1004,10 @@ fn analyze_qual<'a>(
                 return Ok(None);
             }
             return Ok(Some(Qual {
-                rels: 1 << one.0 | 1 << two.0,
+                rels: Relids::of(one.0) | Relids::of(two.0),
                 vars,
                 // `COALESCE` is not strict.
-                nonnullable: 0,
+                nonnullable: Relids::EMPTY,
                 strict_vars: VarList::default(),
                 forced_null: None,
                 shape: Shape::Coalesce {
@@ -1024,7 +1024,7 @@ fn analyze_qual<'a>(
     let rels: Relids = vars
         .as_slice()
         .iter()
-        .fold(0, |relids, &(rel, _)| relids | 1 << rel);
+        .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel));
     let volatile = expression.contains_volatile_function().is_some();
     let strict = nonnullable(
         scope,
@@ -1061,7 +1061,7 @@ fn analyze_qual<'a>(
                 (
                     Some((one, left_type, left_collation)),
                     Some((two, right_type, right_collation)),
-                ) if one.base_relids() & two.base_relids() == 0 => {
+                ) if one.base_relids() & two.base_relids() == Relids::EMPTY => {
                     if comparable_types(left_type, right_type)
                         && joinable(left_type)
                         && left_collation == right_collation
@@ -1073,7 +1073,7 @@ fn analyze_qual<'a>(
                 }
                 // A constant equated with an expression of several
                 // relations filters their join.
-                (Some((member, ..)), None) | (None, Some((member, ..))) if member.reads != 0 => {
+                (Some((member, ..)), None) | (None, Some((member, ..))) if member.reads != Relids::EMPTY => {
                     Shape::Other
                 }
                 (Some((member, ctype, _)), None) | (None, Some((member, ctype, _))) => {
@@ -1109,7 +1109,7 @@ fn analyze_qual<'a>(
         nonnullable: strict
             .as_slice()
             .iter()
-            .fold(0, |relids, &(rel, _)| relids | 1 << rel),
+            .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel)),
         strict_vars: strict,
         forced_null,
         shape,
@@ -1134,7 +1134,7 @@ fn join_condition(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
             let rels = vars
                 .as_slice()
                 .iter()
-                .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
+                .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel));
             if rels.count_ones() <= 1 {
                 return true;
             }
@@ -1154,7 +1154,7 @@ fn join_condition(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
                         qual_vars(scope, conjunct).is_some_and(|vars| {
                             vars.as_slice()
                                 .iter()
-                                .fold(0u32, |relids, &(rel, _)| relids | 1 << rel)
+                                .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel))
                                 .count_ones()
                                 <= 1
                         }) || join_condition(scope, conjunct)
@@ -1242,7 +1242,7 @@ fn and_estimate<'a>(
         let rels = vars
             .as_slice()
             .iter()
-            .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
+            .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel));
         let estimate = if rels.count_ones() == 1 {
             // This relation's conditions, estimated as one list.
             let table = rels.trailing_zeros() as usize;
@@ -1254,7 +1254,7 @@ fn and_estimate<'a>(
                 if later_vars
                     .as_slice()
                     .iter()
-                    .fold(0u32, |relids, &(rel, _)| relids | 1 << rel)
+                    .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel))
                     == rels
                 {
                     done[later] = true;
@@ -1265,7 +1265,7 @@ fn and_estimate<'a>(
                 }
             }
             restriction(table, own.expect("this condition"))?
-        } else if rels == 0 {
+        } else if rels.is_empty() {
             None
         } else {
             join_estimate(
@@ -1311,10 +1311,10 @@ fn join_estimate<'a>(
             let rels = vars
                 .as_slice()
                 .iter()
-                .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
+                .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel));
             let estimate = if rels.count_ones() == 1 {
                 restriction(rels.trailing_zeros() as usize, arm)?
-            } else if rels == 0 {
+            } else if rels.is_empty() {
                 None
             } else if matches!(
                 arm,
@@ -1417,7 +1417,7 @@ fn several_relations_constant(scope: &QueryScope<'_>, expression: &Expr<'_>) -> 
     let rels = qual_vars(scope, side)?
         .as_slice()
         .iter()
-        .fold(0u32, |relids, &(rel, _)| relids | 1 << rel);
+        .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel));
     (rels.count_ones() > 1).then_some(*operator)
 }
 
@@ -1603,7 +1603,7 @@ pub(crate) fn modeled_join<'a>(
     }
     let members = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
     let mut entries = [0u8; MAX_JOIN_RELS];
-    let mut joined = 0u32;
+    let mut joined = Relids::EMPTY;
     let mut leaf = 0;
     for (table, item) in core::iter::once(&written.base)
         .chain(written.joins.iter().map(|join| &join.table))
@@ -1620,7 +1620,7 @@ pub(crate) fn modeled_join<'a>(
         // (`member.*`), then whether each member's row is NULL.
         if parenthesized_join(item).is_some() {
             width = 2 * width + count;
-            joined |= 1 << table;
+            joined |= Relids::of(table);
         }
         if width != scope.stored_width(table) {
             return Ok(None);
@@ -1764,14 +1764,6 @@ fn modeled_join_over<'a>(
     };
     let methods = crate::sql::guc::planner_methods();
     let value = crate::sql::guc::planner_value;
-    // Above `geqo_threshold` PostgreSQL searches genetically, and past the
-    // collapse limits it plans several join problems.
-    if (value("geqo") != 0.0 && n as f64 >= value("geqo_threshold"))
-        || n as f64 > value("join_collapse_limit")
-        || n as f64 > value("from_collapse_limit")
-    {
-        return Ok(None);
-    }
     for (index, join) in from.joins.iter().enumerate() {
         if !matches!(
             join.kind,
@@ -2179,6 +2171,8 @@ fn modeled_join_over<'a>(
     // `FROM` list holding the `WHERE` conditions.
     let mut tree = Tree::new(n);
     tree.enable_hashagg = value("enable_hashagg") != 0.0;
+    tree.from_collapse_limit = value("from_collapse_limit") as i64;
+    tree.join_collapse_limit = value("join_collapse_limit") as i64;
     // The pulled-up `EXISTS` and `IN` subqueries' semi and anti joins come
     // last; each wraps the joins and `WHERE` before it
     // (`pull_up_sublinks`).
@@ -2327,13 +2321,13 @@ fn modeled_join_over<'a>(
     // `remove_useless_joins`: a left join to one relation no row above
     // reads, which a unique index makes match at most one row, is dropped
     // with it.
-    let mut removed: Relids = 0;
+    let mut removed: Relids = Relids::EMPTY;
     'restart: loop {
         for at in 0..prepared.special_count {
             let info = prepared.specials[at];
             if info.kind != super::joins::SpecialKind::Left
                 || info.min_right.count_ones() != 1
-                || info.min_right & !BASE_RELIDS != 0
+                || info.min_right & !BASE_RELIDS != Relids::EMPTY
             {
                 continue;
             }
@@ -2375,7 +2369,7 @@ fn modeled_join_over<'a>(
             Placed::Restriction { rel, qual } => (usize::from(rel), quals[usize::from(qual)]),
             // An expression of several relations equated with the
             // constant filters their join, below.
-            Placed::Implied { member, .. } if member.reads != 0 => continue,
+            Placed::Implied { member, .. } if member.reads != Relids::EMPTY => continue,
             Placed::Implied { member, class } => {
                 let Some(value) = constant_of(usize::from(class)) else {
                     return Ok(None);
@@ -2401,15 +2395,15 @@ fn modeled_join_over<'a>(
     let costs = Costs::current();
     let mut clauses = [Clause {
         form: ClauseForm::Other,
-        relids: 0,
-        required: 0,
+        relids: Relids::EMPTY,
+        required: Relids::EMPTY,
         pushed_down: true,
         clone: super::joins::CloneKind::None,
-        incompatible: 0,
+        incompatible: Relids::EMPTY,
         cost: costs.cpu_operator,
         selectivity: None,
         outer_selectivity: None,
-        outer_relids: 0,
+        outer_relids: Relids::EMPTY,
         operands: None,
         other: super::joins::OtherShape::Plain,
         constant: false,
@@ -2425,7 +2419,7 @@ fn modeled_join_over<'a>(
             Placed::Join(join) => join,
             // `process_implied_equality` of a member reading several
             // relations: a join clause of them all.
-            Placed::Implied { member, class } if member.reads != 0 => {
+            Placed::Implied { member, class } if member.reads != Relids::EMPTY => {
                 let Some(value) = constant_of(usize::from(class)) else {
                     return Ok(None);
                 };
@@ -2442,8 +2436,8 @@ fn modeled_join_over<'a>(
                     required: relids,
                     pushed_down: true,
                     clone: super::joins::CloneKind::None,
-                    incompatible: 0,
-                    outer_relids: 0,
+                    incompatible: Relids::EMPTY,
+                    outer_relids: Relids::EMPTY,
                     merge: None,
                 }
             }
@@ -2499,15 +2493,15 @@ fn modeled_join_over<'a>(
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
     // The outer joins that can null each relation (`nulling_relids`).
-    let mut nulling_relids = [0 as Relids; MAX_JOIN_RELS];
+    let mut nulling_relids = [Relids::EMPTY as Relids; MAX_JOIN_RELS];
     for special in &prepared.specials[..prepared.special_count] {
         let nullable = match special.kind {
             super::joins::SpecialKind::Left | super::joins::SpecialKind::Anti => special.syn_right,
             super::joins::SpecialKind::Full => special.syn_left | special.syn_right,
-            super::joins::SpecialKind::Semi => 0,
+            super::joins::SpecialKind::Semi => Relids::EMPTY,
         };
         for (table, relids) in nulling_relids.iter_mut().enumerate().take(n) {
-            if nullable & 1 << table != 0 {
+            if nullable & Relids::of(table) != Relids::EMPTY {
                 *relids |= special.oj;
             }
         }
@@ -2515,8 +2509,8 @@ fn modeled_join_over<'a>(
     // The outer joins that null any of the base relations `relids`.
     let member_nulling = |relids: Relids| {
         (0..n)
-            .filter(|&table| relids & 1 << table != 0)
-            .fold(0, |nulling, table| nulling | nulling_relids[table])
+            .filter(|&table| relids & Relids::of(table) != Relids::EMPTY)
+            .fold(Relids::EMPTY, |nulling, table| nulling | nulling_relids[table])
             & !BASE_RELIDS
     };
     // The query's pathkeys (`make_pathkeys_for_sortclauses`): each `ORDER
@@ -2588,7 +2582,7 @@ fn modeled_join_over<'a>(
                 rel: table as u8,
                 column: column as u16,
                 nulling: nulling_relids[table] & !BASE_RELIDS,
-                reads: 0,
+                reads: Relids::EMPTY,
             };
             let class = match extended[..class_count]
                 .iter()
@@ -2629,7 +2623,7 @@ fn modeled_join_over<'a>(
     let mut expression_classes = [(0u8, &Expr::Null); super::joins::MAX_KEYS];
     let mut expression_class_count = 0;
     for &(target, flags, item) in sort_entries {
-        let mut several: Relids = 0;
+        let mut several: Relids = Relids::EMPTY;
         let (table, column) = match target {
             SortTarget::Column(table, column) => (table, column),
             SortTarget::Expression(expression) => {
@@ -2681,7 +2675,7 @@ fn modeled_join_over<'a>(
         let member = Member {
             rel: table as u8,
             column: column as u16,
-            nulling: member_nulling(1 << table | several),
+            nulling: member_nulling(Relids::of(table) | several),
             reads: several,
         };
         let class = match extended[..class_count]
@@ -3126,7 +3120,7 @@ fn modeled_join_over<'a>(
                     rel: table as u8,
                     column: column as u16,
                     nulling: nulling_relids[table] & !BASE_RELIDS,
-                    reads: 0,
+                    reads: Relids::EMPTY,
                 };
                 key_only_columns[table] &= !(1 << column);
                 if !statement.items.iter().any(|item| match item {
@@ -3297,7 +3291,7 @@ fn modeled_join_over<'a>(
                 rel: table as u8,
                 column: column as u16,
                 nulling: clause.relids & nulling_relids[table] & !BASE_RELIDS,
-                reads: 0,
+                reads: Relids::EMPTY,
             };
             clause.operands = Some((member(one), member(two)));
         }
@@ -3310,11 +3304,11 @@ fn modeled_join_over<'a>(
         params: [(0, 0); MAX_JOIN_PARAMS],
         param_count: 0,
         clause_params: 0,
-        param_others: [0; MAX_JOIN_PARAMS],
+        param_others: [Relids::EMPTY; MAX_JOIN_PARAMS],
         classes: [NO_CLASS; 64],
         merging: 0,
         order: Keys::NONE,
-        rel_rows: [0.0; 8],
+        rel_rows: [0.0; MAX_JOIN_RELS],
         total_table_pages: 0.0,
         describe: None,
     }; MAX_JOIN_RELS];
@@ -3367,19 +3361,19 @@ fn modeled_join_over<'a>(
         }
     }
     for table in 0..n {
-        if removed & 1 << table == 0 {
+        if removed & Relids::of(table) == Relids::EMPTY {
             total_table_pages += super::relation_size(storage, scope.slots[table], txid).pages;
         }
         let scan = &mut scans[table];
         scan.order = query_keys;
-        let relids: Relids = 1 << table;
+        let relids: Relids = Relids::of(table);
         // `pathkeys_useful_for_merging` at the relation: a class with a
         // member elsewhere, or one a mergeable clause of its `joininfo`
         // sorts by.
         let eclass_joins = classes.iter().any(|class| {
             usize::from(class.count) + usize::from(class.has_const) > 1
-                && class.relids() & relids != 0
-                && class.relids() & !relids != 0
+                && class.relids() & relids != Relids::EMPTY
+                && class.relids() & !relids != Relids::EMPTY
         });
         // Each column, then each expression member an index keys by its
         // variable (`match_index_to_operand`).
@@ -3400,11 +3394,11 @@ fn modeled_join_over<'a>(
             let useful_by_class = eclass_joins
                 && !held.has_const
                 && held.count > 1
-                && held.relids() & !relids != 0
+                && held.relids() & !relids != Relids::EMPTY
                 && held
                     .members()
                     .iter()
-                    .any(|member| member.relids() & relids == 0);
+                    .any(|member| member.relids() & relids == Relids::EMPTY);
             let useful_by_clause = clauses[..placed_join_count].iter().any(|clause| {
                 clause.in_joininfo_of(relids)
                     && matches!(clause.form, ClauseForm::Join { left_class, right_class, .. }
@@ -3434,9 +3428,9 @@ fn modeled_join_over<'a>(
         });
         for (id, clause) in clauses[..placed_join_count].iter().enumerate() {
             if !clause.in_joininfo_of(relids)
-                || clause.relids & relids == 0
-                || clause.outer_relids & relids != 0
-                || clause.relids & nulling_relids[table] != 0
+                || clause.relids & relids == Relids::EMPTY
+                || clause.outer_relids & relids != Relids::EMPTY
+                || clause.relids & nulling_relids[table] != Relids::EMPTY
                 || clause.clone == super::joins::CloneKind::Is
             {
                 continue;
@@ -3494,7 +3488,7 @@ fn modeled_join_over<'a>(
         }
         for (class_id, class) in classes.iter().enumerate() {
             let Some(own) = class.members().iter().find(|member| {
-                usize::from(member.rel) == table && member.nulling == 0 && member.reads == 0
+                usize::from(member.rel) == table && member.nulling == Relids::EMPTY && member.reads == Relids::EMPTY
             }) else {
                 continue;
             };
@@ -3511,7 +3505,7 @@ fn modeled_join_over<'a>(
                 // A member reading the relation is no value from outside it
                 // (`generate_implied_equalities_for_column`); an expression
                 // of several relations parameterizes the scan by them all.
-                if other.base_relids() & relids != 0 {
+                if other.base_relids() & relids != Relids::EMPTY {
                     continue;
                 }
                 let at = usize::from(scan.param_count);
@@ -3532,7 +3526,7 @@ fn modeled_join_over<'a>(
     // or outer join reads (`attr_needed`).
     let mut join_columns = [0u64; MAX_JOIN_RELS];
     for &((rel, column), relids, _) in &prepared.needed[..prepared.needed_count] {
-        if relids != 0 && column < 64 {
+        if relids != Relids::EMPTY && column < 64 {
             join_columns[usize::from(rel)] |= 1 << column;
             note(usize::from(rel), usize::from(column));
         }
@@ -3546,11 +3540,11 @@ fn modeled_join_over<'a>(
         rel: 0,
         column: 0,
         width: 0.0,
-        needed_by: 0,
+        needed_by: Relids::EMPTY,
         output: false,
     }; 64 * 2];
     let mut needed_count = 0;
-    let mut rel_rows = [0.0f64; 8];
+    let mut rel_rows = [0.0f64; MAX_JOIN_RELS];
     // The indexes each relation's first sizing found, which the
     // extracted restrictions' estimates read.
     let mut sized_indexes = [&[][..]; MAX_JOIN_RELS];
@@ -3565,13 +3559,13 @@ fn modeled_join_over<'a>(
             // `extract_restriction_or_clauses`.
             let mut extracted = false;
             for table in 0..n {
-                let relids: Relids = 1 << table;
+                let relids: Relids = Relids::of(table);
                 for (id, clause) in clauses[..placed_join_count].iter().enumerate() {
                     if clause.form != ClauseForm::Other
                         || !clause.in_joininfo_of(relids)
-                        || clause.relids & relids == 0
-                        || clause.outer_relids & relids != 0
-                        || clause.relids & nulling_relids[table] != 0
+                        || clause.relids & relids == Relids::EMPTY
+                        || clause.outer_relids & relids != Relids::EMPTY
+                        || clause.relids & nulling_relids[table] != Relids::EMPTY
                         || clause.clone == super::joins::CloneKind::Is
                     {
                         continue;
@@ -3712,12 +3706,12 @@ fn modeled_join_over<'a>(
                 needed[needed_count] = NeededColumn {
                     rel: table as u8,
                     column: column as u16,
-                    width: if prepared.false_relids == 1 << table {
+                    width: if prepared.false_relids == Relids::of(table) {
                         0.0
                     } else {
                         f64::from(super::column_width(storage, txid, slot, column))
                     },
-                    needed_by: prepared.needed_by((table as u8, column as u16)) & !(1 << table),
+                    needed_by: prepared.needed_by((table as u8, column as u16)) & !Relids::of(table),
                     output: output[table] & 1 << column != 0,
                 };
                 needed_count += 1;
@@ -3740,7 +3734,7 @@ fn modeled_join_over<'a>(
             rel: expression.rel,
             column: Member::expression(expression.rel, id as u16).column,
             width: expression.width,
-            needed_by: 0,
+            needed_by: Relids::EMPTY,
             output: false,
         };
         needed_count += 1;
@@ -3775,13 +3769,13 @@ fn modeled_join_over<'a>(
             required: relids,
             pushed_down: true,
             clone: super::joins::CloneKind::None,
-            incompatible: 0,
+            incompatible: Relids::EMPTY,
             cost: costs.cpu_operator
                 + member_cost(members[usize::from(left)])
                 + member_cost(members[usize::from(right)]),
             selectivity: None,
             outer_selectivity: None,
-            outer_relids: 0,
+            outer_relids: Relids::EMPTY,
             operands: None,
             other: super::joins::OtherShape::Plain,
             constant: false,
@@ -3799,7 +3793,7 @@ fn modeled_join_over<'a>(
         let inner = special.min_right;
         if special.kind != super::joins::SpecialKind::Semi
             || inner.count_ones() != 1
-            || inner & !BASE_RELIDS != 0
+            || inner & !BASE_RELIDS != Relids::EMPTY
         {
             continue;
         }
@@ -3821,7 +3815,7 @@ fn modeled_join_over<'a>(
             }
             let first = |side: Relids| {
                 held.members().iter().position(|member| {
-                    member.relids() & !joined == 0 && member.relids() & !side == 0
+                    member.relids() & !joined == Relids::EMPTY && member.relids() & !side == Relids::EMPTY
                 })
             };
             if let (Some(outer), Some(within)) = (first(special.min_left), first(inner))
@@ -3843,7 +3837,7 @@ fn modeled_join_over<'a>(
         let rel = rels[table].expect("planned");
         let paths = planned_paths[table].expect("planned");
         // A dummy relation has no paths and derives no clauses.
-        if prepared.false_relids == 1 << table {
+        if prepared.false_relids == Relids::of(table) {
             base[table] = BaseRel {
                 rows: 0.0,
                 width: 0.0,
@@ -3860,7 +3854,7 @@ fn modeled_join_over<'a>(
             column
                 .and_then(|column| {
                     members.iter().position(|member| {
-                        member.relids() == 1 << table
+                        member.relids() == Relids::of(table)
                             && match member.expression_id() {
                                 Some(id) => expression_keys[id] == Some(column as u16),
                                 None => usize::from(member.column) == column,
@@ -3870,17 +3864,17 @@ fn modeled_join_over<'a>(
                 .or_else(|| {
                     members
                         .iter()
-                        .position(|member| member.relids() == 1 << table)
+                        .position(|member| member.relids() == Relids::of(table))
                 })
         };
         // The clauses a path parameterized by `param` moves into the scan:
         // the outer joins' movable clauses, then one per class.
-        let moved = |param: u32, derive: &mut dyn FnMut(u8, u8, u8) -> Option<u8>| {
+        let moved = |param: Relids, derive: &mut dyn FnMut(u8, u8, u8) -> Option<u8>| {
             let mut list = ClauseList::EMPTY;
             let params = &rel.scan.params[..usize::from(rel.scan.param_count)];
             for (at, (&(_, other), clause)) in params.iter().zip(param_clause[table]).enumerate() {
                 if let Some(id) = clause
-                    && (1 << other | rel.scan.param_others[at]) & !param == 0
+                    && (Relids::of(other) | rel.scan.param_others[at]) & !param == Relids::EMPTY
                 {
                     list.push_id(id)?;
                 }
@@ -3901,14 +3895,14 @@ fn modeled_join_over<'a>(
                     && held
                         .members()
                         .iter()
-                        .any(|member| member.relids() & !param == 0)
+                        .any(|member| member.relids() & !param == Relids::EMPTY)
                 {
                     return None;
                 }
                 let Some(outer) = held
                     .members()
                     .iter()
-                    .position(|member| member.relids() & !param == 0)
+                    .position(|member| member.relids() & !param == Relids::EMPTY)
                 else {
                     continue;
                 };
@@ -3946,7 +3940,7 @@ fn modeled_join_over<'a>(
                 }
             }
             for (at, candidate) in paths.candidates.iter().enumerate() {
-                if usize::from(candidate.describe.index) == index_at && candidate.param != 0 {
+                if usize::from(candidate.describe.index) == index_at && !candidate.param.is_empty() {
                     let Some(list) = moved(candidate.param, &mut derive) else {
                         return Ok(None);
                     };
@@ -3955,7 +3949,7 @@ fn modeled_join_over<'a>(
             }
         }
         for (at, candidate) in paths.candidates.iter().enumerate() {
-            if candidate.param != 0 && candidate.describe.index == u16::MAX {
+            if !candidate.param.is_empty() && candidate.describe.index == u16::MAX {
                 let Some(list) = moved(candidate.param, &mut derive) else {
                     return Ok(None);
                 };
@@ -3971,7 +3965,7 @@ fn modeled_join_over<'a>(
                     rows: candidate.rows,
                     disabled: candidate.candidate.disabled,
                     keys: Keys::of(&candidate.keys[..usize::from(candidate.key_count)]),
-                    param: Relids::from(candidate.param),
+                    param: candidate.param,
                     enforced: enforced[at],
                     mark_restore: matches!(
                         candidate.candidate.kind,
@@ -4032,7 +4026,7 @@ fn modeled_join_over<'a>(
             let members = classes[usize::from(class)].members();
             let own = members
                 .iter()
-                .position(|member| usize::from(member.rel) == table && member.reads == 0)
+                .position(|member| usize::from(member.rel) == table && member.reads == Relids::EMPTY)
                 .expect("a member of the relation") as u8;
             let reads = rel.scan.param_others[at] & BASE_RELIDS;
             let other = members
@@ -4084,7 +4078,7 @@ fn modeled_join_over<'a>(
         .enumerate()
         .take(expressions.count)
     {
-        if expressions.get(id).reads != 0 {
+        if expressions.get(id).reads != Relids::EMPTY {
             *vars = expressions.get(id).vars;
         }
     }
@@ -4346,7 +4340,7 @@ fn modeled_join_over<'a>(
                                     (a.rel, a.column) == (own.rel, own.column)
                                         && (b.rel, b.column) == (other.rel, other.column)
                                 };
-                                if clause.in_joininfo_of(1 << referencing)
+                                if clause.in_joininfo_of(Relids::of(referencing))
                                     && (pair(left, right) || pair(right, left))
                                 {
                                     if matched_clauses.push_id(id as u8).is_none() {
@@ -4380,7 +4374,7 @@ fn modeled_join_over<'a>(
     // column's, a full join's merged column at its type's.
     // A dummy relation's columns were never sized (`attr_widths`).
     let column_width = |(table, column): (usize, usize)| {
-        if prepared.false_relids == 1 << table {
+        if prepared.false_relids == Relids::of(table) {
             return 0.0;
         }
         f64::from(super::column_width(
@@ -4605,6 +4599,7 @@ fn modeled_join_over<'a>(
         classes,
         specials: &prepared.specials[..prepared.special_count],
         subproblems,
+        subproblem_items: &prepared.subproblem_items[..prepared.subproblem_item_count],
         clauses: &clauses[..clause_count],
         needed: &needed[..needed_count],
         expression_costs: &expression_costs,
@@ -4664,6 +4659,7 @@ fn modeled_join_over<'a>(
             sort: methods.sort,
             incremental_sort: methods.incremental_sort,
             memoize: value("enable_memoize") != 0.0,
+            geqo: super::joins::GeqoSettings::current(),
         },
     };
     let Ok(plan) = super::joins::search(&problem, &reader, arena)? else {
@@ -4856,7 +4852,7 @@ fn join_is_removable(
     if output != 0
         || prepared.needed[..prepared.needed_count]
             .iter()
-            .any(|&((rel, _), relids, _)| usize::from(rel) == table && relids & !inputs != 0)
+            .any(|&((rel, _), relids, _)| usize::from(rel) == table && relids & !inputs != Relids::EMPTY)
     {
         return false;
     }
@@ -4864,7 +4860,7 @@ fn join_is_removable(
     for class in prepared.classes() {
         if class.has_const {
             for member in class.members() {
-                if usize::from(member.rel) == table && member.nulling == 0 && member.column < 64 {
+                if usize::from(member.rel) == table && member.nulling == Relids::EMPTY && member.column < 64 {
                     matched |= 1 << member.column;
                 }
             }
@@ -4875,9 +4871,9 @@ fn join_is_removable(
             continue;
         };
         if join.clone == super::joins::CloneKind::Is
-            || join.required & info.min_right == 0
+            || join.required & info.min_right == Relids::EMPTY
             || join.pushed_down
-            || join.required & !joinrelids != 0
+            || join.required & !joinrelids != Relids::EMPTY
         {
             continue;
         }
@@ -4886,7 +4882,7 @@ fn join_is_removable(
         };
         for (own, other) in [(left, right), (right, left)] {
             if own.relids() == info.min_right
-                && other.relids() & !info.min_left == 0
+                && other.relids() & !info.min_left == Relids::EMPTY
                 && own.column < 64
             {
                 matched |= 1 << own.column;
@@ -4929,15 +4925,15 @@ fn removable_self_join(
     let n = scope.n.min(MAX_JOIN_RELS);
     for r in 0..n {
         for k in r + 1..n {
-            if removed & (1 << r | 1 << k) != 0 || scope.slots[r] != scope.slots[k] {
+            if removed & (Relids::of(r) | Relids::of(k)) != Relids::EMPTY || scope.slots[r] != scope.slots[k] {
                 continue;
             }
-            let (r_bit, k_bit): (Relids, Relids) = (1 << r, 1 << k);
+            let (r_bit, k_bit): (Relids, Relids) = (Relids::of(r), Relids::of(k));
             if prepared.specials[..prepared.special_count]
                 .iter()
                 .any(|info| {
-                    (info.syn_left & r_bit != 0) != (info.syn_left & k_bit != 0)
-                        || (info.syn_right & r_bit != 0) != (info.syn_right & k_bit != 0)
+                    (info.syn_left & r_bit != Relids::EMPTY) != (info.syn_left & k_bit != Relids::EMPTY)
+                        || (info.syn_right & r_bit != Relids::EMPTY) != (info.syn_right & k_bit != Relids::EMPTY)
                 })
             {
                 continue;
@@ -4947,8 +4943,8 @@ fn removable_self_join(
                 let plain = |rel: usize| {
                     class.members().iter().filter(move |member| {
                         usize::from(member.rel) == rel
-                            && member.nulling == 0
-                            && member.reads == 0
+                            && member.nulling == Relids::EMPTY
+                            && member.reads == Relids::EMPTY
                             && member.column < 64
                             && member.expression_id().is_none()
                     })
@@ -5080,14 +5076,12 @@ impl RelStatistics<'_, '_, '_> {
     ) -> impl Iterator<Item = (usize, ([usize; 64], usize))> + 's {
         let mut order = [0u8; MAX_JOIN_RELS];
         let mut count = 0;
-        let mut done = 0u32;
+        let mut done = Relids::EMPTY;
         for member in members {
-            for rel in 0..MAX_JOIN_RELS {
-                if member.base_relids() & 1 << rel != 0 && done & 1 << rel == 0 {
-                    done |= 1 << rel;
-                    order[count] = rel as u8;
-                    count += 1;
-                }
+            for rel in (member.base_relids() & !done).rels() {
+                done |= Relids::of(rel);
+                order[count] = rel;
+                count += 1;
             }
         }
         (0..count).map(move |at| {
@@ -5110,7 +5104,7 @@ impl RelStatistics<'_, '_, '_> {
             }
         };
         // An expression of several relations: its columns of this one.
-        for member in members.iter().filter(|member| member.reads != 0) {
+        for member in members.iter().filter(|member| member.reads != Relids::EMPTY) {
             let id = member.expression_id().expect("an expression");
             for &(held, var) in self.expression_vars[id].as_slice() {
                 if held == rel {
@@ -5120,7 +5114,7 @@ impl RelStatistics<'_, '_, '_> {
         }
         for member in members
             .iter()
-            .filter(|member| member.rel == rel && member.reads == 0)
+            .filter(|member| member.rel == rel && member.reads == Relids::EMPTY)
         {
             let column = self.column(*member);
             if member.expression_id().is_none() {
@@ -5198,9 +5192,9 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
         // An expression of several relations has no statistics and the
         // default distinct count (`get_variable_numdistinct` without a
         // relation): `eqjoinsel_inner` without MCV lists.
-        if left.reads != 0 || right.reads != 0 {
+        if left.reads != Relids::EMPTY || right.reads != Relids::EMPTY {
             let side = |member: Member| {
-                if member.reads != 0 {
+                if member.reads != Relids::EMPTY {
                     return (super::DEFAULT_NUM_DISTINCT, 0.0);
                 }
                 let planner = self.planner(member);
@@ -5302,8 +5296,8 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
     fn semi(&self, outer: Member, inner: Member, inner_rows: f64) -> Result<f64, SqlError> {
         // An expression of several relations: a default distinct count,
         // `eqjoinsel_semi` without MCV lists.
-        if outer.reads != 0 || inner.reads != 0 {
-            let nulls = if outer.reads != 0 {
+        if outer.reads != Relids::EMPTY || inner.reads != Relids::EMPTY {
+            let nulls = if outer.reads != Relids::EMPTY {
                 0.0
             } else {
                 let variable = self.planner(outer).variable(self.column(outer));
@@ -5428,7 +5422,7 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
 
     fn bucket(&self, member: Member, buckets: f64) -> Result<(f64, f64), SqlError> {
         // No statistics: `estimate_hash_bucket_stats`' default.
-        if member.reads != 0 {
+        if member.reads != Relids::EMPTY {
             return Ok((0.0, 0.1));
         }
         let planner = self.planner(member);
@@ -5472,7 +5466,7 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
     ) -> Result<Option<[f64; 4]>, SqlError> {
         let mut range = [0.0, 1.0, 0.0, 1.0];
         // No histogram bounds: `mergejoinscansel` keeps the whole ranges.
-        if left.reads != 0 || right.reads != 0 {
+        if left.reads != Relids::EMPTY || right.reads != Relids::EMPTY {
             return Ok(Some(range));
         }
         let (first, second) = (self.planner(left), self.planner(right));

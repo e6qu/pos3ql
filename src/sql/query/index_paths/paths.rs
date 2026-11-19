@@ -14,6 +14,7 @@ use crate::sql::eval::SqlError;
 use crate::sql::types::{ColType, Datum};
 use crate::storage::{ColumnSet, Storage};
 
+use super::joins::Relids;
 use super::super::scope::QueryScope;
 use super::clauses::{self, Analyzer, Clause, QualCost, Restriction, narrow_mask};
 use super::predicate::{self, Prop};
@@ -127,7 +128,7 @@ struct IndexPath<'a> {
     total: f64,
     /// The relations whose values its join clauses read (`PATH_REQ_OUTER`)
     /// and its rows: the relation's, or `ppi_rows` of a parameterized path.
-    param: u32,
+    param: Relids,
     rows: f64,
 }
 
@@ -150,7 +151,7 @@ struct BitmapNode<'a> {
     /// The identities of the clauses it applies (`classify_index_clause_usage`).
     clauses: u64,
     /// The relations its join clauses read (`PATH_REQ_OUTER`).
-    param: u32,
+    param: Relids,
 }
 
 /// One candidate path of the relation, or of its ordered or limited
@@ -306,28 +307,28 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     }
 
     /// The other relation join clause `at` reads, by bit.
-    fn join_rel(&self, at: usize) -> u32 {
+    fn join_rel(&self, at: usize) -> Relids {
         let scan = self.join.expect("a join clause").scan;
-        1 << scan.params[at].1 | scan.param_others[at]
+        Relids::of(scan.params[at].1) | scan.param_others[at]
     }
 
     /// The relations the join clauses among `clauses` read.
-    fn clauses_param(&self, clauses: &[IndexClause<'a>]) -> u32 {
+    fn clauses_param(&self, clauses: &[IndexClause<'a>]) -> Relids {
         clauses
             .iter()
             .filter_map(|clause| self.param_of(clause.restriction))
-            .fold(0, |param, at| param | self.join_rel(at))
+            .fold(Relids::EMPTY, |param, at| param | self.join_rel(at))
     }
 
     /// `get_loop_count`: the fewest rows among the relations `param`
     /// names, or one.
-    fn loop_count(&self, param: u32) -> f64 {
+    fn loop_count(&self, param: Relids) -> f64 {
         let Some(join) = self.join else {
             return 1.0;
         };
         let mut result = 0.0f64;
         for (rel, &rows) in join.scan.rel_rows.iter().enumerate() {
-            if param & 1 << rel != 0 && (result == 0.0 || result > rows) {
+            if param.contains(rel as u32) && (result == 0.0 || result > rows) {
                 result = rows;
             }
         }
@@ -339,14 +340,14 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     /// relations, then per equivalence class the clause with its first
     /// member among `param`, as `generate_join_implied_equalities` chooses
     /// it.
-    fn moved_clauses(&self, param: u32, out: &mut [usize; super::MAX_JOIN_PARAMS]) -> usize {
-        let Some(join) = self.join.filter(|_| param != 0) else {
+    fn moved_clauses(&self, param: Relids, out: &mut [usize; super::MAX_JOIN_PARAMS]) -> usize {
+        let Some(join) = self.join.filter(|_| !param.is_empty()) else {
             return 0;
         };
         let mut count = 0;
         let params = &join.scan.params[..usize::from(join.scan.param_count)];
         for (at, &(class, _)) in params.iter().enumerate() {
-            if self.join_rel(at) & !param == 0
+            if self.join_rel(at) & !param == Relids::EMPTY
                 && (self.clause_param(at)
                     || !out[..count]
                         .iter()
@@ -362,7 +363,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     /// `has_indexed_join_quals` of a path parameterized by `param` whose
     /// index applies `clauses`: each moved join clause is an index
     /// condition, a class's equality by any of the class's.
-    fn indexed_join_quals(&self, clauses: &[IndexClause<'a>], param: u32) -> bool {
+    fn indexed_join_quals(&self, clauses: &[IndexClause<'a>], param: Relids) -> bool {
         let mut moved = [0usize; super::MAX_JOIN_PARAMS];
         let moved_count = self.moved_clauses(param, &mut moved);
         moved_count > 0
@@ -374,7 +375,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     /// The rows of the relation's paths parameterized by `param`
     /// (`get_parameterized_baserel_size`): its restrictions and the moved
     /// join clauses, at most its own rows.
-    fn param_rows(&self, param: u32) -> Result<f64, SqlError> {
+    fn param_rows(&self, param: Relids) -> Result<f64, SqlError> {
         let mut moved = [0usize; super::MAX_JOIN_PARAMS];
         let moved_count = self.moved_clauses(param, &mut moved);
         if moved_count == 0 {
@@ -1288,7 +1289,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     /// `cost_bitmap_heap_scan` over a bitmap whose tree costs `tree_cost`
     /// and keeps `selectivity` of the rows: startup and total cost.
     fn bitmap_heap(&self, tree_cost: f64, selectivity: f64) -> (f64, f64) {
-        self.bitmap_heap_param(tree_cost, selectivity, 0, 0.0)
+        self.bitmap_heap_param(tree_cost, selectivity, Relids::EMPTY, 0.0)
     }
 
     /// `cost_bitmap_heap_scan` of a bitmap parameterized by `param`, whose
@@ -1297,7 +1298,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         &self,
         tree_cost: f64,
         selectivity: f64,
-        param: u32,
+        param: Relids,
         index_pages: f64,
     ) -> (f64, f64) {
         let costs = self.costs();
@@ -1356,7 +1357,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         let mut cost = 0.0;
         let mut selectivity = if and { 1.0 } else { 0.0 };
         let mut clauses = 0u64;
-        let mut param = 0u32;
+        let mut param = Relids::EMPTY;
         for (position, &child) in children.iter().enumerate() {
             let node = self.nodes.items[child];
             cost += node.tree_cost;
@@ -1490,7 +1491,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
                 // `bitmap_and_cost_est`.
                 let mut cost = 0.0;
                 let mut selectivity = 1.0;
-                let mut param = 0u32;
+                let mut param = Relids::EMPTY;
                 let mut pages = 0.0;
                 for (position, &member) in group[..=group_count].iter().enumerate() {
                     pages += self.bitmap_index_pages(member);
@@ -2833,7 +2834,7 @@ pub(crate) fn scan_path<'a>(
                 selectivity: 1.0,
                 startup: 0.0,
                 total: 0.0,
-                param: 0,
+                param: Relids::EMPTY,
                 rows: 0.0,
             },
         )?,
@@ -2846,7 +2847,7 @@ pub(crate) fn scan_path<'a>(
                 selectivity: 1.0,
                 total: 0.0,
                 clauses: 0,
-                param: 0,
+                param: Relids::EMPTY,
             },
         )?,
         next_id,
@@ -3674,7 +3675,7 @@ pub(crate) struct JoinCandidate {
     pub(crate) candidate: Candidate,
     /// The relations whose values its join clauses read, by FROM position,
     /// and the outer joins that null those values (`PATH_REQ_OUTER`).
-    pub(crate) param: u32,
+    pub(crate) param: Relids,
     /// Its pathkeys useful for merging: equivalence classes, ascending.
     pub(crate) keys: [u8; 8],
     pub(crate) key_count: u8,
@@ -3793,7 +3794,7 @@ fn join_candidates<'a>(
             sort: SortKind::None,
             reordered: false,
         },
-        0,
+        Relids::EMPTY,
         super::joins::Keys::NONE
     );
     let mut bitmap_candidates = [usize::MAX; MAX_CHILDREN];
@@ -3843,7 +3844,7 @@ fn join_candidates<'a>(
         // `consider_index_join_outer_rels`: per key column, its join
         // clauses then its classes' equalities, each clause's relation
         // alone and with each set tried before.
-        let mut considered = [0u32; 64];
+        let mut considered = [Relids::EMPTY; 64];
         let mut considered_count = 0usize;
         let mut considered_clauses = 0usize;
         for position in 0..keys {
@@ -3869,7 +3870,7 @@ fn join_candidates<'a>(
                         if !paths.clause_param(at)
                             && list.iter().any(|&other| {
                                 paths.join_class(other) == class
-                                    && paths.join_rel(other) & !old == 0
+                                    && paths.join_rel(other) & !old == Relids::EMPTY
                             })
                         {
                             continue;
@@ -3926,13 +3927,13 @@ fn join_candidates<'a>(
                 sort: SortKind::None,
                 reordered: false,
             },
-            0,
+            Relids::EMPTY,
             super::joins::Keys::NONE
         );
     }
     // One bitmap heap path per parameterization the join clauses' bitmap
     // paths need, over those needing no more and the restrictions'.
-    let mut outers = [0u32; MAX_CHILDREN];
+    let mut outers = [Relids::EMPTY; MAX_CHILDREN];
     let mut outer_count = 0;
     for &node in &join_bitmaps[..join_bitmap_count] {
         let param = paths.nodes.items[node].param;
@@ -3948,7 +3949,7 @@ fn join_candidates<'a>(
             .iter()
             .chain(&bitmap_candidates[..bitmap_count])
         {
-            if paths.nodes.items[node].param & !outer == 0 && set_count < MAX_CHILDREN {
+            if paths.nodes.items[node].param & !outer == Relids::EMPTY && set_count < MAX_CHILDREN {
                 set[set_count] = node;
                 set_count += 1;
             }
@@ -3990,8 +3991,8 @@ fn join_index_paths_for<'a>(
     all: &'a [&'a Restriction<'a>],
     by_column: &[[usize; super::MAX_JOIN_PARAMS]; crate::storage::MAX_INDEX_COLS],
     column_count: &[usize; crate::storage::MAX_INDEX_COLS],
-    relids: u32,
-    considered: &mut [u32; 64],
+    relids: Relids,
+    considered: &mut [Relids; 64],
     considered_count: &mut usize,
     out: &mut [Option<JoinCandidate>; 128],
     count: &mut usize,
@@ -4008,7 +4009,7 @@ fn join_index_paths_for<'a>(
         // Every join clause of the relations, then one class equality.
         let mut class_taken = false;
         for &at in &by_column[position][..column_count[position]] {
-            if paths.join_rel(at) & !relids != 0 || (class_taken && !paths.clause_param(at)) {
+            if paths.join_rel(at) & !relids != Relids::EMPTY || (class_taken && !paths.clause_param(at)) {
                 continue;
             }
             class_taken |= !paths.clause_param(at);
@@ -4067,7 +4068,7 @@ fn join_index_paths<'a>(
         }
         let path = outside!(paths.index_path(index, clauses, backward, index_only, 0)?);
         let index_path = paths.index_paths.items[path];
-        if parameterized && index_path.param == 0 {
+        if parameterized && index_path.param == Relids::EMPTY {
             // A join clause set no key column takes builds nothing new.
             continue;
         }

@@ -1790,3 +1790,89 @@ pub(super) fn fold_catalog_inputs<'a>(
         _ => Ok(expression),
     }
 }
+
+/// The most subplans one explained statement records costs for.
+const MAX_SUBPLAN_COSTS: usize = 64;
+
+thread_local! {
+    /// Per subquery the statement being explained runs as a subplan, by
+    /// the address of its query: what `cost_qual_eval` charges a condition
+    /// reading it (`cost_subplan`, its test expression included), as
+    /// startup and per-row cost. An InitPlan's output costs nothing to read.
+    static SUBPLAN_COSTS: core::cell::RefCell<([(usize, f64, f64); MAX_SUBPLAN_COSTS], usize)> =
+        const { core::cell::RefCell::new(([(0, 0.0, 0.0); MAX_SUBPLAN_COSTS], 0)) };
+}
+
+/// Forgets the subplan costs of the statement explained before.
+pub(crate) fn reset_subplan_costs() {
+    SUBPLAN_COSTS.with(|costs| costs.borrow_mut().1 = 0);
+}
+
+/// Records what a condition reading the subplan of `select` costs.
+pub(crate) fn record_subplan_cost(
+    select: *const (),
+    startup: f64,
+    per_tuple: f64,
+) -> Result<(), SqlError> {
+    SUBPLAN_COSTS.with(|costs| {
+        let mut costs = costs.borrow_mut();
+        let count = costs.1;
+        if count == MAX_SUBPLAN_COSTS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "EXPLAIN subplans exceed {}",
+                MAX_SUBPLAN_COSTS
+            ));
+        }
+        costs.0[count] = (select as usize, startup, per_tuple);
+        costs.1 = count + 1;
+        Ok(())
+    })
+}
+
+/// The startup and per-row cost the subplans `expression` reads (outside
+/// other subqueries) add to it; `None` when it reads a subquery no subplan
+/// was recorded for, or none.
+pub(crate) fn subplan_qual_cost(expression: &Expr<'_>) -> Option<(f64, f64)> {
+    fn visit(expression: &Expr<'_>, total: &mut Option<(f64, f64)>, known: &mut bool) {
+        let select = match expression {
+            Expr::Subquery(select)
+            | Expr::RowSubquery { select, .. }
+            | Expr::InSubquery { select, .. }
+            | Expr::QuantifiedSubquery { select, .. }
+            | Expr::Exists(select)
+            | Expr::ArraySubquery(select) => Some(core::ptr::from_ref(*select) as usize),
+            _ => None,
+        };
+        if let Some(select) = select {
+            let found = SUBPLAN_COSTS.with(|costs| {
+                let costs = costs.borrow();
+                costs.0[..costs.1]
+                    .iter()
+                    .find(|(held, ..)| *held == select)
+                    .map(|&(_, startup, per_tuple)| (startup, per_tuple))
+            });
+            match found {
+                Some((startup, per_tuple)) => {
+                    let (s, p) = total.unwrap_or((0.0, 0.0));
+                    *total = Some((s + startup, p + per_tuple));
+                }
+                None => *known = false,
+            }
+            if let Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } =
+                expression
+            {
+                visit(operand, total, known);
+            }
+            return;
+        }
+        let _ = super::walk_children(expression, &mut |child| {
+            visit(child, total, known);
+            Ok(())
+        });
+    }
+    let mut total = None;
+    let mut known = true;
+    visit(expression, &mut total, &mut known);
+    total.filter(|_| known)
+}

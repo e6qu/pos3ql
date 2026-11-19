@@ -923,6 +923,67 @@ thread_local! {
 /// Forgets the subplans of the statement explained before.
 fn reset_subplans() {
     SUBPLANS.with(|subplans| subplans.borrow_mut().1 = 0);
+    query::reset_subplan_costs();
+}
+
+/// What a condition reading the sublink `node`, planned as `plan` with top
+/// node `top`, costs per `cost_subplan`, as startup and per-row cost: its
+/// test expression's comparisons per row, plus loading a hash table once,
+/// or rescanning the plan's output per row. An InitPlan's output costs
+/// nothing to read.
+fn subplan_cost(
+    node: &Expr<'_>,
+    plan: crate::sql::catalog::deparse::SublinkPlan,
+    correlated: bool,
+    top: &PlanNode,
+) -> (f64, f64) {
+    use crate::sql::catalog::deparse::SublinkPlan;
+    let operator = crate::sql::guc::planner_value("cpu_operator_cost");
+    let rows = clamp_row_estimate(top.rows as f64);
+    // `cost_qual_eval` of the test expression: one operator per compared
+    // column.
+    let compared = match node {
+        Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } => {
+            match operand {
+                Expr::Call { args, .. } if operand.is_row_constructor() => args.len() as f64,
+                _ => 1.0,
+            }
+        }
+        _ => 0.0,
+    };
+    let mut startup = 0.0;
+    let mut per_tuple = compared * operator;
+    match plan {
+        SublinkPlan::InitPlan(_) => return (0.0, 0.0),
+        SublinkPlan::HashedSubPlan(_) => startup += top.total_cost + operator * top.rows as f64,
+        SublinkPlan::SubPlan(_) => {
+            let run = top.total_cost - top.startup_cost;
+            per_tuple += match node {
+                Expr::Exists(_) => run / rows,
+                Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } => {
+                    0.5 * run + 0.5 * top.rows as f64 * operator
+                }
+                _ => run,
+            };
+            // `ExecMaterializesOutput` of an uncorrelated plan's top node.
+            if !correlated
+                && matches!(
+                    top.name.as_str(),
+                    "Materialize"
+                        | "Function Scan"
+                        | "Table Function Scan"
+                        | "CTE Scan"
+                        | "WorkTable Scan"
+                        | "Sort"
+                )
+            {
+                startup += top.startup_cost;
+            } else {
+                per_tuple += top.startup_cost;
+            }
+        }
+    }
+    (startup, per_tuple)
 }
 
 /// Numbers `select` as the next subplan, as PostgreSQL numbers each
@@ -6112,9 +6173,14 @@ fn plan_sublinks<'a>(
         {
             arena
                 .alloc_slice_with(count + 1, |index| match index {
+                    // `cost_material`: two operator costs per row stored.
                     0 => PlanNode {
                         name: StackStr::from_str("Materialize"),
-                        total_cost: nodes[0].total_cost,
+                        startup_cost: nodes[0].startup_cost,
+                        total_cost: nodes[0].total_cost
+                            + 2.0
+                                * crate::sql::guc::planner_value("cpu_operator_cost")
+                                * nodes[0].rows as f64,
                         rows: nodes[0].rows,
                         width: nodes[0].width,
                         output: nodes[0].output,
@@ -6130,7 +6196,10 @@ fn plan_sublinks<'a>(
         } else {
             &nodes[..count]
         };
-        let number = match register_subplan(select, correlated, compared)? {
+        let registered = register_subplan(select, correlated, compared)?;
+        let (startup, per_tuple) = subplan_cost(node, registered, correlated, &nodes[0]);
+        query::record_subplan_cost(core::ptr::from_ref(select).cast(), startup, per_tuple)?;
+        let number = match registered {
             crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
             | crate::sql::catalog::deparse::SublinkPlan::SubPlan(number)
             | crate::sql::catalog::deparse::SublinkPlan::HashedSubPlan(number) => number,

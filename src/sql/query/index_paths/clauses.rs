@@ -642,6 +642,29 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 ),
             }
         };
+        // A test of a subplan (`[NOT] IN`, `ANY`, `ALL` or `EXISTS` of a
+        // subquery), which `boolvarsel` estimates at one half, and its
+        // complement or `booltestsel`'s `IS [NOT] TRUE` or `FALSE` too.
+        let subplan_test = match conjunct {
+            Expr::Unary {
+                operator: crate::sql::ast::UnaryOp::Not,
+                operand,
+                ..
+            } => operand,
+            _ => conjunct
+                .boolean_test_operand()
+                .map_or(conjunct, |(operand, ..)| operand),
+        };
+        if matches!(
+            subplan_test,
+            Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } | Expr::Exists(_)
+        ) {
+            return Ok(Ok(Clause::Expression {
+                columns: self.columns_of(conjunct),
+                bound: None,
+                selectivity: 0.5,
+            }));
+        }
         Ok(Ok(match conjunct {
             Expr::Binary {
                 operator: BinaryOp::Or,
@@ -1290,6 +1313,12 @@ impl<'a> Analyzer<'_, '_, 'a> {
     /// `cost_qual_eval` of the clause.
     fn cost(&self, source: &Expr<'_>, clause: &Clause<'_>) -> QualCost {
         let operator = self.planner.costs.cpu_operator;
+        // A subplan's test costs what `cost_subplan` charges for it.
+        if matches!(clause, Clause::Expression { bound: None, .. })
+            && let Some((startup, per_tuple)) = crate::sql::query::subplan_qual_cost(source)
+        {
+            return QualCost { startup, per_tuple };
+        }
         match *clause {
             Clause::Or(arms) => arms
                 .iter()

@@ -1103,17 +1103,33 @@ files are not sized). An `INSERT ... ON CONFLICT` prints its resolution,
 arbiter indexes and, analyzed, its inserted and conflicting tuples
 (`differential_exact/940`); a conflict target's `WHERE`, a `DO UPDATE ...
 WHERE` (`Conflict Filter`) and an expression target fail `EXPLAIN` with
-`0A000`. A `LIMIT` over a `GroupAggregate` over a join reads the whole join
-rather than stopping after its last group, and a merge join over an input
-in order without a sort fails `EXPLAIN ANALYZE` with `0A000`. An
-uncorrelated scalar subquery's `min` or `max` is planned as an `Aggregate`
-over its scan rather than as `preprocess_minmax_aggregates`' InitPlans, and
-an `INSERT ... SELECT`'s InitPlans print under its source scan rather than
-under the `Insert` node. An error a PL/pgSQL `FOR ... IN EXECUTE` query
-raises while it runs (a unique violation, an `EXPLAIN ANALYZE`'s error)
-carries a `SQL statement` context line, which PostgreSQL prints only for
-errors raised while the query is planned (`_SPI_error_callback` is not
-installed around a cursor's fetches). Windows over a join the search plans read its plan's rows, also when
+`0A000`. A `LIMIT` directly over a sorted grouping stops reading its
+input at the first row of the group after the last one it takes (a
+`GroupAggregate` reads that group's rows, a `Group` of a `GROUP BY`
+without aggregates, costed by `cost_group`, only its first row), and only
+the groups it reads are filtered and projected (`differential_exact/941`).
+A merge join reads an index or index-only scan in order as far as it
+fetches, counting that scan's rows and heap fetches
+(`differential_exact/945`); one over another input in order without a sort
+(a filtered index scan, a join) fails `EXPLAIN ANALYZE` with `0A000`. Under
+`BUFFERS`, an index scan read in part counts its leaf pages from the
+index's average entries per leaf, one page more than PostgreSQL's full
+leaves when the scan stops early, and the visibility map counts no page
+all-visible after any change since `VACUUM`, where PostgreSQL clears only
+the changed pages' bits. An uncorrelated subquery's `min` or `max` is
+planned and run as `preprocess_minmax_aggregates`' InitPlans
+(`differential_exact/942`). An `INSERT` whose source PostgreSQL pulls up
+runs the source's InitPlans in its `Insert` node, as it does a `VALUES`
+row's, and the source's top node computes the target list coerced to the
+columns; a value coerced while the query runs leaves its cost unmodeled
+(`0A000` when costs print), as does a subquery in `ON CONFLICT`
+(`differential_exact/943`). A PL/pgSQL `FOR` loop over a query names it in
+an error's context only when the error is raised planning it
+(`differential_exact/944`). An `IN` or `= ANY` condition of the `WHERE` list over a subquery
+the search does not join, and an `IN`, `ANY` or `ALL` test reading no
+column, fail `EXPLAIN` with `0A000`, since PostgreSQL joins the subquery
+(`convert_ANY_sublink_to_join`) or gates the query with the test.
+Windows over a join the search plans read its plan's rows, also when
 the statement spills their input to object storage,
 so `EXPLAIN ANALYZE` counts its nodes (`differential_exact/935`); windows
 over a join it does not plan (a window function in the `ORDER BY`) fail
@@ -1182,9 +1198,12 @@ parenthesized join whose members join by written conditions (`a LEFT JOIN
 (b JOIN c ON x) ON y`, nested to any depth) is a node of the join tree
 `deconstruct_jointree` reads: its relations join in the same search, and
 each joined row fills the parenthesized join's columns from its members'
-rows (`differential_exact/934`). Remaining there: an aliased one, one
-joined by `USING` or `NATURAL`, and one under grouping, aggregates or
-windows (`0A000` when costs print); a parenthesized join's own
+rows (`differential_exact/934`). Grouping, aggregates and `DISTINCT` over
+such joins are planned by the same search, a hashed grouping over a join
+reporting its memory (`differential_exact/946`). Remaining there: an
+aliased one, one joined by `USING` or `NATURAL`, and one under windows
+(`0A000` when costs print; with `COSTS OFF` such a plan prints pos3ql's
+own join order); a parenthesized join's own
 query runs only when the search does not plan the query, so one nested in
 another (`a LEFT JOIN (b JOIN (c JOIN d ON z) ON x) ON y`) joins its
 members without reading its rows first (`differential_exact/937`). Remaining for that search:

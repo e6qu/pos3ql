@@ -131,6 +131,9 @@ struct PlanNode {
     planned_partitions: Option<u32>,
     /// What sizes a hash aggregate's memory as PostgreSQL's.
     hash_agg: Option<query::postgres_memory::HashAggSizing>,
+    /// On an InitPlan's top node: what running it once added to the costs
+    /// of the node it is attached to (`SS_charge_for_initplans`).
+    initplan_charge: f64,
 }
 
 /// How a node runs a subplan: once before its first row, or per row.
@@ -443,6 +446,7 @@ impl PlanNode {
         analyze_unsupported: None,
         planned_partitions: None,
         hash_agg: None,
+        initplan_charge: 0.0,
     };
 }
 
@@ -1036,6 +1040,36 @@ fn sublinks_registered(expression: &Expr<'_>, correlated: bool) -> bool {
 
 /// Calls `visit` with each subquery of `expression` outside other
 /// subqueries, in written order.
+/// Whether `node` is one of the `AND`ed conditions of `condition`.
+fn where_conjunct(condition: &Expr<'_>, node: &Expr<'_>) -> bool {
+    if core::ptr::eq(condition, node) {
+        return true;
+    }
+    match condition {
+        Expr::Binary {
+            operator: crate::sql::ast::BinaryOp::And,
+            left,
+            right,
+            ..
+        } => where_conjunct(left, node) || where_conjunct(right, node),
+        _ => false,
+    }
+}
+
+/// Whether `expression` reads a column (a subquery's own columns are not
+/// its children).
+fn mentions_column(expression: &Expr<'_>) -> bool {
+    if matches!(expression, Expr::Column { .. }) {
+        return true;
+    }
+    let mut found = false;
+    let _ = query::walk_children(expression, &mut |child| {
+        found |= mentions_column(child);
+        Ok(())
+    });
+    found
+}
+
 fn visit_sublinks<'e>(expression: &'e Expr<'e>, visit: &mut dyn FnMut(&'e Expr<'e>)) {
     if matches!(
         expression,
@@ -3345,6 +3379,7 @@ fn push_members(
         analyze_unsupported: None,
         planned_partitions: None,
         hash_agg: None,
+        initplan_charge: 0.0,
         ..PlanNode::EMPTY
     })?;
     for &leaf in expansion.started {
@@ -4073,6 +4108,10 @@ fn has_aggregate(
 #[derive(Clone, Copy)]
 struct GroupedScan<'a> {
     path: query::index_paths::ScanPath<'a>,
+    /// The query shape and read columns the path was planned for, which
+    /// the scan's execution plans it from again.
+    shape: query::index_paths::QueryShape,
+    needed: Option<crate::storage::ColumnSet>,
     sort_keys: &'a [KeyItem<'a>],
     group_keys: &'a [KeyItem<'a>],
     /// The width of the rows the grouping returns, each column of the
@@ -4357,10 +4396,38 @@ fn grouped_scan_path<'a>(
         .map_err(|_| arena_full())?;
     Ok(Some(GroupedScan {
         path,
+        shape,
+        needed,
         sort_keys,
         group_keys,
         width: output_width,
     }))
+}
+
+/// The shape and read columns of a query grouping the rows of one table
+/// by its columns, when PostgreSQL's planner plans its scan and grouping
+/// ([`grouped_scan_path`]): its execution scans by that path, counting
+/// what the path reads.
+pub(crate) fn grouped_scan_context<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    arena: &'a Arena,
+) -> Result<
+    Option<(
+        query::index_paths::QueryShape,
+        Option<crate::storage::ColumnSet>,
+    )>,
+    SqlError,
+> {
+    let (width, _) = projected_shape(statement, Some(scope), None, storage, txid, arena)?;
+    Ok(
+        grouped_scan_path(storage, txid, statement, scope, from, columns, width, arena)?
+            .map(|grouped| (grouped.shape, grouped.needed)),
+    )
 }
 
 /// The grouping sets of a query of one plain table as PostgreSQL's
@@ -5643,6 +5710,7 @@ fn scan_node<'a>(
         analyze_unsupported: None,
         planned_partitions: None,
         hash_agg: None,
+        initplan_charge: 0.0,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -5708,11 +5776,12 @@ fn plan_select_with_ctes<'a>(
         return plan_select_with_ctes(storage, txid, rewritten, ctes, outer, block, arena);
     }
     // `min` and `max` of a local table are planned, and executed, as
-    // PostgreSQL plans them when an index orders them.
-    if outer.is_none()
+    // PostgreSQL plans them when an index orders them, also in a subquery
+    // reading no enclosing query's names.
+    if (outer.is_none() || !query::select_correlated(statement, storage, txid, arena)?)
         && let Some(rewritten) = query::local_minmax_subquery(storage, txid, statement, arena)?
     {
-        return plan_select_with_ctes(storage, txid, rewritten, ctes, outer, block, arena);
+        return plan_select_with_ctes(storage, txid, rewritten, ctes, None, block, arena);
     }
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
@@ -5950,6 +6019,34 @@ fn plan_sublinks<'a>(
             continue;
         };
         let correlated = query::subquery_node_correlated(node, storage, txid, arena)?;
+        if origin == SublinkOrigin::Where
+            && statement
+                .where_clause
+                .is_some_and(|condition| where_conjunct(condition, node))
+            && let Some((operand, any)) = match node {
+                Expr::InSubquery {
+                    operand, negated, ..
+                } => Some((*operand, !negated)),
+                Expr::QuantifiedSubquery { operand, all, .. } => Some((*operand, !all)),
+                _ => None,
+            }
+        {
+            let columns = mentions_column(operand);
+            // `convert_ANY_sublink_to_join` joins the subquery; a test of no
+            // column gates the query from a `Result` (`One-Time Filter`).
+            // A query without FROM evaluates its conditions in its
+            // `Result` already.
+            if (!columns && statement.from.is_some())
+                || (columns
+                    && any
+                    && !query::expression_contains_volatile(operand, storage, txid, false))
+            {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN of an IN, ANY or ALL subquery PostgreSQL joins or gates the query with is not supported"
+                ));
+            }
+        }
         let outer_slot =
             relation.and_then(|(_, schema, table)| relation_slot(storage, txid, schema, table));
         if correlated && outer_slot.is_none() {
@@ -6315,6 +6412,11 @@ fn attach_subplans<'a>(
                 } else {
                     node.subplan
                 },
+                initplan_charge: if at == 0 && sublink.kind == SubplanKind::InitPlan {
+                    sublink.initplan_cost()
+                } else {
+                    node.initplan_charge
+                },
                 alias: renamed[offsets[index] + at].unwrap_or(node.alias),
                 ..*node
             })?;
@@ -6654,8 +6756,10 @@ fn plan_pulled_select<'a>(
                     "Unique"
                 } else if group.keys.is_empty() {
                     "Aggregate"
-                } else {
+                } else if group.aggregated {
                     "GroupAggregate"
+                } else {
+                    "Group"
                 }),
                 key: Some(NodeKey::new(
                     block,
@@ -6671,6 +6775,11 @@ fn plan_pulled_select<'a>(
                 width: chosen.width as u32,
                 // A `Unique` names no keys.
                 keys: if unique { PlanKeys::NONE } else { group_keys },
+                hash_agg: group.hash_agg,
+                analyze_unsupported: (group.hashed && !group.distinct && group.hash_agg.is_none())
+                    .then_some(
+                        "EXPLAIN ANALYZE of a hash aggregate whose memory PostgreSQL's figure is not modelled for is not supported",
+                    ),
                 ..PlanNode::EMPTY
             }
             .with_qual(
@@ -7449,7 +7558,11 @@ fn plan_pulled_select<'a>(
                 add_stage(&mut stages, &mut stage_count, node)?;
             }
             if !path.hashed {
-                aggregate_name = "GroupAggregate";
+                aggregate_name = if path.aggregated {
+                    "GroupAggregate"
+                } else {
+                    "Group"
+                };
             }
             planned_partitions = path.planned_partitions;
             hash_agg_sizing = Some(path.hash_agg);
@@ -11001,6 +11114,7 @@ fn physical_scan_node(
         analyze_unsupported: None,
         planned_partitions: None,
         hash_agg: None,
+        initplan_charge: 0.0,
     }
 }
 
@@ -11178,6 +11292,7 @@ fn push_set_tree(
                 analyze_unsupported: None,
                 planned_partitions: None,
                 hash_agg: None,
+                initplan_charge: 0.0,
             };
             let node = if hashed_union {
                 let width = node.width;
@@ -11553,11 +11668,12 @@ pub(super) fn plan_modification<'a>(
     attach_subplans(plan?, 1, block, initplans, arena)
 }
 
-/// The InitPlans of an `UPDATE` or `DELETE`: each uncorrelated scalar
-/// subquery of its new values, in column order (`SS_process_sublinks` over
-/// the processed target list), then of its `WHERE`. Their outputs are
-/// parameters the write's node computes once. Any other subquery there is
-/// outside this plan.
+/// The InitPlans of a write: each uncorrelated scalar subquery of an
+/// `UPDATE`'s new values or an `INSERT`'s one `VALUES` row, in column order
+/// (`SS_process_sublinks` over the processed target list), of several
+/// `VALUES` rows in their order, then of the `WHERE`. Their outputs are
+/// parameters the write's node computes once. An `INSERT ... SELECT`'s
+/// source plans its own; any other subquery there is outside this plan.
 fn write_initplans<'a, 'e>(
     storage: &Storage,
     txid: u32,
@@ -11581,8 +11697,30 @@ fn write_initplans<'a, 'e>(
                 delete.returning,
                 delete.using.is_some(),
             ),
+            Stmt::Insert(insert) => (insert.table, &[], None, insert.returning, false),
             _ => return Ok(&[]),
         };
+    if let Stmt::Insert(insert) = statement
+        && let Some(on_conflict) = &insert.on_conflict
+    {
+        let mut nested = false;
+        for expression in on_conflict
+            .update
+            .unwrap_or(&[])
+            .iter()
+            .map(|(_, value)| *value)
+            .chain(on_conflict.update_where)
+            .chain(on_conflict.target_where)
+        {
+            visit_sublinks(expression, &mut |_| nested = true);
+        }
+        if nested {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN of a subquery in INSERT ... ON CONFLICT is not supported"
+            ));
+        }
+    }
     let mut found = crate::mem::arena::ArenaList::new(arena);
     let mut collect = |expression: &'e Expr<'e>| -> Result<(), SqlError> {
         let mut failed = false;
@@ -11606,6 +11744,30 @@ fn write_initplans<'a, 'e>(
         None => {
             for (_, value) in assignments {
                 collect(value)?;
+            }
+        }
+    }
+    if let Stmt::Insert(insert) = statement {
+        match (insert.rows, definition.as_deref()) {
+            ([row], Some(definition)) => {
+                for (index, column) in definition.columns().iter().enumerate() {
+                    let at = if insert.columns.is_empty() {
+                        Some(index)
+                    } else {
+                        insert
+                            .columns
+                            .iter()
+                            .position(|named| *named == column.name.as_str())
+                    };
+                    if let Some(value) = at.and_then(|at| row.get(at)) {
+                        collect(value)?;
+                    }
+                }
+            }
+            (rows, _) => {
+                for value in rows.iter().flat_map(|row| row.iter()) {
+                    collect(value)?;
+                }
             }
         }
     }
@@ -11899,6 +12061,7 @@ fn plan_write<'a>(
         analyze_unsupported: None,
         planned_partitions: None,
         hash_agg: None,
+        initplan_charge: 0.0,
     };
     plan.push(target_node)?;
     if let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
@@ -12405,12 +12568,41 @@ fn plan_write<'a>(
             plan.nodes[0].set_output(None);
         }
         // The source query's range table entries join the INSERT's.
-        let source_plan = in_nested_block(|| {
+        let (source_plan, pulled) = in_nested_block(|| {
             rewrite::insert_source_plan(storage, txid, insert, select, block, arena)
         })?;
         let root = source_plan.nodes[0];
-        for source_node in &source_plan.nodes[..source_plan.count] {
+        let source_nodes = &source_plan.nodes[..source_plan.count];
+        // A pulled-up query's InitPlans belong to the `INSERT`, whose node
+        // runs them and pays for them in place of the source's top node.
+        let moved = |at: usize| {
+            pulled
+                && source_nodes[at].depth > root.depth
+                && source_nodes[..=at]
+                    .iter()
+                    .rev()
+                    .find(|node| node.depth == root.depth + 1)
+                    .is_some_and(|top| {
+                        top.subplan
+                            .is_some_and(|(kind, _)| kind == SubplanKind::InitPlan)
+                    })
+        };
+        let charge = (1..source_nodes.len())
+            .filter(|&at| moved(at) && source_nodes[at].depth == root.depth + 1)
+            .map(|at| source_nodes[at].initplan_charge)
+            .sum::<f64>();
+        for at in (1..source_nodes.len()).filter(|&at| moved(at)) {
+            plan.push(source_nodes[at])?;
+        }
+        for (at, source_node) in source_nodes.iter().enumerate() {
+            if at > 0 && moved(at) {
+                continue;
+            }
             let mut source_node = *source_node;
+            if at == 0 {
+                source_node.startup_cost -= charge;
+                source_node.total_cost -= charge;
+            }
             source_node.depth = source_node.depth.saturating_add(1);
             // The INSERT's range table holds the target and its source, so
             // PostgreSQL qualifies the columns of the source's keys.

@@ -40437,6 +40437,7 @@ fn execute_trigger_step<'a>(
             name
         ));
     }
+    let context_arena = context.arena;
     let run = || {
         execute_trigger_step_in(
             context,
@@ -40466,12 +40467,90 @@ fn execute_trigger_step<'a>(
                 ..
             })
     ) {
-        let frame = crate::sql::error_context::DynamicQueryFrame::new();
-        return crate::sql::error_context::within(&frame, || {
-            crate::sql::error_position::with_internal_source("", run)
+        let fetched = matches!(statement, TriggerStatement::For(_));
+        let frame = crate::sql::error_context::DynamicQueryFrame::new(fetched);
+        return crate::sql::error_context::with_frame(&frame, || {
+            crate::sql::error_position::with_internal_source("", run).map_err(|error| {
+                if fetched
+                    && let Some(text) = frame.query_text()
+                    && raised_planning_query(&error, text, None, context_arena)
+                {
+                    frame.planned();
+                }
+                crate::sql::error_context::capture(error)
+            })
+        });
+    }
+    // A `FOR` loop over a query reads its rows from a cursor, whose fetches
+    // PostgreSQL's SPI runs without naming the query.
+    if let TriggerStatement::For(TriggerFor {
+        source: source @ (TriggerForSource::Query(_) | TriggerForSource::Dml(_)),
+        ..
+    }) = statement
+        && let Some(text) = procedural_statement_query(statement, invocation)
+    {
+        let select = match source {
+            TriggerForSource::Query(query) => Some(query),
+            _ => None,
+        };
+        let frame = crate::sql::error_context::QueryFrame::new(
+            text,
+            crate::sql::error_context::QueryMode::Statement,
+            true,
+        );
+        return crate::sql::error_context::with_frame(&frame, || {
+            crate::sql::error_position::with_internal_source(text, run).map_err(|error| {
+                if raised_planning_query(&error, text, select, context_arena) {
+                    frame.planned();
+                }
+                crate::sql::error_context::capture(error)
+            })
         });
     }
     in_statement_query(procedural_statement_query(statement, invocation), run)
+}
+
+/// Whether PostgreSQL raises `error` planning the query `text` (`select`
+/// when parsed): analyzing its names, or folding a constant part of its
+/// select list, `WHERE` or `HAVING`.
+fn raised_planning_query(
+    error: &SqlError,
+    text: &str,
+    select: Option<&Select<'_>>,
+    arena: &Arena,
+) -> bool {
+    if error.sqlstate.internal_control().is_some() {
+        return false;
+    }
+    if matches!(
+        error.sqlstate.as_str(),
+        sqlstate::UNDEFINED_PARAMETER | sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+    ) || record_reference_error(error)
+    {
+        return true;
+    }
+    let mark = arena.mark();
+    let folded = crate::sql::error_position::preserving_pending(|| {
+        let select = match select {
+            Some(select) => Some(select),
+            None => super::parser::parse_procedural_query(text, arena).ok(),
+        }?;
+        select
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::Expr { expression, .. } => Some(*expression),
+                _ => None,
+            })
+            .chain(select.where_clause)
+            .chain(select.having)
+            .find_map(|expression| constant_fold_error(expression, arena))
+    });
+    let planned = folded
+        .is_some_and(|folded| folded.sqlstate == error.sqlstate && folded.message == error.message);
+    // The probe's values are discarded with its scratch.
+    unsafe { arena.rewind_to(mark) };
+    planned
 }
 
 #[expect(

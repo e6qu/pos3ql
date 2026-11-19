@@ -298,12 +298,18 @@ pub(crate) struct ModeledGroup<'a> {
     /// A `HashAggregate`, whose groups come back in its hash table's
     /// order, rather than a `GroupAggregate`.
     pub(crate) hashed: bool,
+    /// The query calls an aggregate: a sorted grouping without one is a
+    /// `Group`.
+    pub(crate) aggregated: bool,
     /// The grouping columns in its `Group Key` order, by their position
     /// in the `GROUP BY` (a `DISTINCT`'s in the select list), each with the
     /// direction its sort orders it.
     pub(crate) keys: &'a [(usize, u8)],
     /// The buckets the hash table starts with (`build_hash_table`).
     pub(crate) buckets: usize,
+    /// What sizes a grouping `HashAggregate`'s memory, when the model
+    /// covers it.
+    pub(crate) hash_agg: Option<crate::sql::query::postgres_memory::HashAggSizing>,
     /// A `DISTINCT`'s `Unique` or `HashAggregate`, whose keys are select
     /// list positions.
     pub(crate) distinct: bool,
@@ -1623,8 +1629,8 @@ pub(crate) fn modeled_join<'a>(
     else {
         return Ok(None);
     };
-    // Grouping and windows read the written entries.
-    if model.group.is_some() || model.plan.upper.group.is_some() || !model.windows.is_empty() {
+    // Windows read the written entries.
+    if !model.windows.is_empty() {
         return Ok(None);
     }
     model.nested = Some(NestedMembers {
@@ -4739,8 +4745,21 @@ fn modeled_join_over<'a>(
             let buckets = problem_group_aggregates.map_or(0, |aggregates| {
                 super::aggregate::hash_agg_buckets(&aggregates, chosen.groups, output_width)
             });
+            let hash_agg = problem_group_aggregates
+                .filter(|_| chosen.hashed && !distinct)
+                .and_then(|aggregates| {
+                    super::aggregate::hash_agg_sizing(
+                        &aggregates,
+                        chosen.groups,
+                        output_width,
+                        usize::from(group_columns_count),
+                    )
+                });
             Some(ModeledGroup {
                 hashed: chosen.hashed,
+                aggregated: problem_group_aggregates
+                    .is_some_and(|aggregates| aggregates.aggregated()),
+                hash_agg,
                 distinct,
                 keys,
                 presorted: arena

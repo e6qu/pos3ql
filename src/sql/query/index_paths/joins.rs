@@ -2648,11 +2648,15 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         };
         // `create_agg_path`: `cost_agg` with the `HAVING` quals, then the
         // target list's cost per group it returns.
+        // A sorted `GROUP BY` without aggregates is `create_group_path`'s
+        // `Group`.
         let aggregate = |strategy: AggStrategy, input: AggInput| {
-            let (startup, total, rows) = super::aggregate::with_having(
-                cost_agg(strategy, &group.aggregates, columns, groups, input),
-                group.having,
-            );
+            let costed = if strategy == AggStrategy::Sorted && !group.aggregates.aggregated() {
+                super::aggregate::cost_group(columns, groups, input)
+            } else {
+                cost_agg(strategy, &group.aggregates, columns, groups, input)
+            };
+            let (startup, total, rows) = super::aggregate::with_having(costed, group.having);
             (startup, total + group.target_cost * rows, rows)
         };
         // Each grouped path, the join path below it and its plan.

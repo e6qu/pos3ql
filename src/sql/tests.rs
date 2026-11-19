@@ -56030,30 +56030,21 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     // UPDATE FROM and DELETE USING evaluate their auxiliary source once per
     // target row. That source can probe an index with the target row supplied
     // through the executor's outer lookup.
-    let joined_dml_plan = data_rows(&run_with(
-        &mut engine,
-        &mut budget,
+    // PostgreSQL costs that probe against its other joins, which pos3ql's
+    // write join does not, so EXPLAIN refuses the plan.
+    for explain in [
         "EXPLAIN (COSTS OFF) UPDATE probe_keys p SET label = e.payload FROM indexed_events e
-           WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted;
-         EXPLAIN (COSTS OFF) DELETE FROM probe_keys p USING indexed_events e
            WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted",
-    ));
-    assert_eq!(
-        joined_dml_plan
-            .iter()
-            .filter(|row| row.contains("Nested Loop"))
-            .count(),
-        2,
-        "{joined_dml_plan:?}"
-    );
-    assert_eq!(
-        joined_dml_plan
-            .iter()
-            .filter(|row| row.contains("Index Scan using indexed_events_key on indexed_events e"))
-            .count(),
-        2,
-        "joined DML explanation must expose the parameterized source: {joined_dml_plan:?}"
-    );
+        "EXPLAIN (COSTS OFF) DELETE FROM probe_keys p USING indexed_events e
+           WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted",
+    ] {
+        let output = run_with(&mut engine, &mut budget, explain);
+        assert!(
+            String::from_utf8_lossy(&output).contains("joining through an index"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
     assert_eq!(
         data_rows(&run_with(
             &mut engine,

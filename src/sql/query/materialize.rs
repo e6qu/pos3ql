@@ -1649,25 +1649,31 @@ fn modeled_distinct<'a>(
         }
         instrument::SortTuples::new(Some(&columns[..collations.len()]), 0, false)
             .ok_or_else(instrument::unsized_value)?
-            .sort_rows(arena, held, None, &mut |left, right| {
-                for &(position, flags) in group.keys {
-                    let ordering = compare_ordered_key(
-                        storage,
-                        txid,
-                        collations[position],
-                        (
-                            flags & super::index_paths::joins::KEY_DESCENDING != 0,
-                            flags & super::index_paths::joins::KEY_NULLS_FIRST != 0,
-                        ),
-                        crate::sql::exec::ProjectedValue::column(left, position),
-                        crate::sql::exec::ProjectedValue::column(right, position),
-                    )?;
-                    if !ordering.is_eq() {
-                        return Ok(ordering);
+            .sort_rows(
+                super::postgres_memory::SizeSource { storage, txid },
+                arena,
+                held,
+                None,
+                &mut |left, right| {
+                    for &(position, flags) in group.keys {
+                        let ordering = compare_ordered_key(
+                            storage,
+                            txid,
+                            collations[position],
+                            (
+                                flags & super::index_paths::joins::KEY_DESCENDING != 0,
+                                flags & super::index_paths::joins::KEY_NULLS_FIRST != 0,
+                            ),
+                            crate::sql::exec::ProjectedValue::column(left, position),
+                            crate::sql::exec::ProjectedValue::column(right, position),
+                        )?;
+                        if !ordering.is_eq() {
+                            return Ok(ordering);
+                        }
                     }
-                }
-                Ok(core::cmp::Ordering::Equal)
-            })?;
+                    Ok(core::cmp::Ordering::Equal)
+                },
+            )?;
     }
     let held: &[&[u8]] = held;
     let same = |left: u32, right: u32| -> Result<bool, SqlError> {
@@ -2498,13 +2504,10 @@ pub(crate) fn materialized_rows<'a>(
         let bounded = rank_window.filter(|_| sort_bounded);
         // The tuples PostgreSQL's sort holds: the output columns, the keys
         // that are not among them and the row identities a lock reads.
-        let tuples = instrument::SortTuples::new(
-            Some(&columns[..count]),
-            n_identities,
-            rank_window.is_some(),
-        )
-        .ok_or_else(instrument::unsized_value)?
-        .computed(super::sole_item_computed(statement.items));
+        let tuples =
+            instrument::SortTuples::new(Some(&columns[..count]), n_identities, bounded.is_some())
+                .ok_or_else(instrument::unsized_value)?
+                .computed(super::sole_item_computed(statement.items));
         // An incremental sort's batches, which it reports instead of one
         // sort's method and memory.
         let mut incremental: Option<instrument::IncrementalGroups> = None;
@@ -2577,6 +2580,7 @@ pub(crate) fn materialized_rows<'a>(
                         };
                         let space = match sort_bound {
                             Some(sort_bound) => instrument::SortSpace::postgres_top_n(
+                                super::postgres_memory::SizeSource { storage, txid },
                                 batch_rows,
                                 Some(&columns[..count]),
                                 n_identities,
@@ -2587,6 +2591,7 @@ pub(crate) fn materialized_rows<'a>(
                                 Some(&mut kind.array_kept),
                             )?,
                             None => instrument::SortSpace::postgres_locking(
+                                super::postgres_memory::SizeSource { storage, txid },
                                 batch_rows,
                                 Some(&columns[..count]),
                                 n_identities,
@@ -2608,8 +2613,13 @@ pub(crate) fn materialized_rows<'a>(
             // Every other sort is PostgreSQL's tuplesort, charged tuple by
             // tuple as the rows arrive.
             _ => {
-                let (_, sorted) =
-                    tuples.sort_rows(arena, rows, bounded, &mut |a, b| compare(&a, &b))?;
+                let (_, sorted) = tuples.sort_rows(
+                    super::postgres_memory::SizeSource { storage, txid },
+                    arena,
+                    rows,
+                    bounded,
+                    &mut |a, b| compare(&a, &b),
+                )?;
                 space = Some(sorted);
             }
         }
@@ -3146,6 +3156,7 @@ pub(crate) fn external_materialized_into<'a>(
             ),
             (bounded && statement.locking.is_empty() && plan.n_order > 0)
                 .then(|| offset.saturating_add(limit).min(usize::MAX as u64) as usize),
+            super::postgres_memory::SizeSource { storage, txid },
         );
     }
     let mut compare = |left: &[u8], right: &[u8]| {

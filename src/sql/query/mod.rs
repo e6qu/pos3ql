@@ -1622,7 +1622,7 @@ pub(crate) fn record_cte_storage(block: instrument::BlockId, rows: &[&[u8]]) {
     }
     let mut store = postgres_memory::Tuplestore::new();
     for row in rows {
-        match postgres_memory::projected_tuple_len(row, None) {
+        match postgres_memory::projected_tuple_len(None, row, None) {
             Some(length) => store.put(length),
             None => {
                 instrument::cte_stored(block, instrument::StoredSpace::Unsized);
@@ -16312,7 +16312,13 @@ pub(crate) fn constant_select_resumable<'a>(
                 Some(tuples) => tuples.computed(sole_item_computed(statement.items)),
                 None => return sql_fail(instrument::unsized_value()),
             };
-        let space = match tuples.sort_rows(arena, out_rows, bounded, &mut |a, b| compare(&a, &b)) {
+        let space = match tuples.sort_rows(
+            postgres_memory::SizeSource { storage, txid },
+            arena,
+            out_rows,
+            bounded,
+            &mut |a, b| compare(&a, &b),
+        ) {
             Ok((_, space)) => space,
             Err(error) => return sql_fail(error),
         };

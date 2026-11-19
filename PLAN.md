@@ -1576,13 +1576,31 @@ no size prediction (`differential_exact/911`, `912`). With a spill store
 attached, the first clause's sort is charged while the source is counted, and
 when it outgrows `work_mem` the windows stream through external runs instead
 of the arena; arena exhaustion is the named error, never a switch of path.
-Not yet done: the external window path (each clause sorted from a fresh scan
-of the source, tied rows restitched by rank) does not return tied rows in
-`tuplesort.c`'s run and merge order, and its sorts carry no lower clause's
-results; a clause whose tuples hold a value of no PostgreSQL size here
-(`jsonb`, arrays, records) is not accounted and sorts as one quicksort; and
-`ORDER BY` and the other sorts still sort in one quicksort when PostgreSQL's
-would spill, where tied rows come out in a different order. A bounded sort
+Every sort that orders rows the client sees (`ORDER BY`, `DISTINCT ON`,
+a grouping's or a set operation's `ORDER BY`, a window clause's input, the
+merge join and semi join input sorts, a modeled `DISTINCT`) now runs one
+`tuplesort.c` state machine (`SortTuples::sort_rows`): each tuple is charged
+as it arrives, a sort that outgrows `work_mem` forms its runs where
+`dumptuples` does and merges them through `pg_tuplesort_runs`, a limit
+directly above bounds a heap, and the `EXPLAIN ANALYZE` `Sort Method`,
+`Memory` and `Disk` come from the same model (`differential_exact/915` to
+`921`). A value is charged at its PostgreSQL size: jsonb (`convertToJsonb`),
+arrays, records, whole rows, named composites (decoded through the catalog),
+ranges, multiranges, `tsquery`, `jsonpath`, snapshots, `bit` and paths, with
+`pg_column_size` reporting the same sizes (`differential_exact/919`); a value
+with no size here (a column wider than the sort's 1664 columns, vectors of
+other types) fails with `0A000` rather than sorting unaccounted. jsonb orders
+as `compareJsonbContainers` does. A window over a USING-merged column reads
+the join alias variable's columns and `(expr).*` reads the record's own.
+With a spill store attached, a sort whose rows fit the external sorter's one
+256 KiB chunk is ordered as PostgreSQL does; rows beyond that chunk still
+merge in arrival order for ties (PostgreSQL's order needs work_mem sized run
+buffers and a streaming merge over up to 500 tapes). Not yet done: the
+modeled-join grouping sort and an incremental sort's batches are not charged
+against `work_mem`; a one-table `GROUP BY` and a hashed `DISTINCT` return
+groups in sort order, not `simplehash` order; the arrival order of a table
+whose rows vary in width differs from PostgreSQL's where its free space map
+places a later, smaller tuple on an earlier page. A bounded sort
 (`LIMIT`) that outgrows its heap in `EXPLAIN ANALYZE` still fails with `0A000`.
 A `CTE Scan` prints its query's tuplestore
 (`tuplestore_get_stats`: 2048 row pointers, doubled when a row reaches the

@@ -2311,13 +2311,14 @@ impl<'r, 'a> Runner<'r, 'a> {
         cache.stats.misses += 1;
         let mut stored = [Datum::Null; super::index_paths::joins::MAX_KEYS];
         stored[..key.len()].copy_from_slice(key);
-        let key_len = super::postgres_memory::minimal_tuple_len_with_tids(key.iter().copied(), 0)
-            .ok_or_else(|| {
-            crate::sql_err!(
-                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                "a Memoize key with no PostgreSQL size here is not supported"
-            )
-        })?;
+        let key_len =
+            super::postgres_memory::minimal_tuple_len_with_tids(None, key.iter().copied(), 0)
+                .ok_or_else(|| {
+                    crate::sql_err!(
+                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                        "a Memoize key with no PostgreSQL size here is not supported"
+                    )
+                })?;
         // `EMPTY_ENTRY_MEMORY_BYTES`: the entry, its key and the key's tuple.
         cache.used += 24 + 24 + key_len;
         cache.stats.peak = cache.stats.peak.max(cache.used);
@@ -3322,16 +3323,27 @@ impl<'r, 'a> Runner<'r, 'a> {
             });
         let sizes = fits
             .then(|| {
-                let length = super::postgres_memory::minimal_tuple_len_with_tids(
-                    values[..width].iter().copied(),
-                    0,
-                )?;
-                let written = if datum {
-                    4 + super::postgres_memory::value_written_size(&values[0], false)?
-                } else {
-                    length - 10 + 4
-                };
-                Some((length, written))
+                super::postgres_memory::SizeSource {
+                    storage: self.storage,
+                    txid: self.txid,
+                }
+                .with(|sizing| {
+                    let length = super::postgres_memory::minimal_tuple_len_with_tids(
+                        Some(sizing),
+                        values[..width].iter().copied(),
+                        0,
+                    )?;
+                    let written = if datum {
+                        4 + super::postgres_memory::value_written_size(
+                            Some(sizing),
+                            &values[0],
+                            false,
+                        )?
+                    } else {
+                        length - 10 + 4
+                    };
+                    Some((length, written))
+                })
             })
             .flatten();
         sizes.ok_or_else(|| {

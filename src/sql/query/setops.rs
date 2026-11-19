@@ -895,6 +895,7 @@ pub(crate) fn external_set_body_into<'a>(
                 set_sort_bound(limit_written, with_ties, limit, offset).is_some(),
             ),
             set_sort_bound(limit_written, with_ties, limit, offset),
+            super::postgres_memory::SizeSource { storage, txid },
         );
         let mut compare = |left: &[u8], right: &[u8]| {
             compare_set_order(
@@ -1044,6 +1045,7 @@ fn external_set_query<'a>(
                 set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset).is_some(),
             ),
             set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset),
+            super::postgres_memory::SizeSource { storage, txid },
         );
         let mut compare = |left: &[u8], right: &[u8]| {
             compare_set_order(storage, txid, columns, left, right, &keys[..key_count])
@@ -2626,9 +2628,13 @@ pub(crate) fn sort_set_rows<'a>(
     // keeps only a heap of the rows the limit returns, as PostgreSQL's does.
     let tuples = instrument::SortTuples::new(None, 0, bound.is_some())
         .ok_or_else(instrument::unsized_value)?;
-    let (_, space) = tuples.sort_rows(arena, rows, bound, &mut |a, b| {
-        compare_set_order(storage, txid, columns, a, b, keys)
-    })?;
+    let (_, space) = tuples.sort_rows(
+        super::postgres_memory::SizeSource { storage, txid },
+        arena,
+        rows,
+        bound,
+        &mut |a, b| compare_set_order(storage, txid, columns, a, b, keys),
+    )?;
     sort.sorted(space);
     Ok(())
 }

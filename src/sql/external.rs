@@ -205,6 +205,15 @@ impl ExternalRunReader {
     }
 }
 
+/// The storage that owns a sorter, which only reads it while sizing rows.
+#[derive(Clone, Copy)]
+struct StorageRef(core::ptr::NonNull<crate::storage::Storage>);
+
+// SAFETY: a shared reference to the storage, which is `Sync`, and the storage
+// outlives the sorter it owns.
+unsafe impl Send for StorageRef {}
+unsafe impl Sync for StorageRef {}
+
 /// Scratch for ordering one chunk's rows as `tuplesort.c` does: a chunk
 /// holds at most `ROWS_PER_CHUNK` rows, so every array is sized from that.
 struct ExactScratch {
@@ -256,6 +265,10 @@ pub(crate) struct ExternalSorter {
     postgres: Option<crate::sql::query::instrument::SortTuples>,
     /// The limit's row count a bounded sort keeps.
     bound: Option<usize>,
+    /// The storage whose catalog sizes the rows' values, and the
+    /// transaction. Set by [`ExternalSorter::size_as_postgres`]; the storage
+    /// owns this sorter, so it outlives every use.
+    source: Option<(StorageRef, u32)>,
     /// PostgreSQL's sort of the rows pushed so far, once one was.
     model: Option<crate::sql::query::postgres_memory::TuplesortModel>,
     /// The row counts of the runs the model's `dumptuples` wrote, in
@@ -303,6 +316,7 @@ impl ExternalSorter {
             bounded: false,
             postgres: None,
             bound: None,
+            source: None,
             model: None,
             pg_runs: vec![0u32; ROWS_PER_CHUNK].into_boxed_slice(),
             pg_run_count: 0,
@@ -325,6 +339,7 @@ impl ExternalSorter {
         self.bounded = false;
         self.postgres = None;
         self.bound = None;
+        self.source = None;
         self.model = None;
         self.pg_run_count = 0;
         self.ordered = false;
@@ -342,9 +357,14 @@ impl ExternalSorter {
         &mut self,
         tuples: Option<crate::sql::query::instrument::SortTuples>,
         bound: Option<usize>,
+        source: crate::sql::query::postgres_memory::SizeSource<'_>,
     ) {
         self.postgres = tuples;
         self.bound = bound;
+        self.source = Some((
+            StorageRef(core::ptr::NonNull::from(source.storage)),
+            source.txid,
+        ));
     }
 
     fn buffered_row(&self, position: usize) -> &[u8] {
@@ -361,7 +381,13 @@ impl ExternalSorter {
         let model = self
             .model
             .get_or_insert_with(|| tuples.model(Some(row), self.bound));
-        if let Some(rows) = tuples.push(model, Some(row), row)?
+        let (storage, txid) = self.source.expect("sized rows name their catalog");
+        // SAFETY: the storage owns this sorter and outlives it.
+        let source = crate::sql::query::postgres_memory::SizeSource {
+            storage: unsafe { storage.0.as_ref() },
+            txid,
+        };
+        if let Some(rows) = tuples.push(source, model, Some(row), row)?
             && let Some(slot) = self.pg_runs.get_mut(self.pg_run_count)
         {
             *slot = rows as u32;
@@ -383,6 +409,10 @@ impl ExternalSorter {
             return Ok(None);
         };
         if model.bounded() && self.heap_charge.is_none() {
+            // Only an analyzed statement reports the figure.
+            if !crate::sql::query::instrument::active() {
+                return Ok(None);
+            }
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "EXPLAIN ANALYZE of a bounded sort whose rows outgrew a chunk is not supported"
@@ -549,6 +579,11 @@ impl ExternalSorter {
             let charge = {
                 let this = &*self;
                 tuples.heap_charge(
+                    // SAFETY: the storage owns this sorter and outlives it.
+                    crate::sql::query::postgres_memory::SizeSource {
+                        storage: unsafe { this.source.expect("sized rows").0.0.as_ref() },
+                        txid: this.source.expect("sized rows").1,
+                    },
                     this.row_count,
                     model.heap_at(),
                     &|position| this.buffered_row(position),

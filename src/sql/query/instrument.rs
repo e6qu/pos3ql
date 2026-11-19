@@ -630,7 +630,7 @@ pub(crate) type SortCompare<'c> =
     &'c mut dyn FnMut(&[u8], &[u8]) -> Result<core::cmp::Ordering, crate::sql::SqlError>;
 
 /// The most columns a sort tuple sized as PostgreSQL's names.
-const MAX_SORT_COLUMNS: usize = 64;
+const MAX_SORT_COLUMNS: usize = crate::sql::exec::MAX_PROJ;
 
 /// The tuples a PostgreSQL sort holds for rows pos3ql sorts as projected
 /// rows: the values at its columns (every value when `all`), then `tids`
@@ -671,12 +671,17 @@ impl SortTuples {
         self
     }
 
-    fn length(&self, row: &[u8]) -> Option<usize> {
+    fn length(
+        &self,
+        sizing: Option<&super::postgres_memory::Sizing<'_>>,
+        row: &[u8],
+    ) -> Option<usize> {
         let mut columns = [0usize; MAX_SORT_COLUMNS];
         for (column, &held) in columns.iter_mut().zip(&self.columns[..self.count]) {
             *column = usize::from(held);
         }
         super::postgres_memory::projected_tuple_len_with_tids(
+            sizing,
             row,
             (!self.all).then_some(&columns[..self.count]),
             self.tids,
@@ -711,6 +716,7 @@ impl SortTuples {
     /// `writetup_datum`'s of a datum sort's value.
     fn tape_bytes(
         &self,
+        sizing: Option<&super::postgres_memory::Sizing<'_>>,
         row: &[u8],
         length: usize,
         copies: super::postgres_memory::SortTuples,
@@ -720,6 +726,7 @@ impl SortTuples {
             super::postgres_memory::SortTuples::Datum if !self.all && self.count == 0 => 4 + 6,
             super::postgres_memory::SortTuples::Datum => {
                 4 + super::postgres_memory::sorted_datum_size(
+                    sizing,
                     row,
                     (!self.all).then(|| usize::from(self.columns[0])),
                     self.computed,
@@ -743,14 +750,17 @@ impl SortTuples {
     /// made `dumptuples` write, if it did.
     pub(crate) fn push(
         &self,
+        source: super::postgres_memory::SizeSource<'_>,
         model: &mut super::postgres_memory::TuplesortModel,
         copies_of_first: Option<&[u8]>,
         row: &[u8],
     ) -> Result<Option<usize>, crate::sql::SqlError> {
-        let length = self.length(row).ok_or_else(unsized_value)?;
         let copies = self.copies(copies_of_first);
-        let written = self
-            .tape_bytes(row, length, copies)
+        let (length, written) = source
+            .with(|sizing| {
+                let length = self.length(Some(sizing), row)?;
+                Some((length, self.tape_bytes(Some(sizing), row, length, copies)?))
+            })
             .ok_or_else(unsized_value)?;
         Ok(model.push(length, written))
     }
@@ -759,6 +769,7 @@ impl SortTuples {
     /// (`bounded_heap_charge`), over `count` rows in arrival order.
     pub(crate) fn heap_charge<'r>(
         &self,
+        source: super::postgres_memory::SizeSource<'_>,
         count: usize,
         heapify_at: usize,
         row_at: &dyn Fn(usize) -> &'r [u8],
@@ -772,7 +783,11 @@ impl SortTuples {
             Copies::Bump => maxalign(length),
             Copies::AllocSet => allocset_chunk_space(length),
         };
-        let length = |row: usize| self.length(row_at(row)).unwrap_or(0);
+        let length = |row: usize| {
+            source
+                .with(|sizing| self.length(Some(sizing), row_at(row)))
+                .unwrap_or(0)
+        };
         super::postgres_memory::bounded_heap_charge(
             count,
             heapify_at,
@@ -788,6 +803,7 @@ impl SortTuples {
     /// scratch array of the bound's positions.
     pub(crate) fn space<'r>(
         &self,
+        source: super::postgres_memory::SizeSource<'_>,
         count: usize,
         row_at: &dyn Fn(usize) -> &'r [u8],
         heap: Option<(&mut [usize], SortCompare<'_>)>,
@@ -800,12 +816,17 @@ impl SortTuples {
             model = model.reuse_array();
         }
         for row in 0..count {
-            self.push(&mut model, first, row_at(row))?;
+            self.push(source, &mut model, first, row_at(row))?;
         }
         let heap_charge = match heap {
-            Some((positions, compare)) if model.bounded() => {
-                Some(self.heap_charge(count, model.heap_at(), row_at, positions, compare)?)
-            }
+            Some((positions, compare)) if model.bounded() => Some(self.heap_charge(
+                source,
+                count,
+                model.heap_at(),
+                row_at,
+                positions,
+                compare,
+            )?),
             _ => None,
         };
         if let Some(kept) = kept {
@@ -827,6 +848,7 @@ impl SortTuples {
     /// here, which cannot be charged, fails with `0A000`.
     pub(crate) fn sort_rows<'a>(
         &self,
+        source: super::postgres_memory::SizeSource<'_>,
         arena: &'a crate::mem::arena::Arena,
         rows: &mut [&'a [u8]],
         bound: Option<usize>,
@@ -838,7 +860,7 @@ impl SortTuples {
         let mut runs: &mut [u32] = &mut [];
         let mut run_count = 0usize;
         for row in rows.iter() {
-            if let Some(length) = self.push(&mut model, first, row)? {
+            if let Some(length) = self.push(source, &mut model, first, row)? {
                 if runs.is_empty() {
                     runs = arena
                         .alloc_slice_with(count, |_| 0u32)
@@ -896,6 +918,7 @@ impl SortTuples {
                 .alloc_slice_with(bound, |_| 0usize)
                 .map_err(|_| super::arena_full_pub())?;
             heap_charge = Some(self.heap_charge(
+                source,
                 count,
                 model.heap_at(),
                 &|row| held[row],
@@ -929,17 +952,19 @@ impl SortSpace {
     /// PostgreSQL's sort of `rows` (in arrival order), whose tuples hold the
     /// values at `columns`.
     pub(crate) fn postgres(
+        source: super::postgres_memory::SizeSource<'_>,
         rows: &[&[u8]],
         columns: Option<&[usize]>,
         bounded: bool,
         computed: bool,
     ) -> Result<Self, crate::sql::SqlError> {
-        Self::postgres_locking(rows, columns, 0, bounded, computed, None)
+        Self::postgres_locking(source, rows, columns, 0, bounded, computed, None)
     }
 
     /// [`Self::postgres`] of rows that also carry `tids` row identities a
     /// locking clause reads.
     pub(crate) fn postgres_locking(
+        source: super::postgres_memory::SizeSource<'_>,
         rows: &[&[u8]],
         columns: Option<&[usize]>,
         tids: usize,
@@ -951,7 +976,7 @@ impl SortSpace {
             .ok_or_else(unsized_value)?
             .computed(computed);
         Ok(Self::from_postgres(
-            tuples.space(rows.len(), &|row| rows[row], None, kept)?,
+            tuples.space(source, rows.len(), &|row| rows[row], None, kept)?,
             false,
         ))
     }
@@ -964,6 +989,7 @@ impl SortSpace {
         reason = "the sort's tuple, bound, comparison and tuplesort reuse"
     )]
     pub(crate) fn postgres_top_n(
+        source: super::postgres_memory::SizeSource<'_>,
         rows: &[&[u8]],
         columns: Option<&[usize]>,
         tids: usize,
@@ -982,6 +1008,7 @@ impl SortSpace {
             .map_err(|_| super::arena_full_pub())?;
         let mut compare = |left: &[u8], right: &[u8]| compare(&left, &right);
         let space = tuples.space(
+            source,
             rows.len(),
             &|row| rows[row],
             Some((positions, &mut compare)),
@@ -1148,7 +1175,7 @@ pub(crate) fn hashed_row_bytes(
         if length != -1 {
             return None;
         }
-        let payload = varlena_payload(value?)?;
+        let payload = varlena_payload(None, value?)?;
         // A packable value short enough takes a one-byte header and no
         // alignment; others a four-byte header at the type's alignment.
         if storage != b'p' && payload < SHORT_VARLENA_MAX {
@@ -1227,7 +1254,7 @@ fn composite_bytes(
         if layout.length != -1 {
             return None;
         }
-        let payload = varlena_payload(value)?;
+        let payload = varlena_payload(None, value)?;
         if layout.storage != b'p' && payload < SHORT_VARLENA_MAX {
             data += payload + 1;
         } else {
@@ -2112,7 +2139,7 @@ impl Node {
                     stores.tables[stores.steps % 2].clear();
                 }
             }
-            let Some(length) = super::postgres_memory::projected_tuple_len(row, None) else {
+            let Some(length) = super::postgres_memory::projected_tuple_len(None, row, None) else {
                 stores.unsized_rows = true;
                 slot.counters.cte_stored = Some(StoredSpace::Unsized);
                 return;

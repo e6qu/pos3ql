@@ -2050,20 +2050,25 @@ fn sort_clause_input<'a>(
     let mut sort = figures::InputSort::new(tuple);
     for &row in order.iter() {
         let mark = arena.mark();
-        let size = figures::row_size(tuple, arena, |column| match *column {
-            figures::InputColumn::Column(table, index) => Ok(rows[row][offs[table] + index]),
-            figures::InputColumn::Expression(expression) => {
-                let lookup = window_row(scope, rows[row], offs);
-                eval_full(expression, arena, params, &lookup, hooks)
-            }
-            figures::InputColumn::Result(node) => match win_vals[node].get(row) {
-                Some(&value) => Ok(value),
-                None => Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "a window clause sorts before the clause below it ran"
-                )),
+        let size = figures::row_size(
+            super::postgres_memory::SizeSource { storage, txid },
+            tuple,
+            arena,
+            |column| match *column {
+                figures::InputColumn::Column(table, index) => Ok(rows[row][offs[table] + index]),
+                figures::InputColumn::Expression(expression) => {
+                    let lookup = window_row(scope, rows[row], offs);
+                    eval_full(expression, arena, params, &lookup, hooks)
+                }
+                figures::InputColumn::Result(node) => match win_vals[node].get(row) {
+                    Some(&value) => Ok(value),
+                    None => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a window clause sorts before the clause below it ran"
+                    )),
+                },
             },
-        });
+        );
         // SAFETY: only the size escapes the values allocated since `mark`.
         unsafe { arena.rewind_to(mark) };
         let size = size?.ok_or_else(figures::unsized_row)?;
@@ -2193,14 +2198,21 @@ fn window_figures<'a>(
         let mut sort = figures::InputSort::new(tuple);
         for &row in order.iter() {
             let mark = arena.mark();
-            let size = figures::row_size(tuple, arena, |column| match *column {
-                figures::InputColumn::Column(table, index) => Ok(rows[row][offs[table] + index]),
-                figures::InputColumn::Expression(expression) => {
-                    let lookup = window_row(scope, rows[row], offs);
-                    eval_full(expression, arena, params, &lookup, hooks)
-                }
-                figures::InputColumn::Result(node) => Ok(win_vals[node][row]),
-            });
+            let size = figures::row_size(
+                super::postgres_memory::SizeSource { storage, txid },
+                tuple,
+                arena,
+                |column| match *column {
+                    figures::InputColumn::Column(table, index) => {
+                        Ok(rows[row][offs[table] + index])
+                    }
+                    figures::InputColumn::Expression(expression) => {
+                        let lookup = window_row(scope, rows[row], offs);
+                        eval_full(expression, arena, params, &lookup, hooks)
+                    }
+                    figures::InputColumn::Result(node) => Ok(win_vals[node][row]),
+                },
+            );
             // SAFETY: only the sizes escape the values allocated since `mark`.
             unsafe { arena.rewind_to(mark) };
             let size = size?.ok_or_else(figures::unsized_row)?;
@@ -2372,23 +2384,28 @@ pub(crate) fn project_window_rows<'a>(
         count += 1;
         if let Some((tuple, sort)) = first_sort.as_mut() {
             let mark = arena.mark();
-            let size = figures::row_size(tuple, arena, |column| match *column {
-                figures::InputColumn::Column(table, index) => {
-                    let values = row.table_values(table).expect("bound");
-                    Ok(if values.is_empty() {
-                        Datum::Null
-                    } else {
-                        values[index]
-                    })
-                }
-                figures::InputColumn::Expression(expression) => {
-                    eval_full(expression, arena, params, row, hooks)
-                }
-                figures::InputColumn::Result(_) => Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "the first window clause's sort holds no window result"
-                )),
-            });
+            let size = figures::row_size(
+                super::postgres_memory::SizeSource { storage, txid },
+                tuple,
+                arena,
+                |column| match *column {
+                    figures::InputColumn::Column(table, index) => {
+                        let values = row.table_values(table).expect("bound");
+                        Ok(if values.is_empty() {
+                            Datum::Null
+                        } else {
+                            values[index]
+                        })
+                    }
+                    figures::InputColumn::Expression(expression) => {
+                        eval_full(expression, arena, params, row, hooks)
+                    }
+                    figures::InputColumn::Result(_) => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "the first window clause's sort holds no window result"
+                    )),
+                },
+            );
             // SAFETY: only the size escapes the values allocated since `mark`.
             unsafe { arena.rewind_to(mark) };
             match size? {
@@ -2704,6 +2721,7 @@ impl<'a> WindowRows<'a> {
     /// above lets it keep.
     fn model_rows(
         &self,
+        source: super::postgres_memory::SizeSource<'_>,
         rows: core::ops::Range<usize>,
         bound: Option<usize>,
         reuse_array: bool,
@@ -2745,18 +2763,27 @@ impl<'a> WindowRows<'a> {
             model = model.reuse_array();
         }
         for (row, length) in lengths.iter_mut().enumerate() {
-            *length = minimal_tuple_len_with_tids(
-                self.tuple_columns.iter().map(|&column| value(row, column)),
-                0,
-            )
-            .ok_or_else(unsized_value)?;
-            let written = match self.tuple_columns {
-                [only] => {
-                    4 + value_written_size(&value(row, *only), self.sole_computed)
-                        .ok_or_else(unsized_value)?
-                }
-                _ => *length - 10 + 4,
-            };
+            let (size, written) = source
+                .with(|sizing| {
+                    let size = minimal_tuple_len_with_tids(
+                        Some(sizing),
+                        self.tuple_columns.iter().map(|&column| value(row, column)),
+                        0,
+                    )?;
+                    let written = match self.tuple_columns {
+                        [only] => {
+                            4 + value_written_size(
+                                Some(sizing),
+                                &value(row, *only),
+                                self.sole_computed,
+                            )?
+                        }
+                        _ => size - 10 + 4,
+                    };
+                    Some((size, written))
+                })
+                .ok_or_else(unsized_value)?;
+            *length = size;
             if let Some(run) = model.push(*length, written) {
                 if runs.is_empty() {
                     runs = arena
@@ -2790,13 +2817,14 @@ impl<'a> WindowRows<'a> {
     /// one `pg_qsort`.
     fn tuplesort(
         &self,
+        source: super::postgres_memory::SizeSource<'_>,
         order: &mut [usize],
         bound: Option<usize>,
         compare: &dyn Fn(&usize, &usize) -> Result<core::cmp::Ordering, SqlError>,
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
         let count = order.len();
-        let modeled = self.model_rows(0..count, bound, false, arena)?;
+        let modeled = self.model_rows(source, 0..count, bound, false, arena)?;
         let positions = arena
             .alloc_slice_with(count, |at| order[at] as u32)
             .map_err(|_| arena_full())?;
@@ -2838,6 +2866,7 @@ impl<'a> WindowRows<'a> {
     /// `bound` is the row count a limit directly above lets it keep.
     fn sort_space(
         &self,
+        source: super::postgres_memory::SizeSource<'_>,
         rows: core::ops::Range<usize>,
         bound: Option<usize>,
         reuse_array: bool,
@@ -2853,7 +2882,7 @@ impl<'a> WindowRows<'a> {
             copies,
             lengths,
             ..
-        } = self.model_rows(rows, bound, reuse_array, arena)?;
+        } = self.model_rows(source, rows, bound, reuse_array, arena)?;
         let heap_charge = if model.bounded() {
             let positions = arena
                 .alloc_slice_with(bound.unwrap_or(0), |_| 0usize)
@@ -2894,6 +2923,7 @@ impl<'a> WindowRows<'a> {
         sort: instrument::Node,
         arena: &'a Arena,
     ) -> Result<&'a [usize], SqlError> {
+        let source = super::postgres_memory::SizeSource { storage, txid };
         let order = arena
             .alloc_slice_with(self.rows.len(), |i| i)
             .map_err(|_| arena_full())?;
@@ -2911,10 +2941,10 @@ impl<'a> WindowRows<'a> {
             // PostgreSQL's tuplesort charges the rows as they arrive: past
             // `work_mem` it merges runs, and past twice its limit's bound it
             // keeps a heap of the rows the limit returns.
-            self.tuplesort(order, bound, &compare, arena)?;
+            self.tuplesort(source, order, bound, &compare, arena)?;
             if sort.measured() {
                 sort.sorted(
-                    self.sort_space(0..self.rows.len(), bound, false, &compare, arena)?
+                    self.sort_space(source, 0..self.rows.len(), bound, false, &compare, arena)?
                         .0,
                 );
             }
@@ -2934,7 +2964,7 @@ impl<'a> WindowRows<'a> {
                         instrument::BatchKind::Presorted => &mut groups.presorted,
                     };
                     let (space, regrown) =
-                        self.sort_space(range, None, kind.array_kept, &compare, arena)?;
+                        self.sort_space(source, range, None, kind.array_kept, &compare, arena)?;
                     kind.array_kept = !regrown;
                     kind.add_sorted(space);
                     Ok(())

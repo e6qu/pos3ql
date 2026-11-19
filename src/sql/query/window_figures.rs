@@ -64,9 +64,12 @@ fn pull_columns<'a>(
                 push_once(out, InputColumn::Column(table, column))
             }
             Ok(ResolvedColumn::TableOid(_)) => push_once(out, InputColumn::Expression(expression)),
-            Ok(ResolvedColumn::Merged(_)) => Err(refused(
-                "a window over a column a USING or NATURAL join merges",
-            )),
+            Ok(ResolvedColumn::Merged(merged)) => {
+                for &(table, column) in scope.merged_vars(merged) {
+                    push_once(out, InputColumn::Column(table, column))?;
+                }
+                Ok(())
+            }
             Err(_) => Ok(()),
         },
         // A whole-row reference is one column: a composite datum.
@@ -116,6 +119,8 @@ struct Target<'a> {
     column: Option<(usize, usize)>,
     expression: Option<&'a Expr<'a>>,
     window: bool,
+    /// A USING-merged column, whose alias variable the planner expands.
+    merged: Option<usize>,
 }
 
 /// The tuple of a window's input (`make_window_input_target`): the entries
@@ -139,6 +144,7 @@ pub(crate) fn input_target<'a>(
                     column: resolve(scope, expression),
                     expression: Some(expression),
                     window: false,
+                    merged: None,
                 })
                 .map_err(|_| arena_full())?,
             SelectItem::Wildcard(_) => {
@@ -159,9 +165,15 @@ pub(crate) fn input_target<'a>(
                         .map_err(|_| arena_full())?;
                 }
             }
-            SelectItem::RecordStar(_) => {
-                return Err(refused("a window over a record expansion `(expression).*`"));
-            }
+            // The fields are read from the record's own columns.
+            SelectItem::RecordStar(base) => targets
+                .push(Target {
+                    column: None,
+                    expression: Some(base),
+                    window: false,
+                    merged: None,
+                })
+                .map_err(|_| arena_full())?,
         }
     }
     let item_count = targets.len();
@@ -202,6 +214,7 @@ pub(crate) fn input_target<'a>(
                 column: resolve(scope, key),
                 expression: Some(key),
                 window: false,
+                merged: None,
             })
             .map_err(|_| arena_full())?;
         Ok(targets.len() - 1)
@@ -250,6 +263,12 @@ pub(crate) fn input_target<'a>(
     }
     let mut columns = ArenaList::new(arena);
     for target in targets.as_slice().iter().filter(|target| !target.window) {
+        if let Some(merged) = target.merged {
+            for &(table, column) in scope.merged_vars(merged) {
+                push_once(&mut columns, InputColumn::Column(table, column))?;
+            }
+            continue;
+        }
         match (target.column, target.expression) {
             (Some((table, column)), _) => {
                 push_once(&mut columns, InputColumn::Column(table, column))?
@@ -275,17 +294,22 @@ fn star_target<'a>(
             column: Some((table, column)),
             expression: None,
             window: false,
+            merged: None,
         },
         ResolvedColumn::TableOid(_) => Target {
             column: None,
             expression: Some(scope.copied_output_expression(entry, arena)?),
             window: false,
+            merged: None,
         },
-        ResolvedColumn::Merged(_) => {
-            return Err(refused(
-                "a window over a column a USING or NATURAL join merges",
-            ));
-        }
+        // The planner reads the alias variable's columns, not the merged
+        // value: an expression stands for it as a window key.
+        ResolvedColumn::Merged(merged) => Target {
+            column: None,
+            expression: Some(scope.copied_output_expression(entry, arena)?),
+            window: false,
+            merged: Some(merged),
+        },
     })
 }
 
@@ -370,6 +394,7 @@ pub(crate) struct RowSize {
 /// Sizes the input row `value` yields the columns of, as the sort and the
 /// window's buffer hold it; `None` when a value has no PostgreSQL size here.
 pub(crate) fn row_size<'a>(
+    source: super::postgres_memory::SizeSource<'_>,
     target: &[InputColumn<'a>],
     arena: &'a Arena,
     mut value: impl FnMut(&InputColumn<'a>) -> Result<Datum<'a>, SqlError>,
@@ -380,19 +405,19 @@ pub(crate) fn row_size<'a>(
     for (slot, column) in values.iter_mut().zip(target) {
         *slot = value(column)?;
     }
-    let Some(length) = minimal_tuple_len_with_tids(values.iter().copied(), 0) else {
-        return Ok(None);
-    };
-    let written = if let [only] = values {
-        let Some(size) = value_written_size(only, matches!(target[0], InputColumn::Expression(_)))
-        else {
-            return Ok(None);
+    Ok(source.with(|sizing| {
+        let length = minimal_tuple_len_with_tids(Some(sizing), values.iter().copied(), 0)?;
+        let written = if let [only] = &*values {
+            4 + value_written_size(
+                Some(sizing),
+                only,
+                matches!(target[0], InputColumn::Expression(_)),
+            )?
+        } else {
+            length - 10 + 4
         };
-        4 + size
-    } else {
-        length - 10 + 4
-    };
-    Ok(Some(RowSize { length, written }))
+        Some(RowSize { length, written })
+    }))
 }
 
 /// The error of `EXPLAIN ANALYZE` over a row with no PostgreSQL size here.

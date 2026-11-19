@@ -230,6 +230,7 @@ pub(super) fn groups_for_mask<'a>(
             sorter.size_as_postgres(
                 instrument::SortTuples::new(Some(&columns[..n_keys]), 0, false),
                 None,
+                super::postgres_memory::SizeSource { storage, txid },
             );
         }
         // Equal keys keep input order, so each group reports its first input
@@ -438,7 +439,13 @@ pub(super) fn groups_for_mask<'a>(
                 let rows = arena
                     .alloc_slice_with(keys.len(), |at| keys[at].0)
                     .map_err(|_| arena_full())?;
-                instrument::SortSpace::postgres(rows, None, false, false)?
+                instrument::SortSpace::postgres(
+                    super::postgres_memory::SizeSource { storage, txid },
+                    rows,
+                    None,
+                    false,
+                    false,
+                )?
             } else {
                 instrument::SortSpace {
                     method: instrument::SortMethod::Quicksort,
@@ -1378,7 +1385,13 @@ pub(super) fn grouped_rows<'a>(
             .computed(super::sole_item_computed(statement.items));
         // The tuples reach the sort in the grouping's order, which a join's
         // modeled grouping and a one-table grouping both give.
-        let (_, space) = tuples.sort_rows(arena, out_rows, bounded, &mut |a, b| compare(&a, &b))?;
+        let (_, space) = tuples.sort_rows(
+            super::postgres_memory::SizeSource { storage, txid },
+            arena,
+            out_rows,
+            bounded,
+            &mut |a, b| compare(&a, &b),
+        )?;
         stages.sort.sorted(space);
     }
 
@@ -1819,7 +1832,7 @@ pub(super) fn record_hash_agg_memory(
         let new = if seen.get(group).copied() == Some(false) {
             seen[group] = true;
             let Some(length) =
-                super::postgres_memory::projected_tuple_len(rep_keys[group], Some(columns))
+                super::postgres_memory::projected_tuple_len(None, rep_keys[group], Some(columns))
             else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,

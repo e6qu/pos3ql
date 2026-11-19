@@ -4,9 +4,9 @@
 //! and polygons. Each size counts the data after the four-byte varlena header,
 //! as a tuple holds the value.
 
-use crate::sql::types::ArrElem;
+use crate::sql::types::{ArrElem, Datum, RangeKind};
 
-use super::postgres_memory::{Stored, maxalign, stored};
+use super::postgres_memory::{Sizing, Stored, maxalign, stored};
 
 /// The bytes of a `jsonb` value after its varlena header. `text` is the
 /// canonical rendering, whose members come in storage order. `None` for text
@@ -348,15 +348,270 @@ pub(crate) fn polygon_payload(text: &str) -> usize {
     36 + 16 * point_count(text, true)
 }
 
+/// `datum_compute_size` (`rangetypes.c`) of one finite bound of `kind` at
+/// byte `offset` of a range: a numeric packs to a one-byte header when short.
+fn range_bound(offset: usize, kind: RangeKind, text: &str) -> Option<usize> {
+    Some(match kind {
+        RangeKind::Int4 | RangeKind::Date => offset.next_multiple_of(4) + 4,
+        RangeKind::Int8 | RangeKind::Ts | RangeKind::Tstz => offset.next_multiple_of(8) + 8,
+        RangeKind::Num => {
+            let payload = match text {
+                "NaN" | "Infinity" | "-Infinity" => 2,
+                _ => decimal_payload(text)?,
+            };
+            if payload < 127 {
+                offset + payload + 1
+            } else {
+                offset.next_multiple_of(4) + payload + 4
+            }
+        }
+    })
+}
+
+/// `range_serialize`'s size of the range in canonical `text`: the varlena
+/// header, the type OID, the finite bounds then a flag byte.
+fn range_size(text: &str, kind: RangeKind) -> Option<usize> {
+    use core::fmt::Write as _;
+    let mut size = 8usize;
+    if text == "empty" {
+        return Some(size + 1);
+    }
+    let inner = text.get(1..text.len().checked_sub(1)?)?;
+    // Split at the comma outside quotes.
+    let bytes = inner.as_bytes();
+    let (mut quoted, mut split) = (false, None);
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 1,
+            b'"' => quoted = !quoted,
+            b',' if !quoted => {
+                split = Some(at);
+                break;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    let split = split?;
+    for part in [&inner[..split], &inner[split + 1..]] {
+        if part.is_empty() {
+            continue;
+        }
+        let mut value = crate::util::StackStr::<96>::new();
+        let mut chars = part.chars();
+        while let Some(character) = chars.next() {
+            match character {
+                '"' => {}
+                '\\' => {
+                    let _ = value.write_char(chars.next()?);
+                }
+                other => {
+                    let _ = value.write_char(other);
+                }
+            }
+        }
+        size = range_bound(size, kind, value.as_str())?;
+    }
+    Some(size + 1)
+}
+
+/// The bytes of a range after its header.
+pub(crate) fn range_payload(text: &str, kind: RangeKind) -> Option<usize> {
+    Some(range_size(text, kind)? - 4)
+}
+
+/// The bytes of a multirange after its header (`multirange_size_estimate`):
+/// the count, an offset and a flag byte per range, then each range's bounds
+/// at the element type's alignment.
+pub(crate) fn multirange_payload(text: &str, kind: RangeKind) -> Option<usize> {
+    let align = match kind {
+        RangeKind::Int4 | RangeKind::Date | RangeKind::Num => 4,
+        _ => 8,
+    };
+    let bytes = text.as_bytes();
+    let (mut count, mut bounds) = (0usize, 0usize);
+    let (mut quoted, mut start) = (false, None);
+    for (at, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'"' => quoted = !quoted,
+            b'[' | b'(' if !quoted && start.is_none() => start = Some(at),
+            b']' | b')' if !quoted => {
+                if let Some(first) = start.take() {
+                    let size = range_size(&text[first..=at], kind)?;
+                    bounds += (size - 8 - 1).next_multiple_of(align);
+                    count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let header = (12 + count.saturating_sub(1) * 4 + count).next_multiple_of(align);
+    Some(header + bounds - 4)
+}
+
+/// The bytes of a `tsquery` after its header: the item count, twelve bytes
+/// per operand or operator, then each operand's text and its NUL.
+pub(crate) fn tsquery_payload(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let (mut items, mut strings) = (0usize, 0usize);
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\'' => {
+                items += 1;
+                at += 1;
+                while at < bytes.len() {
+                    match bytes[at] {
+                        b'\\' => at += 1,
+                        b'\'' if bytes.get(at + 1) == Some(&b'\'') => at += 1,
+                        b'\'' => break,
+                        _ => {}
+                    }
+                    strings += 1;
+                    at += 1;
+                }
+                strings += 1;
+            }
+            b'&' | b'|' | b'!' => items += 1,
+            b'<' => {
+                items += 1;
+                while bytes.get(at).is_some_and(|&byte| byte != b'>') {
+                    at += 1;
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    4 + 12 * items + strings
+}
+
+/// The bytes of a snapshot after its header: the member count, `xmin`,
+/// `xmax` and eight bytes per in-progress transaction.
+pub(crate) fn snapshot_payload(members: usize) -> usize {
+    4 + 8 + 8 + 8 * members
+}
+
+/// `flattenJsonPathParseItem`'s running buffer length.
+struct Flatten {
+    len: usize,
+}
+
+impl Flatten {
+    /// An item's type byte, then its pointer to the next item at int
+    /// alignment.
+    fn header(&mut self) {
+        self.len = (self.len + 1).next_multiple_of(4) + 4;
+    }
+
+    fn expression(&mut self, expression: &crate::sql::jsonpath::Expr<'_>) -> Option<()> {
+        use crate::sql::jsonpath::Expr;
+        if let Expr::Chain { base, steps } = expression {
+            self.expression(base)?;
+            for step in *steps {
+                self.step(step)?;
+            }
+            return Some(());
+        }
+        self.header();
+        match expression {
+            Expr::Null | Expr::Root | Expr::Current | Expr::Last => {}
+            Expr::Bool(_) => self.len += 1,
+            Expr::Number(number) => {
+                self.len += 4 + super::postgres_memory::varlena_payload(
+                    None,
+                    &crate::sql::types::Datum::Numeric(*number),
+                )?;
+            }
+            Expr::String(text) | Expr::Variable(text) => self.len += 4 + text.len() + 1,
+            Expr::Unary { operand, .. } => {
+                self.len += 4;
+                self.expression(operand)?;
+            }
+            Expr::Binary { left, right, .. } => {
+                self.len += 8;
+                self.expression(left)?;
+                self.expression(right)?;
+            }
+            Expr::LikeRegex {
+                operand, pattern, ..
+            } => {
+                self.len += 4 + 4 + 4 + pattern.len() + 1;
+                self.expression(operand)?;
+            }
+            Expr::Chain { .. } => unreachable!("handled above"),
+        }
+        Some(())
+    }
+
+    fn step(&mut self, step: &crate::sql::jsonpath::Step<'_>) -> Option<()> {
+        use crate::sql::jsonpath::{Method, Step};
+        self.header();
+        match step {
+            Step::Key(key) => self.len += 4 + key.len() + 1,
+            Step::AnyKey | Step::AnyArray => {}
+            Step::Index(subscripts) => {
+                self.len += 4 + 8 * subscripts.len();
+                for subscript in *subscripts {
+                    self.expression(subscript.from)?;
+                    if let Some(to) = subscript.to {
+                        self.expression(to)?;
+                    }
+                }
+            }
+            Step::Descendants { .. } => self.len += 8,
+            Step::Filter(predicate) => {
+                self.len += 4;
+                self.expression(predicate)?;
+            }
+            Step::Method {
+                method,
+                first,
+                second,
+            } => match method {
+                Method::Decimal => {
+                    self.len += 8;
+                    for argument in [first, second].into_iter().flatten() {
+                        self.expression(argument)?;
+                    }
+                }
+                Method::Datetime
+                | Method::Time
+                | Method::TimeTz
+                | Method::Timestamp
+                | Method::TimestampTz => {
+                    self.len += 4;
+                    if let Some(argument) = first {
+                        self.expression(argument)?;
+                    }
+                }
+                _ => {}
+            },
+        }
+        Some(())
+    }
+}
+
+/// The bytes of a `jsonpath` after its header: the flags word, then the
+/// items. `scratch` holds the parse.
+pub(crate) fn jsonpath_payload(text: &str, scratch: &crate::mem::arena::Arena) -> Option<usize> {
+    let path = crate::sql::jsonpath::parse(text, scratch).ok()?;
+    let mut flatten = Flatten { len: 8 };
+    flatten.expression(path.expression)?;
+    Some(flatten.len - 4)
+}
+
 /// The bytes of an array after its header (`ARR_OVERHEAD_*`: the type, flags,
 /// dimensions and bounds, a null bitmap when an element is `NULL`, then each
 /// non-null element at its type's alignment). `None` when an element has no
 /// PostgreSQL size here.
-pub(crate) fn array_payload(element: ArrElem, raw: &[u8]) -> Option<usize> {
-    if matches!(
-        element,
-        ArrElem::Record | ArrElem::Composite(_) | ArrElem::Nested { .. }
-    ) {
+pub(crate) fn array_payload(
+    sizing: Option<&Sizing<'_>>,
+    element: ArrElem,
+    raw: &[u8],
+) -> Option<usize> {
+    if matches!(element, ArrElem::Nested { .. }) {
         return None;
     }
     let layout = crate::sql::types::ColType::Array(element).physical_layout();
@@ -371,12 +626,13 @@ pub(crate) fn array_payload(element: ArrElem, raw: &[u8]) -> Option<usize> {
     let count = shape.element_count();
     let mut nulls = false;
     let mut data = 0usize;
-    for value in crate::sql::array::elements(raw, element) {
+    // A record's elements are rebuilt with their fields.
+    let mut size = |value: Datum<'_>| -> Option<()> {
         if value.is_null() {
             nulls = true;
-            continue;
+            return Some(());
         }
-        let Stored { payload, .. } = stored(None, &value)?;
+        let Stored { payload, .. } = stored(sizing, None, &value)?;
         data = data.next_multiple_of(align)
             + if element_layout.length > 0 {
                 element_layout.length as usize
@@ -386,6 +642,16 @@ pub(crate) fn array_payload(element: ArrElem, raw: &[u8]) -> Option<usize> {
                 payload + 4
             };
         data = data.next_multiple_of(align);
+        Some(())
+    };
+    if element == ArrElem::Record {
+        for value in crate::sql::array::structured_elements(raw, element, sizing?.scratch) {
+            size(value.ok()?)?;
+        }
+    } else {
+        for value in crate::sql::array::elements(raw, element) {
+            size(value)?;
+        }
     }
     let _ = layout;
     let header =

@@ -268,6 +268,10 @@ pub(crate) struct ModeledJoin<'a> {
     /// the plan's relation numbers name; `None` when the plan's relations
     /// are the written FROM's entries.
     pub(crate) nested: Option<NestedMembers<'a>>,
+    /// Two scans of one table joined on columns a unique index covers,
+    /// which PostgreSQL 18's `remove_useless_self_joins` may merge into
+    /// one scan; the search does not model that removal.
+    pub(crate) self_join: bool,
 }
 
 /// The base relations of a FROM clause holding parenthesized joins
@@ -2348,6 +2352,7 @@ fn modeled_join_over<'a>(
         }
         break;
     }
+    let self_join = removable_self_join(storage, txid, scope, &prepared, removed);
     let classes = prepared.classes();
     let class_count = classes.len();
     // The constant a class equates its members with.
@@ -4801,6 +4806,7 @@ fn modeled_join_over<'a>(
             .map_err(|_| crate::sql::eval::arena_full())?,
         expressions: expressions.alloc()?,
         nested: None,
+        self_join,
     }))
 }
 
@@ -4903,6 +4909,75 @@ fn join_is_removable(
         });
     });
     distinct
+}
+
+/// Whether `remove_useless_self_joins` may remove one of two scans of the
+/// same table that no outer join separates: the columns one class equates
+/// between them cover a unique index (`innerrel_is_unique_ext`). A
+/// superset of PostgreSQL's removals, for `EXPLAIN` to refuse rather than
+/// print a join PostgreSQL does not run.
+fn removable_self_join(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    prepared: &join_tree::Prepared,
+    removed: Relids,
+) -> bool {
+    if crate::sql::guc::planner_value("enable_self_join_elimination") == 0.0 {
+        return false;
+    }
+    let n = scope.n.min(MAX_JOIN_RELS);
+    for r in 0..n {
+        for k in r + 1..n {
+            if removed & (1 << r | 1 << k) != 0 || scope.slots[r] != scope.slots[k] {
+                continue;
+            }
+            let (r_bit, k_bit): (Relids, Relids) = (1 << r, 1 << k);
+            if prepared.specials[..prepared.special_count]
+                .iter()
+                .any(|info| {
+                    (info.syn_left & r_bit != 0) != (info.syn_left & k_bit != 0)
+                        || (info.syn_right & r_bit != 0) != (info.syn_right & k_bit != 0)
+                })
+            {
+                continue;
+            }
+            let mut covered = 0u64;
+            for class in prepared.classes() {
+                let plain = |rel: usize| {
+                    class.members().iter().filter(move |member| {
+                        usize::from(member.rel) == rel
+                            && member.nulling == 0
+                            && member.reads == 0
+                            && member.column < 64
+                            && member.expression_id().is_none()
+                    })
+                };
+                for member in plain(k) {
+                    if plain(r).any(|other| other.column == member.column) {
+                        covered |= 1 << member.column;
+                    }
+                }
+            }
+            if covered == 0 {
+                continue;
+            }
+            let mut unique = false;
+            crate::sql::catalog::planner_indexes(storage, txid, scope.slots[k], &mut |index| {
+                unique |= index.unique
+                    && index.immediate
+                    && (0..index.n_cols).all(|position| {
+                        !index.expression_keys[position]
+                            && index.columns[position] < 64
+                            && covered & 1 << index.columns[position] != 0
+                    });
+            });
+            if unique {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn and<'a>(

@@ -1232,9 +1232,13 @@ of join conditions that a semi or anti join evaluates
 that an indexed relation's parameterized scan evaluates (as a filter, or
 as a `BitmapOr` of parameterized index scans), a merge join over a partly sorted outer input (`Incremental
 Sort`), derived tables kept as subqueries (`SubqueryScan`), self-join removal
-(`remove_useless_self_joins`), a constant equated with an outer join's
+(`remove_useless_self_joins`: `EXPLAIN` of two scans of one table joined
+on columns that cover a unique index fails with `0A000`), a constant equated with an outer join's
 column another outer join nulls, `UPDATE ... FROM` and `DELETE ...
-USING` through the same search, more relations than
+USING` through the same search (`EXPLAIN` of one that joins through an
+index fails with `0A000`, and its join's costs refuse to print), a
+hashed `NOT IN` subplan filter of one relation's scan (its costs and rows
+print the scan's alone), a `LATERAL` subquery's `Memoize`, more relations than
 `join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,
 not ported; such queries run pos3ql's join order, and `EXPLAIN` of them
 fails with `0A000`). A parameterized index scan's cost reads its index's pages:

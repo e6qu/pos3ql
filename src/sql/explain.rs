@@ -6618,6 +6618,20 @@ fn plan_pulled_select<'a>(
         )?,
         _ => None,
     };
+    // PostgreSQL 18 may merge two scans of one table joined on a unique
+    // key into one scan, which the join search does not model.
+    if match (&modeled, scope.as_ref(), statement.from.as_ref()) {
+        (Some(model), ..) => model.self_join,
+        (None, Some(scope), Some(from)) => {
+            written_self_join(storage, txid, scope, from, statement.where_clause)
+        }
+        _ => false,
+    } {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a self-join PostgreSQL's remove_useless_self_joins may remove is not supported"
+        ));
+    }
     // A parenthesized join the join search does not plan would print
     // pos3ql's own join order, as would a join PostgreSQL searches
     // genetically (GEQO) or splits into several join problems past the
@@ -12352,6 +12366,14 @@ fn plan_write<'a>(
                 arena,
             )?;
         }
+        // PostgreSQL costs a nested loop over an index against its other
+        // joins; pos3ql's write join picks it unweighed.
+        if parameterized.iter().any(Option::is_some) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN of UPDATE ... FROM or DELETE ... USING joining through an index is not supported"
+            ));
+        }
         // The target joins first, then each FROM item in execution order.
         let relations_count = scope.n + 1;
         let top_depth = 1usize;
@@ -12550,6 +12572,9 @@ fn plan_write<'a>(
                 join_kind(relations_count - 1),
                 hash_at(relations_count - 1),
             )),
+            // pos3ql's own join order and method, not PostgreSQL's costed
+            // choice.
+            unmodeled_costs: true,
             depth: top_depth as u8,
             total_cost: total_cost + rows as f64 * 0.01,
             rows,
@@ -12611,6 +12636,7 @@ fn plan_write<'a>(
                 PlanNode {
                     name: StackStr::from_str(join_node(join_kind(position), hash_at(position))),
                     depth: (top_depth + relations_count - 1 - position) as u8,
+                    unmodeled_costs: true,
                     ..PlanNode::EMPTY
                 }
                 .with_qual(
@@ -16794,6 +16820,89 @@ fn printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), SqlError> {
         )),
         None => Ok(()),
     }
+}
+
+/// Whether two inner-joined scans of one table equate, in `WHERE` or an
+/// inner join's `ON`, the same columns of each covering a unique index:
+/// a self-join `remove_useless_self_joins` may remove, for a join the join
+/// search does not plan.
+fn written_self_join(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    from: &crate::sql::ast::FromClause<'_>,
+    where_clause: Option<&Expr<'_>>,
+) -> bool {
+    if crate::sql::guc::planner_value("enable_self_join_elimination") == 0.0
+        || scope.n < 2
+        || !from
+            .joins
+            .iter()
+            .all(|join| join.kind.is_cross() || join.kind == crate::sql::ast::JoinKind::Inner)
+    {
+        return false;
+    }
+    let mut conjuncts = [&Expr::Null; query::MAX_CONJUNCTS];
+    let mut count = 0;
+    for condition in where_clause
+        .into_iter()
+        .chain(from.joins.iter().filter_map(|join| join.on))
+    {
+        if !query::flatten_and(condition, &mut conjuncts, &mut count) {
+            return false;
+        }
+    }
+    let column = |side: &Expr<'_>| match side {
+        Expr::Column { qualifier, name } => match scope.probe_column(*qualifier, name) {
+            Some(query::ResolvedColumn::Table(table, column)) => Some((table, column)),
+            _ => None,
+        },
+        _ => None,
+    };
+    for r in 0..scope.n {
+        for k in r + 1..scope.n {
+            if scope.slots[r] == usize::MAX
+                || scope.slots[r] != scope.slots[k]
+                || scope.derived[r].is_some()
+                || scope.derived[k].is_some()
+            {
+                continue;
+            }
+            let mut covered = 0u64;
+            for conjunct in &conjuncts[..count] {
+                let Expr::Binary {
+                    operator: crate::sql::ast::BinaryOp::Eq,
+                    left,
+                    right,
+                    ..
+                } = conjunct
+                else {
+                    continue;
+                };
+                if let (Some((lt, lc)), Some((rt, rc))) = (column(left), column(right))
+                    && lc == rc
+                    && lc < 64
+                    && ((lt, rt) == (r, k) || (lt, rt) == (k, r))
+                {
+                    covered |= 1 << lc;
+                }
+            }
+            let mut unique = false;
+            crate::sql::catalog::planner_indexes(storage, txid, scope.slots[k], &mut |index| {
+                unique |= index.unique
+                    && index.immediate
+                    && (0..index.n_cols).all(|position| {
+                        !index.expression_keys[position]
+                            && index.columns[position] < 64
+                            && covered & 1 << index.columns[position] != 0
+                    });
+            });
+            if covered != 0 && unique {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// [`printable`] for each query a rule produces.

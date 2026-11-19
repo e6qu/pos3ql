@@ -8,6 +8,7 @@
 //! caches; no provider identity reaches this module.
 
 use crate::sql::query::instrument::{SortMethod, SortSpace};
+use crate::sql::query::postgres_memory::TuplesortSpace;
 use core::cmp::Ordering;
 
 use crate::mem::budget::{Budget, BudgetError};
@@ -223,8 +224,15 @@ pub(crate) struct ExternalSorter {
     /// The tuples PostgreSQL's sort of these rows would hold, which size
     /// the space `EXPLAIN ANALYZE` reports.
     postgres: Option<crate::sql::query::instrument::SortTuples>,
-    /// The memory PostgreSQL's sort reports, once known.
-    postgres_bytes: Option<usize>,
+    /// The limit's row count a bounded sort keeps.
+    bound: Option<usize>,
+    /// PostgreSQL's sort of the rows pushed so far, once one was.
+    model: Option<crate::sql::query::postgres_memory::TuplesortModel>,
+    /// A pushed value had no PostgreSQL size, so there is no model.
+    unsized_row: bool,
+    /// What the rows of a bounded heap charge, once [`ExternalSorter::keep_least`]
+    /// kept them.
+    heap_charge: Option<usize>,
     /// Scratch positions of a bounded heap.
     heap: Box<[usize]>,
 }
@@ -256,7 +264,10 @@ impl ExternalSorter {
             space: None,
             bounded: false,
             postgres: None,
-            postgres_bytes: None,
+            bound: None,
+            model: None,
+            unsized_row: false,
+            heap_charge: None,
             heap: vec![0usize; ROWS_PER_CHUNK].into_boxed_slice(),
         })
     }
@@ -272,7 +283,10 @@ impl ExternalSorter {
         self.space = None;
         self.bounded = false;
         self.postgres = None;
-        self.postgres_bytes = None;
+        self.bound = None;
+        self.model = None;
+        self.unsized_row = false;
+        self.heap_charge = None;
         for reader in &mut self.readers {
             reader.cursor = None;
             reader.current_len = 0;
@@ -280,12 +294,15 @@ impl ExternalSorter {
     }
 
     /// Sizes the space `EXPLAIN ANALYZE` reports for this input as
-    /// PostgreSQL's sort of `tuples` would hold it; set after [`Self::reset`].
+    /// PostgreSQL's sort of `tuples` would hold it, keeping the first `bound`
+    /// rows when a limit bounds it; set after [`Self::reset`].
     pub(crate) fn size_as_postgres(
         &mut self,
         tuples: Option<crate::sql::query::instrument::SortTuples>,
+        bound: Option<usize>,
     ) {
         self.postgres = tuples;
+        self.bound = bound;
     }
 
     fn buffered_row(&self, position: usize) -> &[u8] {
@@ -293,30 +310,38 @@ impl ExternalSorter {
         &self.chunk[entry.offset as usize + ORDINAL_BYTES..(entry.offset + entry.length) as usize]
     }
 
-    /// PostgreSQL's figure for the buffered rows, still in arrival order.
-    fn postgres_space(
-        &mut self,
-        heap: Option<(usize, crate::sql::query::instrument::SortCompare<'_>)>,
-    ) -> Result<(), SqlError> {
+    /// Feeds the row just buffered at `offset` to PostgreSQL's sort.
+    fn size_row(&mut self, offset: usize, total: usize) {
         let Some(tuples) = self.postgres else {
-            return Ok(());
+            return;
         };
-        let mut positions = core::mem::take(&mut self.heap);
-        let result = {
-            let this = &*self;
-            let row_at = |position: usize| this.buffered_row(position);
-            match heap {
-                Some((bound, compare)) => tuples.space(
-                    this.row_count,
-                    &row_at,
-                    Some((&mut positions[..bound.min(ROWS_PER_CHUNK)], compare)),
-                ),
-                None => tuples.space(this.row_count, &row_at, None),
-            }
+        if self.unsized_row {
+            return;
+        }
+        let row = &self.chunk[offset + ORDINAL_BYTES..offset + total];
+        let model = self
+            .model
+            .get_or_insert_with(|| tuples.model(Some(row), self.bound));
+        if !tuples.push(model, Some(row), row) {
+            self.unsized_row = true;
+        }
+    }
+
+    /// What PostgreSQL's sort of the rows reports, `None` when it is not
+    /// sized.
+    fn postgres_space(
+        &self,
+    ) -> Result<Option<crate::sql::query::postgres_memory::TuplesortSpace>, SqlError> {
+        let Some(model) = self.model.filter(|_| !self.unsized_row) else {
+            return Ok(None);
         };
-        self.heap = positions;
-        self.postgres_bytes = result?;
-        Ok(())
+        if model.bounded() && self.heap_charge.is_none() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN ANALYZE of a bounded sort whose rows outgrew a chunk is not supported"
+            ));
+        }
+        Ok(Some(model.space(self.heap_charge)))
     }
 
     /// Encodes and appends one self-describing projected row without touching
@@ -382,6 +407,7 @@ impl ExternalSorter {
         };
         self.row_count += 1;
         self.chunk_len += total;
+        self.size_row(offset, total);
         self.next_ordinal = self.next_ordinal.checked_add(1).ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -400,24 +426,34 @@ impl ExternalSorter {
         // run is written for reading; more input merges the runs it spilled.
         let spilled = self.level_counts.iter().any(|&count| count != 0);
         let chunk_bytes = self.chunk_len + self.row_count * core::mem::size_of::<BufferedRow>();
-        if !spilled && !self.bounded {
-            self.postgres_space(None)?;
-        }
+        let heap = self.model.is_some_and(|model| model.bounded());
+        let postgres = self.postgres_space()?;
         self.flush_chunk(store, compare)?;
-        self.space = Some(if spilled {
-            SortSpace {
+        self.space = Some(match postgres {
+            Some(TuplesortSpace::Memory(bytes)) => SortSpace {
+                method: if heap {
+                    SortMethod::TopNHeapsort
+                } else {
+                    SortMethod::Quicksort
+                },
+                bytes,
+            },
+            Some(TuplesortSpace::Disk(bytes)) => SortSpace {
+                method: SortMethod::ExternalMerge,
+                bytes,
+            },
+            None if spilled => SortSpace {
                 method: SortMethod::ExternalMerge,
                 bytes: self.spilled_bytes,
-            }
-        } else {
-            SortSpace {
+            },
+            None => SortSpace {
                 method: if self.bounded {
                     SortMethod::TopNHeapsort
                 } else {
                     SortMethod::Quicksort
                 },
-                bytes: self.postgres_bytes.unwrap_or(chunk_bytes),
-            }
+                bytes: chunk_bytes,
+            },
         });
         let mut carry: Option<ExternalRun> = None;
         for level in 0..MERGE_LEVELS {
@@ -454,16 +490,32 @@ impl ExternalSorter {
         bound: usize,
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
     ) -> Result<(), SqlError> {
-        if self.level_counts.iter().any(|&count| count != 0)
-            || self.row_count <= bound.saturating_mul(2)
-        {
+        if self.level_counts.iter().any(|&count| count != 0) {
             return Ok(());
         }
         // The rows are still in arrival order, which PostgreSQL's bounded
         // heap charges by.
-        self.postgres_space(Some((bound, &mut |left: &[u8], right: &[u8]| {
-            compare(left, right)
-        })))?;
+        if let Some(tuples) = self.postgres
+            && let Some(model) = self.model.filter(|model| model.bounded())
+            && !self.unsized_row
+        {
+            let mut positions = core::mem::take(&mut self.heap);
+            let charge = {
+                let this = &*self;
+                tuples.heap_charge(
+                    this.row_count,
+                    model.heap_at(),
+                    &|position| this.buffered_row(position),
+                    &mut positions[..bound.min(ROWS_PER_CHUNK)],
+                    &mut |left: &[u8], right: &[u8]| compare(left, right),
+                )
+            };
+            self.heap = positions;
+            self.heap_charge = Some(charge?);
+        }
+        if self.row_count <= bound.saturating_mul(2) {
+            return Ok(());
+        }
         let chunk = &self.chunk;
         crate::util::try_heap_select_by(&mut self.rows[..self.row_count], bound, |a, b| {
             let row = |entry: &BufferedRow| {

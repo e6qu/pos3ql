@@ -2079,16 +2079,22 @@ impl<'r, 'a> Runner<'r, 'a> {
                 } else {
                     super::postgres_memory::SortTuples::Bump
                 };
+                // A merge join's inner sort reads backwards and marks
+                // (`EXEC_FLAG_MARK`), so a sort that spills materializes a
+                // tape whose size depends on the merge order.
                 let bytes = fits
                     .then(|| {
-                        super::postgres_memory::tuplesort_memory(
+                        super::postgres_memory::tuplesort_space(
                             tuples,
-                            lengths.borrowed_slice().iter().copied(),
+                            lengths.borrowed_slice().iter().map(|&length| (length, 0)),
                             None,
                             None,
                         )
                     })
-                    .flatten()
+                    .and_then(|space| match space {
+                        super::postgres_memory::TuplesortSpace::Memory(bytes) => Some(bytes),
+                        _ => None,
+                    })
                     .ok_or_else(|| {
                         crate::sql_err!(
                             crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,

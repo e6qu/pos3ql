@@ -200,6 +200,31 @@ pub(crate) fn projected_tuple_len_with_tids(
     minimal_tuple_len_with_tids(values, tids)
 }
 
+/// `datumGetSize` of the value a datum sort copies: nothing for a null,
+/// a pass-by-value datum's eight bytes, a fixed-width value's length, or a
+/// varlena as stored (a one-byte header when short). `column` names the
+/// value in a projected row (the first when `None`).
+pub(crate) fn sorted_datum_size(row: &[u8], column: Option<usize>) -> usize {
+    let value = crate::sql::exec::decode_projected_pub(row, column.unwrap_or(0));
+    if value.is_null() {
+        return 0;
+    }
+    let Some(layout) = datum_layout(&value) else {
+        return 0;
+    };
+    if layout.by_value {
+        return core::mem::size_of::<usize>();
+    }
+    if layout.length > 0 {
+        return layout.length as usize;
+    }
+    match varlena_payload(&value) {
+        Some(payload) if layout.storage != b'p' && payload < SHORT_VARLENA_MAX => payload + 1,
+        Some(payload) => payload + 4,
+        None => 0,
+    }
+}
+
 /// `work_mem` in bytes, the memory a sort or tuplestore may use.
 fn work_mem_bytes() -> i64 {
     i64::from(crate::sql::guc::work_mem_kilobytes()).saturating_mul(1024)
@@ -223,68 +248,229 @@ pub(crate) enum SortTuples {
     AllocSet,
 }
 
-/// The memory an in-memory tuplesort reports (`tuplesort_get_stats` after
-/// `tuplesort_performsort`): its `SortTuple` array, grown as
-/// `grow_memtuples` grows it while the rows arrived, and the rows it still
-/// charges. `input` is the `t_len` of every row it read, in arrival order;
-/// `heap_charge` what the rows charge once a bounded heap took them (see
-/// [`bounded_heap_charge`]). `None` when the rows overflowed `work_mem`,
-/// which spills them.
-pub(crate) fn tuplesort_memory(
+/// `BLCKSZ`: the size of a temporary file block and of a tape buffer.
+const BLOCK_BYTES: u64 = 8192;
+/// `TapeBlockPayloadSize`: a tape block less its two-`int64` trailer.
+const TAPE_BLOCK_PAYLOAD: u64 = BLOCK_BYTES - 16;
+/// `TAPE_BUFFER_OVERHEAD`.
+const TAPE_BUFFER_OVERHEAD: i64 = BLOCK_BYTES as i64;
+/// `MERGE_BUFFER_SIZE`.
+const MERGE_BUFFER_SIZE: i64 = 32 * BLOCK_BYTES as i64;
+/// `MINORDER` and `MAXORDER`.
+const MIN_MERGE_ORDER: usize = 6;
+const MAX_MERGE_ORDER: usize = 500;
+
+/// `tuplesort_merge_order`: the tapes a sort of `allowed` bytes merges.
+pub(crate) fn tuplesort_merge_order(allowed: i64) -> usize {
+    let order = allowed / (2 * TAPE_BUFFER_OVERHEAD + MERGE_BUFFER_SIZE);
+    usize::try_from(order)
+        .unwrap_or(0)
+        .clamp(MIN_MERGE_ORDER, MAX_MERGE_ORDER)
+}
+
+/// What a tuplesort reports (`tuplesort_get_stats`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TuplesortSpace {
+    /// The rows were sorted in memory, which held this many bytes.
+    Memory(usize),
+    /// The rows were written as runs on tapes and merged: the bytes of the
+    /// temporary file (`LogicalTapeSetBlocks`). A merge pass reads a block
+    /// before it writes the block that replaces it, so the file never grows
+    /// past the initial runs' blocks, however many passes the merge takes.
+    Disk(usize),
+}
+
+/// One sort's accounting as `tuplesort.c` keeps it (`availMem` and its
+/// `memtuples` array) and, once the rows overflow `work_mem`, the runs it
+/// writes to tapes (`inittapes`, `dumptuples`). Feed it each row in arrival
+/// order, then ask for [`TuplesortModel::space`]. It holds a fixed amount:
+/// the tapes are an array of the most `MAXORDER` byte counts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TuplesortModel {
     tuples: SortTuples,
-    input: impl Iterator<Item = usize>,
     bound: Option<usize>,
-    heap_charge: Option<usize>,
-) -> Option<usize> {
-    let charge = |length: usize| match tuples {
-        SortTuples::Datum => 0,
-        SortTuples::Bump => maxalign(length),
-        SortTuples::AllocSet => allocset_chunk_space(length),
-    };
-    let allowed = work_mem_bytes();
-    let array_space = |slots: usize| (maxalign(slots * SORT_TUPLE) + CHUNK_HEADER) as i64;
-    let mut slots = INITIAL_SORT_SLOTS;
-    let mut available = allowed - array_space(slots);
-    let mut grows = true;
-    let mut count = 0usize;
-    let mut heap = false;
-    for length in input {
-        available -= charge(length) as i64;
-        if heap {
-            continue;
-        }
-        if count + 1 >= slots && grows {
-            let used = allowed - available;
-            let next = if used <= available {
-                slots * 2
-            } else {
-                grows = false;
-                (slots as f64 * (allowed as f64 / used as f64)) as usize
-            };
-            if next > slots && available >= ((next - slots) * SORT_TUPLE) as i64 {
-                available += array_space(slots) - array_space(next);
-                slots = next;
-            } else {
-                grows = false;
-            }
-        }
-        count += 1;
-        if let Some(bound) = bound
-            && (count > bound * 2 || (count > bound && available < 0))
-        {
-            heap = true;
-            continue;
-        }
-        if count >= slots || available < 0 {
-            return None;
+    allowed: i64,
+    available: i64,
+    slots: usize,
+    grows: bool,
+    count: usize,
+    /// `make_bounded_heap` ran, once this many rows had arrived.
+    heap: bool,
+    heap_at: usize,
+    /// The charge of the rows since the last run, which a dump returns.
+    tuple_memory: i64,
+    /// The tape bytes of the rows since the last run.
+    run_bytes: u64,
+    /// `inittapes` ran: the tapes' count and what each holds.
+    tapes: Option<Tapes>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Tapes {
+    max_tapes: usize,
+    runs: usize,
+    /// The bytes written to each tape, run end markers included.
+    tape_bytes: [u64; MAX_MERGE_ORDER],
+}
+
+impl TuplesortModel {
+    /// A sort of the session's `work_mem`; `bound` is the row count a limit
+    /// lets it keep (`tuplesort_set_bound`).
+    pub(crate) fn new(tuples: SortTuples, bound: Option<usize>) -> Self {
+        let allowed = work_mem_bytes();
+        Self {
+            tuples,
+            bound,
+            allowed,
+            available: allowed - Self::array_space(INITIAL_SORT_SLOTS),
+            slots: INITIAL_SORT_SLOTS,
+            grows: true,
+            count: 0,
+            heap: false,
+            heap_at: 0,
+            tuple_memory: 0,
+            run_bytes: 0,
+            tapes: None,
         }
     }
-    let rows = if heap {
-        heap_charge.unwrap_or(0)
-    } else {
-        (allowed - array_space(slots) - available) as usize
-    };
-    Some(array_space(slots) as usize + rows)
+
+    fn array_space(slots: usize) -> i64 {
+        (maxalign(slots * SORT_TUPLE) + CHUNK_HEADER) as i64
+    }
+
+    /// Whether the rows went to a bounded heap, whose memory the caller
+    /// charges (see [`bounded_heap_charge`]).
+    pub(crate) fn bounded(&self) -> bool {
+        self.heap
+    }
+
+    /// The rows `make_bounded_heap` took in at once.
+    pub(crate) fn heap_at(&self) -> usize {
+        self.heap_at
+    }
+
+    /// `grow_memtuples`.
+    fn grow(&mut self) {
+        let used = self.allowed - self.available;
+        let next = if used <= self.available {
+            self.slots * 2
+        } else {
+            self.grows = false;
+            (self.slots as f64 * (self.allowed as f64 / used as f64)) as usize
+        };
+        if next > self.slots && self.available >= ((next - self.slots) * SORT_TUPLE) as i64 {
+            self.available += Self::array_space(self.slots) - Self::array_space(next);
+            self.slots = next;
+        } else {
+            self.grows = false;
+        }
+    }
+
+    /// `tuplesort_puttuple_common` of a row whose copy is `length` bytes (the
+    /// minimal tuple's `t_len`, or a datum's size) and whose tape image is
+    /// `written` bytes (`writetup_heap`, `writetup_datum`).
+    pub(crate) fn push(&mut self, length: usize, written: usize) {
+        let charge = match self.tuples {
+            SortTuples::Datum => 0,
+            SortTuples::Bump => maxalign(length),
+            SortTuples::AllocSet => allocset_chunk_space(length),
+        } as i64;
+        self.available -= charge;
+        self.tuple_memory += charge;
+        self.run_bytes += written as u64;
+        if self.tapes.is_some() {
+            self.count += 1;
+            if self.count >= self.slots || self.available < 0 {
+                self.dump();
+            }
+            return;
+        }
+        if self.heap {
+            return;
+        }
+        if self.count + 1 >= self.slots && self.grows {
+            self.grow();
+        }
+        self.count += 1;
+        if let Some(bound) = self.bound
+            && (self.count > bound * 2 || (self.count > bound && self.available < 0))
+        {
+            self.heap = true;
+            self.heap_at = self.count;
+            return;
+        }
+        if self.count >= self.slots || self.available < 0 {
+            self.begin_tapes();
+            self.dump();
+        }
+    }
+
+    /// `inittapes` (and `inittapestate`'s tape buffers).
+    fn begin_tapes(&mut self) {
+        let max_tapes = tuplesort_merge_order(self.allowed);
+        let space = max_tapes as i64 * TAPE_BUFFER_OVERHEAD;
+        if space + Self::array_space(self.slots) < self.allowed {
+            self.available -= space;
+        }
+        self.tapes = Some(Tapes {
+            max_tapes,
+            runs: 0,
+            tape_bytes: [0; MAX_MERGE_ORDER],
+        });
+    }
+
+    /// `dumptuples`: the rows in memory become one run, on the tape the runs
+    /// take in turn, ended by a zero length word.
+    fn dump(&mut self) {
+        let tapes = self.tapes.as_mut().expect("tapes begun");
+        tapes.tape_bytes[tapes.runs % tapes.max_tapes] += self.run_bytes + 4;
+        tapes.runs += 1;
+        self.run_bytes = 0;
+        self.count = 0;
+        self.available += self.tuple_memory;
+        self.tuple_memory = 0;
+    }
+
+    /// What `tuplesort_get_stats` reports once the input ended
+    /// (`tuplesort_performsort`'s last `dumptuples` included); `heap_charge`
+    /// is what the rows of a bounded heap charge, which only a sort that
+    /// took one needs.
+    pub(crate) fn space(mut self, heap_charge: Option<usize>) -> TuplesortSpace {
+        if self.tapes.is_some() {
+            if self.count > 0 {
+                self.dump();
+            }
+            let tapes = self.tapes.as_ref().expect("tapes begun");
+            let blocks: u64 = tapes
+                .tape_bytes
+                .iter()
+                .map(|&bytes| bytes.div_ceil(TAPE_BLOCK_PAYLOAD))
+                .sum();
+            return TuplesortSpace::Disk((blocks * BLOCK_BYTES) as usize);
+        }
+        let array = Self::array_space(self.slots);
+        let rows = if self.heap {
+            heap_charge.unwrap_or(0) as i64
+        } else {
+            self.allowed - array - self.available
+        };
+        TuplesortSpace::Memory((array + rows) as usize)
+    }
+}
+
+/// The report of a sort whose rows (`input`: each one's copy length and tape
+/// image bytes, in arrival order) a sort of `bound` rows (if any) read.
+pub(crate) fn tuplesort_space(
+    tuples: SortTuples,
+    input: impl Iterator<Item = (usize, usize)>,
+    bound: Option<usize>,
+    heap_charge: Option<usize>,
+) -> TuplesortSpace {
+    let mut model = TuplesortModel::new(tuples, bound);
+    for (length, written) in input {
+        model.push(length, written);
+    }
+    model.space(heap_charge)
 }
 
 /// What the rows of a bounded sort charge once its heap took them
@@ -296,12 +482,13 @@ pub(crate) fn tuplesort_memory(
 /// row sorts strictly before another; `heap` holds the bound's positions.
 pub(crate) fn bounded_heap_charge<E>(
     count: usize,
+    heapify_at: usize,
     chunk: impl Fn(usize) -> usize,
     heap: &mut [usize],
     mut better: impl FnMut(usize, usize) -> Result<bool, E>,
 ) -> Result<usize, E> {
     let bound = heap.len();
-    let heapify_at = (bound * 2 + 1).min(count);
+    let heapify_at = heapify_at.min(count);
     let mut charge: usize = (0..heapify_at).map(&chunk).sum();
     let mut size = 0usize;
     // A heap whose top is its worst row: `worse(a, b)` when `b` is better.
@@ -684,28 +871,33 @@ mod tests {
         // 100 rows of two integers: 24584 + 100 * 24 bytes, 27kB.
         let lengths = core::iter::repeat_n(24, 100);
         assert_eq!(
-            tuplesort_memory(SortTuples::Bump, lengths, None, None),
-            Some(26_984)
+            tuplesort_space(SortTuples::Bump, lengths.map(|n| (n, 0)), None, None),
+            TuplesortSpace::Memory(26_984)
         );
         // Ascending input to a descending bounded sort: each row of the
         // first seven replaces the heap's worst, which stays charged.
         let mut heap = [0usize; 3];
         let charge =
-            bounded_heap_charge::<()>(100, |_| 40, &mut heap, |new, worst| Ok(new > worst))
+            bounded_heap_charge::<()>(100, 7, |_| 40, &mut heap, |new, worst| Ok(new > worst))
                 .unwrap();
         assert_eq!(charge, 7 * 40);
         assert_eq!(
-            tuplesort_memory(
+            tuplesort_space(
                 SortTuples::AllocSet,
-                core::iter::repeat_n(24, 100),
+                core::iter::repeat_n((24, 0), 100),
                 Some(3),
                 Some(charge)
             ),
-            Some(24_584 + 280)
+            TuplesortSpace::Memory(24_584 + 280)
         );
         assert_eq!(
-            tuplesort_memory(SortTuples::Datum, core::iter::repeat_n(24, 120), None, None),
-            Some(24_584)
+            tuplesort_space(
+                SortTuples::Datum,
+                core::iter::repeat_n((24, 0), 120),
+                None,
+                None
+            ),
+            TuplesortSpace::Memory(24_584)
         );
     }
 

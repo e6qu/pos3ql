@@ -183,11 +183,13 @@ CREATE TYPE cmt_enum AS ENUM ('new');
 SELECT obj_description(oid, 'pg_type') AS enum_after_recreate
   FROM pg_type WHERE typname = 'cmt_enum';
 
-COMMENT ON TYPE integer IS NULL;
-COMMENT ON TYPE regclass IS NULL;
+-- The shipped descriptions of the shared catalog return, so the fixtures
+-- that read them next find what a new cluster holds.
+COMMENT ON TYPE integer IS '-2 billion to 2 billion integer, 4-byte storage';
+COMMENT ON TYPE regclass IS 'registered class';
 COMMENT ON TYPE integer[] IS NULL;
-COMMENT ON ACCESS METHOD btree IS NULL;
-COMMENT ON PROCEDURAL LANGUAGE plpgsql IS NULL;
+COMMENT ON ACCESS METHOD btree IS 'b-tree index access method';
+COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'PL/pgSQL procedural language';
 DROP FUNCTION cmt_fn(integer);
 CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1';
 SELECT obj_description(oid, 'pg_proc') AS recreated_function_comment

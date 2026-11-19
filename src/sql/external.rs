@@ -596,6 +596,10 @@ impl ExternalSorter {
             // A sort that kept a heap returns its rows in the heap's order.
             return self.order_heap_as_postgres(bound, compare);
         }
+        // A sort PostgreSQL charged keeps every row unless its heap took them.
+        if self.postgres.is_some() {
+            return Ok(());
+        }
         if self.row_count <= bound.saturating_mul(2) {
             return Ok(());
         }

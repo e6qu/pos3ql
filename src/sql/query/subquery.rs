@@ -2298,7 +2298,10 @@ fn needs_row_source<'a>(
             return Ok(true);
         }
     }
-    Ok(false)
+    // `min` and `max` the planner reads from index scans' InitPlans run as
+    // that rewritten query.
+    Ok(!select_correlated(select, storage, txid, arena)?
+        && super::local_minmax_subquery(storage, txid, select, arena)?.is_some())
 }
 
 /// A chain of query scopes from innermost outward, used to decide whether a
@@ -2343,7 +2346,7 @@ pub(crate) fn subquery_node_correlated<'a>(
 }
 
 /// Whether `select` references a column of a query level around it.
-pub(super) fn select_correlated<'a>(
+pub(crate) fn select_correlated<'a>(
     select: &'a Select<'a>,
     storage: &'a Storage,
     txid: u32,

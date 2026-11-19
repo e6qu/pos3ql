@@ -2314,21 +2314,9 @@ impl<'r, 'a> Runner<'r, 'a> {
         })?;
         let _ = kept;
         *bound = saved;
-        let mut entries = ArenaList::new(self.arena);
-        for (at, entry) in cache.entries.borrowed_slice().iter().enumerate() {
-            entries
-                .push(if at == entry_at {
-                    MemoEntry {
-                        len,
-                        complete,
-                        ..*entry
-                    }
-                } else {
-                    *entry
-                })
-                .map_err(|_| arena_full())?;
-        }
-        cache.entries = entries;
+        let entry = &mut cache.entries.as_mut_slice().map_err(|_| arena_full())?[entry_at];
+        entry.len = len;
+        entry.complete = complete;
         memoize.memoize(cache.stats);
         self.memos[id as usize].set(Some(cache));
         Ok(!stopped)

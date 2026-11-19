@@ -298,6 +298,9 @@ pub(crate) struct ModeledGroup<'a> {
     /// A `HashAggregate`, whose groups come back in its hash table's
     /// order, rather than a `GroupAggregate`.
     pub(crate) hashed: bool,
+    /// The query calls an aggregate: a sorted grouping without one is a
+    /// `Group`.
+    pub(crate) aggregated: bool,
     /// The grouping columns in its `Group Key` order, by their position
     /// in the `GROUP BY` (a `DISTINCT`'s in the select list), each with the
     /// direction its sort orders it.
@@ -4741,6 +4744,8 @@ fn modeled_join_over<'a>(
             });
             Some(ModeledGroup {
                 hashed: chosen.hashed,
+                aggregated: problem_group_aggregates
+                    .is_some_and(|aggregates| aggregates.aggregated()),
                 distinct,
                 keys,
                 presorted: arena

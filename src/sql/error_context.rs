@@ -80,13 +80,31 @@ pub(crate) trait Frame {
 /// evaluated: `SQL statement "..."` from then on.
 pub(crate) struct DynamicQueryFrame {
     text: Cell<Option<*const str>>,
+    /// A `FOR` loop reads the query's rows from a cursor, whose fetches
+    /// PostgreSQL's SPI runs without naming the query: only an error raised
+    /// planning it adds the line.
+    fetched: bool,
+    /// The error being recorded was raised planning the query.
+    planned: Cell<bool>,
 }
 
 impl DynamicQueryFrame {
-    pub(crate) const fn new() -> Self {
+    pub(crate) const fn new(fetched: bool) -> Self {
         Self {
             text: Cell::new(None),
+            fetched,
+            planned: Cell::new(false),
         }
+    }
+
+    /// The query's text, once its string has been evaluated.
+    pub(crate) fn query_text(&self) -> Option<&str> {
+        self.text()
+    }
+
+    /// Marks the error about to be recorded as raised while planning.
+    pub(crate) fn planned(&self) {
+        self.planned.set(true);
     }
 
     fn text(&self) -> Option<&str> {
@@ -103,7 +121,9 @@ impl Frame for DynamicQueryFrame {
 
     fn write_line(&self, out: &mut dyn Write, positioned: bool) -> fmt::Result {
         match self.text() {
-            Some(text) if !positioned => write!(out, "SQL statement \"{text}\""),
+            Some(text) if !positioned && (!self.fetched || self.planned.get()) => {
+                write!(out, "SQL statement \"{text}\"")
+            }
             _ => Ok(()),
         }
     }

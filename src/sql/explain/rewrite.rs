@@ -1179,10 +1179,11 @@ fn qualify_columns<'a>(
     .map_err(|RewriteFailure(error)| error)
 }
 
-/// The plan of an `INSERT ... SELECT`'s source. PostgreSQL reads a query it
-/// cannot pull up as the `*SELECT*` subquery, whose `Subquery Scan` it
-/// drops when the scan only passes the subquery's columns on unchanged to
-/// every target column in order.
+/// The plan of an `INSERT ... SELECT`'s source, and whether PostgreSQL
+/// pulls the query up into the `INSERT`'s, whose top node then runs its
+/// InitPlans. PostgreSQL reads a query it cannot pull up as the `*SELECT*`
+/// subquery, whose `Subquery Scan` it drops when the scan only passes the
+/// subquery's columns on unchanged to every target column in order.
 pub(super) fn insert_source_plan<'a>(
     storage: &Storage,
     txid: u32,
@@ -1190,9 +1191,10 @@ pub(super) fn insert_source_plan<'a>(
     select: &Select<'_>,
     block: BlockId,
     arena: &'a Arena,
-) -> Result<Plan<'a>, SqlError> {
+) -> Result<(Plan<'a>, bool), SqlError> {
     // Execution runs the source in its own block.
     let source = block.child(Segment::Source);
+    let mut pulled = false;
     let (plan, wrapper) = if select.set_body.is_some() {
         (
             plan_derived(storage, txid, select, None, source, arena)?,
@@ -1221,10 +1223,16 @@ pub(super) fn insert_source_plan<'a>(
                     (!passes).then_some(alias),
                 )
             }
-            None => (
-                plan_select(storage, txid, select, None, source, arena)?,
-                None,
-            ),
+            None => {
+                pulled = true;
+                let plan = plan_select(storage, txid, select, None, source, arena)?;
+                // Its top node computes the `INSERT`'s target list.
+                match pulled_target_width(storage, txid, insert, select, arena)? {
+                    Some(width) => plan.nodes[0].width = width,
+                    None => plan.nodes[0].unmodeled_costs = true,
+                }
+                (plan, None)
+            }
         }
     } else {
         let passes = passes_columns(storage, txid, insert, select, None, arena)?;
@@ -1234,7 +1242,7 @@ pub(super) fn insert_source_plan<'a>(
         )
     };
     let Some(alias) = wrapper else {
-        return Ok(plan);
+        return Ok((plan, pulled));
     };
     let mut wrapped = Plan::new(arena, plan.count + 1)?;
     wrapped.methods = plan.methods;
@@ -1256,7 +1264,109 @@ pub(super) fn insert_source_plan<'a>(
             ..*node
         })?;
     }
-    Ok(wrapped)
+    Ok((wrapped, false))
+}
+
+/// The width of the target list a pulled-up `INSERT` source computes
+/// (`expand_insert_targetlist`): each target column's value coerced to the
+/// column's type, a source column of that type as wide as it is analyzed,
+/// any other value its type's `get_typavgwidth`, an omitted column its
+/// default of the column's type and a dropped one a NULL `integer`. `None`
+/// when a value is coerced while the query runs, at a cost this does not
+/// model.
+fn pulled_target_width(
+    storage: &Storage,
+    txid: u32,
+    insert: &Insert<'_>,
+    select: &Select<'_>,
+    arena: &Arena,
+) -> Result<Option<u32>, SqlError> {
+    let Some(ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(insert.table.schema, insert.table.name, txid)
+    else {
+        return Ok(None);
+    };
+    let definition = storage.table_def(slot, txid);
+    let scope = match &select.from {
+        Some(from) => Some(query::QueryScope::resolve_schema(
+            storage, from, txid, arena, None,
+        )?),
+        None => None,
+    };
+    let infer = |expression: &Expr<'_>| match &scope {
+        Some(scope) => crate::sql::exec::infer_type_res(
+            expression,
+            &query::CatalogScopeCols {
+                scope,
+                outer: None,
+                storage,
+                txid,
+                arena,
+            },
+        ),
+        None => crate::sql::exec::infer_type_res(
+            expression,
+            &crate::sql::exec::CatalogCols {
+                remote_ctid: false,
+                definition: None,
+                alias: None,
+                output_aliases: &[],
+                storage,
+                txid,
+                arena,
+            },
+        ),
+    };
+    let mut width = 4.0 * definition.attributes.dropped() as f64;
+    for (index, column) in definition.columns().iter().enumerate() {
+        let target_width = query::index_paths::type_average_width(column.ctype, column.type_mod);
+        let at = if insert.columns.is_empty() {
+            Some(index)
+        } else {
+            insert
+                .columns
+                .iter()
+                .position(|named| *named == column.name.as_str())
+        };
+        let Some(item) = at.and_then(|at| select.items.get(at)) else {
+            width += target_width;
+            continue;
+        };
+        let SelectItem::Expr { expression, .. } = item else {
+            return Ok(None);
+        };
+        if expression.is_constant(false) && !expression.calls_routine() {
+            width += target_width;
+            continue;
+        }
+        let Ok((type_oid, _)) = infer(expression) else {
+            return Ok(None);
+        };
+        if Some(type_oid) != storage.routine_type_oid(column.ctype, column.user_type, txid)
+            || column.type_mod != -1
+        {
+            return Ok(None);
+        }
+        width += match (expression, &scope) {
+            (Expr::Column { qualifier, name }, Some(scope)) => {
+                match scope.find_column(*qualifier, name) {
+                    Ok(query::ResolvedColumn::Table(table, source_column))
+                        if scope.slots[table] != usize::MAX =>
+                    {
+                        f64::from(query::index_paths::column_width(
+                            storage,
+                            txid,
+                            scope.slots[table],
+                            source_column,
+                        ))
+                    }
+                    _ => target_width,
+                }
+            }
+            _ => target_width,
+        };
+    }
+    Ok(Some(width as u32))
 }
 
 /// A pulled-up query that only reads one derived table's columns: its

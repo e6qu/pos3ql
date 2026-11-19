@@ -45,10 +45,12 @@ for spill_entry in \
     '- { name: d, corpus_shard: "3-of-6", auxiliary: none }' \
     '- { name: e, corpus_shard: "4-of-6", auxiliary: none }' \
     '- { name: f, corpus_shard: "5-of-6", auxiliary: none }' \
-    '- { name: exact-a, corpus_shard: "none", auxiliary: exact, exact_shard: "0", exact_shards: "4" }' \
-    '- { name: exact-b, corpus_shard: "none", auxiliary: exact, exact_shard: "1", exact_shards: "4" }' \
-    '- { name: exact-c, corpus_shard: "none", auxiliary: exact, exact_shard: "2", exact_shards: "4" }' \
-    '- { name: exact-d, corpus_shard: "none", auxiliary: exact, exact_shard: "3", exact_shards: "4" }' \
+    '- { name: exact-a, corpus_shard: "none", auxiliary: exact, exact_shard: "0", exact_shards: "6" }' \
+    '- { name: exact-b, corpus_shard: "none", auxiliary: exact, exact_shard: "1", exact_shards: "6" }' \
+    '- { name: exact-c, corpus_shard: "none", auxiliary: exact, exact_shard: "2", exact_shards: "6" }' \
+    '- { name: exact-d, corpus_shard: "none", auxiliary: exact, exact_shard: "3", exact_shards: "6" }' \
+    '- { name: exact-e, corpus_shard: "none", auxiliary: exact, exact_shard: "4", exact_shards: "6" }' \
+    '- { name: exact-f, corpus_shard: "none", auxiliary: exact, exact_shard: "5", exact_shards: "6" }' \
     '- { name: copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: types, corpus_shard: "none", auxiliary: types }' \
     '- { name: grouping, corpus_shard: "none", auxiliary: grouping }' \

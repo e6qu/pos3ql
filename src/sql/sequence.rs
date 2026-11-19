@@ -1689,6 +1689,11 @@ pub(crate) fn next_cached(
             if let Some(value) = session.take_cached(slot, sequence.cache_identity()) {
                 return Ok(value);
             }
+            // PostgreSQL reads the sequence's page for values its session
+            // has not cached.
+            crate::sql::query::instrument::page_accessed(
+                sequence.persistence == crate::storage::RelationPersistence::Temporary,
+            );
             let (value, reserved, prelogged) =
                 storage.reserve_sequence_values(slot, txid, sequence.cache)?;
             // Only reserving a new WAL range assigns a full transaction ID.

@@ -2485,7 +2485,7 @@ pub(crate) fn materialized_rows<'a>(
                 Some(&columns[..count]),
                 n_identities,
                 rank_window.is_some(),
-            ),
+            )?,
         };
         // An incremental sort's batches, which it reports instead of one
         // sort's method and memory.
@@ -2568,7 +2568,7 @@ pub(crate) fn materialized_rows<'a>(
                                         Some(&columns[..count]),
                                         n_identities,
                                         bounded.is_some(),
-                                    ),
+                                    )?,
                                 };
                                 let groups: &mut instrument::IncrementalGroups =
                                     incremental.get_or_insert_with(Default::default);
@@ -2577,10 +2577,7 @@ pub(crate) fn materialized_rows<'a>(
                                 } else {
                                     &mut groups.full
                                 };
-                                kind.add_sorted(
-                                    space.bytes,
-                                    space.method == instrument::SortMethod::TopNHeapsort,
-                                );
+                                kind.add_sorted(space);
                                 Ok(())
                             },
                         )?
@@ -3118,15 +3115,16 @@ pub(crate) fn external_materialized_into<'a>(
             &plan.order_exprs[..plan.n_keys],
             &mut columns,
         );
-        sorter.size_as_postgres(instrument::SortTuples::new(
-            Some(&columns[..count]),
-            plan.n_identities,
-            statement.limit.is_some()
-                && limit != u64::MAX
-                && !statement.with_ties
-                && !statement.distinct
-                && plan.n_on == 0,
-        ));
+        let bounded = statement.limit.is_some()
+            && limit != u64::MAX
+            && !statement.with_ties
+            && !statement.distinct
+            && plan.n_on == 0;
+        sorter.size_as_postgres(
+            instrument::SortTuples::new(Some(&columns[..count]), plan.n_identities, bounded),
+            (bounded && statement.locking.is_empty() && plan.n_order > 0)
+                .then(|| offset.saturating_add(limit).min(usize::MAX as u64) as usize),
+        );
     }
     let mut compare = |left: &[u8], right: &[u8]| {
         compare_materialized_rows(

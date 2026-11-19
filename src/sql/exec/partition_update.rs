@@ -39,6 +39,7 @@ pub(super) fn prepare_move<'arena>(
     if !dml_row_available(storage, txn, selected, "updated")? {
         return Ok(false);
     }
+    crate::sql::query::write_buffers::row_deleted(storage, txn.txid, old_target.table(), arena)?;
     txn.move_row_out(
         storage,
         old_target,

@@ -198,6 +198,10 @@ pub(crate) struct NodeCounters {
     pub(crate) buffers: BufferUsage,
     /// A page model counted the node's pages.
     pub(crate) paged: bool,
+    /// The node wrote rows the page model does not cover.
+    pub(crate) unmodeled: bool,
+    /// The rows an `INSERT ... ON CONFLICT` found conflicting.
+    pub(crate) conflicts: u64,
 }
 
 /// Page accesses in PostgreSQL's `BufferUsage` terms, each page the 8 kB
@@ -339,51 +343,100 @@ pub(crate) enum MergeChange {
 
 /// The batches of one kind an incremental sort sorted
 /// (`IncrementalSortGroupInfo`).
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct SortGroups {
     pub(crate) count: u64,
-    /// The kilobytes each group reported, summed, and their peak
+    /// The kilobytes each group reported in memory, summed, and their peak
     /// (`totalMemorySpaceUsed`, `maxMemorySpaceUsed`).
     pub(crate) total_kb: u64,
     pub(crate) peak_kb: u64,
-    /// The sort methods the groups used (`sortMethods`): a top-N heapsort
-    /// and a quicksort.
+    /// The kilobytes the groups that reported disk space used, summed, and
+    /// their peak (`totalDiskSpaceUsed`, `maxDiskSpaceUsed`).
+    pub(crate) total_disk_kb: u64,
+    pub(crate) peak_disk_kb: u64,
+    /// The sort methods the groups used (`sortMethods`).
     pub(crate) top_n: bool,
     pub(crate) quicksort: bool,
-    /// The most memory the batches' sort held so far
-    /// (`tuplesort_updatemax`), which each group reports.
+    pub(crate) external_merge: bool,
+    /// What the batches' one tuplesort remembers across `tuplesort_reset`:
+    /// the most space it held so far, whether that was disk, and the method
+    /// it sorted by then (`tuplesort_updatemax`), which each group reports.
     max_space: usize,
+    max_disk: bool,
+    max_method: SortMethod,
+}
+
+impl Default for SortGroups {
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 impl SortGroups {
-    /// `instrumentSortedGroup` after a batch whose sort held `bytes`.
-    pub(crate) fn add_sorted(&mut self, bytes: usize, top_n: bool) {
-        self.max_space = self.max_space.max(bytes);
+    pub(crate) const NONE: Self = Self {
+        count: 0,
+        total_kb: 0,
+        peak_kb: 0,
+        total_disk_kb: 0,
+        peak_disk_kb: 0,
+        top_n: false,
+        quicksort: false,
+        external_merge: false,
+        max_space: 0,
+        max_disk: false,
+        max_method: SortMethod::Quicksort,
+    };
+
+    /// `instrumentSortedGroup` after a batch whose sort used `space`.
+    pub(crate) fn add_sorted(&mut self, space: SortSpace) {
+        let disk = space.method == SortMethod::ExternalMerge;
+        if (disk && !self.max_disk) || (disk == self.max_disk && space.bytes > self.max_space) {
+            self.max_space = space.bytes;
+            self.max_disk = disk;
+            self.max_method = space.method;
+        }
         let kb = self.max_space.div_ceil(1024) as u64;
         self.count += 1;
-        self.total_kb += kb;
-        self.peak_kb = self.peak_kb.max(kb);
-        self.top_n |= top_n;
-        self.quicksort |= !top_n;
+        if self.max_disk {
+            self.total_disk_kb += kb;
+            self.peak_disk_kb = self.peak_disk_kb.max(kb);
+        } else {
+            self.total_kb += kb;
+            self.peak_kb = self.peak_kb.max(kb);
+        }
+        match self.max_method {
+            SortMethod::TopNHeapsort => self.top_n = true,
+            SortMethod::Quicksort => self.quicksort = true,
+            SortMethod::ExternalMerge => self.external_merge = true,
+        }
     }
 
     fn add(&mut self, bytes: usize) {
-        self.add_sorted(bytes, false);
+        self.add_sorted(SortSpace {
+            method: SortMethod::Quicksort,
+            bytes,
+        });
     }
 
     /// The methods' names in `show_incremental_sort_group_info`'s order.
     pub(crate) fn methods(&self) -> impl Iterator<Item = &'static str> {
         [
-            (self.top_n, "top-N heapsort"),
-            (self.quicksort, "quicksort"),
+            (self.top_n, SortMethod::TopNHeapsort),
+            (self.quicksort, SortMethod::Quicksort),
+            (self.external_merge, SortMethod::ExternalMerge),
         ]
         .into_iter()
-        .filter_map(|(used, name)| used.then_some(name))
+        .filter_map(|(used, method)| used.then_some(method.name()))
     }
 
-    /// The average kilobytes a group reported.
+    /// The average kilobytes a group reported in memory.
     pub(crate) fn average_kb(&self) -> u64 {
         self.total_kb / self.count.max(1)
+    }
+
+    /// The average kilobytes a group reported on disk.
+    pub(crate) fn average_disk_kb(&self) -> u64 {
+        self.total_disk_kb / self.count.max(1)
     }
 }
 
@@ -426,18 +479,10 @@ enum BatchState {
 
 impl IncrementalSortBatches {
     pub(crate) const fn new() -> Self {
-        const NONE: SortGroups = SortGroups {
-            count: 0,
-            total_kb: 0,
-            peak_kb: 0,
-            top_n: false,
-            quicksort: false,
-            max_space: 0,
-        };
         Self {
             groups: IncrementalGroups {
-                full: NONE,
-                presorted: NONE,
+                full: SortGroups::NONE,
+                presorted: SortGroups::NONE,
             },
             group: 0,
             started: false,
@@ -630,67 +675,133 @@ impl SortTuples {
         values + self.tids
     }
 
-    /// What PostgreSQL's in-memory sort of `count` rows (`row_at`, in
-    /// arrival order) reports (`tuplesort_get_stats` after the sort); with
-    /// `heap`, a sort bounded to its first rows, whose bounded heap
-    /// `compare` orders in a scratch array of the bound's positions. `None`
-    /// when a value has no PostgreSQL size here or the rows overflow
-    /// `work_mem`.
-    pub(crate) fn space<'r>(
-        &self,
-        count: usize,
-        row_at: &dyn Fn(usize) -> &'r [u8],
-        heap: Option<(&mut [usize], SortCompare<'_>)>,
-    ) -> Result<Option<usize>, crate::sql::SqlError> {
-        use super::postgres_memory::{
-            SortTuples as Copies, allocset_chunk_space, bounded_heap_charge, maxalign,
-            tuplesort_memory,
-        };
-        let copies = if self.width((count > 0).then(|| row_at(0))) == 1 {
+    /// How the sort copies its rows: a one-value tuple is a datum sort
+    /// (`ExecInitSort`), a bounded sort keeps them in an aset.c context.
+    /// `first` is the first row it read.
+    fn copies(&self, first: Option<&[u8]>) -> super::postgres_memory::SortTuples {
+        use super::postgres_memory::SortTuples as Copies;
+        if self.width(first) == 1 {
             Copies::Datum
-        } else if self.bounded || heap.is_some() {
+        } else if self.bounded {
             Copies::AllocSet
         } else {
             Copies::Bump
+        }
+    }
+
+    /// `writetup_heap`'s bytes of a row whose minimal tuple is `length`
+    /// bytes (its length word and its tuple after the header's padding), or
+    /// `writetup_datum`'s of a datum sort's value.
+    fn tape_bytes(
+        &self,
+        row: &[u8],
+        length: usize,
+        copies: super::postgres_memory::SortTuples,
+    ) -> usize {
+        match copies {
+            // A datum sort of the row identity alone: a `tid` is six bytes.
+            super::postgres_memory::SortTuples::Datum if !self.all && self.count == 0 => 4 + 6,
+            super::postgres_memory::SortTuples::Datum => {
+                4 + super::postgres_memory::sorted_datum_size(
+                    row,
+                    (!self.all).then(|| usize::from(self.columns[0])),
+                )
+            }
+            _ => length - 10 + 4,
+        }
+    }
+
+    /// A sort's accounting of rows read in arrival order, with the row
+    /// count a limit bounds it to.
+    pub(crate) fn model(
+        &self,
+        first: Option<&[u8]>,
+        bound: Option<usize>,
+    ) -> super::postgres_memory::TuplesortModel {
+        super::postgres_memory::TuplesortModel::new(self.copies(first), bound)
+    }
+
+    /// Feeds one row to `model`; `false` when a value has no PostgreSQL
+    /// size here.
+    pub(crate) fn push(
+        &self,
+        model: &mut super::postgres_memory::TuplesortModel,
+        copies_of_first: Option<&[u8]>,
+        row: &[u8],
+    ) -> bool {
+        let Some(length) = self.length(row) else {
+            return false;
         };
+        let copies = self.copies(copies_of_first);
+        model.push(length, self.tape_bytes(row, length, copies));
+        true
+    }
+
+    /// What the rows of a bounded sort charge once its heap took them
+    /// (`bounded_heap_charge`), over `count` rows in arrival order.
+    pub(crate) fn heap_charge<'r>(
+        &self,
+        count: usize,
+        heapify_at: usize,
+        row_at: &dyn Fn(usize) -> &'r [u8],
+        positions: &mut [usize],
+        compare: SortCompare<'_>,
+    ) -> Result<usize, crate::sql::SqlError> {
+        use super::postgres_memory::{SortTuples as Copies, allocset_chunk_space, maxalign};
+        let copies = self.copies((count > 0).then(|| row_at(0)));
         let charge = |length: usize| match copies {
             Copies::Datum => 0,
             Copies::Bump => maxalign(length),
             Copies::AllocSet => allocset_chunk_space(length),
         };
+        let length = |row: usize| self.length(row_at(row)).unwrap_or(0);
+        super::postgres_memory::bounded_heap_charge(
+            count,
+            heapify_at,
+            |row| charge(length(row)),
+            positions,
+            |new, worst| Ok(compare(row_at(new), row_at(worst))?.is_lt()),
+        )
+    }
+
+    /// What PostgreSQL's sort of `count` rows (`row_at`, in arrival order)
+    /// reports (`tuplesort_get_stats` after the sort); with `heap`, a sort
+    /// bounded to its first rows, whose bounded heap `compare` orders in a
+    /// scratch array of the bound's positions. `None` when a value has no
+    /// PostgreSQL size here.
+    pub(crate) fn space<'r>(
+        &self,
+        count: usize,
+        row_at: &dyn Fn(usize) -> &'r [u8],
+        heap: Option<(&mut [usize], SortCompare<'_>)>,
+    ) -> Result<Option<super::postgres_memory::TuplesortSpace>, crate::sql::SqlError> {
+        let first = (count > 0).then(|| row_at(0));
+        let bound = heap.as_ref().map(|(positions, _)| positions.len());
+        let mut model = self.model(first, bound.filter(|&bound| bound > 0));
         for row in 0..count {
-            if self.length(row_at(row)).is_none() {
+            if !self.push(&mut model, first, row_at(row)) {
                 return Ok(None);
             }
         }
-        let length = |row: usize| self.length(row_at(row)).unwrap_or(0);
-        let (bound, heap_charge) = match heap {
-            Some((positions, compare)) if count > positions.len() * 2 && !positions.is_empty() => {
-                let bound = positions.len();
-                let held = bounded_heap_charge(
-                    count,
-                    |row| charge(length(row)),
-                    positions,
-                    |new, worst| Ok(compare(row_at(new), row_at(worst))?.is_lt()),
-                )?;
-                (Some(bound), Some(held))
+        let heap_charge = match heap {
+            Some((positions, compare)) if model.bounded() => {
+                Some(self.heap_charge(count, model.heap_at(), row_at, positions, compare)?)
             }
-            _ => (None, None),
+            _ => None,
         };
-        Ok(tuplesort_memory(
-            copies,
-            (0..count).map(length),
-            bound,
-            heap_charge,
-        ))
+        Ok(Some(model.space(heap_charge)))
     }
 }
 
 impl SortSpace {
-    /// PostgreSQL's in-memory sort of `rows` (in arrival order), whose
-    /// tuples hold the values at `columns`; pos3ql's own figure when a value
-    /// has no PostgreSQL size here or the rows overflow `work_mem`.
-    pub(crate) fn postgres(rows: &[&[u8]], columns: Option<&[usize]>, bounded: bool) -> Self {
+    /// PostgreSQL's sort of `rows` (in arrival order), whose tuples hold the
+    /// values at `columns`; pos3ql's own in-memory figure when a value has
+    /// no PostgreSQL size here.
+    pub(crate) fn postgres(
+        rows: &[&[u8]],
+        columns: Option<&[usize]>,
+        bounded: bool,
+    ) -> Result<Self, crate::sql::SqlError> {
         Self::postgres_locking(rows, columns, 0, bounded)
     }
 
@@ -701,18 +812,13 @@ impl SortSpace {
         columns: Option<&[usize]>,
         tids: usize,
         bounded: bool,
-    ) -> Self {
+    ) -> Result<Self, crate::sql::SqlError> {
         let own = Self::in_memory(rows, false);
-        let space = SortTuples::new(columns, tids, bounded).and_then(|tuples| {
-            tuples
-                .space(rows.len(), &|row| rows[row], None)
-                .ok()
-                .flatten()
-        });
-        Self {
-            method: own.method,
-            bytes: space.unwrap_or(own.bytes),
-        }
+        let space = match SortTuples::new(columns, tids, bounded) {
+            Some(tuples) => tuples.space(rows.len(), &|row| rows[row], None)?,
+            None => None,
+        };
+        Self::from_postgres(space, own, false)
     }
 
     /// [`Self::postgres_locking`] of a sort a limit of `bound` rows bounds,
@@ -740,9 +846,32 @@ impl SortSpace {
             &|row| rows[row],
             Some((positions, &mut compare)),
         )?;
-        Ok(Self {
-            method: own.method,
-            bytes: space.unwrap_or(own.bytes),
+        Self::from_postgres(space, own, heap)
+    }
+
+    /// The figure PostgreSQL's sort reported, or `own` when a value has no
+    /// PostgreSQL size here. `bounded` names a sort that kept only the
+    /// rows its limit returns.
+    pub(crate) fn from_postgres(
+        space: Option<super::postgres_memory::TuplesortSpace>,
+        own: Self,
+        bounded: bool,
+    ) -> Result<Self, crate::sql::SqlError> {
+        use super::postgres_memory::TuplesortSpace;
+        Ok(match space {
+            None => own,
+            Some(TuplesortSpace::Memory(bytes)) => Self {
+                method: if bounded {
+                    SortMethod::TopNHeapsort
+                } else {
+                    SortMethod::Quicksort
+                },
+                bytes,
+            },
+            Some(TuplesortSpace::Disk(bytes)) => Self {
+                method: SortMethod::ExternalMerge,
+                bytes,
+            },
         })
     }
 
@@ -1071,6 +1200,8 @@ impl Slot {
                     temp_written: 0,
                 },
                 paged: false,
+                unmodeled: false,
+                conflicts: 0,
             },
             open: 0,
             started: None,
@@ -1151,7 +1282,10 @@ struct Registry {
     buffers: bool,
     /// Tables' heap page maps, built once per statement for the scans
     /// that count pages (see [`heap_pages`]).
-    heap_pages: [Option<HeapPages>; HEAP_PAGE_TABLES],
+    heap_pages: [Option<HeldHeap>; HEAP_PAGE_TABLES],
+    /// The nodes with an open loop, innermost last, whose work a page
+    /// access no node counts itself belongs to.
+    open: [Option<NonNull<Slot>>; OPEN_NODES],
     /// For a statement rewrite rules turn into several queries, the
     /// position of the next query to run.
     next_query: Option<u16>,
@@ -1246,6 +1380,7 @@ fn install<R>(
         timing,
         buffers,
         heap_pages: [None; HEAP_PAGE_TABLES],
+        open: [None; OPEN_NODES],
         next_query,
         attempt: 0,
         reruns: 0,
@@ -1286,6 +1421,7 @@ pub(crate) fn restart() {
     registry.attempt = registry.attempt.wrapping_add(1);
     // A later attempt may run in a fresh workspace.
     registry.heap_pages = [None; HEAP_PAGE_TABLES];
+    registry.open = [None; OPEN_NODES];
     if registry.next_query.is_some() {
         registry.next_query = Some(0);
     }
@@ -1370,53 +1506,172 @@ pub(crate) fn active() -> bool {
 /// The tables whose heap page maps one analyzed statement keeps.
 const HEAP_PAGE_TABLES: usize = 16;
 
+/// The nested open loops whose nodes [`page_accessed`] can count; deeper
+/// loops count in the innermost one tracked.
+const OPEN_NODES: usize = 64;
+
+/// Tracks `slot`'s loop as the innermost open one (`opened`), or no longer
+/// open.
+fn track_open(slot: NonNull<Slot>, opened: bool) {
+    let Some(mut registry) = ACTIVE.with(Cell::get) else {
+        return;
+    };
+    // SAFETY: see `node`; nothing else borrows the registry here.
+    let open = &mut unsafe { registry.as_mut() }.open;
+    if opened {
+        if let Some(free) = open.iter_mut().find(|held| held.is_none()) {
+            *free = Some(slot);
+        }
+        return;
+    }
+    if let Some(at) = open.iter().rposition(|held| *held == Some(slot)) {
+        open.copy_within(at + 1.., at);
+        open[OPEN_NODES - 1] = None;
+    }
+}
+
+/// Counts an access of one page of a relation no scan node reads (a
+/// sequence's, as `nextval` reads it): PostgreSQL counts it in the node
+/// whose expression made it, the innermost running node, else the
+/// statement's `ModifyTable`.
+pub(crate) fn page_accessed(local: bool) {
+    let Some(registry) = ACTIVE.with(Cell::get) else {
+        return;
+    };
+    // SAFETY: see `node`; the registry outlives its installation.
+    let registry = unsafe { registry.as_ref() };
+    if !registry.buffers {
+        return;
+    }
+    let usage = BufferUsage::accessed(local, 1, 0);
+    match registry.open.iter().rev().flatten().next() {
+        Some(&slot) => Node {
+            slot: Some(slot),
+            timing: registry.timing,
+            attempt: registry.attempt,
+        }
+        .add_buffers(usage),
+        None => node(Role::Modify).add_buffers(usage),
+    }
+}
+
 /// A table's `(row identity, heap page)` pairs sorted by identity, and its
 /// heap pages.
 pub(crate) type HeapPageMap<'a> = (&'a [(u64, u64)], u64);
 
-/// A [`HeapPageMap`] the analyzed statement keeps for the table in `slot`.
-#[derive(Clone, Copy)]
-struct HeapPages {
-    slot: usize,
-    rows: NonNull<[(u64, u64)]>,
-    pages: u64,
+/// A table's modeled heap layout: each visible row's page, sorted by row
+/// identity, each page's free bytes and the packing past the last row.
+pub(crate) struct HeapLayout<'a> {
+    pub(crate) rows: &'a mut [(u64, u64)],
+    pub(crate) free: &'a mut [u16],
+    pub(crate) packing: crate::storage::heap_layout::HeapPacking,
 }
 
-/// The heap page map of the table in `slot`, built by `build` in the
-/// persistent tail of the statement's owning `arena` the first time a scan
-/// of the analyzed statement asks for it, so a scan run once per outer row
-/// does not build it again.
-pub(crate) fn heap_pages<'a, E>(
+/// The heap layout the analyzed statement keeps for the table in `slot`,
+/// as its first read found it, and the state its writes changed.
+#[derive(Clone, Copy)]
+pub(crate) struct HeldHeap {
     slot: usize,
-    arena: &'a crate::mem::arena::Arena,
-    build: impl FnOnce(&'a crate::mem::arena::Arena) -> Result<HeapPageMap<'a>, E>,
-) -> Result<HeapPageMap<'a>, E> {
+    rows: NonNull<[(u64, u64)]>,
+    /// The table's pages when the statement first read them, which its
+    /// scans read.
+    pages: u64,
+    /// Each page's free bytes, which the statement's updates use up.
+    free: NonNull<[u16]>,
+    /// The packing past the last row, which the statement's new tuples
+    /// continue.
+    pub(crate) packing: crate::storage::heap_layout::HeapPacking,
+    /// The table's indexes as its writes descend them, once read.
+    pub(crate) indexes: Option<super::write_buffers::WriteIndexes>,
+}
+
+impl HeldHeap {
+    /// The rows the statement's first read saw.
+    pub(crate) fn rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The page of the row `rowid`, when the statement's first read saw it.
+    pub(crate) fn page_of(&self, rowid: u64) -> Option<u64> {
+        // SAFETY: the map lives in the owning arena's persistent tail, which
+        // no front rewind reclaims and which outlives the statement's
+        // analysis; a restarted attempt forgets it.
+        let rows = unsafe { self.rows.as_ref() };
+        rows.binary_search_by_key(&rowid, |&(row, _)| row)
+            .ok()
+            .map(|at| rows[at].1)
+    }
+
+    /// The free bytes of page `page`, which `take` uses up when they fit
+    /// it; `false` when they do not.
+    pub(crate) fn take_free(&mut self, page: u64, take: usize) -> bool {
+        // SAFETY: see `page_of`; nothing else borrows the free bytes.
+        let free = unsafe { self.free.as_mut() };
+        let Some(free) = free.get_mut(page as usize) else {
+            return false;
+        };
+        if usize::from(*free) < take {
+            return false;
+        }
+        *free -= take as u16;
+        true
+    }
+}
+
+/// The heap layout of the table in `slot`, built in the persistent tail of
+/// the statement's owning `arena` the first time the analyzed statement
+/// reads or writes the table, so a scan run once per outer row does not
+/// build it again, then `visit`ed.
+pub(crate) fn held_heap<R>(
+    storage: &crate::storage::Storage,
+    slot: usize,
+    txid: u32,
+    arena: &crate::mem::arena::Arena,
+    visit: impl FnOnce(&mut HeldHeap) -> R,
+) -> Result<R, crate::sql::SqlError> {
+    let build = |arena| -> Result<HeldHeap, crate::sql::SqlError> {
+        let layout = super::scan::heap_pages_of_rows(storage, slot, txid, arena)?;
+        Ok(HeldHeap {
+            slot,
+            pages: layout.packing.pages(),
+            rows: NonNull::from(layout.rows),
+            free: NonNull::from(layout.free),
+            packing: layout.packing,
+            indexes: None,
+        })
+    };
     let Some(mut registry) = ACTIVE.with(Cell::get) else {
-        return build(arena);
+        return Ok(visit(&mut build(arena)?));
     };
     // SAFETY: see `node`; nothing else borrows the registry here.
     let registry = unsafe { registry.as_mut() };
     if let Some(held) = registry
         .heap_pages
-        .iter()
+        .iter_mut()
         .flatten()
         .find(|held| held.slot == slot)
     {
-        // SAFETY: the map lives in the owning arena's persistent tail,
-        // which no front rewind reclaims and which outlives the statement's
-        // analysis; a restarted attempt forgets it.
-        return Ok((unsafe { held.rows.as_ref() }, held.pages));
+        return Ok(visit(held));
     }
-    let owner = arena.retention_owner();
-    let (rows, pages) = build(owner)?;
+    let mut held = build(arena)?;
+    let result = visit(&mut held);
     if let Some(free) = registry.heap_pages.iter_mut().find(|held| held.is_none()) {
-        *free = Some(HeapPages {
-            slot,
-            rows: NonNull::from(rows),
-            pages,
-        });
+        *free = Some(held);
     }
-    Ok((rows, pages))
+    Ok(result)
+}
+
+/// The heap page map of the table in `slot` (see [`held_heap`]).
+pub(crate) fn heap_pages<'a>(
+    storage: &crate::storage::Storage,
+    slot: usize,
+    txid: u32,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<HeapPageMap<'a>, crate::sql::SqlError> {
+    held_heap(storage, slot, txid, arena, |held| {
+        // SAFETY: see `HeldHeap::page_of`.
+        (unsafe { held.rows.as_ref() }, held.pages)
+    })
 }
 
 /// Whether the analyzed statement counts the pages its scans access.
@@ -1550,13 +1805,18 @@ impl Node {
     }
 
     fn begin(self) {
+        let mut opened = false;
         self.with(|slot, timing| {
             slot.open += 1;
             if slot.open == 1 {
                 slot.started = timing.then(std::time::Instant::now);
                 slot.first_row = None;
+                opened = true;
             }
         });
+        if let Some(slot) = self.slot.filter(|_| opened) {
+            track_open(slot, true);
+        }
     }
 
     /// The loops the node has finished.
@@ -1828,6 +2088,25 @@ impl Node {
         });
     }
 
+    /// Adds page accesses the node made outside a page model's scan: a
+    /// write's, or a sequence's.
+    pub(crate) fn add_buffers(self, usage: BufferUsage) {
+        self.with(|slot, _| {
+            slot.counters.buffers = slot.counters.buffers.plus(usage);
+            slot.counters.paged = true;
+        });
+    }
+
+    /// Counts a row an `INSERT ... ON CONFLICT` found conflicting.
+    pub(crate) fn conflicted(self) {
+        self.with(|slot, _| slot.counters.conflicts = slot.counters.conflicts.saturating_add(1));
+    }
+
+    /// Marks the node as having written rows the page model does not cover.
+    pub(crate) fn unmodeled(self) {
+        self.with(|slot, _| slot.counters.unmodeled = true);
+    }
+
     /// Counts a read of heap page `page`, unless it is the page the scan
     /// read last.
     pub(crate) fn heap_page(self, page: u64) {
@@ -1916,11 +2195,13 @@ impl Node {
     }
 
     fn end_step(self) {
+        let mut closed = false;
         self.with(|slot, _| {
             slot.open = slot.open.saturating_sub(1);
             if slot.open != 0 {
                 return;
             }
+            closed = true;
             slot.end_page_loop();
             let first = slot.counters.loops == 0;
             slot.counters.loops = 1;
@@ -1932,9 +2213,13 @@ impl Node {
                 }
             }
         });
+        if let Some(slot) = self.slot.filter(|_| closed) {
+            track_open(slot, false);
+        }
     }
 
     fn end(self) {
+        let mut closed = false;
         self.with(|slot, _| {
             // A loop a rerun's restart closed does not count again.
             if slot.open == 0 {
@@ -1944,6 +2229,7 @@ impl Node {
             if slot.open != 0 {
                 return;
             }
+            closed = true;
             slot.end_page_loop();
             slot.counters.loops += 1;
             if let Some(started) = slot.started.take() {
@@ -1955,6 +2241,9 @@ impl Node {
                     .saturating_add(slot.first_row.take().unwrap_or(total));
             }
         });
+        if let Some(slot) = self.slot.filter(|_| closed) {
+            track_open(slot, false);
+        }
     }
 }
 

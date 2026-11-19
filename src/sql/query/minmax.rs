@@ -155,22 +155,37 @@ pub(crate) fn local_minmax_subquery<'a>(
             unreachable!("checked above")
         };
         let descending = name.ends_with("max");
-        let not_null = arena
-            .alloc(Expr::IsNull {
-                operand: argument,
-                negated: true,
-            })
-            .map_err(|_| arena_full())?;
-        let where_clause = match statement.where_clause {
-            Some(condition) => &*arena
-                .alloc(Expr::Binary {
-                    operator: BinaryOp::And,
-                    left: not_null,
-                    right: condition,
-                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+        // PostgreSQL drops the `IS NOT NULL` of a column its validated NOT
+        // NULL constraint keeps from holding a NULL
+        // (`restriction_is_always_true`).
+        let never_null = match argument {
+            Expr::Column { name, .. } => table.column_index(name).is_some_and(|column| {
+                let column = &table.columns()[column];
+                column.not_null != crate::storage::NotNullOrigin::Nullable
+                    && column.not_null_validated
+            }),
+            _ => false,
+        };
+        let where_clause = if never_null {
+            statement.where_clause
+        } else {
+            let not_null = arena
+                .alloc(Expr::IsNull {
+                    operand: argument,
+                    negated: true,
                 })
-                .map_err(|_| arena_full())?,
-            None => not_null,
+                .map_err(|_| arena_full())?;
+            Some(match statement.where_clause {
+                Some(condition) => &*arena
+                    .alloc(Expr::Binary {
+                        operator: BinaryOp::And,
+                        left: not_null,
+                        right: condition,
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                    })
+                    .map_err(|_| arena_full())?,
+                None => not_null,
+            })
         };
         let items = arena
             .alloc_slice_copy(&[SelectItem::Expr {
@@ -189,7 +204,7 @@ pub(crate) fn local_minmax_subquery<'a>(
         let subquery = arena
             .alloc(Select {
                 items,
-                where_clause: Some(where_clause),
+                where_clause,
                 order_by,
                 limit: Some(one),
                 offset: None,
@@ -218,8 +233,8 @@ pub(crate) fn local_minmax_subquery<'a>(
             storage,
             &scope,
             txid,
-            Some(where_clause),
-            streaming_pax_columns_ordered(&scope, from, items, Some(where_clause), order_by)
+            where_clause,
+            streaming_pax_columns_ordered(&scope, from, items, where_clause, order_by)
                 .selected_columns(0),
             &[],
             arena,

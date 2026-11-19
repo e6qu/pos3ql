@@ -1911,8 +1911,8 @@ impl<'r, 'a> Runner<'r, 'a> {
                     state = MergeState::NextInner;
                     let inner_rows = inner_input.as_ref().expect("read").rows;
                     let (o, i) = (outer_at.expect("outer"), inner_at.expect("inner"));
-                    self.bind(bound, &outer_rows[o], outer_relids);
-                    self.bind(bound, &inner_rows[i], inner_relids);
+                    self.bind(bound, outer_rows[o], outer_relids);
+                    self.bind(bound, inner_rows[i], inner_relids);
                     if !self.equal(bound, &join_quals)? {
                         join.join_filtered();
                         continue;
@@ -1949,8 +1949,8 @@ impl<'r, 'a> Runner<'r, 'a> {
                         MergeEval::Matchable => {
                             let inner_rows = inner_input.as_ref().expect("read").rows;
                             match compare(
-                                &outer_rows[outer_at.expect("outer")],
-                                &inner_rows[inner_at.expect("inner")],
+                                outer_rows[outer_at.expect("outer")],
+                                inner_rows[inner_at.expect("inner")],
                             )? {
                                 Ordering::Equal => MergeState::JoinTuples,
                                 Ordering::Less => MergeState::NextOuter,
@@ -1985,7 +1985,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 MergeState::TestOuter => {
                     let inner_rows = inner_input.as_ref().expect("read").rows;
                     let mark = marked.expect("a marked inner row");
-                    match compare(&outer_rows[outer_at.expect("outer")], &inner_rows[mark])? {
+                    match compare(outer_rows[outer_at.expect("outer")], inner_rows[mark])? {
                         Ordering::Equal => {
                             if !skip_mark_restore {
                                 // `ExecRestrPos`: the next fetch follows the mark.
@@ -2000,7 +2000,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                         Ordering::Greater => {
                             let current = match inner_at {
                                 None => MergeEval::EndOfJoin,
-                                Some(at) => eval(&inner_rows[at], false),
+                                Some(at) => eval(inner_rows[at], false),
                             };
                             match current {
                                 MergeEval::Matchable => state = MergeState::SkipTest,
@@ -2019,8 +2019,8 @@ impl<'r, 'a> Runner<'r, 'a> {
                 MergeState::SkipTest => {
                     let inner_rows = inner_input.as_ref().expect("read").rows;
                     state = match compare(
-                        &outer_rows[outer_at.expect("outer")],
-                        &inner_rows[inner_at.expect("inner")],
+                        outer_rows[outer_at.expect("outer")],
+                        inner_rows[inner_at.expect("inner")],
                     )? {
                         Ordering::Equal => {
                             marked = inner_at;
@@ -2342,7 +2342,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             let mut keep = true;
             for position in entry.start..entry.start + entry.len {
                 let row = cache.rows.borrowed_slice()[position];
-                self.bind(bound, &row, inner_relids);
+                self.bind(bound, row, inner_relids);
                 memoize.row();
                 if !sink(bound)? {
                     keep = false;
@@ -2780,14 +2780,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 continue;
             };
             let size = 16 + self.tuple_len(row, inner)?;
-            table.insert(
-                HashedRow {
-                    row: *row,
-                    hash,
-                    size,
-                },
-                self.arena,
-            )?;
+            table.insert(HashedRow { row, hash, size }, self.arena)?;
             table.total += 1;
         }
         if table.buckets != table.optimal_buckets {
@@ -2913,12 +2906,12 @@ impl<'r, 'a> Runner<'r, 'a> {
             };
             if Some(row.hash) != hash
                 || outer_null
-                || self.has_null(&row.row, probe.keys, false)
-                || self.compare_sides(bound, &row.row, probe.keys)? != Ordering::Equal
+                || self.has_null(row.row, probe.keys, false)
+                || self.compare_sides(bound, row.row, probe.keys)? != Ordering::Equal
             {
                 continue;
             }
-            self.bind(bound, &row.row, probe.inner_relids);
+            self.bind(bound, row.row, probe.inner_relids);
             if !self.equal(bound, probe.quals.0)? {
                 probe.join.join_filtered();
                 continue;
@@ -3423,7 +3416,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             .map_err(|_| arena_full())?;
         let mut bytes = 0usize;
         for (at, &row) in index.iter().enumerate() {
-            lengths[at] = self.tuple_len(&rows[row as usize], inner)?;
+            lengths[at] = self.tuple_len(rows[row as usize], inner)?;
             // `HJTUPLE_OVERHEAD` and the tuple, as `spaceUsed` counts them.
             bytes += 16 + lengths[at];
         }
@@ -3504,8 +3497,8 @@ impl<'r, 'a> Runner<'r, 'a> {
                         self.storage,
                         self.txid,
                         self.collation(o),
-                        &self.value(&rows[a as usize], i),
-                        &self.value(&rows[b as usize], i),
+                        &self.value(rows[a as usize], i),
+                        &self.value(rows[b as usize], i),
                     )?;
                     if order != Ordering::Equal {
                         return Ok(order);
@@ -3533,8 +3526,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         let (mut low, mut high) = (0usize, index.len());
         while low < high {
             let middle = (low + high) / 2;
-            if self.compare_sides(bound, &rows[index[middle] as usize], keys)? == Ordering::Greater
-            {
+            if self.compare_sides(bound, rows[index[middle] as usize], keys)? == Ordering::Greater {
                 low = middle + 1;
             } else {
                 high = middle;
@@ -3586,17 +3578,17 @@ impl<'r, 'a> Runner<'r, 'a> {
                 Ok(Ordering::Equal)
             };
         crate::sql::pg_qsort::pg_qsort(order, &mut |a, b| {
-            compare(&rows[a as usize], &rows[b as usize])
+            compare(rows[a as usize], rows[b as usize])
         })?;
         let mut previous: Option<u32> = None;
         for &at in order.iter() {
             if let Some(held) = previous
-                && compare(&rows[held as usize], &rows[at as usize])? == Ordering::Equal
+                && compare(rows[held as usize], rows[at as usize])? == Ordering::Equal
             {
                 continue;
             }
             previous = Some(at);
-            self.bind(bound, &rows[at as usize], relids);
+            self.bind(bound, rows[at as usize], relids);
             if !sink(bound)? {
                 return Ok(false);
             }
@@ -3631,7 +3623,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 if at != 0 {
                     hash = hash.rotate_left(1);
                 }
-                let value = self.value(&rows[row], column(member));
+                let value = self.value(rows[row], column(member));
                 if value.is_null() {
                     continue;
                 }
@@ -3647,8 +3639,8 @@ impl<'r, 'a> Runner<'r, 'a> {
         let mut same = |a: usize, b: usize| -> Result<bool, SqlError> {
             for member in keys {
                 let (one, two) = (
-                    self.value(&rows[a], column(member)),
-                    self.value(&rows[b], column(member)),
+                    self.value(rows[a], column(member)),
+                    self.value(rows[b], column(member)),
                 );
                 let equal = match (one.is_null(), two.is_null()) {
                     (true, true) => true,
@@ -3679,7 +3671,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             &mut same,
         )?;
         for &row in order {
-            self.bind(bound, &rows[row as usize], relids);
+            self.bind(bound, rows[row as usize], relids);
             if !sink(bound)? {
                 return Ok(false);
             }
@@ -3710,8 +3702,8 @@ impl<'r, 'a> Runner<'r, 'a> {
         crate::sql::pg_qsort::pg_qsort(order, &mut |a, b| {
             for &(column, key) in columns {
                 let (one, two) = (
-                    self.value(&rows[a as usize], column),
-                    self.value(&rows[b as usize], column),
+                    self.value(rows[a as usize], column),
+                    self.value(rows[b as usize], column),
                 );
                 let first = key & KEY_NULLS_FIRST != 0;
                 let order = match (one.is_null(), two.is_null()) {

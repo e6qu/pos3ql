@@ -1644,8 +1644,8 @@ fn cmp_order<'a>(
 /// Sorts row positions as PostgreSQL's tuplesort does in memory
 /// (`pg_qsort`, or a bounded heap past twice `bound` rows), so rows with
 /// equal keys come back in its order. Returns how many rows the sort kept.
-fn pg_sort_positions<'a>(
-    arena: &'a Arena,
+fn pg_sort_positions(
+    arena: &Arena,
     order: &mut [usize],
     bound: Option<usize>,
     compare: &mut dyn FnMut(usize, usize) -> Result<core::cmp::Ordering, SqlError>,

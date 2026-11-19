@@ -7465,16 +7465,10 @@ fn plan_pulled_select<'a>(
             estimated_rows = path.rows as u64;
             width = grouped.width;
         }
-        // A hash table's memory, sized from pos3ql's own estimates outside
-        // the cost model.
+        // A hash table's memory, sized from the planner's group estimate;
+        // a grouping outside the cost model has none and fails under ANALYZE.
         let hash_agg = if aggregate_name == "HashAggregate" && sets_keys.is_none() {
-            match hash_agg_sizing {
-                Some(sizing) => sizing,
-                // The groups PostgreSQL estimates for keys outside the cost
-                // model (expressions, joins pos3ql does not plan) decide the
-                // table's size, which pos3ql's own estimate does not match.
-                None => None,
-            }
+            hash_agg_sizing.flatten()
         } else {
             None
         };

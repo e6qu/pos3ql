@@ -1328,6 +1328,21 @@ Where pos3ql's planner has the same choice, the setting decides it:
   index on `b.a_id`, is planned with PostgreSQL's costs: `EXPLAIN` prints
   the same plan and costs (a hash join, or a nested loop over an index scan
   of `b` for each row of `a`), and the rows come back in the same order.
+- `geqo`, `geqo_threshold`, `geqo_effort`, `geqo_pool_size`,
+  `geqo_generations`, `geqo_selection_bias` and `geqo_seed` steer the genetic
+  query optimizer (GEQO), which PostgreSQL uses instead of trying every join
+  order once a join problem has `geqo_threshold` (12) relations or more. GEQO
+  tries random join orders and breeds better ones from the cheapest; pos3ql
+  runs the same algorithm with the same random numbers, so at a given
+  `geqo_seed` a query gets PostgreSQL's plan and costs. For example, twelve
+  tables joined in a chain print the same `EXPLAIN` in both, and `SET
+  geqo_seed = 0.5` changes both plans the same way. Its pool holds at most
+  500 join orders (the largest default, `50 * geqo_effort`); a larger
+  `geqo_pool_size` fails with `54000` when a join is planned. A query of more
+  than 128 relations is not searched: it runs pos3ql's own join order.
+- `join_collapse_limit` and `from_collapse_limit` split a query's joins into
+  separate join problems as PostgreSQL does. With `SET join_collapse_limit =
+  1`, `a JOIN b ON ... JOIN c ON ...` joins `a` and `b` first, as written.
 - When every way to run a step is disabled, the step still runs and `EXPLAIN`
   marks it `Disabled: true`, as PostgreSQL 18 does. `SET enable_seqscan = off`
   followed by `EXPLAIN SELECT * FROM t` on a table without indexes prints
@@ -1336,8 +1351,8 @@ Where pos3ql's planner has the same choice, the setting decides it:
 
 The other settings name plan types pos3ql's planner does not have, so they
 change no plan, just as disabling an unused method changes nothing in
-PostgreSQL: there is no parallel query, JIT, genetic optimizer, TID scan or
-partitionwise planning.
+PostgreSQL: there is no parallel query, JIT, TID scan or partitionwise
+planning.
 
 ### Cursor capacity
 

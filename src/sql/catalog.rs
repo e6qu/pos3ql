@@ -30901,7 +30901,19 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                     },
                     arena,
                 )?,
-                Datum::Null,
+                match (
+                    planner
+                        .as_ref()
+                        .and_then(|planner| planner.extra_description),
+                    name,
+                ) {
+                    (Some(extra), _) => text(extra, arena)?,
+                    (None, "work_mem") => text(
+                        "This much memory can be used by each internal sort operation and hash table before switching to temporary disk files.",
+                        arena,
+                    )?,
+                    (None, _) => Datum::Null,
+                },
                 text(context, arena)?,
                 text(vartype, arena)?,
                 text(source, arena)?,

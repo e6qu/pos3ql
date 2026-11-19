@@ -2228,6 +2228,10 @@ pub(crate) struct GroupedPath {
 /// What the planning of one member of a partition or inheritance tree
 /// returns to the tree's.
 #[derive(Clone, Copy, Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a join scan is carried inline on the stack; boxing would heap-allocate"
+)]
 pub(crate) enum Member {
     /// The relation is planned on its own.
     No,
@@ -2260,7 +2264,7 @@ pub(crate) struct JoinScan {
     /// The other relations each parameter reads beyond its first (an
     /// expression of several relations') and the outer joins that null
     /// them, which a path applying it is parameterized by too.
-    pub(crate) param_others: [u32; MAX_JOIN_PARAMS],
+    pub(crate) param_others: [joins::Relids; MAX_JOIN_PARAMS],
     /// Each column's equivalence class when it has a member in another
     /// relation (`eclass_useful_for_merging`) or the query orders by it,
     /// else [`NO_CLASS`].
@@ -2270,7 +2274,7 @@ pub(crate) struct JoinScan {
     /// The query's pathkeys (`query_pathkeys`).
     pub(crate) order: joins::Keys,
     /// Each relation's rows by FROM position (`get_loop_count`).
-    pub(crate) rel_rows: [f64; 8],
+    pub(crate) rel_rows: [f64; joins::MAX_JOIN_RELS],
     /// `root->total_table_pages`.
     pub(crate) total_table_pages: f64,
     /// The path to describe, or `None` for the relation's paths.
@@ -2285,7 +2289,7 @@ pub(crate) struct JoinDescribe {
     pub(crate) kind: ScanKind,
     pub(crate) index: u16,
     pub(crate) backward: bool,
-    pub(crate) param: u32,
+    pub(crate) param: joins::Relids,
 }
 
 /// No equivalence class in [`JoinScan::classes`].

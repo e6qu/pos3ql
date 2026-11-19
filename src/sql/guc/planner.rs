@@ -29,6 +29,48 @@ pub(super) struct PlannerSettingDef {
     pub(super) description: &'static str,
 }
 
+/// `pg_settings.extra_desc` of the planner settings that have one.
+pub(super) fn extra_description(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "constraint_exclusion" => {
+            "Table scans will be skipped if their constraints guarantee that no rows match the query."
+        }
+        "default_statistics_target" => {
+            "This applies to table columns that have not had a column-specific target set via ALTER TABLE SET STATISTICS."
+        }
+        "effective_cache_size" => {
+            "That is, the total size of the caches (kernel cache and shared buffers) used for PostgreSQL data files. This is measured in disk pages, which are normally 8 kB each."
+        }
+        "enable_partition_pruning" => {
+            "Allows the query planner and executor to compare partition bounds to conditions in the query to determine which partitions must be scanned."
+        }
+        "enable_presorted_aggregate" => {
+            "Allows the query planner to build plans that provide presorted input for aggregate functions with an ORDER BY / DISTINCT clause.  When disabled, implicit sorts are always performed during execution."
+        }
+        "from_collapse_limit" => {
+            "The planner will merge subqueries into upper queries if the resulting FROM list would have no more than this many items."
+        }
+        "geqo" => "This algorithm attempts to do planning without exhaustive searching.",
+        "geqo_generations" | "geqo_pool_size" => "0 means use a suitable default value.",
+        "jit_above_cost" => "-1 disables JIT compilation.",
+        "jit_inline_above_cost" => "-1 disables inlining.",
+        "jit_optimize_above_cost" => "-1 disables optimization.",
+        "join_collapse_limit" => {
+            "The planner will flatten explicit JOIN constructs into lists of FROM items whenever a list of no more than this many items would result."
+        }
+        "min_parallel_index_scan_size" => {
+            "If the planner estimates that it will read a number of index pages too small to reach this limit, a parallel scan will not be considered."
+        }
+        "min_parallel_table_scan_size" => {
+            "If the planner estimates that it will read a number of table pages too small to reach this limit, a parallel scan will not be considered."
+        }
+        "plan_cache_mode" => {
+            "Prepared statements can have custom and generic plans, and the planner will attempt to choose which is better.  This can be set to override the default behavior."
+        }
+        _ => return None,
+    })
+}
+
 const METHOD: &str = "Query Tuning / Planner Method Configuration";
 const COST: &str = "Query Tuning / Planner Cost Constants";
 const GEQO: &str = "Query Tuning / Genetic Query Optimizer";

@@ -69,7 +69,10 @@ pub(crate) use minmax::local_minmax_subquery;
 
 pub(crate) mod partition_prune;
 mod scan;
-pub(crate) use plan::{MAX_CONJUNCTS, flatten_and, order_qual, plan_time_bool, qual_cost};
+pub(crate) use plan::{
+    MAX_CONJUNCTS, flatten_and, order_qual, plan_time_bool, qual_cost, record_subplan_cost,
+    reset_subplan_costs, subplan_qual_cost,
+};
 pub(crate) use scan::Chained;
 #[cfg(test)]
 pub(crate) use scan::JOIN_CANDIDATES;

@@ -1218,12 +1218,21 @@ coercion (`int` with `bigint`) or merges more than two columns, a member
 named as a later FROM item, a whole-row reference to the join, an outer
 `USING` join of a parenthesized one, and nested aliased joins; `EXPLAIN` of
 any parenthesized join the search does not plan fails with `0A000`. A
-query of a parenthesized join that the search does not plan runs the old
-executor's nested loop over the join's rows, resolving names per row (a
-three-table join of 400 rows takes 50 seconds). A parenthesized join's own
+query of a parenthesized inner join that the search does not plan runs the
+old executor over the flattened chain. With only inner joins in the FROM
+the outer join's condition joins the `WHERE` conditions, so the executor
+joins by it once its relations have joined (`differential_exact/951`: 20
+seconds down to 0.3). With an outer join in the FROM, or when the chain's
+first members share no condition (`na JOIN (nb JOIN nc JOIN nd ON ...) ON
+na.id = nd.id`), the written order still leaves a cross product the old
+executor loops over per row (over 20 seconds for 400, 300 and 200 rows):
+A condition reading a subquery keeps the loop too. It needs PostgreSQL's join order, not the written one. A parenthesized join's own
 query runs only when the search does not plan the query, so one nested in
 another (`a LEFT JOIN (b JOIN (c JOIN d ON z) ON x) ON y`) joins its
-members without reading its rows first (`differential_exact/937`). Remaining for that search:
+members without reading its rows first (`differential_exact/937`). A
+scan's filter testing a subplan (`[NOT] IN`, `ANY`, `ALL`) costs what
+`cost_subplan` charges and keeps half the rows (`differential_exact/950`).
+Remaining for that search:
 `GROUP BY` of an expression (`0A000` when costs print), conditions
 comparing expressions of several relations other than by a mergeable
 equality (`COALESCE(a.id, 0) < b.id`), an `OR`
@@ -1237,11 +1246,27 @@ on columns that cover a unique index fails with `0A000`), a constant equated wit
 column another outer join nulls, `UPDATE ... FROM` and `DELETE ...
 USING` through the same search (`EXPLAIN` of one that joins through an
 index fails with `0A000`, and its join's costs refuse to print), a
-hashed `NOT IN` subplan filter of one relation's scan (its costs and rows
-print the scan's alone), a `LATERAL` subquery's `Memoize`, more relations than
-`join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,
-not ported; such queries run pos3ql's join order, and `EXPLAIN` of them
-fails with `0A000`). A parameterized index scan's cost reads its index's pages:
+`LATERAL` subquery (PostgreSQL may cache it in a `Memoize`; `EXPLAIN` of
+one the search does not plan fails with `0A000` while `enable_memoize` is
+on), a correlated subplan in an `OR` or compared with a column (`0A000`),
+`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), and more than
+128 relations in one query, past which the search holds no plan and such
+queries run pos3ql's join order. An `ORDER BY` over a join keeps every joined row in
+the statement arena before sorting, so a join of millions of rows (seven
+8-row tables cross joined, `ORDER BY 1 LIMIT 1`) fails with `54000` where
+PostgreSQL runs a bounded top-N sort; the join's rows must feed the
+spilling sort instead. A join estimated past 2^64 rows refuses
+`EXPLAIN` with costs (`0A000`), since plan rows are kept as integers where
+PostgreSQL prints its double in full. Joins of never-analyzed tables keep
+Joins of never-analyzed tables keep
+pos3ql's join order. Modeling them matches PostgreSQL on probe joins but
+needs, first: the join executor yielding on cold reads as the old executor
+does (the `result_streams` and `result_output_tests` streaming tests);
+GEQO finding a plan for the wide explicit-join trees of
+`wide_join_trees_execute_without_allocation` (it fails with `XX000 geqo
+failed to make a valid plan`); and EXPLAIN of the widest statement fitting
+the statement arena (`54000` today). The hash/merge plan tests then take
+PostgreSQL's plans. A parameterized index scan's cost reads its index's pages:
 an index built over loaded rows is sized as `_bt_buildadd` fills its
 pages (a page closes when its free space and its last tuple's posting
 list fall under the fill factor's reserve, that tuple moving on), but one

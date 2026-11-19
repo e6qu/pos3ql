@@ -20,8 +20,8 @@ use super::joins::{
 
 /// Quals of one query the preparation holds.
 pub(crate) const MAX_QUALS: usize = 48;
-/// Nodes of one join tree.
-pub(crate) const MAX_NODES: usize = 32;
+/// Nodes of one join tree, numbered by `u8`.
+pub(crate) const MAX_NODES: usize = 256;
 /// Columns a qual's strictness names.
 pub(crate) const MAX_QUAL_VARS: usize = 8;
 /// Equivalence classes of one query.
@@ -152,6 +152,10 @@ pub(crate) struct Tree {
     /// `enable_hashagg`, which lets a semi join's inner relation be made
     /// unique by hashing.
     pub(crate) enable_hashagg: bool,
+    /// `from_collapse_limit` and `join_collapse_limit`, which split the
+    /// join problem (`deconstruct_recurse`).
+    pub(crate) from_collapse_limit: i64,
+    pub(crate) join_collapse_limit: i64,
     /// The columns each expression member reads
     /// ([`super::joins::Member::expression_id`]).
     pub(crate) expression_vars: [VarList; super::joins::MAX_JOIN_EXPRESSIONS],
@@ -166,9 +170,9 @@ impl Tree {
             child_count: 0,
             root: 0,
             quals: [Qual {
-                rels: 0,
+                rels: Relids::EMPTY,
                 vars: VarList::default(),
-                nonnullable: 0,
+                nonnullable: Relids::EMPTY,
                 strict_vars: VarList::default(),
                 forced_null: None,
                 shape: Shape::Other,
@@ -177,6 +181,8 @@ impl Tree {
             qual_count: 0,
             rels,
             enable_hashagg: true,
+            from_collapse_limit: 8,
+            join_collapse_limit: 8,
             expression_vars: [VarList::default(); super::joins::MAX_JOIN_EXPRESSIONS],
         }
     }
@@ -225,11 +231,11 @@ impl Tree {
     /// The base relations under `node`.
     fn base_rels(&self, node: u8) -> Relids {
         match self.nodes[usize::from(node)] {
-            TreeNode::Rel(rel) => 1 << rel,
+            TreeNode::Rel(rel) => Relids::of(rel),
             TreeNode::From { first, count } => self
                 .items(first, count)
                 .iter()
-                .fold(0, |relids, &item| relids | self.base_rels(item)),
+                .fold(Relids::EMPTY, |relids, &item| relids | self.base_rels(item)),
             TreeNode::Join { left, right, .. } => self.base_rels(left) | self.base_rels(right),
         }
     }
@@ -285,6 +291,8 @@ pub(crate) struct Prepared {
     pub(crate) special_count: usize,
     pub(crate) subproblems: [Subproblem; MAX_JOIN_RELS],
     pub(crate) subproblem_count: usize,
+    pub(crate) subproblem_items: [Relids; 2 * MAX_JOIN_RELS],
+    pub(crate) subproblem_item_count: usize,
     pub(crate) classes: [EquivalenceClass; MAX_CLASSES],
     pub(crate) class_count: usize,
     /// Each class's constant, by the qual that equated it.
@@ -325,7 +333,7 @@ impl Prepared {
         let join_plus_commute =
             info.min_left | info.min_right | info.oj | info.commute_above_r | info.commute_below_l;
         if self.classes().iter().any(|class| {
-            !class.has_const && class.count > 1 && class.relids() & info.min_right != 0
+            !class.has_const && class.count > 1 && class.relids() & info.min_right != Relids::EMPTY
         }) {
             return Err("a removable join's relation in an equivalence class");
         }
@@ -334,13 +342,21 @@ impl Prepared {
         for index in 0..self.placed_count {
             let mut entry = self.placed[index];
             let keep = match &mut entry {
-                Placed::Restriction { rel, .. } => 1 << *rel & info.min_right == 0,
-                Placed::Implied { member, .. } => member.relids() & gone == 0,
-                Placed::Equated { left, .. } => left.relids() & gone == 0,
-                Placed::Join(join) if join.required & gone == 0 && join.relids & gone == 0 => true,
+                Placed::Restriction { rel, .. } => {
+                    Relids::of(*rel) & info.min_right == Relids::EMPTY
+                }
+                Placed::Implied { member, .. } => member.relids() & gone == Relids::EMPTY,
+                Placed::Equated { left, .. } => left.relids() & gone == Relids::EMPTY,
+                Placed::Join(join)
+                    if join.required & gone == Relids::EMPTY
+                        && join.relids & gone == Relids::EMPTY =>
+                {
+                    true
+                }
                 Placed::Join(join) => {
-                    if join.relids & info.min_right != 0
-                        || !(join.pushed_down || join.required & !join_plus_commute != 0)
+                    if join.relids & info.min_right != Relids::EMPTY
+                        || !(join.pushed_down
+                            || join.required & !join_plus_commute != Relids::EMPTY)
                     {
                         dropped_quals[usize::from(join.qual)] = true;
                         false
@@ -362,13 +378,13 @@ impl Prepared {
         let mut kept = 0;
         for index in 0..self.needed_count {
             let (var, relids, qual) = self.needed[index];
-            if 1 << var.0 & info.min_right != 0 {
+            if Relids::of(var.0) & info.min_right != Relids::EMPTY {
                 continue;
             }
             // A column only a dropped clause read stays in its relation's
             // target list (`reltarget` is not rebuilt), needed by no join.
             let relids = if qual != NO_QUAL && dropped_quals[usize::from(qual)] {
-                1 << var.0
+                Relids::of(var.0)
             } else {
                 relids & !gone
             };
@@ -394,17 +410,22 @@ impl Prepared {
                 *set &= !gone;
             }
         }
+        let mut kept = 0;
         for problem in &mut self.subproblems[..self.subproblem_count] {
-            let mut kept = 0;
-            for index in 0..usize::from(problem.count) {
-                let item = problem.items[index] & !gone;
-                if item != 0 {
-                    problem.items[kept] = item;
+            let first = kept;
+            for index in usize::from(problem.first)..usize::from(problem.first + problem.count) {
+                let item = self.subproblem_items[index] & !gone;
+                if !item.is_empty() {
+                    self.subproblem_items[kept] = item;
                     kept += 1;
                 }
             }
-            problem.count = kept as u8;
+            *problem = Subproblem {
+                first: first as u16,
+                count: (kept - first) as u16,
+            };
         }
+        self.subproblem_item_count = kept;
         Ok(())
     }
 
@@ -414,7 +435,7 @@ impl Prepared {
         self.needed[..self.needed_count]
             .iter()
             .filter(|(held, ..)| *held == var)
-            .fold(0, |relids, (_, needed, _)| relids | needed)
+            .fold(Relids::EMPTY, |relids, (_, needed, _)| relids | *needed)
     }
 }
 
@@ -493,11 +514,19 @@ struct Prep<'t> {
     domain_root: [Option<u8>; MAX_NODES],
     /// The join lists: each list's elements, a negative entry naming a
     /// nested list by `-(index + 1)`.
-    lists: [[i8; MAX_JOIN_RELS]; MAX_NODES],
+    lists: [[i16; MAX_JOIN_RELS]; MAX_NODES],
     list_len: [u8; MAX_NODES],
     list_count: usize,
     contradictory: bool,
     false_relids: Relids,
+}
+
+/// The join problems `make_rel_from_joinlist` collects.
+struct Subproblems {
+    subproblems: [Subproblem; MAX_JOIN_RELS],
+    count: usize,
+    items: [Relids; 2 * MAX_JOIN_RELS],
+    item_count: usize,
 }
 
 const FULL: Outside = "a query beyond the join preparation's capacity";
@@ -508,25 +537,25 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         tree,
         kinds: [None; MAX_NODES],
         sides: [(0, 0); MAX_NODES],
-        oj: [0; MAX_NODES],
-        qualscope: [0; MAX_NODES],
-        inner_join_rels: [0; MAX_NODES],
-        left_rels: [0; MAX_NODES],
-        right_rels: [0; MAX_NODES],
-        nonnullable_rels: [0; MAX_NODES],
+        oj: [Relids::EMPTY; MAX_NODES],
+        qualscope: [Relids::EMPTY; MAX_NODES],
+        inner_join_rels: [Relids::EMPTY; MAX_NODES],
+        left_rels: [Relids::EMPTY; MAX_NODES],
+        right_rels: [Relids::EMPTY; MAX_NODES],
+        nonnullable_rels: [Relids::EMPTY; MAX_NODES],
         special_of: [None; MAX_NODES],
         specials: [SpecialJoin {
             kind: SpecialKind::Left,
-            min_left: 0,
-            min_right: 0,
-            syn_left: 0,
-            syn_right: 0,
-            oj: 0,
+            min_left: Relids::EMPTY,
+            min_right: Relids::EMPTY,
+            syn_left: Relids::EMPTY,
+            syn_right: Relids::EMPTY,
+            oj: Relids::EMPTY,
             lhs_strict: false,
-            commute_above_l: 0,
-            commute_above_r: 0,
-            commute_below_l: 0,
-            commute_below_r: 0,
+            commute_above_l: Relids::EMPTY,
+            commute_above_r: Relids::EMPTY,
+            commute_below_l: Relids::EMPTY,
+            commute_below_r: Relids::EMPTY,
             semi_rhs: [Member::plain(0, 0); super::joins::MAX_KEYS],
             semi_count: 0,
             semi_can_btree: false,
@@ -553,7 +582,7 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         placed_count: 0,
         sources: [(0, 0); MAX_QUALS],
         source_count: 0,
-        needed: [((0, 0), 0, NO_QUAL); 64],
+        needed: [((0, 0), Relids::EMPTY, NO_QUAL); 64],
         needed_count: 0,
         left_join: [Pending { join: empty_join() }; MAX_QUALS],
         left_count: 0,
@@ -571,7 +600,7 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         list_len: [0; MAX_NODES],
         list_count: 0,
         contradictory: false,
-        false_relids: 0,
+        false_relids: Relids::EMPTY,
     };
     for (at, node) in tree.nodes[..tree.node_count].iter().enumerate() {
         if let TreeNode::Join {
@@ -582,7 +611,7 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
             prep.sides[at] = (left, right);
         }
     }
-    prep.reduce_outer_joins(tree.root, 0, VarList::default())?;
+    prep.reduce_outer_joins(tree.root, Relids::EMPTY, VarList::default())?;
     prep.number_outer_joins();
     prep.assign_domains(tree.root, 0);
     let top = prep.deconstruct_recurse(tree.root)?;
@@ -599,12 +628,13 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
     prep.reconsider_outer_join_clauses()?;
     prep.generate_base_implied_equalities()?;
     // `make_rel_from_joinlist`: each nested list's problem first.
-    let mut subproblems = [Subproblem {
-        items: [0; MAX_JOIN_RELS],
+    let mut problems = Subproblems {
+        subproblems: [Subproblem::default(); MAX_JOIN_RELS],
         count: 0,
-    }; MAX_JOIN_RELS];
-    let mut subproblem_count = 0;
-    prep.make_rel_from_joinlist(top, &mut subproblems, &mut subproblem_count)?;
+        items: [Relids::EMPTY; 2 * MAX_JOIN_RELS],
+        item_count: 0,
+    };
+    prep.make_rel_from_joinlist(top, &mut problems)?;
     // The classes in their final order.
     let mut map = [u8::MAX; MAX_CLASSES];
     let mut classes = [EquivalenceClass {
@@ -639,8 +669,10 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
     Ok(Prepared {
         specials: prep.specials,
         special_count: prep.special_count,
-        subproblems,
-        subproblem_count,
+        subproblems: problems.subproblems,
+        subproblem_count: problems.count,
+        subproblem_items: problems.items,
+        subproblem_item_count: problems.item_count,
         classes,
         class_count,
         class_constant,
@@ -656,12 +688,12 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
 const fn empty_join() -> JoinQual {
     JoinQual {
         qual: 0,
-        relids: 0,
-        required: 0,
+        relids: Relids::EMPTY,
+        required: Relids::EMPTY,
         pushed_down: false,
         clone: CloneKind::None,
-        incompatible: 0,
-        outer_relids: 0,
+        incompatible: Relids::EMPTY,
+        outer_relids: Relids::EMPTY,
         merge: None,
     }
 }
@@ -704,10 +736,17 @@ impl Prep<'_> {
                 let (left_rels, right_rels) = (tree.base_rels(left), tree.base_rels(right));
                 let mut kind = self.kinds[at].expect("a join");
                 match kind {
-                    TreeJoin::Left if nonnullable & right_rels != 0 => kind = TreeJoin::Inner,
-                    TreeJoin::Right if nonnullable & left_rels != 0 => kind = TreeJoin::Inner,
+                    TreeJoin::Left if nonnullable & right_rels != Relids::EMPTY => {
+                        kind = TreeJoin::Inner
+                    }
+                    TreeJoin::Right if nonnullable & left_rels != Relids::EMPTY => {
+                        kind = TreeJoin::Inner
+                    }
                     TreeJoin::Full => {
-                        kind = match (nonnullable & left_rels != 0, nonnullable & right_rels != 0) {
+                        kind = match (
+                            nonnullable & left_rels != Relids::EMPTY,
+                            nonnullable & right_rels != Relids::EMPTY,
+                        ) {
                             (true, true) => TreeJoin::Inner,
                             (true, false) => TreeJoin::Left,
                             (false, true) => TreeJoin::Right,
@@ -735,8 +774,8 @@ impl Prep<'_> {
                         .as_slice()
                         .iter()
                         .filter(|var| forced_null.as_slice().contains(var))
-                        .fold(0, |relids, &(rel, _)| relids | 1 << rel);
-                    if overlap & right_rels != 0 {
+                        .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel));
+                    if overlap & right_rels != Relids::EMPTY {
                         kind = TreeJoin::Anti;
                     }
                 }
@@ -747,7 +786,7 @@ impl Prep<'_> {
                 if !left_outer && !right_outer {
                     return Ok(());
                 }
-                let (mut local_nonnullable, mut local_forced) = (0, VarList::default());
+                let (mut local_nonnullable, mut local_forced) = (Relids::EMPTY, VarList::default());
                 if kind != TreeJoin::Full {
                     for qual in tree.quals_of(node) {
                         let qual = self.qual(qual);
@@ -764,14 +803,14 @@ impl Prep<'_> {
                 if left_outer {
                     let (pass, forced) = match kind {
                         TreeJoin::Inner | TreeJoin::Semi => (local_nonnullable, local_forced),
-                        TreeJoin::Full => (0, VarList::default()),
+                        TreeJoin::Full => (Relids::EMPTY, VarList::default()),
                         _ => (nonnullable, forced_null),
                     };
                     self.reduce_outer_joins(left, pass, forced)?;
                 }
                 if right_outer {
                     let (pass, forced) = if kind == TreeJoin::Full {
-                        (0, VarList::default())
+                        (Relids::EMPTY, VarList::default())
                     } else {
                         (local_nonnullable, local_forced)
                     };
@@ -849,11 +888,11 @@ impl Prep<'_> {
         }
         order[..count].sort_unstable();
         for (bit, &(_, node)) in order[..count].iter().enumerate() {
-            self.oj[usize::from(node)] = 1 << (OJ_SHIFT + bit as u32);
+            self.oj[usize::from(node)] = Relids::of(OJ_SHIFT + bit as u32);
         }
     }
 
-    fn push_list(&mut self, elements: &[i8]) -> Result<usize, Outside> {
+    fn push_list(&mut self, elements: &[i16]) -> Result<usize, Outside> {
         let at = self.list_count;
         if at == MAX_NODES || elements.len() > MAX_JOIN_RELS {
             return Err(FULL);
@@ -864,7 +903,7 @@ impl Prep<'_> {
         Ok(at)
     }
 
-    fn list(&self, at: usize) -> &[i8] {
+    fn list(&self, at: usize) -> &[i16] {
         &self.lists[at][..usize::from(self.list_len[at])]
     }
 
@@ -875,11 +914,12 @@ impl Prep<'_> {
         let tree = self.tree;
         let joinlist = match tree.nodes[at] {
             TreeNode::Rel(rel) => {
-                self.qualscope[at] = 1 << rel;
-                self.push_list(&[rel as i8])?
+                self.qualscope[at] = Relids::of(rel);
+                self.push_list(&[i16::from(rel)])?
             }
             TreeNode::From { first, count } => {
-                let mut elements = [0i8; MAX_JOIN_RELS * 2];
+                let limit = self.tree.from_collapse_limit;
+                let mut elements = [0i16; MAX_JOIN_RELS];
                 let mut len = 0;
                 let items = tree.items(first, count);
                 for (position, &item) in items.iter().enumerate() {
@@ -888,13 +928,13 @@ impl Prep<'_> {
                     self.inner_join_rels[at] = self.inner_join_rels[usize::from(item)];
                     let remaining = items.len() - position - 1;
                     let members = self.list(sub).len();
-                    if members <= 1 || len + members + remaining <= MAX_JOIN_RELS {
+                    if members <= 1 || (len + members + remaining) as i64 <= limit {
                         for &element in self.list(sub) {
                             *elements.get_mut(len).ok_or(FULL)? = element;
                             len += 1;
                         }
                     } else {
-                        *elements.get_mut(len).ok_or(FULL)? = -(sub as i8 + 1);
+                        *elements.get_mut(len).ok_or(FULL)? = -(sub as i16 + 1);
                         len += 1;
                     }
                 }
@@ -915,7 +955,7 @@ impl Prep<'_> {
                 match kind {
                     TreeJoin::Inner => {
                         self.inner_join_rels[at] = self.qualscope[at];
-                        self.nonnullable_rels[at] = 0;
+                        self.nonnullable_rels[at] = Relids::EMPTY;
                     }
                     TreeJoin::Left | TreeJoin::Anti => {
                         self.inner_join_rels[at] =
@@ -925,7 +965,7 @@ impl Prep<'_> {
                     TreeJoin::Semi => {
                         self.inner_join_rels[at] =
                             self.inner_join_rels[l] | self.inner_join_rels[r];
-                        self.nonnullable_rels[at] = 0;
+                        self.nonnullable_rels[at] = Relids::EMPTY;
                     }
                     TreeJoin::Full => {
                         self.inner_join_rels[at] =
@@ -936,19 +976,31 @@ impl Prep<'_> {
                 }
                 let (left_len, right_len) =
                     (self.list(left_list).len(), self.list(right_list).len());
+                let nested = |list: usize| -(list as i16 + 1);
                 if kind == TreeJoin::Full {
-                    let pair =
-                        self.push_list(&[-(left_list as i8 + 1), -(right_list as i8 + 1)])?;
-                    self.push_list(&[-(pair as i8 + 1)])?
-                } else if left_len + right_len <= MAX_JOIN_RELS {
-                    let mut elements = [0i8; MAX_JOIN_RELS];
+                    let pair = self.push_list(&[nested(left_list), nested(right_list)])?;
+                    self.push_list(&[nested(pair)])?
+                } else if (left_len + right_len) as i64 <= self.tree.join_collapse_limit {
+                    let mut elements = [0i16; MAX_JOIN_RELS];
                     elements[..left_len].copy_from_slice(self.list(left_list));
                     let right_elements = self.lists[right_list];
                     elements[left_len..left_len + right_len]
                         .copy_from_slice(&right_elements[..right_len]);
                     self.push_list(&elements[..left_len + right_len])?
                 } else {
-                    return Err("a join of more relations than join_collapse_limit");
+                    // A side of one element joins as itself, not as a
+                    // one-element sublist.
+                    let part = |list: usize, len: usize, lists: &[[i16; MAX_JOIN_RELS]]| {
+                        if len == 1 {
+                            lists[list][0]
+                        } else {
+                            nested(list)
+                        }
+                    };
+                    self.push_list(&[
+                        part(left_list, left_len, &self.lists),
+                        part(right_list, right_len, &self.lists),
+                    ])?
                 }
             }
         };
@@ -962,31 +1014,35 @@ impl Prep<'_> {
     fn make_rel_from_joinlist(
         &self,
         list: usize,
-        out: &mut [Subproblem; MAX_JOIN_RELS],
-        count: &mut usize,
+        out: &mut Subproblems,
     ) -> Result<Relids, Outside> {
-        let mut items = [0 as Relids; MAX_JOIN_RELS];
+        let mut items = [Relids::EMPTY; MAX_JOIN_RELS];
         let elements = self.list(list);
         for (at, &element) in elements.iter().enumerate() {
             items[at] = if element >= 0 {
-                1 << element
+                Relids::of(element as u8)
             } else {
-                self.make_rel_from_joinlist((-element - 1) as usize, out, count)?
+                self.make_rel_from_joinlist((-element - 1) as usize, out)?
             };
         }
-        if elements.len() == 1 {
+        let items = &items[..elements.len()];
+        if items.len() == 1 {
             return Ok(items[0]);
         }
-        let all = items[..elements.len()]
-            .iter()
-            .fold(0, |relids, item| relids | item);
-        let slot = out.get_mut(*count).ok_or(FULL)?;
-        *slot = Subproblem {
-            items,
-            count: elements.len() as u8,
+        let first = out.item_count;
+        out.items
+            .get_mut(first..first + items.len())
+            .ok_or(FULL)?
+            .copy_from_slice(items);
+        out.item_count += items.len();
+        *out.subproblems.get_mut(out.count).ok_or(FULL)? = Subproblem {
+            first: first as u16,
+            count: items.len() as u16,
         };
-        *count += 1;
-        Ok(all)
+        out.count += 1;
+        Ok(items
+            .iter()
+            .fold(Relids::EMPTY, |relids, &item| relids | item))
     }
 
     /// The outer joins below `node` nulling relation `rel`
@@ -994,12 +1050,12 @@ impl Prep<'_> {
     fn nulling_below(&self, node: u8, rel: u8) -> Relids {
         let at = usize::from(node);
         match self.tree.nodes[at] {
-            TreeNode::Rel(_) => 0,
+            TreeNode::Rel(_) => Relids::EMPTY,
             TreeNode::From { first, count } => self
                 .tree
                 .items(first, count)
                 .iter()
-                .fold(0, |relids, &item| {
+                .fold(Relids::EMPTY, |relids, &item| {
                     relids | self.nulling_below_item(item, rel)
                 }),
             TreeNode::Join { .. } => {
@@ -1020,9 +1076,9 @@ impl Prep<'_> {
         let nullable = match self.kinds[at] {
             Some(TreeJoin::Left | TreeJoin::Anti) => self.tree.base_rels(right),
             Some(TreeJoin::Full) => self.tree.base_rels(left) | self.tree.base_rels(right),
-            _ => 0,
+            _ => Relids::EMPTY,
         };
-        if nullable & 1 << rel != 0 {
+        if nullable & Relids::of(rel) != Relids::EMPTY {
             below | self.oj[at]
         } else {
             below
@@ -1035,7 +1091,7 @@ impl Prep<'_> {
             if rel < self.tree.rels {
                 self.nulling_below(node, rel as u8)
             } else {
-                0
+                Relids::EMPTY
             }
         })
     }
@@ -1055,8 +1111,8 @@ impl Prep<'_> {
                         None,
                         self.qualscope[at],
                         None,
-                        0,
-                        0,
+                        Relids::EMPTY,
+                        Relids::EMPTY,
                         true,
                         CloneKind::None,
                         nulling,
@@ -1095,7 +1151,7 @@ impl Prep<'_> {
                         self.qualscope[at],
                         ojscope,
                         self.nonnullable_rels[at],
-                        0,
+                        Relids::EMPTY,
                         true,
                         CloneKind::None,
                         nulling,
@@ -1140,10 +1196,10 @@ impl Prep<'_> {
             syn_right: right_rels,
             oj: self.oj[at],
             lhs_strict: false,
-            commute_above_l: 0,
-            commute_above_r: 0,
-            commute_below_l: 0,
-            commute_below_r: 0,
+            commute_above_l: Relids::EMPTY,
+            commute_above_r: Relids::EMPTY,
+            commute_below_l: Relids::EMPTY,
+            commute_below_r: Relids::EMPTY,
             semi_rhs: [Member::plain(0, 0); super::joins::MAX_KEYS],
             semi_count: 0,
             semi_can_btree: false,
@@ -1158,8 +1214,8 @@ impl Prep<'_> {
             return Ok(id as u8);
         }
         // `pull_varnos` and `find_nonnullable_rels` of the join's quals.
-        let mut clause_relids = 0;
-        let mut strict_relids = 0;
+        let mut clause_relids = Relids::EMPTY;
+        let mut strict_relids = Relids::EMPTY;
         for qual in self.tree.quals_of(node) {
             let qual = self.qual(qual);
             clause_relids |= qual.rels;
@@ -1171,39 +1227,39 @@ impl Prep<'_> {
                 strict_relids |= nulling[usize::from(rel)];
             }
         }
-        info.lhs_strict = strict_relids & left_rels != 0;
+        info.lhs_strict = strict_relids & left_rels != Relids::EMPTY;
         let mut min_left = clause_relids & left_rels;
         let mut min_right = (clause_relids | self.inner_join_rels[at]) & right_rels;
-        let (mut below_l, mut below_r) = (0, 0);
+        let (mut below_l, mut below_r) = (Relids::EMPTY, Relids::EMPTY);
         // `join_info_list`: the joins below, placed before this one.
         for other in &self.specials[..self.special_count] {
             if other.kind == SpecialKind::Full {
-                if left_rels & (other.syn_left | other.syn_right) != 0 {
+                if left_rels & (other.syn_left | other.syn_right) != Relids::EMPTY {
                     min_left |= other.syn_left | other.syn_right | other.oj;
                 }
-                if right_rels & (other.syn_left | other.syn_right) != 0 {
+                if right_rels & (other.syn_left | other.syn_right) != Relids::EMPTY {
                     min_right |= other.syn_left | other.syn_right | other.oj;
                 }
                 continue;
             }
-            if left_rels & other.syn_right != 0 {
-                if clause_relids & other.syn_right != 0
+            if left_rels & other.syn_right != Relids::EMPTY {
+                if clause_relids & other.syn_right != Relids::EMPTY
                     && (matches!(kind, TreeJoin::Semi | TreeJoin::Anti)
-                        || strict_relids & other.min_right == 0)
+                        || strict_relids & other.min_right == Relids::EMPTY)
                 {
                     min_left |= other.syn_left | other.syn_right | other.oj;
                 } else if kind == TreeJoin::Left
                     && other.kind == SpecialKind::Left
-                    && strict_relids & other.min_right != 0
-                    && clause_relids & other.syn_left == 0
+                    && strict_relids & other.min_right != Relids::EMPTY
+                    && clause_relids & other.syn_left == Relids::EMPTY
                 {
                     min_left &= !other.oj;
                     below_l |= other.oj;
                 }
             }
-            if right_rels & other.syn_right != 0 {
-                if clause_relids & other.syn_right != 0
-                    || clause_relids & other.min_left == 0
+            if right_rels & other.syn_right != Relids::EMPTY {
+                if clause_relids & other.syn_right != Relids::EMPTY
+                    || clause_relids & other.min_left == Relids::EMPTY
                     || matches!(kind, TreeJoin::Semi | TreeJoin::Anti)
                     || matches!(other.kind, SpecialKind::Semi | SpecialKind::Anti)
                     || !other.lhs_strict
@@ -1218,24 +1274,24 @@ impl Prep<'_> {
                 }
             }
         }
-        if min_left == 0 {
+        if min_left.is_empty() {
             min_left = left_rels;
         }
-        if min_right == 0 {
+        if min_right.is_empty() {
             min_right = right_rels;
         }
         info.min_left = min_left;
         info.min_right = min_right;
         below_l &= !min_left;
         below_r &= !min_right;
-        if below_l != 0 || below_r != 0 {
+        if below_l != Relids::EMPTY || below_r != Relids::EMPTY {
             info.commute_below_l = below_l;
             info.commute_below_r = below_r;
             let oj = info.oj;
             for other in &mut self.specials[..self.special_count] {
-                if other.oj & below_l != 0 {
+                if other.oj & below_l != Relids::EMPTY {
                     other.commute_above_l |= oj;
-                } else if other.oj & below_r != 0 {
+                } else if other.oj & below_r != Relids::EMPTY {
                     other.commute_above_r |= oj;
                 }
             }
@@ -1262,13 +1318,13 @@ impl Prep<'_> {
             for &(rel, _) in qual.vars.as_slice() {
                 all |= nulling[usize::from(rel)];
             }
-            if all & right == 0 || all & !right == 0 {
+            if all & right == Relids::EMPTY || all & !right == Relids::EMPTY {
                 continue;
             }
             let Shape::Columns(left, other) = qual.shape else {
                 return;
             };
-            let inside = |var: Var| right & 1 << var.0 != 0;
+            let inside = |var: Var| right & Relids::of(var.0) != Relids::EMPTY;
             let member = match (inside(left), inside(other)) {
                 (false, true) => other,
                 (true, false) => left,
@@ -1299,7 +1355,7 @@ impl Prep<'_> {
         let quals = self.postponed[at];
         let quals = &quals[..usize::from(self.postponed_count[at])];
         let base_nulling = self.nulling_at(node);
-        if info.commute_above_r != 0 || info.commute_below_l != 0 {
+        if info.commute_above_r != Relids::EMPTY || info.commute_below_l != Relids::EMPTY {
             let (above, below) = (info.commute_above_r, info.commute_below_l);
             // The quals without the nulling of the joins it commutes with
             // from below.
@@ -1308,25 +1364,25 @@ impl Prep<'_> {
                 *relids &= !below;
             }
             let mut incompatible = below | above | info.oj;
-            let mut so_far = 0;
+            let mut so_far = Relids::EMPTY;
             for position in 0..self.item_count {
                 let item = self.items[position];
                 let Some(other_id) = self.special_of[usize::from(item)] else {
                     continue;
                 };
                 let other = self.specials[usize::from(other_id)];
-                let (below_join, above_join) = if other.oj & below != 0 {
+                let (below_join, above_join) = if other.oj & below != Relids::EMPTY {
                     (true, false)
                 } else if other_id == special {
                     (false, false)
-                } else if other.oj & above != 0 {
+                } else if other.oj & above != Relids::EMPTY {
                     (false, true)
                 } else {
                     continue;
                 };
                 if above_join {
                     for (rel, relids) in nulling.iter_mut().enumerate().take(self.tree.rels) {
-                        if info.syn_left & 1 << rel != 0 {
+                        if info.syn_left & Relids::of(rel) != Relids::EMPTY {
                             *relids |= other.oj;
                         }
                     }
@@ -1339,7 +1395,7 @@ impl Prep<'_> {
                     this_ojscope |= other.oj;
                     this_ojscope &= !info.oj;
                 }
-                let allow_equivalence = so_far == 0;
+                let allow_equivalence = so_far == Relids::EMPTY;
                 let clone = if allow_equivalence {
                     CloneKind::Has
                 } else {
@@ -1362,7 +1418,7 @@ impl Prep<'_> {
                 }
                 if below_join {
                     for (rel, relids) in nulling.iter_mut().enumerate().take(self.tree.rels) {
-                        if other.syn_right & 1 << rel != 0 {
+                        if other.syn_right & Relids::of(rel) != Relids::EMPTY {
                             *relids |= other.oj;
                         }
                     }
@@ -1379,7 +1435,7 @@ impl Prep<'_> {
                     qualscope,
                     Some(ojscope),
                     nonnullable,
-                    0,
+                    Relids::EMPTY,
                     true,
                     CloneKind::None,
                     base_nulling,
@@ -1412,18 +1468,18 @@ impl Prep<'_> {
             relids |= nulling[usize::from(rel)];
         }
         let clause_relids = relids;
-        if relids == 0 {
+        if relids == Relids::EMPTY {
             // A constant qual: PostgreSQL places it as a gating qual.
             let _ = qualscope;
             return Err("a join condition reading no relation");
         }
         if let Some(scope) = ojscope
-            && relids & !scope != 0
+            && relids & !scope != Relids::EMPTY
         {
             return Err("a join condition reading relations outside its join");
         }
         let (pushed_down, maybe_equivalence, maybe_outer_join);
-        if relids & nonnullable != 0 {
+        if relids & nonnullable != Relids::EMPTY {
             if postpone {
                 let at = usize::from(node);
                 let count = usize::from(self.postponed_count[at]);
@@ -1469,7 +1525,7 @@ impl Prep<'_> {
                 let left_member = self.var_member(left, &nulling);
                 let right_member = self.var_member(right, &nulling);
                 // `can_join`: each side reads relations the other does not.
-                let can_join = left_member.relids() & right_member.relids() == 0;
+                let can_join = left_member.relids() & right_member.relids() == Relids::EMPTY;
                 if maybe_equivalence {
                     let domain = self.domain[usize::from(node)];
                     if self.process_equivalence(
@@ -1487,12 +1543,16 @@ impl Prep<'_> {
                     let left_relids = left_member.relids();
                     let right_relids = right_member.relids();
                     let pending = Pending { join };
-                    if left_relids & !nonnullable == 0 && right_relids & nonnullable == 0 {
+                    if left_relids & !nonnullable == Relids::EMPTY
+                        && right_relids & nonnullable == Relids::EMPTY
+                    {
                         *self.left_join.get_mut(self.left_count).ok_or(FULL)? = pending;
                         self.left_count += 1;
                         return Ok(());
                     }
-                    if right_relids & !nonnullable == 0 && left_relids & nonnullable == 0 {
+                    if right_relids & !nonnullable == Relids::EMPTY
+                        && left_relids & nonnullable == Relids::EMPTY
+                    {
                         *self.right_join.get_mut(self.right_count).ok_or(FULL)? = pending;
                         self.right_count += 1;
                         return Ok(());
@@ -1516,7 +1576,7 @@ impl Prep<'_> {
                         return Ok(());
                     }
                 }
-                if member.nulling != 0 {
+                if member.nulling != Relids::EMPTY {
                     return Err("a constant equality of a nulled column");
                 }
             }
@@ -1543,14 +1603,15 @@ impl Prep<'_> {
 
     /// `distribute_restrictinfo_to_rels`.
     fn distribute_restrictinfo(&mut self, join: JoinQual) -> Result<(), Outside> {
-        let placed = if join.required.count_ones() == 1 && join.required & BASE_RELIDS != 0 {
-            Placed::Restriction {
-                rel: join.required.trailing_zeros() as u8,
-                qual: join.qual,
-            }
-        } else {
-            Placed::Join(join)
-        };
+        let placed =
+            if join.required.count_ones() == 1 && join.required & BASE_RELIDS != Relids::EMPTY {
+                Placed::Restriction {
+                    rel: join.required.trailing_zeros() as u8,
+                    qual: join.qual,
+                }
+            } else {
+                Placed::Join(join)
+            };
         self.place(placed)
     }
 
@@ -1573,10 +1634,10 @@ impl Prep<'_> {
             return false;
         };
         let nulled = nulling[usize::from(rel)];
-        nulled != 0
-            && self.specials[..self.special_count]
-                .iter()
-                .any(|special| special.kind == SpecialKind::Anti && special.oj & nulled != 0)
+        nulled != Relids::EMPTY
+            && self.specials[..self.special_count].iter().any(|special| {
+                special.kind == SpecialKind::Anti && special.oj & nulled != Relids::EMPTY
+            })
     }
 
     fn canonical(&self, mut class: u8) -> u8 {
@@ -1745,7 +1806,9 @@ impl Prep<'_> {
             return Err("an equivalence class of two constants in a full join's condition");
         };
         let relids = self.min_rels(root)?;
-        if relids == 0 || (self.false_relids != 0 && self.false_relids != relids) {
+        if relids == Relids::EMPTY
+            || (self.false_relids != Relids::EMPTY && self.false_relids != relids)
+        {
             return Err("equivalence classes of two constants inside different outer joins");
         }
         self.false_relids = relids;
@@ -1757,9 +1820,9 @@ impl Prep<'_> {
     fn min_rels(&self, node: u8) -> Result<Relids, Outside> {
         let at = usize::from(node);
         match self.tree.nodes[at] {
-            TreeNode::Rel(table) => Ok(1 << table),
+            TreeNode::Rel(table) => Ok(Relids::of(table)),
             TreeNode::From { first, count } => {
-                let mut relids = 0;
+                let mut relids = Relids::EMPTY;
                 for position in 0..usize::from(count) {
                     relids |= self.min_rels(self.tree.children[usize::from(first) + position])?;
                 }
@@ -1839,7 +1902,7 @@ impl Prep<'_> {
                     *count -= 1;
                     self.distribute_restrictinfo(JoinQual {
                         qual: TRUE_QUAL,
-                        relids: 0,
+                        relids: Relids::EMPTY,
                         merge: None,
                         ..join
                     })?;
@@ -1857,7 +1920,7 @@ impl Prep<'_> {
                 self.full_count -= 1;
                 self.distribute_restrictinfo(JoinQual {
                     qual: TRUE_QUAL,
-                    relids: 0,
+                    relids: Relids::EMPTY,
                     merge: None,
                     ..join
                 })?;
@@ -1920,7 +1983,7 @@ impl Prep<'_> {
         };
         let (qual, _, _, constant) = self.coalesce[at];
         for side in [left, right] {
-            if side.nulling != 0 {
+            if side.nulling != Relids::EMPTY {
                 return Err("a full join clause of a nulled column equated with a constant");
             }
             let Some(node) = self.tree.nodes[..self.tree.node_count]
@@ -1960,10 +2023,10 @@ impl Prep<'_> {
         let Some((qual, constant, _)) = held.constant.filter(|_| held.class.has_const) else {
             return Ok(false);
         };
-        if inner.nulling != 0 {
+        if inner.nulling != Relids::EMPTY {
             return Err("an outer join clause of a nulled column equated with a constant");
         }
-        if inner.reads != 0 || outer.reads != 0 {
+        if inner.reads != Relids::EMPTY || outer.reads != Relids::EMPTY {
             return Ok(false);
         }
         let Some(node) = self.tree.nodes[..self.tree.node_count]
@@ -1984,16 +2047,16 @@ impl Prep<'_> {
     /// all, nulled by any of theirs.
     fn var_member(&self, var: Var, nulling: &[Relids]) -> Member {
         let mut member = Member::plain(var.0, var.1);
-        let mut relids: Relids = 1 << var.0;
+        let mut relids: Relids = Relids::of(var.0);
         if let Some(id) = member.expression_id() {
             for &(rel, _) in self.tree.expression_vars[id].as_slice() {
-                relids |= 1 << rel;
+                relids |= Relids::of(rel);
             }
         }
-        member.reads = relids & !(1 << var.0);
+        member.reads = relids & !Relids::of(var.0);
         for (rel, nulled) in nulling.iter().enumerate().take(MAX_JOIN_RELS) {
-            if relids & 1 << rel != 0 {
-                member.nulling |= nulled;
+            if relids & Relids::of(rel) != Relids::EMPTY {
+                member.nulling |= *nulled;
             }
         }
         member
@@ -2010,7 +2073,7 @@ impl Prep<'_> {
             }
             let members = held.class.members();
             if held.class.has_const {
-                if members.iter().any(|member| member.nulling != 0) {
+                if members.iter().any(|member| member.nulling != Relids::EMPTY) {
                     return Err("a constant's class of a nulled column");
                 }
                 // One `column = constant`: the clause itself.
@@ -2029,7 +2092,7 @@ impl Prep<'_> {
                     })?;
                     // A member of several relations is a join clause of
                     // them, which reads its columns there.
-                    if member.reads != 0
+                    if member.reads != Relids::EMPTY
                         && let Some(id) = member.expression_id()
                     {
                         for &var in self.tree.expression_vars[id].as_slice() {
@@ -2045,7 +2108,7 @@ impl Prep<'_> {
             // Each plain member equated with the relation's previous one.
             let mut previous = [None::<Member>; MAX_JOIN_RELS];
             for &member in members {
-                if member.nulling != 0 || member.reads != 0 {
+                if member.nulling != Relids::EMPTY || member.reads != Relids::EMPTY {
                     continue;
                 }
                 let rel = usize::from(member.rel);
@@ -2083,9 +2146,9 @@ mod tests {
         vars.add(left).expect("room");
         vars.add(right).expect("room");
         Qual {
-            rels: 1 << left.0 | 1 << right.0,
+            rels: Relids::of(left.0) | Relids::of(right.0),
             vars,
-            nonnullable: 1 << left.0 | 1 << right.0,
+            nonnullable: Relids::of(left.0) | Relids::of(right.0),
             strict_vars: vars,
             forced_null: None,
             shape: Shape::Columns(left, right),
@@ -2097,9 +2160,9 @@ mod tests {
         let mut vars = VarList::default();
         vars.add(var).expect("room");
         Qual {
-            rels: 1 << var.0,
+            rels: Relids::of(var.0),
             vars,
-            nonnullable: 0,
+            nonnullable: Relids::EMPTY,
             strict_vars: VarList::default(),
             forced_null: Some(var),
             shape: Shape::Other,
@@ -2146,10 +2209,16 @@ mod tests {
         let specials = &prepared.specials[..prepared.special_count];
         assert_eq!(specials.len(), 2);
         let (one, two) = (specials[0], specials[1]);
-        assert_eq!((one.min_left, one.min_right), (1, 2));
+        assert_eq!(
+            (one.min_left, one.min_right),
+            (Relids::from_mask(1), Relids::from_mask(2))
+        );
         // The upper join reads only `rel1` of its left side, so it may run
         // first: it commutes with the lower one.
-        assert_eq!((two.min_left, two.min_right), (2, 4));
+        assert_eq!(
+            (two.min_left, two.min_right),
+            (Relids::from_mask(2), Relids::from_mask(4))
+        );
         assert_eq!(two.commute_below_l, one.oj);
         assert_eq!(one.commute_above_l, two.oj);
         // Each copy of the upper join's clause: one for each order.
@@ -2194,9 +2263,16 @@ mod tests {
         let prepared = prepare(&chain(TreeJoin::Right, TreeJoin::Inner, &[])).expect("modeled");
         let special = prepared.specials[0];
         assert_eq!(special.kind, SpecialKind::Left);
-        assert_eq!((special.syn_left, special.syn_right), (2, 1));
+        assert_eq!(
+            (special.syn_left, special.syn_right),
+            (Relids::from_mask(2), Relids::from_mask(1))
+        );
         // The join list starts with the swapped join's preserved side.
         let top = prepared.subproblems[prepared.subproblem_count - 1];
-        assert_eq!(&top.items[..usize::from(top.count)], &[2, 1, 4]);
+        let first = usize::from(top.first);
+        assert_eq!(
+            &prepared.subproblem_items[first..first + usize::from(top.count)],
+            &[2, 1, 4].map(Relids::from_mask)
+        );
     }
 }

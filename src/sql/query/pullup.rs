@@ -172,14 +172,14 @@ fn flatten_parenthesized_joins<'a>(
     let push = |joins: &mut crate::mem::arena::ArenaList<'a, Join<'a>>, join: Join<'a>| {
         joins.push(join).map_err(|_| arena_full())
     };
-    let base = if position == 0 {
+    let (base, lifted) = if position == 0 {
         for &join in inner.joins {
             push(&mut joins, join)?;
         }
         for &join in from.joins {
             push(&mut joins, join)?;
         }
-        inner.base
+        (inner.base, None)
     } else {
         for &join in &from.joins[..position - 1] {
             push(&mut joins, join)?;
@@ -193,8 +193,22 @@ fn flatten_parenthesized_joins<'a>(
             JoinKind::Cross
         };
         let last = inner.joins.len();
+        // With only inner joins in the FROM, the outer join's condition
+        // filters the joined rows, so it joins the query's conditions ahead
+        // of the `WHERE` ones (keeping PostgreSQL's order of the quals):
+        // the old executor then joins by it as soon as its relations have
+        // joined, rather than looping over the members' cross product.
+        let all_inner = from.joins.iter().chain(inner.joins.iter()).all(|join| {
+            matches!(
+                join.kind,
+                JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
+            )
+        });
+        let lifted = (all_inner && outer.kind != JoinKind::Comma)
+            .then_some(outer.on)
+            .flatten();
         let condition = |at: usize, on: Option<&'a Expr<'a>>| {
-            if outer.kind != JoinKind::Comma && at == last {
+            if outer.kind != JoinKind::Comma && at == last && lifted.is_none() {
                 super::view_write::and_where(on, outer.on, arena)
             } else {
                 Ok(on)
@@ -233,7 +247,7 @@ fn flatten_parenthesized_joins<'a>(
         for &join in &from.joins[position..] {
             push(&mut joins, join)?;
         }
-        from.base
+        (from.base, lifted)
     };
     let flattened = arena
         .alloc(Select {
@@ -241,6 +255,10 @@ fn flatten_parenthesized_joins<'a>(
                 base,
                 joins: joins.into_mut_slice().map_err(|_| arena_full())?,
             }),
+            where_clause: match lifted {
+                Some(on) => super::view_write::and_where(Some(on), select.where_clause, arena)?,
+                None => select.where_clause,
+            },
             ..*select
         })
         .map_err(|_| arena_full())?;

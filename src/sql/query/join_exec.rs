@@ -56,7 +56,7 @@ struct BaseRow<'a> {
 /// A hash table or `Materialize` store a node keeps across rescans.
 #[derive(Clone, Copy)]
 struct Built<'a> {
-    rows: &'a [Bound<'a>],
+    rows: &'a [Row<'a>],
     index: &'a [u32],
 }
 
@@ -64,7 +64,7 @@ struct Built<'a> {
 /// `spaceUsed` counts it (`HJTUPLE_OVERHEAD` and the minimal tuple).
 #[derive(Clone, Copy)]
 struct HashedRow<'a> {
-    row: Bound<'a>,
+    row: Row<'a>,
     hash: u32,
     size: usize,
 }
@@ -501,7 +501,7 @@ impl<'a> BatchTable<'a> {
     /// The rows no outer row matched, as `ExecScanHashTableForUnmatched`
     /// walks them: each bucket's chain in bucket order, then each skew
     /// bucket's.
-    fn unmatched(&self, out: &mut ArenaList<'a, Bound<'a>>) -> Result<(), SqlError> {
+    fn unmatched(&self, out: &mut ArenaList<'a, Row<'a>>) -> Result<(), SqlError> {
         let rows = self.memory.borrowed_slice();
         let order = self
             .arena
@@ -590,7 +590,7 @@ impl<'a> Frozen<'a> {
     fn unmatched(
         &self,
         arena: &'a Arena,
-        out: &mut ArenaList<'a, Bound<'a>>,
+        out: &mut ArenaList<'a, Row<'a>>,
     ) -> Result<(), SqlError> {
         let order = arena
             .alloc_slice_with(self.memory.len(), |at| at as u32)
@@ -778,7 +778,7 @@ enum MergeState {
 /// A merge join's input rows in merge order, and the nodes counting what
 /// the join fetched: its `Sort`, or the scan it read in part.
 struct MergeInput<'a> {
-    rows: &'a [Bound<'a>],
+    rows: &'a [Row<'a>],
     sort: super::instrument::Node,
     lazy: Option<super::instrument::Node>,
     /// The pages the scan read in part reads, when `BUFFERS` counts them.
@@ -853,7 +853,7 @@ struct MemoEntry<'a> {
 /// A `Memoize` node's cache, kept across the nested loop's rescans.
 struct MemoCache<'a> {
     entries: ArenaList<'a, MemoEntry<'a>>,
-    rows: ArenaList<'a, Bound<'a>>,
+    rows: ArenaList<'a, Row<'a>>,
     stats: super::instrument::MemoizeStats,
     /// `mem_used`.
     used: usize,
@@ -865,7 +865,7 @@ struct Probe<'k> {
     keys: &'k KeySides,
     quals: (&'k ClauseList, &'k ClauseList),
     jointype: JoinType,
-    inner_relids: u32,
+    inner_relids: Relids,
     join: super::instrument::Node,
 }
 
@@ -874,6 +874,10 @@ type KeySides = [((usize, usize), (usize, usize)); super::index_paths::joins::MA
 
 /// The rows bound so far, by FROM position.
 type Bound<'a> = [Option<BaseRow<'a>>; MAX_JOIN_RELS];
+
+/// A kept row: the query's relations of a [`Bound`], so a store of rows
+/// grows with the relations the query joins, not the most it may.
+type Row<'a> = &'a [Option<BaseRow<'a>>];
 
 struct Runner<'r, 'a> {
     /// Each path's kept hash table or store, which a rescan reads again
@@ -1223,7 +1227,7 @@ pub(super) fn run_modeled<'a>(
             let start = offsets[table];
             let columns = scope.stored_width(table);
             // A removed join's relation reads as NULLs, which nothing reads.
-            if model.plan.removed & 1 << table != 0 {
+            if model.plan.removed & Relids::of(table) != Relids::EMPTY {
                 values[start..start + columns].copy_from_slice(&nulls[table][..columns]);
                 rowids[table] = None;
                 continue;
@@ -1251,7 +1255,7 @@ pub(super) fn run_modeled<'a>(
             let mut at = written_offsets[table];
             let members = leaf..leaf + count;
             leaf += count;
-            if nested.joined & 1 << table == 0 {
+            if !nested.joined.contains(table as u32) {
                 let width = scope.stored_width(members.start);
                 written_values[at..at + width]
                     .copy_from_slice(&values[offsets[members.start]..][..width]);
@@ -1290,7 +1294,7 @@ pub(super) fn run_modeled<'a>(
 /// The rows a materialized input holds: each one's base rows, by FROM
 /// position.
 struct Held<'a> {
-    rows: ArenaList<'a, Bound<'a>>,
+    rows: ArenaList<'a, Row<'a>>,
 }
 
 impl<'r, 'a> Runner<'r, 'a> {
@@ -1318,11 +1322,11 @@ impl<'r, 'a> Runner<'r, 'a> {
             } => match method {
                 super::index_paths::joins::UniqueMethod::Noop => self.exec(input, bound, sink),
                 super::index_paths::joins::UniqueMethod::Sort => {
-                    self.unique(input, &keys[..usize::from(key_count)], bound, sink)
+                    self.unique(input, self.model.plan.keys(keys, key_count), bound, sink)
                 }
                 super::index_paths::joins::UniqueMethod::Hash => self.unique_hashed(
                     input,
-                    &keys[..usize::from(key_count)],
+                    self.model.plan.keys(keys, key_count),
                     path.rows,
                     bound,
                     sink,
@@ -1337,7 +1341,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             } => self.memoize(
                 id,
                 input,
-                &keys[..usize::from(key_count)],
+                self.model.plan.keys(keys, key_count),
                 (single_row, binary),
                 bound,
                 sink,
@@ -1514,7 +1518,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 // An inner input reading the values of an outer row above
                 // changes at each rescan, which builds the table again
                 // (`ExecReScanHashJoin` with the inner plan's `chgParam`).
-                if self.model.plan.path(inner).param != 0 {
+                if self.model.plan.path(inner).param != Relids::EMPTY {
                     self.built[id as usize].set(None);
                     self.frozen[id as usize].set(None);
                 }
@@ -1712,7 +1716,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         // `MJEvalOuterValues` and `MJEvalInnerValues`: a NULL first key
         // sorted last ends the join unless the join returns that side's
         // unmatched rows.
-        let eval = |row: &Bound<'a>, outer_side: bool| -> MergeEval {
+        let eval = |row: &[Option<BaseRow<'a>>], outer_side: bool| -> MergeEval {
             let fills = if outer_side { fill_outer } else { fill_inner };
             let mut result = MergeEval::Matchable;
             for (at, &(o, i)) in Self::keys(&keys).enumerate() {
@@ -1823,46 +1827,47 @@ impl<'r, 'a> Runner<'r, 'a> {
         // `MJCompare`: each key compared as its sort orders it
         // (`ApplySortComparator`), NULL equal to NULL only to order the
         // rows, never to join them.
-        let compare =
-            |outer_row: &Bound<'a>, inner_row: &Bound<'a>| -> Result<Ordering, SqlError> {
-                let mut null_equals_null = false;
-                for (at, &(o, i)) in Self::keys(&keys).enumerate() {
-                    let (one, two) = (self.value(outer_row, o), self.value(inner_row, i));
-                    let first = nulls_first >> at & 1 != 0;
-                    let order = match (one.is_null(), two.is_null()) {
-                        (true, true) => {
-                            null_equals_null = true;
-                            continue;
-                        }
-                        (true, false) if first => Ordering::Less,
-                        (true, false) => Ordering::Greater,
-                        (false, true) if first => Ordering::Greater,
-                        (false, true) => Ordering::Less,
-                        (false, false) => {
-                            let order = crate::sql::eval::compare_datums_collated(
-                                self.storage,
-                                self.txid,
-                                self.collation(o),
-                                &one,
-                                &two,
-                            )?;
-                            if descending >> at & 1 != 0 {
-                                order.reverse()
-                            } else {
-                                order
-                            }
-                        }
-                    };
-                    if order != Ordering::Equal {
-                        return Ok(order);
+        let compare = |outer_row: &[Option<BaseRow<'a>>],
+                       inner_row: &[Option<BaseRow<'a>>]|
+         -> Result<Ordering, SqlError> {
+            let mut null_equals_null = false;
+            for (at, &(o, i)) in Self::keys(&keys).enumerate() {
+                let (one, two) = (self.value(outer_row, o), self.value(inner_row, i));
+                let first = nulls_first >> at & 1 != 0;
+                let order = match (one.is_null(), two.is_null()) {
+                    (true, true) => {
+                        null_equals_null = true;
+                        continue;
                     }
+                    (true, false) if first => Ordering::Less,
+                    (true, false) => Ordering::Greater,
+                    (false, true) if first => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => {
+                        let order = crate::sql::eval::compare_datums_collated(
+                            self.storage,
+                            self.txid,
+                            self.collation(o),
+                            &one,
+                            &two,
+                        )?;
+                        if descending >> at & 1 != 0 {
+                            order.reverse()
+                        } else {
+                            order
+                        }
+                    }
+                };
+                if order != Ordering::Equal {
+                    return Ok(order);
                 }
-                Ok(if null_equals_null {
-                    Ordering::Greater
-                } else {
-                    Ordering::Equal
-                })
-            };
+            }
+            Ok(if null_equals_null {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            })
+        };
         let out_of_order = || {
             crate::sql_err!(
                 crate::sql::eval::sqlstate::INTERNAL_ERROR,
@@ -1906,8 +1911,8 @@ impl<'r, 'a> Runner<'r, 'a> {
                     state = MergeState::NextInner;
                     let inner_rows = inner_input.as_ref().expect("read").rows;
                     let (o, i) = (outer_at.expect("outer"), inner_at.expect("inner"));
-                    self.bind(bound, &outer_rows[o], outer_relids);
-                    self.bind(bound, &inner_rows[i], inner_relids);
+                    self.bind(bound, outer_rows[o], outer_relids);
+                    self.bind(bound, inner_rows[i], inner_relids);
                     if !self.equal(bound, &join_quals)? {
                         join.join_filtered();
                         continue;
@@ -1944,8 +1949,8 @@ impl<'r, 'a> Runner<'r, 'a> {
                         MergeEval::Matchable => {
                             let inner_rows = inner_input.as_ref().expect("read").rows;
                             match compare(
-                                &outer_rows[outer_at.expect("outer")],
-                                &inner_rows[inner_at.expect("inner")],
+                                outer_rows[outer_at.expect("outer")],
+                                inner_rows[inner_at.expect("inner")],
                             )? {
                                 Ordering::Equal => MergeState::JoinTuples,
                                 Ordering::Less => MergeState::NextOuter,
@@ -1980,7 +1985,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 MergeState::TestOuter => {
                     let inner_rows = inner_input.as_ref().expect("read").rows;
                     let mark = marked.expect("a marked inner row");
-                    match compare(&outer_rows[outer_at.expect("outer")], &inner_rows[mark])? {
+                    match compare(outer_rows[outer_at.expect("outer")], inner_rows[mark])? {
                         Ordering::Equal => {
                             if !skip_mark_restore {
                                 // `ExecRestrPos`: the next fetch follows the mark.
@@ -1995,7 +2000,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                         Ordering::Greater => {
                             let current = match inner_at {
                                 None => MergeEval::EndOfJoin,
-                                Some(at) => eval(&inner_rows[at], false),
+                                Some(at) => eval(inner_rows[at], false),
                             };
                             match current {
                                 MergeEval::Matchable => state = MergeState::SkipTest,
@@ -2014,8 +2019,8 @@ impl<'r, 'a> Runner<'r, 'a> {
                 MergeState::SkipTest => {
                     let inner_rows = inner_input.as_ref().expect("read").rows;
                     state = match compare(
-                        &outer_rows[outer_at.expect("outer")],
-                        &inner_rows[inner_at.expect("inner")],
+                        outer_rows[outer_at.expect("outer")],
+                        inner_rows[inner_at.expect("inner")],
                     )? {
                         Ordering::Equal => {
                             marked = inner_at;
@@ -2291,7 +2296,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             let mut keep = true;
             for position in entry.start..entry.start + entry.len {
                 let row = cache.rows.borrowed_slice()[position];
-                self.bind(bound, &row, inner_relids);
+                self.bind(bound, row, inner_relids);
                 memoize.row();
                 if !sink(bound)? {
                     keep = false;
@@ -2348,7 +2353,10 @@ impl<'r, 'a> Runner<'r, 'a> {
                     "EXPLAIN ANALYZE of a Memoize node that evicts cache entries is not supported"
                 ));
             }
-            cache.rows.push(*bound).map_err(|_| arena_full())?;
+            cache
+                .rows
+                .push(self.keep(bound)?)
+                .map_err(|_| arena_full())?;
             len += 1;
             memoize.row();
             if !sink(bound)? {
@@ -2645,9 +2653,9 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// when the join's filters pass it (`HJ_FILL_INNER_TUPLES`).
     fn fill_inner_rows(
         &self,
-        rows: &[Bound<'a>],
+        rows: &[Row<'a>],
         probe: &Probe<'_>,
-        outer_relids: u32,
+        outer_relids: Relids,
         bound: &mut Bound<'a>,
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
@@ -2670,7 +2678,7 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// `None` when a key is NULL.
     fn key_hash(
         &self,
-        row: &Bound<'a>,
+        row: &[Option<BaseRow<'a>>],
         keys: &KeySides,
         outer: bool,
         keep_nulls: bool,
@@ -2727,14 +2735,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 continue;
             };
             let size = 16 + self.tuple_len(row, inner)?;
-            table.insert(
-                HashedRow {
-                    row: *row,
-                    hash,
-                    size,
-                },
-                self.arena,
-            )?;
+            table.insert(HashedRow { row, hash, size }, self.arena)?;
             table.total += 1;
         }
         if table.buckets != table.optimal_buckets {
@@ -2860,12 +2861,12 @@ impl<'r, 'a> Runner<'r, 'a> {
             };
             if Some(row.hash) != hash
                 || outer_null
-                || self.has_null(&row.row, probe.keys, false)
-                || self.compare_sides(bound, &row.row, probe.keys)? != Ordering::Equal
+                || self.has_null(row.row, probe.keys, false)
+                || self.compare_sides(bound, row.row, probe.keys)? != Ordering::Equal
             {
                 continue;
             }
-            self.bind(bound, &row.row, probe.inner_relids);
+            self.bind(bound, row.row, probe.inner_relids);
             if !self.equal(bound, probe.quals.0)? {
                 probe.join.join_filtered();
                 continue;
@@ -2939,7 +2940,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         // The bound rows of the relations the scan's join clauses read.
         let outer_values;
         let outer_row;
-        let outer: Option<&dyn ColumnLookup<'a>> = if scan.param != 0 {
+        let outer: Option<&dyn ColumnLookup<'a>> = if scan.param != Relids::EMPTY {
             let n = self.scope.n;
             let offsets = self
                 .arena
@@ -2956,7 +2957,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 .map_err(|_| arena_full())?;
             for table in 0..n {
                 if let Some(row) = bound[table]
-                    && scan.param & 1 << table != 0
+                    && scan.param.contains(table as u32)
                 {
                     let columns = self.columns_of(row.values);
                     values[offsets[table]..offsets[table] + columns.len()].copy_from_slice(columns);
@@ -3034,16 +3035,25 @@ impl<'r, 'a> Runner<'r, 'a> {
         let mut rows = ArenaList::new(self.arena);
         let saved = *bound;
         self.exec(id, bound, &mut |bound| {
-            rows.push(*bound).map_err(|_| arena_full())?;
+            rows.push(self.keep(bound)?).map_err(|_| arena_full())?;
             Ok(true)
         })?;
         *bound = saved;
         Ok(Held { rows })
     }
 
-    fn bind(&self, bound: &mut Bound<'a>, row: &Bound<'a>, relids: u32) {
+    /// `bound`'s relations of the query, kept in the arena.
+    fn keep(&self, bound: &Bound<'a>) -> Result<Row<'a>, SqlError> {
+        let row = self
+            .arena
+            .alloc_slice_with(self.scope.n, |table| bound[table])
+            .map_err(|_| arena_full())?;
+        Ok(row)
+    }
+
+    fn bind(&self, bound: &mut Bound<'a>, row: &[Option<BaseRow<'a>>], relids: Relids) {
         for table in 0..self.scope.n {
-            if relids & 1 << table != 0 {
+            if relids.contains(table as u32) {
                 bound[table] = row[table];
             }
         }
@@ -3061,9 +3071,9 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// A member's value in the bound row: a column, an expression member
     /// its scan computed after the columns, or an expression of several
     /// relations evaluated over their bound rows.
-    fn value(&self, row: &Bound<'a>, (table, column): (usize, usize)) -> Datum<'a> {
+    fn value(&self, row: &[Option<BaseRow<'a>>], (table, column): (usize, usize)) -> Datum<'a> {
         if let Some(id) = Member::plain(0, column as u16).expression_id()
-            && self.model.expressions[id].reads != 0
+            && self.model.expressions[id].reads != Relids::EMPTY
         {
             return match self.evaluate(row, self.model.expressions[id].expression) {
                 Ok(value) => value,
@@ -3120,7 +3130,7 @@ impl<'r, 'a> Runner<'r, 'a> {
     }
 
     /// Each clause's (outer, inner) columns.
-    fn sides(&self, clauses: &ClauseList, outer: u32) -> KeySides {
+    fn sides(&self, clauses: &ClauseList, outer: Relids) -> KeySides {
         let mut sides =
             [((usize::MAX, 0), (usize::MAX, 0)); super::index_paths::joins::MAX_JOIN_CLAUSES];
         for (at, &id) in clauses.as_slice().iter().enumerate() {
@@ -3128,7 +3138,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 .model
                 .clause_columns(&self.model.plan.clauses[usize::from(id)])
                 .expect("a hash or merge clause equates columns");
-            sides[at] = if outer & 1 << left.0 != 0 {
+            sides[at] = if outer.contains(left.0 as u32) {
                 (left, right)
             } else {
                 (right, left)
@@ -3159,9 +3169,9 @@ impl<'r, 'a> Runner<'r, 'a> {
     }
 
     /// Binds a row of NULLs to the relations of `relids`.
-    fn null_extend(&self, bound: &mut Bound<'a>, relids: u32) {
+    fn null_extend(&self, bound: &mut Bound<'a>, relids: Relids) {
         for (table, (slot, nulls)) in bound.iter_mut().zip(self.nulls).enumerate() {
-            if relids & 1 << table != 0 {
+            if relids.contains(table as u32) {
                 *slot = Some(BaseRow {
                     values: nulls,
                     rowid: None,
@@ -3173,7 +3183,7 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// `expression` over the bound rows, its value kept in the arena.
     fn evaluate(
         &self,
-        bound: &Bound<'a>,
+        bound: &[Option<BaseRow<'a>>],
         expression: &crate::sql::ast::Expr<'a>,
     ) -> Result<Datum<'a>, SqlError> {
         let mut scratch = self.scratch.borrow_mut();
@@ -3201,7 +3211,7 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// Whether a condition no equality models holds for the bound rows.
     fn condition(
         &self,
-        bound: &Bound<'a>,
+        bound: &[Option<BaseRow<'a>>],
         expression: &crate::sql::ast::Expr<'a>,
     ) -> Result<bool, SqlError> {
         let mark = self.arena.mark();
@@ -3239,7 +3249,7 @@ impl<'r, 'a> Runner<'r, 'a> {
     }
 
     /// Whether every clause of `clauses` holds for the bound rows.
-    fn equal(&self, bound: &Bound<'a>, clauses: &ClauseList) -> Result<bool, SqlError> {
+    fn equal(&self, bound: &[Option<BaseRow<'a>>], clauses: &ClauseList) -> Result<bool, SqlError> {
         for &id in clauses.as_slice() {
             let clause = &self.model.plan.clauses[usize::from(id)];
             let Some((left, right)) = self.model.clause_columns(clause) else {
@@ -3266,15 +3276,15 @@ impl<'r, 'a> Runner<'r, 'a> {
         Ok(true)
     }
 
-    fn has_null(&self, row: &Bound<'a>, keys: &KeySides, outer: bool) -> bool {
+    fn has_null(&self, row: &[Option<BaseRow<'a>>], keys: &KeySides, outer: bool) -> bool {
         Self::keys(keys).any(|(o, i)| self.value(row, if outer { *o } else { *i }).is_null())
     }
 
     /// The bound outer row's keys against `inner`'s keys.
     fn compare_sides(
         &self,
-        bound: &Bound<'a>,
-        inner: &Bound<'a>,
+        bound: &[Option<BaseRow<'a>>],
+        inner: &[Option<BaseRow<'a>>],
         keys: &KeySides,
     ) -> Result<Ordering, SqlError> {
         for &(o, i) in Self::keys(keys) {
@@ -3294,7 +3304,7 @@ impl<'r, 'a> Runner<'r, 'a> {
 
     /// The `t_len` of the minimal tuple of path `id`'s target list for
     /// the bound row.
-    fn tuple_len(&self, bound: &Bound<'a>, id: u32) -> Result<usize, SqlError> {
+    fn tuple_len(&self, bound: &[Option<BaseRow<'a>>], id: u32) -> Result<usize, SqlError> {
         self.tuple_sizes(bound, id, false).map(|(length, _)| length)
     }
 
@@ -3303,7 +3313,7 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// `datum` names a sort of one column).
     fn tuple_sizes(
         &self,
-        bound: &Bound<'a>,
+        bound: &[Option<BaseRow<'a>>],
         id: u32,
         datum: bool,
     ) -> Result<(usize, usize), SqlError> {
@@ -3394,7 +3404,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             .map_err(|_| arena_full())?;
         let mut bytes = 0usize;
         for (at, &row) in index.iter().enumerate() {
-            lengths[at] = self.tuple_len(&rows[row as usize], inner)?;
+            lengths[at] = self.tuple_len(rows[row as usize], inner)?;
             // `HJTUPLE_OVERHEAD` and the tuple, as `spaceUsed` counts them.
             bytes += 16 + lengths[at];
         }
@@ -3475,8 +3485,8 @@ impl<'r, 'a> Runner<'r, 'a> {
                         self.storage,
                         self.txid,
                         self.collation(o),
-                        &self.value(&rows[a as usize], i),
-                        &self.value(&rows[b as usize], i),
+                        &self.value(rows[a as usize], i),
+                        &self.value(rows[b as usize], i),
                     )?;
                     if order != Ordering::Equal {
                         return Ok(order);
@@ -3493,8 +3503,8 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// outer row's, when that row's keys have no NULL.
     fn first_match(
         &self,
-        bound: &Bound<'a>,
-        rows: &[Bound<'a>],
+        bound: &[Option<BaseRow<'a>>],
+        rows: &[Row<'a>],
         index: &[u32],
         keys: &KeySides,
     ) -> Result<Option<usize>, SqlError> {
@@ -3504,8 +3514,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         let (mut low, mut high) = (0usize, index.len());
         while low < high {
             let middle = (low + high) / 2;
-            if self.compare_sides(bound, &rows[index[middle] as usize], keys)? == Ordering::Greater
-            {
+            if self.compare_sides(bound, rows[index[middle] as usize], keys)? == Ordering::Greater {
                 low = middle + 1;
             } else {
                 high = middle;
@@ -3530,39 +3539,40 @@ impl<'r, 'a> Runner<'r, 'a> {
         let column = |member: &super::index_paths::joins::Member| {
             (usize::from(member.rel), usize::from(member.column))
         };
-        let compare = |a: &Bound<'a>, b: &Bound<'a>| -> Result<Ordering, SqlError> {
-            for member in keys {
-                let (one, two) = (self.value(a, column(member)), self.value(b, column(member)));
-                let order = match (one.is_null(), two.is_null()) {
-                    (true, true) => Ordering::Equal,
-                    (true, false) => Ordering::Greater,
-                    (false, true) => Ordering::Less,
-                    (false, false) => crate::sql::eval::compare_datums_collated(
-                        self.storage,
-                        self.txid,
-                        self.collation(column(member)),
-                        &one,
-                        &two,
-                    )?,
-                };
-                if order != Ordering::Equal {
-                    return Ok(order);
+        let compare =
+            |a: &[Option<BaseRow<'a>>], b: &[Option<BaseRow<'a>>]| -> Result<Ordering, SqlError> {
+                for member in keys {
+                    let (one, two) = (self.value(a, column(member)), self.value(b, column(member)));
+                    let order = match (one.is_null(), two.is_null()) {
+                        (true, true) => Ordering::Equal,
+                        (true, false) => Ordering::Greater,
+                        (false, true) => Ordering::Less,
+                        (false, false) => crate::sql::eval::compare_datums_collated(
+                            self.storage,
+                            self.txid,
+                            self.collation(column(member)),
+                            &one,
+                            &two,
+                        )?,
+                    };
+                    if order != Ordering::Equal {
+                        return Ok(order);
+                    }
                 }
-            }
-            Ok(Ordering::Equal)
-        };
+                Ok(Ordering::Equal)
+            };
         let (order, _) = self.tuplesort(input, rows, &mut |a, b| {
-            compare(&rows[a as usize], &rows[b as usize])
+            compare(rows[a as usize], rows[b as usize])
         })?;
         let mut previous: Option<u32> = None;
         for &at in order.iter() {
             if let Some(held) = previous
-                && compare(&rows[held as usize], &rows[at as usize])? == Ordering::Equal
+                && compare(rows[held as usize], rows[at as usize])? == Ordering::Equal
             {
                 continue;
             }
             previous = Some(at);
-            self.bind(bound, &rows[at as usize], relids);
+            self.bind(bound, rows[at as usize], relids);
             if !sink(bound)? {
                 return Ok(false);
             }
@@ -3597,7 +3607,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 if at != 0 {
                     hash = hash.rotate_left(1);
                 }
-                let value = self.value(&rows[row], column(member));
+                let value = self.value(rows[row], column(member));
                 if value.is_null() {
                     continue;
                 }
@@ -3613,8 +3623,8 @@ impl<'r, 'a> Runner<'r, 'a> {
         let mut same = |a: usize, b: usize| -> Result<bool, SqlError> {
             for member in keys {
                 let (one, two) = (
-                    self.value(&rows[a], column(member)),
-                    self.value(&rows[b], column(member)),
+                    self.value(rows[a], column(member)),
+                    self.value(rows[b], column(member)),
                 );
                 let equal = match (one.is_null(), two.is_null()) {
                     (true, true) => true,
@@ -3645,7 +3655,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             &mut same,
         )?;
         for &row in order {
-            self.bind(bound, &rows[row as usize], relids);
+            self.bind(bound, rows[row as usize], relids);
             if !sink(bound)? {
                 return Ok(false);
             }
@@ -3659,7 +3669,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         &self,
         held: &Held<'a>,
         keys: &Keys,
-        relids: u32,
+        relids: Relids,
         id: u32,
     ) -> Result<(&'a [u32], super::instrument::SortSpace), SqlError> {
         let rows = held.rows.borrowed_slice();
@@ -3675,8 +3685,8 @@ impl<'r, 'a> Runner<'r, 'a> {
         self.tuplesort(id, rows, &mut |a, b| {
             for &(column, key) in columns {
                 let (one, two) = (
-                    self.value(&rows[a as usize], column),
-                    self.value(&rows[b as usize], column),
+                    self.value(rows[a as usize], column),
+                    self.value(rows[b as usize], column),
                 );
                 let first = key & KEY_NULLS_FIRST != 0;
                 let order = match (one.is_null(), two.is_null()) {
@@ -3716,7 +3726,7 @@ impl<'r, 'a> Runner<'r, 'a> {
     fn tuplesort(
         &self,
         id: u32,
-        rows: &[Bound<'a>],
+        rows: &[Row<'a>],
         compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
     ) -> Result<(&'a [u32], super::instrument::SortSpace), SqlError> {
         use super::postgres_memory::{SortTuples, TuplesortModel};

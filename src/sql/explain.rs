@@ -15,6 +15,7 @@ use crate::sql::ast::{
 };
 use crate::sql::eval::{ColumnLookup, SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
+use crate::sql::query::index_paths::joins::Relids;
 use crate::sql::query::instrument::{
     BlockId, BufferUsage, HashColumns, NodeCounters, NodeKey, Role, Segment, Slot,
 };
@@ -923,6 +924,67 @@ thread_local! {
 /// Forgets the subplans of the statement explained before.
 fn reset_subplans() {
     SUBPLANS.with(|subplans| subplans.borrow_mut().1 = 0);
+    query::reset_subplan_costs();
+}
+
+/// What a condition reading the sublink `node`, planned as `plan` with top
+/// node `top`, costs per `cost_subplan`, as startup and per-row cost: its
+/// test expression's comparisons per row, plus loading a hash table once,
+/// or rescanning the plan's output per row. An InitPlan's output costs
+/// nothing to read.
+fn subplan_cost(
+    node: &Expr<'_>,
+    plan: crate::sql::catalog::deparse::SublinkPlan,
+    correlated: bool,
+    top: &PlanNode,
+) -> (f64, f64) {
+    use crate::sql::catalog::deparse::SublinkPlan;
+    let operator = crate::sql::guc::planner_value("cpu_operator_cost");
+    let rows = clamp_row_estimate(top.rows as f64);
+    // `cost_qual_eval` of the test expression: one operator per compared
+    // column.
+    let compared = match node {
+        Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } => {
+            match operand {
+                Expr::Call { args, .. } if operand.is_row_constructor() => args.len() as f64,
+                _ => 1.0,
+            }
+        }
+        _ => 0.0,
+    };
+    let mut startup = 0.0;
+    let mut per_tuple = compared * operator;
+    match plan {
+        SublinkPlan::InitPlan(_) => return (0.0, 0.0),
+        SublinkPlan::HashedSubPlan(_) => startup += top.total_cost + operator * top.rows as f64,
+        SublinkPlan::SubPlan(_) => {
+            let run = top.total_cost - top.startup_cost;
+            per_tuple += match node {
+                Expr::Exists(_) => run / rows,
+                Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } => {
+                    0.5 * run + 0.5 * top.rows as f64 * operator
+                }
+                _ => run,
+            };
+            // `ExecMaterializesOutput` of an uncorrelated plan's top node.
+            if !correlated
+                && matches!(
+                    top.name.as_str(),
+                    "Materialize"
+                        | "Function Scan"
+                        | "Table Function Scan"
+                        | "CTE Scan"
+                        | "WorkTable Scan"
+                        | "Sort"
+                )
+            {
+                startup += top.startup_cost;
+            } else {
+                per_tuple += top.startup_cost;
+            }
+        }
+    }
+    (startup, per_tuple)
 }
 
 /// Numbers `select` as the next subplan, as PostgreSQL numbers each
@@ -5903,12 +5965,12 @@ thread_local! {
 
 /// Pushes the relations of `mask` in `scope` as the ones whose values a
 /// join's parameterized scan reads, returning how many it pushed.
-fn push_outer_mask(scope: &QueryScope<'_>, mask: u32) -> usize {
+fn push_outer_mask(scope: &QueryScope<'_>, mask: Relids) -> usize {
     OUTER_RELATIONS.with(|outer| {
         let mut outer = outer.borrow_mut();
         let mut pushed = 0;
-        for table in 0..scope.n.min(32) {
-            if mask & 1 << table == 0 {
+        for table in 0..scope.n {
+            if !mask.contains(table as u32) {
                 continue;
             }
             let count = outer.1;
@@ -6112,9 +6174,14 @@ fn plan_sublinks<'a>(
         {
             arena
                 .alloc_slice_with(count + 1, |index| match index {
+                    // `cost_material`: two operator costs per row stored.
                     0 => PlanNode {
                         name: StackStr::from_str("Materialize"),
-                        total_cost: nodes[0].total_cost,
+                        startup_cost: nodes[0].startup_cost,
+                        total_cost: nodes[0].total_cost
+                            + 2.0
+                                * crate::sql::guc::planner_value("cpu_operator_cost")
+                                * nodes[0].rows as f64,
                         rows: nodes[0].rows,
                         width: nodes[0].width,
                         output: nodes[0].output,
@@ -6130,7 +6197,10 @@ fn plan_sublinks<'a>(
         } else {
             &nodes[..count]
         };
-        let number = match register_subplan(select, correlated, compared)? {
+        let registered = register_subplan(select, correlated, compared)?;
+        let (startup, per_tuple) = subplan_cost(node, registered, correlated, &nodes[0]);
+        query::record_subplan_cost(core::ptr::from_ref(select).cast(), startup, per_tuple)?;
+        let number = match registered {
             crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
             | crate::sql::catalog::deparse::SublinkPlan::SubPlan(number)
             | crate::sql::catalog::deparse::SublinkPlan::HashedSubPlan(number) => number,
@@ -6633,25 +6703,7 @@ fn plan_pulled_select<'a>(
         ));
     }
     // A parenthesized join the join search does not plan would print
-    // pos3ql's own join order, as would a join PostgreSQL searches
-    // genetically (GEQO) or splits into several join problems past the
-    // collapse limits.
-    let relations = statement
-        .from
-        .as_ref()
-        .map_or(0, |from| 1 + from.joins.len());
-    let value = crate::sql::guc::planner_value;
-    if modeled.is_none()
-        && relations > 1
-        && ((value("geqo") != 0.0 && relations as f64 >= value("geqo_threshold"))
-            || relations as f64 > value("join_collapse_limit")
-            || relations as f64 > value("from_collapse_limit"))
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "EXPLAIN of a join of more relations than PostgreSQL's join search plans at once (geqo_threshold, join_collapse_limit, from_collapse_limit) is not supported"
-        ));
-    }
+    // pos3ql's own join order.
     if modeled.is_none()
         && statement.from.as_ref().is_some_and(|from| {
             core::iter::once(&from.base)
@@ -6662,6 +6714,18 @@ fn plan_pulled_select<'a>(
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "EXPLAIN of a parenthesized join PostgreSQL's join search does not plan here is not supported"
+        ));
+    }
+    // PostgreSQL may cache a LATERAL subquery's rows per outer value in a
+    // `Memoize` node, which only the join search plans.
+    if modeled.is_none()
+        && crate::sql::guc::planner_value("enable_memoize") != 0.0
+        && let (Some(scope), Some(from)) = (scope.as_ref(), statement.from.as_ref())
+        && memoizable_lateral(storage, txid, scope, from)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a LATERAL subquery PostgreSQL may memoize is not supported"
         ));
     }
     // Windows over a join the join search does not plan would print
@@ -6723,7 +6787,11 @@ fn plan_pulled_select<'a>(
                 .map_err(|_| arena_full())?;
         }
         let sorted: &[KeyItem<'_>] = sorted;
-        let unscanned = if scanned == 0 { 0 } else { !u64::from(scanned) };
+        let unscanned = if scanned.is_empty() {
+            Relids::EMPTY
+        } else {
+            !scanned
+        };
         let sort_keys = plan_keys_unscanned(
             storage,
             txid,
@@ -10661,7 +10729,16 @@ fn plan_keys(
     keys: &[KeyItem<'_>],
     arena: &Arena,
 ) -> Result<PlanKeys, SqlError> {
-    plan_keys_unscanned(storage, txid, scope, statement, label, keys, 0, arena)
+    plan_keys_unscanned(
+        storage,
+        txid,
+        scope,
+        statement,
+        label,
+        keys,
+        Relids::EMPTY,
+        arena,
+    )
 }
 
 /// [`plan_keys`] of a plan that does not scan the relations of
@@ -10674,7 +10751,7 @@ fn plan_keys_unscanned(
     statement: &Select<'_>,
     label: KeyLabel,
     keys: &[KeyItem<'_>],
-    unscanned: u64,
+    unscanned: Relids,
     arena: &Arena,
 ) -> Result<PlanKeys, SqlError> {
     // A query without FROM reads no relation.
@@ -10685,13 +10762,13 @@ fn plan_keys_unscanned(
     let Some(joined) = key_relations(scope, statement, arena)? else {
         return Ok(PlanKeys::NONE);
     };
-    let joined = if unscanned == 0 {
+    let joined = if unscanned.is_empty() {
         joined
     } else {
         &*arena
             .alloc_slice_with(joined.len(), |table| {
                 let mut relation = joined[table];
-                if unscanned & 1 << table != 0 {
+                if unscanned.contains(table as u32) {
                     relation.printed = "";
                 }
                 relation
@@ -16833,6 +16910,92 @@ fn printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), SqlError> {
         )),
         None => Ok(()),
     }
+}
+
+/// Whether a LATERAL subquery reading a relation filters it by a column of
+/// an earlier table whose statistics repeat values (fewer distinct values
+/// than rows): a parameter `Memoize` may cache the subquery's rows by.
+fn memoizable_lateral(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    from: &crate::sql::ast::FromClause<'_>,
+) -> bool {
+    fn conditions<'e>(select: &'e Select<'e>, visit: &mut dyn FnMut(&'e Expr<'e>)) {
+        if let Some(condition) = select.where_clause {
+            visit(condition);
+        }
+        if let Some(from) = select.from.as_ref() {
+            for table in
+                core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table))
+            {
+                if let Some(on) = from
+                    .joins
+                    .iter()
+                    .find(|join| core::ptr::eq(&join.table, table))
+                    .and_then(|join| join.on)
+                {
+                    visit(on);
+                }
+                if let Some(inner) = table.subquery {
+                    conditions(inner, visit);
+                }
+            }
+        }
+    }
+    let tables = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+    for (position, table) in tables.enumerate().take(scope.n) {
+        let Some(select) = table.subquery.filter(|_| table.lateral) else {
+            continue;
+        };
+        if select.from.is_none() {
+            continue;
+        }
+        let mut repeats = false;
+        conditions(select, &mut |condition| {
+            condition.for_each_column_reference(&mut |qualifier, name| {
+                let Some(qualifier) = qualifier else {
+                    return;
+                };
+                let Some(outer) = (0..position).find(|&at| scope.names[at] == qualifier) else {
+                    return;
+                };
+                let slot = scope.slots[outer];
+                if slot == usize::MAX || scope.derived[outer].is_some() {
+                    return;
+                }
+                let statistics = storage.table_statistics(slot, txid);
+                let definition = storage.table_def(slot, txid);
+                let Some(column) = definition
+                    .columns()
+                    .iter()
+                    .position(|column| column.name.as_str() == name)
+                else {
+                    return;
+                };
+                let distinct = definition
+                    .attributes
+                    .number(column)
+                    .and_then(|attribute| statistics.column(attribute))
+                    .filter(|_| statistics.valid && statistics.rows > 0)
+                    .map(|column_statistics| {
+                        crate::storage::column_distinct_estimate(
+                            &definition.columns()[column],
+                            column_statistics,
+                            statistics.rows,
+                            false,
+                        )
+                    });
+                // Without statistics PostgreSQL assumes 200 distinct values.
+                let rows = storage.planning_row_estimate(slot) as f64;
+                repeats |= distinct.unwrap_or(200.0) < rows;
+            });
+        });
+        if repeats {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether two inner-joined scans of one table equate, in `WHERE` or an

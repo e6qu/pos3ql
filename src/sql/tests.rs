@@ -6806,12 +6806,10 @@ fn wide_join_trees_execute_without_allocation() {
                 String::from_utf8_lossy(&output)
             );
 
-            // PostgreSQL plans this many relations genetically (GEQO), which
-            // pos3ql refuses to print rather than show its own join order.
             let explain = format!("EXPLAIN (COSTS OFF) {cross}");
             let output = run_with_fixed_memory(&mut engine, &budget, &explain, 32 << 20);
             assert!(
-                String::from_utf8_lossy(&output).contains("geqo_threshold"),
+                !String::from_utf8_lossy(&output).contains("ERROR"),
                 "{}",
                 String::from_utf8_lossy(&output)
             );
@@ -23652,11 +23650,14 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
             );
         }
 
-        // PostgreSQL plans this many relations genetically (GEQO), which
-        // pos3ql refuses to print rather than show its own join order.
         let join_plan = run_with(engine, budget, &explain_join_query);
-        assert!(
-            String::from_utf8_lossy(&join_plan).contains("geqo_threshold"),
+        let join_plan_rows = data_rows(&join_plan);
+        assert_eq!(
+            join_plan_rows
+                .iter()
+                .filter(|line| line.contains("Seq Scan on statement_lock_source source_"))
+                .count(),
+            WIDTH,
             "{phase} join EXPLAIN: {}",
             String::from_utf8_lossy(&join_plan)
         );

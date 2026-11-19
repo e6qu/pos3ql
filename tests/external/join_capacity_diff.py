@@ -95,6 +95,14 @@ def probe(host, port):
     )
     connection = Connection(host, port)
     try:
+        # A run leaves nothing behind, so the probe can run again against
+        # the same servers.
+        cleanup = connection.query(
+            "DROP VIEW IF EXISTS join_capacity_view; "
+            "DROP TABLE IF EXISTS jcj, join_capacity_target"
+        )
+        if not isinstance(cleanup, list):
+            return ("cleanup", cleanup)
         setup = connection.query(
             "CREATE TABLE jcj(id integer); INSERT INTO jcj VALUES (1); "
             "CREATE TABLE join_capacity_target(id integer, note text); "
@@ -110,8 +118,9 @@ def probe(host, port):
         )
         exists_rows = connection.query(f"SELECT EXISTS ({cross})")
         using_rows = connection.query(using)
-        # A 128-relation join is planned by GEQO in PostgreSQL, whose costs
-        # pos3ql refuses to print; capacity is about planning the join at all.
+        # PostgreSQL plans this join with GEQO. pos3ql plans joins of
+        # never-analyzed tables such as jcj in its own order, so only that a
+        # plan prints is compared here.
         explain_ok = isinstance(connection.query(f"EXPLAIN (COSTS OFF) {cross}"), list)
 
         view_setup = connection.query(
@@ -123,6 +132,9 @@ def probe(host, port):
             "UPDATE join_capacity_target SET note='after' FROM "
             f"{sources} WHERE t0.id=t127.id RETURNING join_capacity_target.note"
         )
+        teardown = connection.query(
+            "DROP VIEW join_capacity_view; DROP TABLE jcj, join_capacity_target"
+        )
         return (
             cross_rows,
             ordered_rows,
@@ -133,6 +145,7 @@ def probe(host, port):
             view_setup,
             view_rows,
             update_rows,
+            teardown,
         )
     finally:
         connection.close()
@@ -155,6 +168,7 @@ def main():
         [],
         [["2"]],
         [["after"]],
+        [],
     )
     postgresql = probe(args.host, args.pg)
     pos3ql = probe(args.host, args.p3)

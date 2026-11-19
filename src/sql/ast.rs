@@ -7293,10 +7293,15 @@ impl<'a> Expr<'a> {
     }
 
     /// Visits column references while preserving an optional table qualifier.
-    /// Subqueries own their bindings and are visited by their enclosing query.
+    /// Subqueries own their bindings and are visited by their enclosing query;
+    /// the operand an `IN`, `ANY` or `ALL` subquery compares belongs to this
+    /// query.
     pub fn for_each_column_reference(&self, f: &mut dyn FnMut(Option<&str>, &str)) {
         match self {
             Expr::Column { qualifier, name } => f(*qualifier, name),
+            Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } => {
+                operand.for_each_column_reference(f);
+            }
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -7314,8 +7319,6 @@ impl<'a> Expr<'a> {
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::RowSubquery { .. }
-            | Expr::InSubquery { .. }
-            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_) => {}
             Expr::Unary { operand, .. }

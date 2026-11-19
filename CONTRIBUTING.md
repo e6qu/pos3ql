@@ -46,17 +46,6 @@ results; external suites also need Python 3, Docker and the client tools
 installed by the owning workflow. `Cargo.toml`, `examples/dev.conf` and
 `.github/workflows/` define the actual build and environment.
 
-A local reference PostgreSQL for `tests/external/ci_diff.sh` must be a freshly
-initialized cluster (`initdb --locale=C -E UTF8 -A trust -U postgres`) started
-with `wal_level=logical` and `max_prepared_transactions=8`, as CI's service
-is. Run one phase per cluster: select it with `RUN_CORE=0 RUN_CORPUS=0
-RUN_SLT=0 RUN_FUZZ=0 RUN_AUX=1 AUXILIARY_PHASE=exact` and re-initialize the
-cluster before the next phase. The default run executes the curated corpus
-first, and `59_comment.sql` there clears the shipped descriptions of the
-`btree` access method and the `plpgsql` language in the shared `postgres`
-database, so `differential_exact/297_psql_describe_commands.sql` then fails
-against a reference that CI would not have used.
-
 Protect the interactive machine. Full builds, full test gates and large
 benchmark or evidence regeneration run on GitHub runners. Local work is serial
 and low priority: run one build or one test workload at a time, never a test

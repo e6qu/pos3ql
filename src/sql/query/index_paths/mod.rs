@@ -2146,9 +2146,18 @@ pub(crate) enum GroupOrder {
 /// startup and total cost.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GroupedPath {
-    /// A `GroupAggregate` over its input sorted by the grouping columns,
-    /// whose sort costs these, or a `HashAggregate`.
-    pub(crate) input_sort: Option<(f64, f64)>,
+    /// A `HashAggregate`, rather than a `GroupAggregate`.
+    pub(crate) hashed: bool,
+    /// The grouping columns in the order a sorted aggregate keys them.
+    pub(crate) keys: [usize; MAX_ORDER_KEYS],
+    /// How many of them are keys: the others a condition fixes to a
+    /// constant.
+    pub(crate) key_count: usize,
+    /// The sort of a `GroupAggregate`'s input by the grouping columns, when
+    /// the scan does not return them ordered: its startup and total cost
+    /// and how many leading keys the scan presorts (an incremental sort
+    /// when not zero).
+    pub(crate) input_sort: Option<(f64, f64, u8)>,
     /// The partitions a `HashAggregate` expects to spill its groups to.
     pub(crate) planned_partitions: Option<u32>,
     /// What sizes a `HashAggregate`'s memory, when the model covers it.

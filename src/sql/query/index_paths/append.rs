@@ -1012,6 +1012,7 @@ fn append_cost(
         disabled,
         presorted,
         sort: SortKind::None,
+        reordered: false,
     }
 }
 
@@ -1168,6 +1169,7 @@ pub(crate) fn member_path<'a>(
                 disabled: 0,
                 presorted: 0,
                 sort: SortKind::None,
+                reordered: false,
             }),
             ..member_shape
         },

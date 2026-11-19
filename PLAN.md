@@ -1537,12 +1537,22 @@ multi-pass merge never exceeds because each pass reads a block before it
 writes its replacement; a bounded sort keeps its heap from the row count its
 heap began at (`differential_exact/906`). An incremental sort's batches
 report `Average Disk` and the space its one tuplesort remembers across
-`tuplesort_reset`. A merge join's sort that spills (random-access tapes) stays `0A000`. Remaining: the
-window's storage, the sorts under windows and the incremental sort's group
-memory over windows are pos3ql's own figures; PostgreSQL's need the window's
-`tuplestore_trim` points (its read and mark pointers per frame) and each
-batch's tuplesort reuse, which `differential_exact/472` and `564` still
-mask. A
+`tuplesort_reset` (its array is charged only when the previous batch grew
+it). A merge join's sort that spills (random-access tapes) stays `0A000`.
+`EXPLAIN ANALYZE` of a window replays PostgreSQL over the materialized rows
+(`window_figures.rs`, `window_store.rs`): each clause's `Sort` holds the
+window input target (`make_window_input_target`) plus the functions of the
+clauses below and reports it like any tuplesort, and the `WindowAgg`
+replays its partition tuplestore (`spool_tuples`, each function's mark and
+read pointers, `eval_windowaggregates`, the `RANGE` frame tail,
+`tuplestore_trim`, the spill of a partition past `work_mem`), for the
+default and `ROWS UNBOUNDED PRECEDING` frames and for `row_number`, `rank`,
+`dense_rank` and plain aggregates (`differential_exact/472`, `564`, `907`,
+`935`); other frames and window functions fail with `0A000`. Rows of equal
+keys reach each sort in pos3ql's stable order, not PostgreSQL's quicksort
+order, which matters only when their tuples differ in size. A datum sort of
+a computed varlena counts its four-byte header; set operations' sorts treat
+their values as stored. A
 condition folded to false keeps the query's sort, limit, row locks,
 aggregation and windows over a `Result` with a false `One-Time Filter`. A
 subquery the planner does not merge runs as a subplan: an uncorrelated

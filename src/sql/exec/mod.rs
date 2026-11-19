@@ -9196,8 +9196,23 @@ where
         arena,
     )?
     else {
+        crate::sql::query::write_buffers::conflict_checked(
+            storage,
+            txn.txid,
+            table_index,
+            false,
+            arena,
+        )?;
         return Ok(ConflictOutcome::Store);
     };
+    crate::sql::query::write_buffers::conflict_checked(
+        storage,
+        txn.txid,
+        table_index,
+        true,
+        arena,
+    )?;
+    crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Modify).conflicted();
     let rowid = conflict.rowid;
     if let Some(assigns) = oc.update {
         let mut updated_columns = ColumnSet::EMPTY;
@@ -9560,6 +9575,15 @@ where
         )
     })?;
     rowenc::encode(&new_values[..def.n_columns], new_bytes);
+    crate::sql::query::write_buffers::row_updated(
+        storage,
+        txn.txid,
+        table_index,
+        rowid,
+        &existing[..def.n_columns],
+        &new_values[..def.n_columns],
+        arena,
+    )?;
     let new_image = storage.heap.append_image(new_bytes)?;
     txn.write_row(
         storage,
@@ -37626,6 +37650,10 @@ fn execute_plpgsql_dynamic_explain(
                     "EXPLAIN ANALYZE is not available in trigger execution"
                 )));
             };
+            // The analyzed statement runs as a new command of the routine,
+            // seeing the changes of the commands before it.
+            let mut command = txn.enter_trigger_sql(&engine.storage)?;
+            let txn = &mut *command;
             let (before_wal_records, before_wal_bytes) = engine.wal.stage_stats(txn.txid);
             let touched_mark = txn.touched().len();
             let started = std::time::Instant::now();
@@ -86520,6 +86548,10 @@ fn merge_target<'a>(
             source_rows,
             source_def,
             source_members,
+            pages: match JoinedWritePages::of(storage, txn.txid, leaves, None, arena) {
+                Ok(pages) => pages,
+                Err(error) => return sql_fail(error),
+            },
         });
     }
     let layout = MergeCursor::resume(
@@ -87167,6 +87199,14 @@ fn merge_target<'a>(
                                 ) {
                                     return sql_fail(error);
                                 }
+                                if let Err(error) = crate::sql::query::write_buffers::row_deleted(
+                                    storage,
+                                    txn.txid,
+                                    target_tables[j],
+                                    arena,
+                                ) {
+                                    return sql_fail(error);
+                                }
                                 match txn.write_row(
                                     storage,
                                     row_target,
@@ -87597,6 +87637,28 @@ fn merge_target<'a>(
                                     Err(_) => return sql_fail(arena_full()),
                                 };
                                 rowenc::encode(&persisted[..new_definition.n_columns], out);
+                                let counted = if updated_table == target_tables[j] {
+                                    crate::sql::query::write_buffers::row_updated(
+                                        storage,
+                                        txn.txid,
+                                        updated_table,
+                                        target_ids[j],
+                                        pair_physical,
+                                        &persisted[..new_definition.n_columns],
+                                        arena,
+                                    )
+                                } else {
+                                    crate::sql::query::write_buffers::row_inserted(
+                                        storage,
+                                        txn.txid,
+                                        updated_table,
+                                        &persisted[..new_definition.n_columns],
+                                        arena,
+                                    )
+                                };
+                                if let Err(error) = counted {
+                                    return sql_fail(error);
+                                }
                                 let image = match storage.heap.append_image(out) {
                                     Ok(x) => x,
                                     Err(e) => return sql_fail(e),
@@ -87906,6 +87968,62 @@ struct MergeScans<'r, 'a, Definition0: crate::storage::DefinitionBacking> {
     source_rows: &'r [&'a [u8]],
     source_def: &'r crate::storage::RelationDefinition<'r>,
     source_members: MergeSourceMembers<'r>,
+    /// The heap pages each scan reads in full when `EXPLAIN` counts
+    /// buffers: each target member's, then a stored source table's.
+    pages: Option<JoinedWritePages<'r>>,
+}
+
+/// The heap pages a joined write's scans read in full: `(pages, local)`
+/// of each target member, and of a stored source table.
+#[derive(Clone, Copy)]
+struct JoinedWritePages<'r> {
+    target: &'r [(u64, bool)],
+    source: Option<(u64, bool)>,
+}
+
+impl<'r> JoinedWritePages<'r> {
+    /// The pages of the target members `leaves` and of the stored source
+    /// table `source`, when the analyzed statement counts buffers.
+    fn of(
+        storage: &Storage,
+        txid: u32,
+        leaves: &[usize],
+        source: Option<usize>,
+        arena: &'r Arena,
+    ) -> Result<Option<Self>, SqlError> {
+        if !crate::sql::query::instrument::buffers_counted() {
+            return Ok(None);
+        }
+        let pages = |slot: usize| -> Result<(u64, bool), SqlError> {
+            let (_, pages) = crate::sql::query::instrument::heap_pages(storage, slot, txid, arena)?;
+            Ok((
+                pages,
+                storage.table_def(slot, txid).persistence
+                    == crate::storage::RelationPersistence::Temporary,
+            ))
+        };
+        let mut target = [(0u64, false); MAX_WRITE_MEMBERS];
+        for (held, &leaf) in target.iter_mut().zip(leaves) {
+            *held = pages(leaf)?;
+        }
+        let target = arena
+            .alloc_slice_copy(&target[..leaves.len().min(MAX_WRITE_MEMBERS)])
+            .map_err(|_| arena_full())?;
+        Ok(Some(Self {
+            target,
+            source: source.map(pages).transpose()?,
+        }))
+    }
+}
+
+/// The pages of a scan of `(pages, local)` that read `counts`' rows: every
+/// page when it read them all, its first when it stopped at the first row.
+fn full_scan_pages(
+    (pages, local): (u64, bool),
+    first_only: bool,
+) -> crate::sql::query::instrument::BufferUsage {
+    let read = if first_only { pages.min(1) } else { pages };
+    crate::sql::query::instrument::BufferUsage::accessed(local, read, 0)
 }
 
 /// Records what a `MERGE`'s scans and its join's inner node did, as
@@ -87957,10 +88075,13 @@ fn record_merge_scans<Definition0: crate::storage::DefinitionBacking>(
                 counts
             };
             node.add_counted(counts.passed, counts.removed);
+            if let Some(source) = scans.pages.and_then(|pages| pages.source) {
+                node.add_buffers(full_scan_pages(source, first_only));
+            }
             return;
         }
         let mut done = false;
-        for (&leaf, &member_counts) in scans.leaves.iter().zip(scans.target) {
+        for (at, (&leaf, &member_counts)) in scans.leaves.iter().zip(scans.target).enumerate() {
             if done {
                 break;
             }
@@ -87974,6 +88095,14 @@ fn record_merge_scans<Definition0: crate::storage::DefinitionBacking>(
             let _member = member.start();
             member.add_counted(counts.passed, counts.removed);
             node.add_counted(counts.passed, counts.removed);
+            if let Some(&pages) = scans.pages.and_then(|pages| pages.target.get(at)) {
+                let usage = full_scan_pages(pages, first_only && done);
+                if member.measured() {
+                    member.add_buffers(usage);
+                } else {
+                    node.add_buffers(usage);
+                }
+            }
         }
     };
     if outer_runs {
@@ -89160,6 +89289,13 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                 )),
                 description,
             )?;
+            crate::sql::query::write_buffers::row_inserted(
+                storage,
+                txn.txid,
+                row_target.table(),
+                &row_arr[..def.n_columns],
+                arena,
+            )?;
             store_row(
                 storage,
                 txn,
@@ -89580,13 +89716,22 @@ where
                     Ok(false) => return Ok(Ok(false)),
                     Err(error) => return Ok(Err(error)),
                 }
-            } else if let Err(error) = store_row(
+            } else if let Err(error) = crate::sql::query::write_buffers::row_inserted(
                 storage,
-                txn,
-                row_target,
-                row.stored(),
+                txn.txid,
+                row_target.table(),
                 &values[..definition.n_columns],
-            ) {
+                arena,
+            )
+            .and_then(|()| {
+                store_row(
+                    storage,
+                    txn,
+                    row_target,
+                    row.stored(),
+                    &values[..definition.n_columns],
+                )
+            }) {
                 return Ok(Err(error));
             }
             if let Err(error) = fire_partition_row_triggers(
@@ -95881,6 +96026,28 @@ pub(crate) fn update<'a>(
                     Err(error) => return sql_fail(error),
                 }
             }
+            let counted = if target_table == row_table {
+                crate::sql::query::write_buffers::encoded_row_updated(
+                    storage,
+                    txn.txid,
+                    row_table,
+                    rowid,
+                    &physical_old[..row_definition.n_columns],
+                    new_bytes,
+                    arena,
+                )
+            } else {
+                crate::sql::query::write_buffers::encoded_row_inserted(
+                    storage,
+                    txn.txid,
+                    target_table,
+                    new_bytes,
+                    arena,
+                )
+            };
+            if let Err(error) = counted {
+                return sql_fail(error);
+            }
             let new_image = match storage.heap.append_image(new_bytes) {
                 Ok(x) => x,
                 Err(e) => return sql_fail(e),
@@ -97249,6 +97416,11 @@ pub(crate) fn delete<'a>(
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(error) => return sql_fail(error),
+            }
+            if let Err(error) =
+                crate::sql::query::write_buffers::row_deleted(storage, txn.txid, row_table, arena)
+            {
+                return sql_fail(error);
             }
             match txn.write_row(
                 storage,
@@ -107855,7 +108027,29 @@ pub(super) fn collect_matches<'a>(
         }
         let layout = images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
+        let pages = target_scan_pages(
+            storage,
+            leaf,
+            txid,
+            if member_orders.is_some() {
+                member_order
+            } else {
+                chosen
+            },
+            if member_orders.is_some() {
+                (member, true)
+            } else {
+                (scan, false)
+            },
+            arena,
+        )?;
+        // A scan through an index reaches the rows its search finds; a
+        // condition only the change loop checks reaches them all.
+        let reached_all = pages.is_some_and(|pages| pages.sequential || access.is_some());
         let mut visit = |rowid, loc: crate::storage::VisibleRowHome| {
+            if reached_all && let Some(pages) = pages {
+                pages.reach(rowid);
+            }
             storage.record_relation_tuple_read(
                 txid,
                 leaf,
@@ -107892,6 +108086,9 @@ pub(super) fn collect_matches<'a>(
                             error
                         )
                     })?;
+                if !reached_all && let Some(pages) = pages {
+                    pages.reach(rowid);
+                }
                 // A candidate counts when the change loop qualifies it.
                 if selection == DmlSelection::Qualified {
                     scan.row();
@@ -107933,6 +108130,101 @@ pub(super) fn collect_matches<'a>(
     images.finish()
 }
 
+/// How `EXPLAIN (ANALYZE, BUFFERS)` counts the pages of a write's scan of
+/// its target: the heap pages of the rows it reaches, and the index pages
+/// its search reads.
+#[derive(Clone, Copy)]
+struct TargetScanPages<'a> {
+    node: crate::sql::query::instrument::Node,
+    /// The `Bitmap Index Scan` under a bitmap heap scan.
+    bitmap: crate::sql::query::instrument::Node,
+    sequential: bool,
+    heap: &'a [(u64, u64)],
+}
+
+impl TargetScanPages<'_> {
+    /// Counts the scan's reaching the row `rowid`.
+    fn reach(self, rowid: u64) {
+        if self.sequential {
+            self.node.examined();
+        } else {
+            self.node.index_entry();
+            self.bitmap.index_entry();
+        }
+        if let Ok(at) = self.heap.binary_search_by_key(&rowid, |&(row, _)| row) {
+            self.node.heap_page(self.heap[at].1);
+        }
+    }
+}
+
+/// The page counts of the scan `node` of the write target's leaf `leaf` (a
+/// `member` of its tree) by `order` (a sequential scan when `None`), when
+/// the analyzed statement counts buffers.
+fn target_scan_pages<'a>(
+    storage: &Storage,
+    leaf: usize,
+    txid: u32,
+    order: Option<WriteScanOrder>,
+    (node, member): (crate::sql::query::instrument::Node, bool),
+    arena: &'a Arena,
+) -> Result<Option<TargetScanPages<'a>>, SqlError> {
+    use crate::sql::query::index_paths::ScanKind;
+    use crate::sql::query::instrument;
+    if !instrument::buffers_counted() || !node.measured() {
+        return Ok(None);
+    }
+    let (heap, relation_pages) = instrument::heap_pages(storage, leaf, txid, arena)?;
+    let kind = order.map_or(ScanKind::Seq, |order| order.kind);
+    let index = order.and_then(|order| order.index_pages);
+    let model = instrument::PageModel {
+        local: storage.table_def(leaf, txid).persistence
+            == crate::storage::RelationPersistence::Temporary,
+        relation_pages,
+        rows: heap.len() as u64,
+        index: None,
+        sequential: kind == ScanKind::Seq,
+        visibility_map: false,
+    };
+    let bitmap = match kind {
+        ScanKind::Seq => {
+            node.page_model(model);
+            instrument::Node::NONE
+        }
+        ScanKind::Index | ScanKind::IndexOnly => {
+            let Some(index) = index else {
+                return Ok(None);
+            };
+            node.page_model(instrument::PageModel {
+                index: Some(index),
+                ..model
+            });
+            instrument::Node::NONE
+        }
+        ScanKind::Bitmap => {
+            let Some(index) = index else {
+                return Ok(None);
+            };
+            node.page_model(model);
+            let bitmap = instrument::node(if member {
+                instrument::Role::MemberBitmapIndex(0, u32::try_from(leaf).unwrap_or(u32::MAX))
+            } else {
+                instrument::Role::BitmapIndex(0)
+            });
+            bitmap.page_model(instrument::PageModel {
+                index: Some(index),
+                ..model
+            });
+            bitmap
+        }
+    };
+    Ok(Some(TargetScanPages {
+        node,
+        bitmap,
+        sequential: kind == ScanKind::Seq,
+        heap,
+    }))
+}
+
 /// The order an `UPDATE` or `DELETE` changes its target's rows in: the kind
 /// of the scan PostgreSQL's costs chose and, for an index scan, its keys.
 #[derive(Clone, Copy)]
@@ -107944,6 +108236,9 @@ struct WriteScanOrder {
     deduplicated: bool,
     /// The index, whose expression keys the order evaluates.
     index_name: crate::util::StackStr<64>,
+    /// The pages an index scan's search reads, or a bitmap heap scan's
+    /// single bitmap index scan's.
+    index_pages: Option<crate::sql::query::index_paths::IndexPages>,
 }
 
 impl WriteScanOrder {
@@ -107962,6 +108257,24 @@ impl WriteScanOrder {
             backward: path.backward,
             deduplicated: path.deduplicated,
             index_name: path.index_name,
+            index_pages: match (path.kind, path.bitmap) {
+                (
+                    crate::sql::query::index_paths::ScanKind::Index
+                    | crate::sql::query::index_paths::ScanKind::IndexOnly,
+                    _,
+                ) => Some(path.index_pages),
+                (
+                    crate::sql::query::index_paths::ScanKind::Bitmap,
+                    [
+                        crate::sql::query::index_paths::BitmapPlanNode {
+                            kind:
+                                crate::sql::query::index_paths::BitmapPlanKind::Index { pages, .. },
+                            ..
+                        },
+                    ],
+                ) => Some(*pages),
+                _ => None,
+            },
         }
     }
 }
@@ -109047,6 +109360,7 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
             source_rows,
             source_def: &source_definition,
             source_members: MergeSourceMembers::NONE,
+            pages: JoinedWritePages::of(storage, txid, leaves, Some(source_slot), arena)?,
         });
         let join = instrument::node(Role::Join(1));
         if join.measured() {

@@ -2178,10 +2178,8 @@ impl<'r, 'a> Runner<'r, 'a> {
         let modeled = self.model.rels[rel];
         let scan = modeled.scan(self.storage, self.txid, path, self.params, self.arena)?;
         let slot = self.scope.slots[rel];
-        let (heap, relation_pages) = super::instrument::heap_pages(slot, self.arena, |arena| {
-            super::scan::heap_pages_of_rows(self.storage, slot, self.txid, arena)
-                .map(|(rows, pages)| (&*rows, pages))
-        })?;
+        let (heap, relation_pages) =
+            super::instrument::heap_pages(self.storage, slot, self.txid, self.arena)?;
         Ok(LazyPages {
             rel,
             model: super::instrument::PageModel {

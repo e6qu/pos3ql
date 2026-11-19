@@ -8865,9 +8865,7 @@ fn chosen_scan_counts<'a>(
     let buffers = instrument::buffers_counted();
     let (pages, page_count, visible_pages) =
         if buffers || matches!(path.kind, ScanKind::Bitmap | ScanKind::IndexOnly) {
-            let (pages, page_count) = instrument::heap_pages(slot, arena, |arena| {
-                heap_pages_of_rows(storage, slot, txid, arena).map(|(rows, pages)| (&*rows, pages))
-            })?;
+            let (pages, page_count) = instrument::heap_pages(storage, slot, txid, arena)?;
             let statistics = storage.table_statistics(slot, txid);
             let activity = storage.relation_cumulative_statistics(slot);
             // The visibility map keeps the pages VACUUM set that no later
@@ -9069,18 +9067,15 @@ pub(crate) fn index_key_order<'a>(
     Ok(order)
 }
 
-/// `(row identity, heap page)` pairs.
-pub(super) type RowPages<'a> = &'a mut [(u64, u64)];
-
 /// The heap page of each visible row of the table in `slot`, sorted by row
-/// identity, and the table's pages, which a bitmap scan's page bits need:
-/// the map lives in `arena`'s persistent tail.
+/// identity, each page's free space and the packing past the last row: the
+/// map lives in `arena`'s persistent tail.
 pub(super) fn heap_pages_of_rows<'a>(
     storage: &Storage,
     slot: usize,
     txid: u32,
     arena: &'a Arena,
-) -> Result<(RowPages<'a>, u64), SqlError> {
+) -> Result<instrument::HeapLayout<'a>, SqlError> {
     let definition = storage.table_def(slot, txid);
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     let n_columns = definition.schema(&mut schema);
@@ -9090,12 +9085,17 @@ pub(super) fn heap_pages_of_rows<'a>(
     let pages = arena
         .alloc_persistent_slice_with(count, |_| (0u64, 0u64))
         .map_err(|_| arena_full())?;
+    // A page holds at least one row.
+    let free = arena
+        .alloc_persistent_slice_with(count, |_| 0u16)
+        .map_err(|_| arena_full())?;
     let mut packing = crate::storage::heap_layout::HeapPacking::new();
     let mut filled = 0usize;
     let mut place = |rowid: u64, values: &[Datum<'_>]| {
         let page = packing.add(crate::storage::heap_layout::tuple_length(values, schema));
         if filled < pages.len() {
             pages[filled] = (rowid, page);
+            free[page as usize] = u16::try_from(packing.free()).unwrap_or(u16::MAX);
             filled += 1;
         }
     };
@@ -9127,7 +9127,12 @@ pub(super) fn heap_pages_of_rows<'a>(
     drop(scan);
     let pages = &mut pages[..filled];
     pages.sort_unstable_by_key(|&(rowid, _)| rowid);
-    Ok((pages, packing.pages()))
+    let used = packing.pages() as usize;
+    Ok(instrument::HeapLayout {
+        rows: pages,
+        free: &mut free[..used],
+        packing,
+    })
 }
 
 /// Counts a complete joined row the scan's `WHERE` checked at its leaf: the

@@ -201,6 +201,10 @@ pub(crate) struct NodeCounters {
     pub(crate) buffers: BufferUsage,
     /// A page model counted the node's pages.
     pub(crate) paged: bool,
+    /// The node wrote rows the page model does not cover.
+    pub(crate) unmodeled: bool,
+    /// The rows an `INSERT ... ON CONFLICT` found conflicting.
+    pub(crate) conflicts: u64,
 }
 
 /// Page accesses in PostgreSQL's `BufferUsage` terms, each page the 8 kB
@@ -1229,6 +1233,8 @@ impl Slot {
                     temp_written: 0,
                 },
                 paged: false,
+                unmodeled: false,
+                conflicts: 0,
             },
             open: 0,
             started: None,
@@ -1309,7 +1315,10 @@ struct Registry {
     buffers: bool,
     /// Tables' heap page maps, built once per statement for the scans
     /// that count pages (see [`heap_pages`]).
-    heap_pages: [Option<HeapPages>; HEAP_PAGE_TABLES],
+    heap_pages: [Option<HeldHeap>; HEAP_PAGE_TABLES],
+    /// The nodes with an open loop, innermost last, whose work a page
+    /// access no node counts itself belongs to.
+    open: [Option<NonNull<Slot>>; OPEN_NODES],
     /// For a statement rewrite rules turn into several queries, the
     /// position of the next query to run.
     next_query: Option<u16>,
@@ -1404,6 +1413,7 @@ fn install<R>(
         timing,
         buffers,
         heap_pages: [None; HEAP_PAGE_TABLES],
+        open: [None; OPEN_NODES],
         next_query,
         attempt: 0,
         reruns: 0,
@@ -1444,6 +1454,7 @@ pub(crate) fn restart() {
     registry.attempt = registry.attempt.wrapping_add(1);
     // A later attempt may run in a fresh workspace.
     registry.heap_pages = [None; HEAP_PAGE_TABLES];
+    registry.open = [None; OPEN_NODES];
     if registry.next_query.is_some() {
         registry.next_query = Some(0);
     }
@@ -1528,53 +1539,172 @@ pub(crate) fn active() -> bool {
 /// The tables whose heap page maps one analyzed statement keeps.
 const HEAP_PAGE_TABLES: usize = 16;
 
+/// The nested open loops whose nodes [`page_accessed`] can count; deeper
+/// loops count in the innermost one tracked.
+const OPEN_NODES: usize = 64;
+
+/// Tracks `slot`'s loop as the innermost open one (`opened`), or no longer
+/// open.
+fn track_open(slot: NonNull<Slot>, opened: bool) {
+    let Some(mut registry) = ACTIVE.with(Cell::get) else {
+        return;
+    };
+    // SAFETY: see `node`; nothing else borrows the registry here.
+    let open = &mut unsafe { registry.as_mut() }.open;
+    if opened {
+        if let Some(free) = open.iter_mut().find(|held| held.is_none()) {
+            *free = Some(slot);
+        }
+        return;
+    }
+    if let Some(at) = open.iter().rposition(|held| *held == Some(slot)) {
+        open.copy_within(at + 1.., at);
+        open[OPEN_NODES - 1] = None;
+    }
+}
+
+/// Counts an access of one page of a relation no scan node reads (a
+/// sequence's, as `nextval` reads it): PostgreSQL counts it in the node
+/// whose expression made it, the innermost running node, else the
+/// statement's `ModifyTable`.
+pub(crate) fn page_accessed(local: bool) {
+    let Some(registry) = ACTIVE.with(Cell::get) else {
+        return;
+    };
+    // SAFETY: see `node`; the registry outlives its installation.
+    let registry = unsafe { registry.as_ref() };
+    if !registry.buffers {
+        return;
+    }
+    let usage = BufferUsage::accessed(local, 1, 0);
+    match registry.open.iter().rev().flatten().next() {
+        Some(&slot) => Node {
+            slot: Some(slot),
+            timing: registry.timing,
+            attempt: registry.attempt,
+        }
+        .add_buffers(usage),
+        None => node(Role::Modify).add_buffers(usage),
+    }
+}
+
 /// A table's `(row identity, heap page)` pairs sorted by identity, and its
 /// heap pages.
 pub(crate) type HeapPageMap<'a> = (&'a [(u64, u64)], u64);
 
-/// A [`HeapPageMap`] the analyzed statement keeps for the table in `slot`.
-#[derive(Clone, Copy)]
-struct HeapPages {
-    slot: usize,
-    rows: NonNull<[(u64, u64)]>,
-    pages: u64,
+/// A table's modeled heap layout: each visible row's page, sorted by row
+/// identity, each page's free bytes and the packing past the last row.
+pub(crate) struct HeapLayout<'a> {
+    pub(crate) rows: &'a mut [(u64, u64)],
+    pub(crate) free: &'a mut [u16],
+    pub(crate) packing: crate::storage::heap_layout::HeapPacking,
 }
 
-/// The heap page map of the table in `slot`, built by `build` in the
-/// persistent tail of the statement's owning `arena` the first time a scan
-/// of the analyzed statement asks for it, so a scan run once per outer row
-/// does not build it again.
-pub(crate) fn heap_pages<'a, E>(
+/// The heap layout the analyzed statement keeps for the table in `slot`,
+/// as its first read found it, and the state its writes changed.
+#[derive(Clone, Copy)]
+pub(crate) struct HeldHeap {
     slot: usize,
-    arena: &'a crate::mem::arena::Arena,
-    build: impl FnOnce(&'a crate::mem::arena::Arena) -> Result<HeapPageMap<'a>, E>,
-) -> Result<HeapPageMap<'a>, E> {
+    rows: NonNull<[(u64, u64)]>,
+    /// The table's pages when the statement first read them, which its
+    /// scans read.
+    pages: u64,
+    /// Each page's free bytes, which the statement's updates use up.
+    free: NonNull<[u16]>,
+    /// The packing past the last row, which the statement's new tuples
+    /// continue.
+    pub(crate) packing: crate::storage::heap_layout::HeapPacking,
+    /// The table's indexes as its writes descend them, once read.
+    pub(crate) indexes: Option<super::write_buffers::WriteIndexes>,
+}
+
+impl HeldHeap {
+    /// The rows the statement's first read saw.
+    pub(crate) fn rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The page of the row `rowid`, when the statement's first read saw it.
+    pub(crate) fn page_of(&self, rowid: u64) -> Option<u64> {
+        // SAFETY: the map lives in the owning arena's persistent tail, which
+        // no front rewind reclaims and which outlives the statement's
+        // analysis; a restarted attempt forgets it.
+        let rows = unsafe { self.rows.as_ref() };
+        rows.binary_search_by_key(&rowid, |&(row, _)| row)
+            .ok()
+            .map(|at| rows[at].1)
+    }
+
+    /// The free bytes of page `page`, which `take` uses up when they fit
+    /// it; `false` when they do not.
+    pub(crate) fn take_free(&mut self, page: u64, take: usize) -> bool {
+        // SAFETY: see `page_of`; nothing else borrows the free bytes.
+        let free = unsafe { self.free.as_mut() };
+        let Some(free) = free.get_mut(page as usize) else {
+            return false;
+        };
+        if usize::from(*free) < take {
+            return false;
+        }
+        *free -= take as u16;
+        true
+    }
+}
+
+/// The heap layout of the table in `slot`, built in the persistent tail of
+/// the statement's owning `arena` the first time the analyzed statement
+/// reads or writes the table, so a scan run once per outer row does not
+/// build it again, then `visit`ed.
+pub(crate) fn held_heap<R>(
+    storage: &crate::storage::Storage,
+    slot: usize,
+    txid: u32,
+    arena: &crate::mem::arena::Arena,
+    visit: impl FnOnce(&mut HeldHeap) -> R,
+) -> Result<R, crate::sql::SqlError> {
+    let build = |arena| -> Result<HeldHeap, crate::sql::SqlError> {
+        let layout = super::scan::heap_pages_of_rows(storage, slot, txid, arena)?;
+        Ok(HeldHeap {
+            slot,
+            pages: layout.packing.pages(),
+            rows: NonNull::from(layout.rows),
+            free: NonNull::from(layout.free),
+            packing: layout.packing,
+            indexes: None,
+        })
+    };
     let Some(mut registry) = ACTIVE.with(Cell::get) else {
-        return build(arena);
+        return Ok(visit(&mut build(arena)?));
     };
     // SAFETY: see `node`; nothing else borrows the registry here.
     let registry = unsafe { registry.as_mut() };
     if let Some(held) = registry
         .heap_pages
-        .iter()
+        .iter_mut()
         .flatten()
         .find(|held| held.slot == slot)
     {
-        // SAFETY: the map lives in the owning arena's persistent tail,
-        // which no front rewind reclaims and which outlives the statement's
-        // analysis; a restarted attempt forgets it.
-        return Ok((unsafe { held.rows.as_ref() }, held.pages));
+        return Ok(visit(held));
     }
-    let owner = arena.retention_owner();
-    let (rows, pages) = build(owner)?;
+    let mut held = build(arena)?;
+    let result = visit(&mut held);
     if let Some(free) = registry.heap_pages.iter_mut().find(|held| held.is_none()) {
-        *free = Some(HeapPages {
-            slot,
-            rows: NonNull::from(rows),
-            pages,
-        });
+        *free = Some(held);
     }
-    Ok((rows, pages))
+    Ok(result)
+}
+
+/// The heap page map of the table in `slot` (see [`held_heap`]).
+pub(crate) fn heap_pages<'a>(
+    storage: &crate::storage::Storage,
+    slot: usize,
+    txid: u32,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<HeapPageMap<'a>, crate::sql::SqlError> {
+    held_heap(storage, slot, txid, arena, |held| {
+        // SAFETY: see `HeldHeap::page_of`.
+        (unsafe { held.rows.as_ref() }, held.pages)
+    })
 }
 
 /// Whether the analyzed statement counts the pages its scans access.
@@ -1708,13 +1838,18 @@ impl Node {
     }
 
     fn begin(self) {
+        let mut opened = false;
         self.with(|slot, timing| {
             slot.open += 1;
             if slot.open == 1 {
                 slot.started = timing.then(std::time::Instant::now);
                 slot.first_row = None;
+                opened = true;
             }
         });
+        if let Some(slot) = self.slot.filter(|_| opened) {
+            track_open(slot, true);
+        }
     }
 
     /// The loops the node has finished.
@@ -1992,6 +2127,25 @@ impl Node {
         });
     }
 
+    /// Adds page accesses the node made outside a page model's scan: a
+    /// write's, or a sequence's.
+    pub(crate) fn add_buffers(self, usage: BufferUsage) {
+        self.with(|slot, _| {
+            slot.counters.buffers = slot.counters.buffers.plus(usage);
+            slot.counters.paged = true;
+        });
+    }
+
+    /// Counts a row an `INSERT ... ON CONFLICT` found conflicting.
+    pub(crate) fn conflicted(self) {
+        self.with(|slot, _| slot.counters.conflicts = slot.counters.conflicts.saturating_add(1));
+    }
+
+    /// Marks the node as having written rows the page model does not cover.
+    pub(crate) fn unmodeled(self) {
+        self.with(|slot, _| slot.counters.unmodeled = true);
+    }
+
     /// Counts a read of heap page `page`, unless it is the page the scan
     /// read last.
     pub(crate) fn heap_page(self, page: u64) {
@@ -2080,11 +2234,13 @@ impl Node {
     }
 
     fn end_step(self) {
+        let mut closed = false;
         self.with(|slot, _| {
             slot.open = slot.open.saturating_sub(1);
             if slot.open != 0 {
                 return;
             }
+            closed = true;
             slot.end_page_loop();
             let first = slot.counters.loops == 0;
             slot.counters.loops = 1;
@@ -2096,9 +2252,13 @@ impl Node {
                 }
             }
         });
+        if let Some(slot) = self.slot.filter(|_| closed) {
+            track_open(slot, false);
+        }
     }
 
     fn end(self) {
+        let mut closed = false;
         self.with(|slot, _| {
             // A loop a rerun's restart closed does not count again.
             if slot.open == 0 {
@@ -2108,6 +2268,7 @@ impl Node {
             if slot.open != 0 {
                 return;
             }
+            closed = true;
             slot.end_page_loop();
             slot.counters.loops += 1;
             if let Some(started) = slot.started.take() {
@@ -2119,6 +2280,9 @@ impl Node {
                     .saturating_add(slot.first_row.take().unwrap_or(total));
             }
         });
+        if let Some(slot) = self.slot.filter(|_| closed) {
+            track_open(slot, false);
+        }
     }
 }
 

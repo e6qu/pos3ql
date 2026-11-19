@@ -2773,6 +2773,58 @@ fn grow_slots<'a, T: Copy>(
     Ok(bigger)
 }
 
+/// The rows a spilling window query reads, in the same order on every
+/// pass: a join PostgreSQL's join search plans runs that plan, as the
+/// in-memory path's does, so `EXPLAIN ANALYZE` counts its nodes; one
+/// relation's scan is the windows' own.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+fn external_window_source<'a>(
+    statement: &'a Select<'a>,
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    scan_where: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    pax_columns: super::PaxReadDemand,
+    visit: &mut dyn FnMut(&super::scan::JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
+    if scope.n > 1 {
+        super::join_exec::scan_statement_source(
+            statement,
+            true,
+            storage,
+            scope,
+            from,
+            txid,
+            scan_where,
+            arena,
+            params,
+            hooks,
+            outer,
+            pax_columns,
+            visit,
+        )
+    } else {
+        scan_source_recycling_with_pax_columns(
+            storage,
+            scope,
+            from,
+            txid,
+            scan_where,
+            arena,
+            params,
+            hooks,
+            outer,
+            pax_columns,
+            visit,
+        )
+    }
+}
+
 /// Spill-mode window execution: sorts the source by (PARTITION BY, ORDER BY)
 /// per window call, computes each partition's values against a resident
 /// decoded copy, then re-scans the source to project every row with its
@@ -2899,7 +2951,8 @@ pub(crate) fn external_window_into<'a>(
         // PostgreSQL reads the source once: the first window's scan is the
         // plan's, the others' and the projection's rescans are not.
         let _rescan = (wi > 0).then(instrument::suspend);
-        scan_source_recycling_with_pax_columns(
+        external_window_source(
+            statement,
             storage,
             scope,
             from,
@@ -3213,7 +3266,8 @@ pub(crate) fn external_window_into<'a>(
         .map_err(|_| arena_full())?;
     let mut position = 0i64;
     let rescan = instrument::suspend();
-    scan_source_recycling_with_pax_columns(
+    external_window_source(
+        statement,
         storage,
         scope,
         from,

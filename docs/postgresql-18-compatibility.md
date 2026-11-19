@@ -1280,10 +1280,25 @@ appears (structured formats show the `Planning` counters as zero), and
 sending rows under `SERIALIZE` reads none either. `EXPLAIN (BUFFERS)`
 without `ANALYZE` prints no node counts, as in PostgreSQL. The numbers
 therefore differ from PostgreSQL's, whose counts depend on its buffer
-cache, but they appear on the same nodes. Writes (`INSERT`, `UPDATE`,
-`DELETE`, `MERGE`), scans on a path that does not count pages, and hash
-joins that run in batches fail `EXPLAIN ANALYZE` with `0A000` while
-`BUFFERS` is on; `EXPLAIN (ANALYZE, BUFFERS OFF)` runs them.
+cache, but they appear on the same nodes.
+
+A write's `Insert`, `Update`, `Delete` or `Merge` node counts the pages its
+rows change, with its scan's. For example, inserting one row into a table
+with a two-level primary key index prints `Buffers: shared hit=3`: the
+table's last page and the index's two levels. A row that does not fit the
+last page adds a page, counted as `dirtied` and `written`, as is a new index
+page. An update reads its old row twice and keeps the new version on the
+same page while it has room; an update that changes an indexed column, or
+moves the row, inserts into every index. A delete reads its row's page once.
+`nextval` counts its sequence's page in the node that calls it, as
+PostgreSQL does. pos3ql treats existing pages as already dirty, as they stay
+in PostgreSQL's buffer cache between checkpoints, so only new pages are
+`dirtied`.
+
+A write into a table with an index other than a plain btree on columns (an
+expression, partial or non-btree index), scans on a path that does not count
+pages, and hash joins that run in batches fail `EXPLAIN ANALYZE` with
+`0A000` while `BUFFERS` is on; `EXPLAIN (ANALYZE, BUFFERS OFF)` runs them.
 
 ### Planner settings
 

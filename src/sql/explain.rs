@@ -525,6 +525,36 @@ pub(super) struct Plan<'a> {
     /// The plan methods enabled while planning, which mark nodes that had
     /// to use a disabled one.
     methods: crate::sql::guc::PlannerMethods,
+    /// An `INSERT ... ON CONFLICT`'s resolution.
+    conflict: Option<&'a Conflict>,
+}
+
+/// The most arbiter indexes an `ON CONFLICT` explains.
+const MAX_ARBITERS: usize = 8;
+
+/// An `INSERT ... ON CONFLICT`'s resolution (`show_modifytable_info`): its
+/// action and the unique indexes that arbitrate it, in OID order.
+#[derive(Clone, Copy)]
+struct Conflict {
+    update: bool,
+    arbiters: [StackStr<64>; MAX_ARBITERS],
+    count: usize,
+}
+
+impl Conflict {
+    fn arbiters(&self) -> impl Iterator<Item = &str> {
+        self.arbiters[..self.count].iter().map(StackStr::as_str)
+    }
+
+    /// The conflict's analyzed outcome: the rows the insertion path
+    /// inserted and those that conflicted, from the rows the write's input
+    /// returned.
+    fn tuples(plan: &Plan<'_>) -> Option<(u64, u64)> {
+        let measured = plan.measured?;
+        let input = (1..plan.count).find(|&at| !plan.nodes[at].target_member)?;
+        let conflicts = measured[0].conflicts;
+        Some((measured[input].rows.saturating_sub(conflicts), conflicts))
+    }
 }
 
 impl<'a> Plan<'a> {
@@ -538,6 +568,7 @@ impl<'a> Plan<'a> {
             measured: None,
             planning_micros: 0,
             methods: crate::sql::guc::planner_methods(),
+            conflict: None,
         })
     }
 
@@ -11637,6 +11668,92 @@ fn write_initplans<'a, 'e>(
     Ok(planned.into_mut_slice().map_err(|_| arena_full())?)
 }
 
+/// The resolution of `on_conflict` on the table in `slot`: the unique
+/// indexes `infer_arbiter_indexes` picks, in OID order.
+fn conflict_resolution(
+    storage: &Storage,
+    txid: u32,
+    slot: usize,
+    on_conflict: &crate::sql::ast::OnConflict<'_>,
+) -> Result<Conflict, SqlError> {
+    let unsupported = |what: &str| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of INSERT ... ON CONFLICT with {} is not supported",
+            what
+        )
+    };
+    if on_conflict.target_where.is_some() {
+        return Err(unsupported("a WHERE on its conflict target"));
+    }
+    if on_conflict.update_where.is_some() {
+        return Err(unsupported("a WHERE on DO UPDATE"));
+    }
+    if on_conflict
+        .target
+        .iter()
+        .any(|target| target.column.is_none())
+    {
+        return Err(unsupported("an expression in its conflict target"));
+    }
+    let definition = storage.table_def(slot, txid);
+    let mut wanted = 0u64;
+    for target in on_conflict.target {
+        let column = target
+            .column
+            .and_then(|name| definition.column_index(name))
+            .filter(|&column| column < 64)
+            .ok_or_else(|| unsupported("a conflict target column past the 64th"))?;
+        wanted |= 1 << column;
+    }
+    drop(definition);
+    let mut found = [(0i32, StackStr::<64>::new()); MAX_ARBITERS];
+    let mut count = 0;
+    let mut overflow = false;
+    crate::sql::catalog::planner_indexes(storage, txid, slot, &mut |index| {
+        let keys = &index.columns[..index.n_cols];
+        let mut columns = 0u64;
+        for &column in keys {
+            if column < 64 {
+                columns |= 1 << column;
+            }
+        }
+        let arbitrates = match on_conflict.constraint {
+            Some(name) => index.name.as_str() == name,
+            None => {
+                !on_conflict.target.is_empty()
+                    && index.unique
+                    && index.immediate
+                    && !index.partial
+                    && !index.expression_keys[..index.n_cols].iter().any(|&key| key)
+                    && keys.len() == on_conflict.target.len()
+                    && columns == wanted
+            }
+        };
+        if arbitrates {
+            match found.get_mut(count) {
+                Some(entry) => *entry = (index.oid, index.name),
+                None => overflow = true,
+            }
+            count += 1;
+        }
+    });
+    if overflow {
+        return Err(unsupported("more than 8 arbiter indexes"));
+    }
+    let found = &mut found[..count];
+    found.sort_unstable_by_key(|&(oid, _)| oid as u32);
+    let mut arbiters = [StackStr::new(); MAX_ARBITERS];
+    for (arbiter, (_, name)) in arbiters.iter_mut().zip(found.iter()) {
+        *arbiter = *name;
+    }
+    Ok(Conflict {
+        update: on_conflict.update.is_some(),
+        arbiters,
+        count,
+    })
+}
+
 /// [`plan_modification`] of the write itself, its subqueries planned.
 fn plan_write<'a>(
     storage: &Storage,
@@ -11733,6 +11850,13 @@ fn plan_write<'a>(
             }
     };
     let mut plan = Plan::new(arena, capacity)?;
+    if let Stmt::Insert(insert) = statement
+        && let Some(on_conflict) = &insert.on_conflict
+        && let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
+    {
+        let conflict = conflict_resolution(storage, txid, slot, on_conflict)?;
+        plan.conflict = Some(&*arena.alloc(conflict).map_err(|_| arena_full())?);
+    }
     let mut name = StackStr::new();
     let _ = write!(name, "{verb}");
     let target_node = PlanNode {
@@ -14348,6 +14472,92 @@ fn emit_text(
     responder.command_complete("EXPLAIN")
 }
 
+/// The `Buffers` and, for the top node, `WAL` lines of the node at `index`.
+fn node_usage_text<E>(
+    plan: &Plan<'_>,
+    index: usize,
+    options: ExplainOptions,
+    actual: Option<ExplainActual>,
+    emit: &mut impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
+    let node = &plan.nodes[index];
+    let executed = !matches!(plan.actual(index, actual), NodeActual::NeverExecuted);
+    if options.buffers && actual.is_some() && executed {
+        let usage = plan.buffers(index);
+        if !usage.is_zero() {
+            emit(buffers_text(node_indent(node), usage).as_str())?;
+        }
+    }
+    if index == 0
+        && options.wal
+        && let Some(actual) = actual
+        && actual.wal_records > 0
+    {
+        let mut wal = StackStr::<512>::new();
+        let _ = write!(
+            wal,
+            "  WAL: records={} fpi=0 bytes={}",
+            actual.wal_records, actual.wal_bytes
+        );
+        emit(wal.as_str())?;
+    }
+    Ok(())
+}
+
+/// The lines of a write's top node after its result relations
+/// (`show_modifytable_info`), before the node at `next`: an `ON CONFLICT`'s
+/// resolution and outcome, a `MERGE`'s outcome, then its buffers and WAL.
+fn write_tail_text<E>(
+    plan: &Plan<'_>,
+    next: usize,
+    options: ExplainOptions,
+    actual: Option<ExplainActual>,
+    emit: &mut impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
+    let indent = node_indent(&plan.nodes[0]);
+    let line = |text: core::fmt::Arguments<'_>| {
+        let mut line = StackStr::<768>::new();
+        for _ in 0..indent {
+            let _ = write!(line, " ");
+        }
+        let _ = line.write_fmt(text);
+        line
+    };
+    if let Some(conflict) = plan.conflict {
+        let action = if conflict.update { "UPDATE" } else { "NOTHING" };
+        emit(line(format_args!("Conflict Resolution: {action}")).as_str())?;
+        if conflict.count > 0 {
+            let mut names = StackStr::<640>::new();
+            for (at, name) in conflict.arbiters().enumerate() {
+                let _ = write!(names, "{}{name}", if at == 0 { "" } else { ", " });
+            }
+            emit(line(format_args!("Conflict Arbiter Indexes: {}", names.as_str())).as_str())?;
+        }
+        if let Some((inserted, conflicting)) = Conflict::tuples(plan) {
+            emit(line(format_args!("Tuples Inserted: {inserted}")).as_str())?;
+            emit(line(format_args!("Conflicting Tuples: {conflicting}")).as_str())?;
+        }
+    }
+    if let Some(tuples) = plan.merge_tuples(next)
+        && tuples.total > 0
+    {
+        let mut text = StackStr::<256>::new();
+        let _ = write!(text, "Tuples:");
+        for (label, count) in [
+            ("inserted", tuples.inserted),
+            ("updated", tuples.updated),
+            ("deleted", tuples.deleted),
+            ("skipped", tuples.skipped),
+        ] {
+            if count > 0 {
+                let _ = write!(text, " {label}={count}");
+            }
+        }
+        emit(line(format_args!("{}", text.as_str())).as_str())?;
+    }
+    node_usage_text(plan, 0, options, actual, emit)
+}
+
 pub(super) fn visit_text_rows<E>(
     plan: &Plan<'_>,
     options: ExplainOptions,
@@ -14355,30 +14565,18 @@ pub(super) fn visit_text_rows<E>(
     settings: &PlannerSettings,
     mut emit: impl FnMut(&str) -> Result<(), E>,
 ) -> Result<(), E> {
+    let write = plan.count > 0 && writes(&plan.nodes[0]);
+    let mut tail_written = false;
     for (index, node) in plan.nodes[..plan.count].iter().enumerate() {
-        // A `MERGE`'s outcome follows its result relations.
-        if index > 0
+        // A write's resolution and outcome follow its result relations, and
+        // its buffers and WAL follow them.
+        if write
+            && index > 0
             && !node.target_member
             && plan.nodes[1..index].iter().all(|node| node.target_member)
-            && let Some(tuples) = plan.merge_tuples(index)
-            && tuples.total > 0
         {
-            let mut line = StackStr::<256>::new();
-            for _ in 0..node_indent(&plan.nodes[0]) {
-                let _ = write!(line, " ");
-            }
-            let _ = write!(line, "Tuples:");
-            for (label, count) in [
-                ("inserted", tuples.inserted),
-                ("updated", tuples.updated),
-                ("deleted", tuples.deleted),
-                ("skipped", tuples.skipped),
-            ] {
-                if count > 0 {
-                    let _ = write!(line, " {label}={count}");
-                }
-            }
-            emit(line.as_str())?;
+            write_tail_text(plan, index, options, actual, &mut emit)?;
+            tail_written = true;
         }
         if node.target_member {
             let mut line = StackStr::<512>::new();
@@ -14715,25 +14913,8 @@ pub(super) fn visit_text_rows<E>(
             let _ = write!(filter, "One-Time Filter: false");
             emit(filter.as_str())?;
         }
-        if options.buffers && actual.is_some() && !matches!(node_actual, NodeActual::NeverExecuted)
-        {
-            let usage = plan.buffers(index);
-            if !usage.is_zero() {
-                emit(buffers_text(node_indent(node), usage).as_str())?;
-            }
-        }
-        if index == 0
-            && options.wal
-            && let Some(actual) = actual
-            && actual.wal_records > 0
-        {
-            let mut wal = StackStr::<512>::new();
-            let _ = write!(
-                wal,
-                "  WAL: records={} fpi=0 bytes={}",
-                actual.wal_records, actual.wal_bytes
-            );
-            emit(wal.as_str())?;
+        if !(write && index == 0) {
+            node_usage_text(plan, index, options, actual, &mut emit)?;
         }
         if let Some(removed) = node.subplans_removed.filter(|removed| *removed > 0) {
             let mut line = StackStr::<128>::new();
@@ -14743,6 +14924,9 @@ pub(super) fn visit_text_rows<E>(
             let _ = write!(line, "Subplans Removed: {removed}");
             emit(line.as_str())?;
         }
+    }
+    if write && !tail_written {
+        write_tail_text(plan, plan.count, options, actual, &mut emit)?;
     }
     if options.settings && !settings.entries().is_empty() {
         // Holds every reported setting at its longest shown value.
@@ -15819,6 +16003,21 @@ fn structured_node(
     }
     // A `MERGE`'s outcome, inside its result relations' group.
     if at == 0
+        && let Some(conflict) = plan.conflict
+    {
+        document.text(
+            "Conflict Resolution",
+            if conflict.update { "UPDATE" } else { "NOTHING" },
+        );
+        if conflict.count > 0 {
+            document.list("Conflict Arbiter Indexes", conflict.arbiters());
+        }
+        if let Some((inserted, conflicting)) = Conflict::tuples(plan) {
+            document.number("Tuples Inserted", inserted);
+            document.number("Conflicting Tuples", conflicting);
+        }
+    }
+    if at == 0
         && let Some(tuples) = plan.merge_tuples(members_end)
     {
         tuples.properties(&mut |label, count| document.number(label, count));
@@ -16144,10 +16343,10 @@ fn render_document<'a>(
 }
 
 /// Rejects `BUFFERS` (on by default under `ANALYZE`) of a plan whose scan
-/// or write of a relation ran on a path that does not count its pages, or
-/// whose hash join ran in batches, whose work files are not sized, rather
-/// than print a plan missing their `Buffers` lines. A write counts its
-/// pages even when the executor does not count its loops.
+/// ran on a path that does not count its pages, whose write changed rows
+/// the page model does not cover, or whose hash join ran in batches, whose
+/// work files are not sized, rather than print a plan missing their
+/// `Buffers` lines.
 fn buffers_counted(
     nodes: &[PlanNode],
     counters: &[NodeCounters],
@@ -16157,8 +16356,12 @@ fn buffers_counted(
         return Ok(());
     }
     for (node, counters) in nodes.iter().zip(counters) {
-        let ran = counters.loops != 0 || writes(node);
-        if ran && !node.target_member && !counters.paged && accesses_pages(node) {
+        let unpaged = if writes(node) {
+            counters.unmodeled
+        } else {
+            counters.loops != 0 && !node.target_member && !counters.paged && accesses_pages(node)
+        };
+        if unpaged {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "EXPLAIN ANALYZE cannot count the buffers of node \"{}\"",
@@ -16184,7 +16387,7 @@ fn writes(node: &PlanNode) -> bool {
     matches!(node.name.as_str(), "Insert" | "Update" | "Delete" | "Merge")
 }
 
-/// Whether `node` reads or writes a relation's pages.
+/// Whether `node` reads a relation's pages.
 fn accesses_pages(node: &PlanNode) -> bool {
     let name = node.name.as_str();
     matches!(
@@ -16195,10 +16398,6 @@ fn accesses_pages(node: &PlanNode) -> bool {
             | "Tid Scan"
             | "Tid Range Scan"
             | "Sample Scan"
-            | "Insert"
-            | "Update"
-            | "Delete"
-            | "Merge"
     ) || name.starts_with("Index Scan")
         || name.starts_with("Index Only Scan")
 }

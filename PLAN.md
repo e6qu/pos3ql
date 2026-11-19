@@ -1085,9 +1085,36 @@ btree layout (`heap_layout`, and `btree_size`'s leaf pages, whose
 sizing the index-sizing work owns), a hit unless reaching it took
 a block the RAM cache missed, local for a temporary table, temp for an
 external sort's or spilled store's work files (`differential_exact/936`).
-Remaining: writes' `dirtied` and `written` pages (`0A000` under
-`BUFFERS`), scans on paths that keep no page model (`0A000`), and hash
-joins run in batches (`0A000`: their work files are not sized). Windows over a join the search plans read its plan's rows,
+A write's `ModifyTable` node counts its target scan's pages and the pages
+its rows change on the same layouts: an inserted tuple's last page (two more
+when it extends the table, the new page dirtied and written), an update's
+two accesses of the old version and an insertion's for a version its page
+has no room for, a delete's one, one access per level of each btree index
+an insertion descends (a split leaf's new page dirtied and written), an
+`ON CONFLICT` arbiter's descent, and a `nextval` that reads its sequence's
+page in the node evaluating it; pages already in a table count as dirty
+since their last write (`differential_exact/939`). A write the model does
+not cover (an index that is not a plain btree of columns, a foreign target)
+fails with `0A000` under `BUFFERS`. A `MERGE` and an `UPDATE ... FROM` or
+`DELETE ... USING` count each full scan of their target and stored source.
+Remaining: scans of the old multi-relation executor and of subplans that keep
+no page model (`0A000`), and hash joins run in batches (`0A000`: their work
+files are not sized). An `INSERT ... ON CONFLICT` prints its resolution,
+arbiter indexes and, analyzed, its inserted and conflicting tuples
+(`differential_exact/940`); a conflict target's `WHERE`, a `DO UPDATE ...
+WHERE` (`Conflict Filter`) and an expression target fail `EXPLAIN` with
+`0A000`. A `LIMIT` over a `GroupAggregate` over a join reads the whole join
+rather than stopping after its last group, and a merge join over an input
+in order without a sort fails `EXPLAIN ANALYZE` with `0A000`. An
+uncorrelated scalar subquery's `min` or `max` is planned as an `Aggregate`
+over its scan rather than as `preprocess_minmax_aggregates`' InitPlans, and
+an `INSERT ... SELECT`'s InitPlans print under its source scan rather than
+under the `Insert` node. An error a PL/pgSQL `FOR ... IN EXECUTE` query
+raises while it runs (a unique violation, an `EXPLAIN ANALYZE`'s error)
+carries a `SQL statement` context line, which PostgreSQL prints only for
+errors raised while the query is planned (`_SPI_error_callback` is not
+installed around a cursor's fetches). Windows over a join the search plans read its plan's rows, also when
+the statement spills their input to object storage,
 so `EXPLAIN ANALYZE` counts its nodes (`differential_exact/935`); windows
 over a join it does not plan (a window function in the `ORDER BY`) fail
 `EXPLAIN` with `0A000` rather than print pos3ql's join order, and
@@ -1387,7 +1414,8 @@ startup (`index_other_operands_eval_cost`) (`differential_exact/783`).
 `min` and `max` of the columns of one plain table are explained as
 PostgreSQL's `preprocess_minmax_aggregates` plans them: each an InitPlan
 reading the first row of the index scan ordered by its column with nulls
-excluded, when those scans cost less than the aggregate
+excluded (no `IS NOT NULL` for a validated NOT NULL column,
+`restriction_is_always_true`), when those scans cost less than the aggregate
 (`differential_exact/791`). Execution runs those InitPlans, and a nested
 query's `ORDER BY ... LIMIT` over a scan returning rows in its order stops
 at the limit as PostgreSQL's `Limit` does, so `EXPLAIN ANALYZE` counts one

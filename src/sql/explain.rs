@@ -6733,6 +6733,21 @@ fn plan_pulled_select<'a>(
             "EXPLAIN of a parenthesized join PostgreSQL's join search does not plan here is not supported"
         ));
     }
+    // PostgreSQL may cache a LATERAL subquery's rows per outer value in a
+    // `Memoize` node, which only the join search plans.
+    if modeled.is_none()
+        && crate::sql::guc::planner_value("enable_memoize") != 0.0
+        && statement.from.as_ref().is_some_and(|from| {
+            core::iter::once(&from.base)
+                .chain(from.joins.iter().map(|join| &join.table))
+                .any(|table| table.lateral && table.subquery.is_some())
+        })
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a LATERAL subquery PostgreSQL may memoize is not supported"
+        ));
+    }
     // Windows over a join the join search does not plan would print
     // pos3ql's own join order and sorts.
     if modeled.is_none() && scope.as_ref().is_some_and(|scope| scope.n > 1) && has_window(statement)

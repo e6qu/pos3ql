@@ -1040,6 +1040,36 @@ fn sublinks_registered(expression: &Expr<'_>, correlated: bool) -> bool {
 
 /// Calls `visit` with each subquery of `expression` outside other
 /// subqueries, in written order.
+/// Whether `node` is one of the `AND`ed conditions of `condition`.
+fn where_conjunct(condition: &Expr<'_>, node: &Expr<'_>) -> bool {
+    if core::ptr::eq(condition, node) {
+        return true;
+    }
+    match condition {
+        Expr::Binary {
+            operator: crate::sql::ast::BinaryOp::And,
+            left,
+            right,
+            ..
+        } => where_conjunct(left, node) || where_conjunct(right, node),
+        _ => false,
+    }
+}
+
+/// Whether `expression` reads a column (a subquery's own columns are not
+/// its children).
+fn mentions_column(expression: &Expr<'_>) -> bool {
+    if matches!(expression, Expr::Column { .. }) {
+        return true;
+    }
+    let mut found = false;
+    let _ = query::walk_children(expression, &mut |child| {
+        found |= mentions_column(child);
+        Ok(())
+    });
+    found
+}
+
 fn visit_sublinks<'e>(expression: &'e Expr<'e>, visit: &mut dyn FnMut(&'e Expr<'e>)) {
     if matches!(
         expression,
@@ -5989,6 +6019,30 @@ fn plan_sublinks<'a>(
             continue;
         };
         let correlated = query::subquery_node_correlated(node, storage, txid, arena)?;
+        if origin == SublinkOrigin::Where
+            && statement
+                .where_clause
+                .is_some_and(|condition| where_conjunct(condition, node))
+            && let Some((operand, any)) = match node {
+                Expr::InSubquery {
+                    operand, negated, ..
+                } => Some((*operand, !negated)),
+                Expr::QuantifiedSubquery { operand, all, .. } => Some((*operand, !all)),
+                _ => None,
+            }
+        {
+            let columns = mentions_column(operand);
+            // `convert_ANY_sublink_to_join` joins the subquery; a test of no
+            // column gates the query from a `Result` (`One-Time Filter`).
+            if !columns
+                || (any && !query::expression_contains_volatile(operand, storage, txid, false))
+            {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN of an IN, ANY or ALL subquery PostgreSQL joins or gates the query with is not supported"
+                ));
+            }
+        }
         let outer_slot =
             relation.and_then(|(_, schema, table)| relation_slot(storage, txid, schema, table));
         if correlated && outer_slot.is_none() {

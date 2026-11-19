@@ -1108,8 +1108,15 @@ input at the first row of the group after the last one it takes (a
 `GroupAggregate` reads that group's rows, a `Group` of a `GROUP BY`
 without aggregates, costed by `cost_group`, only its first row), and only
 the groups it reads are filtered and projected (`differential_exact/941`).
-A merge join over an input in order without a sort fails `EXPLAIN
-ANALYZE` with `0A000`. An uncorrelated subquery's `min` or `max` is
+A merge join reads an index or index-only scan in order as far as it
+fetches, counting that scan's rows and heap fetches
+(`differential_exact/945`); one over another input in order without a sort
+(a filtered index scan, a join) fails `EXPLAIN ANALYZE` with `0A000`. Under
+`BUFFERS`, an index scan read in part counts its leaf pages from the
+index's average entries per leaf, one page more than PostgreSQL's full
+leaves when the scan stops early, and the visibility map counts no page
+all-visible after any change since `VACUUM`, where PostgreSQL clears only
+the changed pages' bits. An uncorrelated subquery's `min` or `max` is
 planned and run as `preprocess_minmax_aggregates`' InitPlans
 (`differential_exact/942`). An `INSERT` whose source PostgreSQL pulls up
 runs the source's InitPlans in its `Insert` node, as it does a `VALUES`
@@ -1118,8 +1125,10 @@ columns; a value coerced while the query runs leaves its cost unmodeled
 (`0A000` when costs print), as does a subquery in `ON CONFLICT`
 (`differential_exact/943`). A PL/pgSQL `FOR` loop over a query names it in
 an error's context only when the error is raised planning it
-(`differential_exact/944`). An `IN` over an aggregating subquery is a
-hashed SubPlan rather than PostgreSQL's join of the subquery's one row.
+(`differential_exact/944`). An `IN` or `= ANY` condition of the `WHERE` list over a subquery
+the search does not join, and an `IN`, `ANY` or `ALL` test reading no
+column, fail `EXPLAIN` with `0A000`, since PostgreSQL joins the subquery
+(`convert_ANY_sublink_to_join`) or gates the query with the test.
 Windows over a join the search plans read its plan's rows, also when
 the statement spills their input to object storage,
 so `EXPLAIN ANALYZE` counts its nodes (`differential_exact/935`); windows

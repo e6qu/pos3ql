@@ -793,6 +793,11 @@ struct LazyPages<'a> {
     model: super::instrument::PageModel,
     /// `(row identity, heap page)` sorted by identity.
     heap: &'a [(u64, u64)],
+    /// An index-only scan's all-visible pages, which precede the others:
+    /// a row on a later page is a heap fetch.
+    visible: Option<u64>,
+    /// `BUFFERS` counts the pages.
+    buffers: bool,
 }
 
 impl MergeInput<'_> {
@@ -804,13 +809,30 @@ impl MergeInput<'_> {
             let _scan = lazy.start();
             lazy.rows(fetched as u64);
             if let Some(pages) = self.pages {
-                lazy.page_model(pages.model);
+                if pages.buffers {
+                    lazy.page_model(pages.model);
+                }
                 for row in &self.rows[..fetched.min(self.rows.len())] {
-                    lazy.index_entry();
-                    if let Some(rowid) = row[pages.rel].and_then(|row| row.rowid)
-                        && let Ok(at) = pages.heap.binary_search_by_key(&rowid, |&(id, _)| id)
-                    {
-                        lazy.heap_page(pages.heap[at].1);
+                    if pages.buffers {
+                        lazy.index_entry();
+                    }
+                    let Some(rowid) = row[pages.rel].and_then(|row| row.rowid) else {
+                        continue;
+                    };
+                    let Ok(at) = pages.heap.binary_search_by_key(&rowid, |&(id, _)| id) else {
+                        continue;
+                    };
+                    let page = pages.heap[at].1;
+                    match pages.visible {
+                        Some(visible) if page < visible => {}
+                        Some(_) => {
+                            lazy.heap_fetch();
+                            if pages.buffers {
+                                lazy.heap_page(page);
+                            }
+                        }
+                        None if pages.buffers => lazy.heap_page(page),
+                        None => {}
                     }
                 }
             }
@@ -2147,8 +2169,10 @@ impl<'r, 'a> Runner<'r, 'a> {
             PathKind::Scan { rel, path } if self.counts_lazily(usize::from(rel), path)? => {
                 let rel = usize::from(rel);
                 let _block = super::instrument::enter_block(self.block.child(scan_segment(rel)));
-                if super::instrument::buffers_counted() {
-                    pages = Some(self.lazy_pages(rel, path)?);
+                let buffers = super::instrument::buffers_counted();
+                let lazy_pages = self.lazy_pages(rel, path, buffers)?;
+                if buffers || lazy_pages.visible.is_some() {
+                    pages = Some(lazy_pages);
                 }
                 Some(super::instrument::node(super::instrument::Role::Scan(0)))
             }
@@ -2174,12 +2198,41 @@ impl<'r, 'a> Runner<'r, 'a> {
 
     /// How the index scan of `rel` by its path `path`, read in part by a
     /// merge join, counts its pages.
-    fn lazy_pages(&self, rel: usize, path: u16) -> Result<LazyPages<'a>, SqlError> {
+    fn lazy_pages(&self, rel: usize, path: u16, buffers: bool) -> Result<LazyPages<'a>, SqlError> {
         let modeled = self.model.rels[rel];
         let scan = modeled.scan(self.storage, self.txid, path, self.params, self.arena)?;
         let slot = self.scope.slots[rel];
+        let index_only = scan.path.kind == super::index_paths::ScanKind::IndexOnly;
+        if !buffers && !index_only {
+            return Ok(LazyPages {
+                rel,
+                model: super::instrument::PageModel {
+                    local: false,
+                    relation_pages: 0,
+                    rows: 0,
+                    index: None,
+                    sequential: false,
+                    visibility_map: false,
+                },
+                heap: &[],
+                visible: None,
+                buffers,
+            });
+        }
         let (heap, relation_pages) =
             super::instrument::heap_pages(self.storage, slot, self.txid, self.arena)?;
+        // The visibility map keeps the pages VACUUM set that no later change
+        // touched.
+        let visible = index_only.then(|| {
+            if self.storage.relation_cumulative_statistics(slot).n_dead_tup != 0 {
+                0
+            } else {
+                self.storage
+                    .table_statistics(slot, self.txid)
+                    .relation_all_visible_pages()
+                    .max(0) as u64
+            }
+        });
         Ok(LazyPages {
             rel,
             model: super::instrument::PageModel {
@@ -2189,14 +2242,17 @@ impl<'r, 'a> Runner<'r, 'a> {
                 rows: heap.len() as u64,
                 index: Some(scan.path.index_pages),
                 sequential: false,
-                visibility_map: false,
+                visibility_map: visible.is_some_and(|visible| visible > 0),
             },
             heap,
+            visible,
+            buffers,
         })
     }
 
-    /// Whether the join can count an index scan of `rel` read in part: a
-    /// plain index scan without a filter, whose rows are each one fetch.
+    /// Whether the join can count an index scan of `rel` read in part: an
+    /// index or index-only scan without a filter, whose rows are each one
+    /// fetch.
     fn counts_lazily(&self, rel: usize, path: u16) -> Result<bool, SqlError> {
         let modeled = self.model.rels[rel];
         let scan = modeled.scan(self.storage, self.txid, path, self.params, self.arena)?;
@@ -2206,8 +2262,10 @@ impl<'r, 'a> Runner<'r, 'a> {
             super::plan::flatten_and(restriction, &mut parts, &mut count);
             count
         });
-        Ok(scan.path.kind == super::index_paths::ScanKind::Index
-            && scan.path.absorbed.len() == conjuncts)
+        Ok(matches!(
+            scan.path.kind,
+            super::index_paths::ScanKind::Index | super::index_paths::ScanKind::IndexOnly
+        ) && scan.path.absorbed.len() == conjuncts)
     }
 
     /// A `Memoize` node (`ExecMemoize`): the rows of its input for the bound

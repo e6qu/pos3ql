@@ -526,7 +526,7 @@ pub(super) struct Plan<'a> {
     /// to use a disabled one.
     methods: crate::sql::guc::PlannerMethods,
     /// An `INSERT ... ON CONFLICT`'s resolution.
-    conflict: Option<Conflict>,
+    conflict: Option<&'a Conflict>,
 }
 
 /// The most arbiter indexes an `ON CONFLICT` explains.
@@ -11854,7 +11854,8 @@ fn plan_write<'a>(
         && let Some(on_conflict) = &insert.on_conflict
         && let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
     {
-        plan.conflict = Some(conflict_resolution(storage, txid, slot, on_conflict)?);
+        let conflict = conflict_resolution(storage, txid, slot, on_conflict)?;
+        plan.conflict = Some(&*arena.alloc(conflict).map_err(|_| arena_full())?);
     }
     let mut name = StackStr::new();
     let _ = write!(name, "{verb}");

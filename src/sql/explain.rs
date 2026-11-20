@@ -15,6 +15,7 @@ use crate::sql::ast::{
 };
 use crate::sql::eval::{ColumnLookup, SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
+use crate::sql::query::index_paths::clamp_row_est;
 use crate::sql::query::index_paths::joins::Relids;
 use crate::sql::query::instrument::{
     BlockId, BufferUsage, HashColumns, NodeCounters, NodeKey, Role, Segment, Slot,
@@ -69,7 +70,7 @@ struct PlanNode {
     depth: u8,
     startup_cost: f64,
     total_cost: f64,
-    rows: u64,
+    rows: f64,
     width: u32,
     object_requests: u64,
     cache_blocks: u64,
@@ -124,7 +125,7 @@ struct PlanNode {
     inner_unique: bool,
     /// A bitmap heap scan's index scan cost and rows, when the planner
     /// costed it.
-    bitmap_index_estimate: Option<(f64, u64)>,
+    bitmap_index_estimate: Option<(f64, f64)>,
     /// Why `EXPLAIN ANALYZE` cannot count this node as PostgreSQL does.
     analyze_unsupported: Option<&'static str>,
     /// The partitions a hash aggregate expects to spill its groups to,
@@ -155,6 +156,8 @@ impl SubplanKind {
 
 /// The longest remote query an EXPLAIN node holds.
 const REMOTE_SQL_BYTES: usize = 2_048;
+/// A printed estimate: `%.2f` of the largest double takes 312 bytes.
+const NUMBER_BYTES: usize = 320;
 
 /// `text` as a node's `Remote SQL`, which must fit it whole.
 fn remote_sql_text(text: &str) -> Result<StackStr<REMOTE_SQL_BYTES>, SqlError> {
@@ -287,7 +290,7 @@ impl PlanNode {
     /// A `HashAggregate` keeping distinct rows (no transition states) of
     /// `groups` estimated groups over its key columns: its memory sizing,
     /// or `EXPLAIN ANALYZE`'s refusal past the modelled key columns.
-    fn with_distinct_hash(mut self, groups: u64, width: u32) -> Self {
+    fn with_distinct_hash(mut self, groups: f64, width: u32) -> Self {
         if self.name.as_str() != "HashAggregate" {
             return self;
         }
@@ -300,7 +303,7 @@ impl PlanNode {
             .count();
         self.hash_agg = query::index_paths::hash_agg_sizing(
             &query::index_paths::AggregateCosts::default(),
-            groups as f64,
+            groups,
             f64::from(width),
             columns,
         );
@@ -418,7 +421,7 @@ impl PlanNode {
         depth: 0,
         startup_cost: 0.0,
         total_cost: 0.0,
-        rows: 0,
+        rows: 0.0,
         width: 0,
         object_requests: 0,
         cache_blocks: 0,
@@ -725,8 +728,7 @@ impl<'a> Plan<'a> {
                         .qualifications()
                         .any(|(label, _)| label == QualLabel::Filter)
                 {
-                    counters.filtered = node
-                        .rows
+                    counters.filtered = (node.rows as u64)
                         .saturating_mul(counters.loops)
                         .saturating_sub(counters.rows);
                 }
@@ -940,7 +942,7 @@ fn subplan_cost(
 ) -> (f64, f64) {
     use crate::sql::catalog::deparse::SublinkPlan;
     let operator = crate::sql::guc::planner_value("cpu_operator_cost");
-    let rows = clamp_row_estimate(top.rows as f64);
+    let rows = clamp_row_est(top.rows);
     // `cost_qual_eval` of the test expression: one operator per compared
     // column.
     let compared = match node {
@@ -956,13 +958,13 @@ fn subplan_cost(
     let mut per_tuple = compared * operator;
     match plan {
         SublinkPlan::InitPlan(_) => return (0.0, 0.0),
-        SublinkPlan::HashedSubPlan(_) => startup += top.total_cost + operator * top.rows as f64,
+        SublinkPlan::HashedSubPlan(_) => startup += top.total_cost + operator * top.rows,
         SublinkPlan::SubPlan(_) => {
             let run = top.total_cost - top.startup_cost;
             per_tuple += match node {
                 Expr::Exists(_) => run / rows,
                 Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } => {
-                    0.5 * run + 0.5 * top.rows as f64 * operator
+                    0.5 * run + 0.5 * top.rows * operator
                 }
                 _ => run,
             };
@@ -3353,7 +3355,7 @@ fn push_members(
             depth: scan.depth,
             shift: scan.shift,
             key: scan.key,
-            rows: 0,
+            rows: 0.0,
             width: scan.width,
             output: scan.output,
             output_unprintable: scan.output_unprintable,
@@ -3457,7 +3459,7 @@ fn push_members(
         let mut node = member(leaf, alias.as_str())?;
         node.depth = scan.depth + 1;
         node.key = member_key(leaf);
-        node.rows = scan.rows.div_ceil(planned.len() as u64);
+        node.rows = (scan.rows / planned.len() as f64).ceil();
         node.total_cost = scan.total_cost / planned.len() as f64;
         plan.push(node)?;
     }
@@ -3532,7 +3534,7 @@ fn push_tree_members(
                 }),
                 startup_cost: startup,
                 total_cost: total,
-                rows: path.rows as u64,
+                rows: path.rows,
                 width: path.width,
                 keys,
                 ..PlanNode::EMPTY
@@ -3544,7 +3546,7 @@ fn push_tree_members(
         node.key = key;
         node.startup_cost = path.startup_cost;
         node.total_cost = path.total_cost;
-        node.rows = path.rows as u64;
+        node.rows = path.rows;
         node.width = path.width;
         let mut name = StackStr::new();
         match path.kind {
@@ -3572,7 +3574,7 @@ fn push_tree_members(
                     node.bitmap_index = index_name;
                 }
                 node.bitmap_index_estimate = match path.bitmap {
-                    [only] => Some((only.total_cost, only.rows as u64)),
+                    [only] => Some((only.total_cost, only.rows)),
                     _ => None,
                 };
             }
@@ -3946,7 +3948,7 @@ fn push_bitmap_tree_keyed(
                     BitmapPlanKind::And | BitmapPlanKind::Or => node.total_cost,
                 },
                 total_cost: node.total_cost,
-                rows: node.rows as u64,
+                rows: node.rows,
                 ..PlanNode::EMPTY
             }
             .with_qual(QualLabel::IndexCond, plain)
@@ -5072,11 +5074,6 @@ fn expression_statistics_selectivity(
 const CPU_TUPLE_COST: f64 = 0.01;
 const CPU_OPERATOR_COST: f64 = 0.0025;
 
-/// `clamp_row_est`.
-fn clamp_row_estimate(rows: f64) -> f64 {
-    if rows <= 1.0 { 1.0 } else { rows.round() }
-}
-
 /// The operators and function calls PostgreSQL's `cost_qual_eval` charges
 /// `cpu_operator_cost` each for when it evaluates `expression`.
 fn qual_operators(expression: Option<&Expr<'_>>) -> f64 {
@@ -5176,7 +5173,7 @@ fn costed_relation<'a>(
         let tuples = storage.planning_row_estimate(slot) as f64;
         // The rows a condition keeps, which PostgreSQL's statistics
         // estimate closely for an analyzed table.
-        let rows = clamp_row_estimate(match condition {
+        let rows = clamp_row_est(match condition {
             None => tuples,
             Some(condition) => {
                 match crate::sql::exec::relation_rows_kept(
@@ -5207,11 +5204,11 @@ fn costed_relation<'a>(
             // statistics: the relation's rows when fewer than
             // `DEFAULT_NUM_DISTINCT`, otherwise that default.
             let Some(column) = column else {
-                let values = (tuples < 200.0).then(|| clamp_row_estimate(tuples));
+                let values = (tuples < 200.0).then(|| clamp_row_est(tuples));
                 *distinct = match (*distinct, values) {
                     (Some(sum), Some(values)) => Some(
                         sum + if tuples > 0.0 && rows < tuples {
-                            clamp_row_estimate(values * rows / tuples)
+                            clamp_row_est(values * rows / tuples)
                         } else {
                             values
                         },
@@ -5238,7 +5235,7 @@ fn costed_relation<'a>(
             // `estimate_hash_bucketsize` scales the distinct values by the
             // fraction of rows the scan keeps.
             let scaled = if tuples > 0.0 && rows < tuples {
-                clamp_row_estimate(values * rows / tuples)
+                clamp_row_est(values * rows / tuples)
             } else {
                 values
             };
@@ -5358,12 +5355,8 @@ pub(crate) fn joined_write_shape<'a>(
         let total = startup
             + outer.total
             + CPU_OPERATOR_COST * keys * outer.rows
-            + CPU_OPERATOR_COST
-                * keys
-                * outer.rows
-                * clamp_row_estimate(inner.rows * fraction)
-                * 0.5
-            + (CPU_TUPLE_COST + filter) * clamp_row_estimate(matches);
+            + CPU_OPERATOR_COST * keys * outer.rows * clamp_row_est(inner.rows * fraction) * 0.5
+            + (CPU_TUPLE_COST + filter) * clamp_row_est(matches);
         (startup, total)
     };
     // The paths in the order `add_paths_to_joinrel` generates them: the
@@ -5612,11 +5605,11 @@ fn chosen_scan_node<'a>(
         depth,
         startup_cost: path.startup_cost,
         total_cost: path.total_cost,
-        rows: path.rows as u64,
+        rows: path.rows,
         width: path.width,
         schema,
         bitmap_index_estimate: match path.bitmap {
-            [node] => Some((node.total_cost, node.rows as u64)),
+            [node] => Some((node.total_cost, node.rows)),
             _ => None,
         },
         // An index scan that searches an array, or bridges a key column
@@ -5789,7 +5782,7 @@ fn scan_node<'a>(
         depth,
         startup_cost: 0.0,
         total_cost: io_cost + cpu_cost,
-        rows: output_rows,
+        rows: output_rows as f64,
         width,
         object_requests,
         cache_blocks,
@@ -5970,8 +5963,7 @@ impl Sublink<'_> {
     fn initplan_cost(&self) -> f64 {
         let top = &self.nodes[0];
         if self.exists {
-            top.startup_cost
-                + (top.total_cost - top.startup_cost) / clamp_row_estimate(top.rows as f64)
+            top.startup_cost + (top.total_cost - top.startup_cost) / clamp_row_est(top.rows)
         } else {
             top.total_cost
         }
@@ -6221,7 +6213,7 @@ fn plan_sublinks<'a>(
                         total_cost: nodes[0].total_cost
                             + 2.0
                                 * crate::sql::guc::planner_value("cpu_operator_cost")
-                                * nodes[0].rows as f64,
+                                * nodes[0].rows,
                         rows: nodes[0].rows,
                         width: nodes[0].width,
                         output: nodes[0].output,
@@ -6368,7 +6360,7 @@ fn plan_recursive_union<'a>(
     plan.push(PlanNode {
         name: StackStr::from_str("Recursive Union"),
         key: Some(NodeKey::new(block, Role::SetOperation(0))),
-        rows: base.nodes[0].rows.saturating_mul(10),
+        rows: base.nodes[0].rows * 10.0,
         width: base.nodes[0].width,
         total_cost: base.nodes[0].total_cost + recursive.nodes[0].total_cost * 10.0,
         ..PlanNode::EMPTY
@@ -6933,7 +6925,7 @@ fn plan_pulled_select<'a>(
                 )),
                 startup_cost: chosen.startup,
                 total_cost: chosen.total,
-                rows: chosen.rows as u64,
+                rows: chosen.rows,
                 width: chosen.width as u32,
                 // A `Unique` names no keys.
                 keys: if unique { PlanKeys::NONE } else { group_keys },
@@ -6963,7 +6955,7 @@ fn plan_pulled_select<'a>(
                     key: Some(NodeKey::new(block, Role::GroupSort)),
                     startup_cost: startup,
                     total_cost: total,
-                    rows: chosen.input.rows as u64,
+                    rows: chosen.input.rows,
                     width: model.output_width as u32,
                     keys: plan_keys(
                         storage,
@@ -7375,7 +7367,7 @@ fn plan_pulled_select<'a>(
                 chosen_scan,
             )?;
             scan_indexes[table] = index;
-            estimated_rows = estimated_rows.saturating_mul(scan.rows.max(1));
+            estimated_rows = estimated_rows.saturating_mul((scan.rows as u64).max(1));
             total_cost += scan.total_cost;
             object_requests = object_requests.saturating_add(scan.object_requests);
             cache_blocks = cache_blocks.saturating_add(scan.cache_blocks);
@@ -7449,7 +7441,7 @@ fn plan_pulled_select<'a>(
                 name: StackStr::from_str("Result"),
                 key: Some(NodeKey::new(aggregated_block, Role::Result)),
                 total_cost,
-                rows: estimated_rows,
+                rows: estimated_rows as f64,
                 width,
                 ..PlanNode::EMPTY
             }
@@ -7503,7 +7495,7 @@ fn plan_pulled_select<'a>(
                         .map_err(|_| arena_full())?,
                 )),
                 total_cost,
-                rows: estimated_rows,
+                rows: estimated_rows as f64,
                 width,
                 object_requests,
                 cache_blocks,
@@ -7651,7 +7643,7 @@ fn plan_pulled_select<'a>(
                         )?,
                         startup_cost: startup,
                         total_cost: total,
-                        rows: sets.input.rows as u64,
+                        rows: sets.input.rows,
                         width: sets.input.width as u32,
                         object_requests,
                         cache_blocks,
@@ -7696,7 +7688,7 @@ fn plan_pulled_select<'a>(
                     )?,
                     startup_cost: startup,
                     total_cost: total,
-                    rows: grouped.path.rows as u64,
+                    rows: grouped.path.rows,
                     width: grouped.path.width,
                     object_requests,
                     cache_blocks,
@@ -7774,7 +7766,7 @@ fn plan_pulled_select<'a>(
                 },
                 startup_cost: aggregate_startup,
                 total_cost,
-                rows: estimated_rows,
+                rows: estimated_rows as f64,
                 width,
                 object_requests,
                 cache_blocks,
@@ -7847,7 +7839,7 @@ fn plan_pulled_select<'a>(
                 if node.unmodeled_costs {
                     PlanNode {
                         total_cost,
-                        rows: estimated_rows,
+                        rows: estimated_rows as f64,
                         width,
                         object_requests,
                         cache_blocks,
@@ -7871,7 +7863,7 @@ fn plan_pulled_select<'a>(
                 name: StackStr::from_str("ProjectSet"),
                 key: key(Role::ProjectSet),
                 total_cost,
-                rows: estimated_rows,
+                rows: estimated_rows as f64,
                 width,
                 object_requests,
                 cache_blocks,
@@ -8019,7 +8011,7 @@ fn plan_pulled_select<'a>(
                 arena,
             )?,
             total_cost,
-            rows: estimated_rows,
+            rows: estimated_rows as f64,
             width,
             object_requests,
             cache_blocks,
@@ -8031,7 +8023,7 @@ fn plan_pulled_select<'a>(
         {
             node.startup_cost = startup;
             node.total_cost = total;
-            node.rows = path.rows as u64;
+            node.rows = path.rows;
             node.width = windowed_scan
                 .as_ref()
                 .map_or(path.width, |model| model.final_width as u32);
@@ -8047,7 +8039,7 @@ fn plan_pulled_select<'a>(
         {
             node.startup_cost = startup;
             node.total_cost = total;
-            node.rows = sets.rows as u64;
+            node.rows = sets.rows;
         }
         if presorted != 0 {
             let prefix = plan_keys(
@@ -8072,7 +8064,7 @@ fn plan_pulled_select<'a>(
                     name: StackStr::from_str("Result"),
                     key: key(Role::SortedProjection),
                     total_cost,
-                    rows: estimated_rows,
+                    rows: estimated_rows as f64,
                     width,
                     object_requests,
                     cache_blocks,
@@ -8105,7 +8097,7 @@ fn plan_pulled_select<'a>(
                 name: StackStr::from_str("Limit"),
                 key: key(Role::Unique),
                 total_cost,
-                rows: 1,
+                rows: 1.0,
                 width,
                 ..PlanNode::EMPTY
             },
@@ -8179,13 +8171,13 @@ fn plan_pulled_select<'a>(
                     None => PlanKeys::NONE,
                 },
                 total_cost,
-                rows: estimated_rows,
+                rows: estimated_rows as f64,
                 width,
                 object_requests,
                 cache_blocks,
                 ..PlanNode::EMPTY
             }
-            .with_distinct_hash(groups_estimate.unwrap_or(estimated_rows), width),
+            .with_distinct_hash(groups_estimate.unwrap_or(estimated_rows) as f64, width),
         )?;
     }
     // A locking clause locks each row below the limit, as PostgreSQL's
@@ -8203,7 +8195,7 @@ fn plan_pulled_select<'a>(
                 name: StackStr::from_str("LockRows"),
                 key: key(Role::LockRows),
                 total_cost: total_cost + estimated_rows as f64 * 0.01,
-                rows: estimated_rows,
+                rows: estimated_rows as f64,
                 width,
                 object_requests,
                 cache_blocks,
@@ -8243,7 +8235,7 @@ fn plan_pulled_select<'a>(
                     key: key(Role::Limit),
                     startup_cost: startup,
                     total_cost: total,
-                    rows: rows as u64,
+                    rows,
                     width,
                     object_requests,
                     cache_blocks,
@@ -8253,7 +8245,7 @@ fn plan_pulled_select<'a>(
                     name: StackStr::from_str("Limit"),
                     key: key(Role::Limit),
                     total_cost,
-                    rows: estimated_rows,
+                    rows: estimated_rows as f64,
                     width,
                     object_requests,
                     cache_blocks,
@@ -8424,7 +8416,7 @@ fn plan_pulled_select<'a>(
                 stages.copy_within(0..stage_count, 1);
                 stages[0] = PlanNode {
                     name: StackStr::from_str("Result"),
-                    rows: estimated_rows,
+                    rows: estimated_rows as f64,
                     width,
                     total_cost,
                     passthrough: true,
@@ -8773,7 +8765,7 @@ fn plan_pulled_select<'a>(
                 Some(found) => found.scan_join()?,
                 None => widened(output),
             },
-            rows: 0,
+            rows: 0.0,
             width: dummy_width,
             total_cost: 0.0,
             constant_false: true,
@@ -8968,7 +8960,7 @@ fn plan_pulled_select<'a>(
                 && scope.slots[table] != usize::MAX
                 && storage.has_planning_statistics(scope.slots[table])
             {
-                outer_rows = scan.rows;
+                outer_rows = scan.rows as u64;
             }
             // PostgreSQL scans a function in FROM with a `Function Scan`.
             if let Some(source) = statement.from.as_ref().and_then(|from| {
@@ -8997,7 +8989,7 @@ fn plan_pulled_select<'a>(
                 )?;
                 scan.startup_cost = estimate.startup;
                 scan.total_cost = estimate.total;
-                scan.rows = estimate.rows;
+                scan.rows = estimate.rows as f64;
                 scan.width = estimate.width;
                 scan = scan.with_verbose_qual(
                     QualLabel::FunctionCall,
@@ -10181,7 +10173,7 @@ fn window_stages<'e>(
             {
                 sort.startup_cost = startup;
                 sort.total_cost = total;
-                sort.rows = modeled.rows as u64;
+                sort.rows = modeled.rows;
                 sort.width = step.sort_width as u32;
             }
             if presorted != 0 {
@@ -10250,7 +10242,7 @@ fn window_stages<'e>(
             unmodeled_costs: step.is_none(),
             startup_cost: step.map_or(0.0, |(step, _)| step.startup),
             total_cost: step.map_or(0.0, |(step, _)| step.total),
-            rows: modeled.map_or(0, |modeled| modeled.rows as u64),
+            rows: modeled.map_or(0.0, |modeled| modeled.rows),
             width: step.map_or(0, |(step, _)| step.width as u32),
             ..PlanNode::EMPTY
         }
@@ -10468,7 +10460,7 @@ fn foreign_upper_plan<'a>(
             name: StackStr::from_str("Limit"),
             key: Some(NodeKey::new(block, Role::Limit)),
             total_cost: 100.0,
-            rows: 1,
+            rows: 1.0,
             ..PlanNode::EMPTY
         };
         limit.set_output(above);
@@ -10481,7 +10473,7 @@ fn foreign_upper_plan<'a>(
             key: Some(NodeKey::new(block, Role::Sort)),
             depth,
             total_cost: 100.0,
-            rows: 1,
+            rows: 1.0,
             ..PlanNode::EMPTY
         };
         sort.set_output(above);
@@ -10497,7 +10489,7 @@ fn foreign_upper_plan<'a>(
         key: Some(NodeKey::new(block, Role::Scan(0))),
         depth,
         total_cost: 100.0,
-        rows: 1,
+        rows: 1.0,
         relations,
         plain_relations,
         remote_sql: remote_sql_text(pushed.sql)?,
@@ -11304,7 +11296,7 @@ fn physical_scan_node(
         depth,
         startup_cost: 0.0,
         total_cost,
-        rows: output_rows,
+        rows: output_rows as f64,
         width,
         object_requests,
         cache_blocks,
@@ -11367,6 +11359,11 @@ fn push_set_tree(
             let branch = block.child(Segment::Branch(numbers.1));
             numbers.1 = numbers.1.saturating_add(1);
             // A set operation's leaves are subqueries of its statement.
+            // The leaf's planning memory (its join search and plan) is
+            // dropped once its nodes are copied into `plan`, allocated
+            // before it, so a statement of many leaves holds one leaf's
+            // planning at a time.
+            let mark = arena.mark();
             let leaf =
                 in_nested_block(|| plan_select(storage, txid, select, outer, branch, arena))?;
             let root = leaf.nodes[0];
@@ -11375,6 +11372,9 @@ fn push_set_tree(
                 node.depth = node.depth.saturating_add(depth);
                 plan.push(node)?;
             }
+            // SAFETY: plan nodes are values; nothing allocated while the
+            // leaf was planned is read after its nodes are copied.
+            unsafe { arena.rewind_to(mark) };
             Ok(root)
         }
         SetTree::Op {
@@ -11395,7 +11395,7 @@ fn push_set_tree(
                 plan, storage, txid, right, outer, arena, depth, block, numbers, true,
             )?;
             Ok(PlanNode {
-                rows: left.rows.saturating_add(right.rows),
+                rows: left.rows + right.rows,
                 total_cost: left.total_cost + right.total_cost,
                 width: left.width.max(right.width),
                 object_requests: left.object_requests.saturating_add(right.object_requests),
@@ -11456,12 +11456,12 @@ fn push_set_tree(
                 appended,
             )?;
             let rows = match (operator, all) {
-                (SetOp::Union, true) => left.rows.saturating_add(right.rows),
-                (SetOp::Union, false) => left.rows.saturating_add(right.rows).div_ceil(2),
+                (SetOp::Union, true) => left.rows + right.rows,
+                (SetOp::Union, false) => ((left.rows + right.rows) / 2.0).ceil(),
                 (SetOp::Intersect, true) => left.rows.min(right.rows),
-                (SetOp::Intersect, false) => left.rows.min(right.rows).div_ceil(2),
+                (SetOp::Intersect, false) => (left.rows.min(right.rows) / 2.0).ceil(),
                 (SetOp::Except, true) => left.rows,
-                (SetOp::Except, false) => left.rows.div_ceil(2),
+                (SetOp::Except, false) => (left.rows / 2.0).ceil(),
             };
             let name = match (operator, all) {
                 (SetOp::Union, true) => "Append",
@@ -11477,7 +11477,7 @@ fn push_set_tree(
                 output: left.output,
                 depth,
                 startup_cost: 0.0,
-                total_cost: left.total_cost + right.total_cost + rows as f64 * 0.01,
+                total_cost: left.total_cost + right.total_cost + rows * 0.01,
                 rows,
                 width: left.width.max(right.width),
                 object_requests: left.object_requests.saturating_add(right.object_requests),
@@ -11522,7 +11522,7 @@ fn push_set_tree(
             plan.nodes[at] = node;
             if hashed_union {
                 let input = &mut plan.nodes[at + 1];
-                input.rows = left.rows.saturating_add(right.rows);
+                input.rows = left.rows + right.rows;
                 input.width = node.width;
                 input.output = node.output;
                 input.output_unprintable = node.output_unprintable;
@@ -11662,7 +11662,7 @@ fn values_scan(plan: &Plan<'_>, tree: &SetTree<'_>, depth: u8) -> PlanNode {
         output,
         depth,
         total_cost: rows as f64 * 0.0125,
-        rows,
+        rows: rows as f64,
         width: 4 * columns as u32,
         ..PlanNode::EMPTY
     }
@@ -11815,14 +11815,14 @@ pub(super) fn plan_set_query<'a>(
     for at in (0..wrapper_count).rev() {
         let mut node = plan.nodes[at];
         node.rows = if node.name.as_str() == "Limit" {
-            child.rows.min(100)
+            child.rows.min(100.0)
         } else {
             child.rows
         };
         node.width = child.width;
         node.total_cost = child.total_cost
             + if node.name.as_str() == "Sort" {
-                child.rows as f64 * (child.rows.max(2) as f64).log2() * 0.0025
+                child.rows * child.rows.max(2.0).log2() * 0.0025
             } else {
                 0.0
             };
@@ -12371,7 +12371,7 @@ fn plan_write<'a>(
         depth: 0,
         startup_cost: 0.0,
         total_cost: 0.01,
-        rows: 0,
+        rows: 0.0,
         width: 0,
         object_requests: 0,
         cache_blocks: 0,
@@ -12461,7 +12461,7 @@ fn plan_write<'a>(
                 plan.push(PlanNode {
                     name: StackStr::from_str("Result"),
                     depth: 1,
-                    rows: 0,
+                    rows: 0.0,
                     total_cost: 0.0,
                     constant_false: true,
                     ..PlanNode::EMPTY
@@ -12554,7 +12554,7 @@ fn plan_write<'a>(
         );
         target_scan.alias = target_node.alias;
         let mut total_cost = target_scan.total_cost;
-        let mut rows = target_scan.rows.max(1);
+        let mut rows = (target_scan.rows as u64).max(1);
         let mut object_requests = target_scan.object_requests;
         let mut cache_blocks = target_scan.cache_blocks;
         let source_nodes = arena
@@ -12580,7 +12580,7 @@ fn plan_write<'a>(
             )?;
             scan_indexes[table + 1] = index;
             total_cost += node.total_cost;
-            rows = rows.saturating_mul(node.rows.max(1));
+            rows = rows.saturating_mul((node.rows as u64).max(1));
             object_requests = object_requests.saturating_add(node.object_requests);
             cache_blocks = cache_blocks.saturating_add(node.cache_blocks);
             source_nodes[table] = node;
@@ -12742,7 +12742,7 @@ fn plan_write<'a>(
             unmodeled_costs: true,
             depth: top_depth as u8,
             total_cost: total_cost + rows as f64 * 0.01,
-            rows,
+            rows: rows as f64,
             width: target_scan.width,
             object_requests,
             cache_blocks,
@@ -12983,7 +12983,7 @@ fn plan_write<'a>(
             alias: StackStr::from_str(if several { "*VALUES*" } else { "" }),
             key: Some(NodeKey::new(block, Role::Values)),
             depth: 1,
-            rows: insert.rows.len() as u64,
+            rows: insert.rows.len() as f64,
             width: 32,
             total_cost: 0.01,
             unmodeled_costs: true,
@@ -13027,7 +13027,7 @@ fn plan_write<'a>(
                 alias: StackStr::from_str(if several { "*VALUES*" } else { "" }),
                 key: Some(NodeKey::new(block, Role::Values)),
                 depth: 1,
-                rows: insert.rows.len() as u64,
+                rows: insert.rows.len() as f64,
                 width,
                 total_cost,
                 unmodeled_costs,
@@ -13045,7 +13045,7 @@ fn plan_write<'a>(
             PlanNode {
                 name: StackStr::from_str("Result"),
                 depth: 1,
-                rows: 0,
+                rows: 0.0,
                 width: storage
                     .table_statistics(slot, txid)
                     .average_row_width
@@ -13219,7 +13219,7 @@ fn plan_write<'a>(
             name: StackStr::from_str("Subquery Scan"),
             alias: StackStr::from_str(target.name),
             depth: 1,
-            rows: 1_000,
+            rows: 1_000.0,
             width: 32,
             total_cost: 10.0,
             unmodeled_costs: true,
@@ -14236,7 +14236,7 @@ fn plan_merge<'a, 'e>(
             name: StackStr::from_str("Values Scan"),
             alias: StackStr::from_str("*VALUES*"),
             depth: source_depth,
-            rows: source_rows,
+            rows: source_rows as f64,
             total_cost: 0.01,
             ..PlanNode::EMPTY
         },
@@ -14444,7 +14444,7 @@ fn expanded_write<'e>(
     let empty = PlanNode {
         name: StackStr::from_str("Result"),
         depth: 1,
-        rows: 0,
+        rows: 0.0,
         width,
         total_cost: 0.0,
         constant_false: true,
@@ -14517,7 +14517,7 @@ fn expanded_write<'e>(
     if let Some(tree) = tree {
         scan.startup_cost = tree.startup_cost;
         scan.total_cost = tree.total_cost;
-        scan.rows = tree.rows as u64;
+        scan.rows = tree.rows;
         scan.width = tree.width;
     }
     let member_quals = match tree {
@@ -14853,7 +14853,7 @@ fn text_line(node: &PlanNode, options: ExplainOptions, actual: NodeActual) -> St
     if options.costs {
         let _ = write!(
             line,
-            "  (cost={:.2}..{:.2} rows={} width={})",
+            "  (cost={:.2}..{:.2} rows={:.0} width={})",
             node.startup_cost, node.total_cost, node.rows, node.width
         );
     }
@@ -14907,7 +14907,11 @@ impl PostgresHashTable {
         let memory_limit = crate::sql::guc::hash_memory_bytes().min(u64::MAX as f64) as u64;
         let pointers = (memory_limit / 8).clamp(1, MAX_ALLOC_POINTERS);
         let max_pointers = (1u64 << pointers.ilog2()).min(i32::MAX as u64 / 2 + 1);
-        let estimated = if node.rows == 0 { 1000 } else { node.rows };
+        let estimated = if node.rows <= 0.0 {
+            1000
+        } else {
+            node.rows as u64
+        };
         let original = estimated.min(max_pointers).max(1024).next_power_of_two();
         let mut buckets = original;
         // A row inserted while the rows before it outnumber the buckets
@@ -16162,7 +16166,7 @@ impl<'a> Document<'a> {
     }
 
     fn number(&mut self, label: &str, value: impl core::fmt::Display) {
-        let value = stack_format!(48, "{value}");
+        let value = stack_format!(NUMBER_BYTES, "{value}");
         self.property(label, value.as_str(), true);
     }
 
@@ -16493,10 +16497,13 @@ fn structured_node(
     if options.costs {
         document.number(
             "Startup Cost",
-            stack_format!(32, "{:.2}", node.startup_cost),
+            stack_format!(NUMBER_BYTES, "{:.2}", node.startup_cost),
         );
-        document.number("Total Cost", stack_format!(32, "{:.2}", node.total_cost));
-        document.number("Plan Rows", node.rows);
+        document.number(
+            "Total Cost",
+            stack_format!(NUMBER_BYTES, "{:.2}", node.total_cost),
+        );
+        document.number("Plan Rows", stack_format!(NUMBER_BYTES, "{:.0}", node.rows));
         document.number("Plan Width", node.width);
     }
     let full_actual = actual;
@@ -17480,10 +17487,10 @@ mod tests {
 
     #[test]
     fn hash_tables_size_buckets_as_postgresql() {
-        let table = |rows, tuples| {
+        let table = |rows: u64, tuples| {
             PostgresHashTable::of(
                 &PlanNode {
-                    rows,
+                    rows: rows as f64,
                     ..PlanNode::EMPTY
                 },
                 query::instrument::HashTable {

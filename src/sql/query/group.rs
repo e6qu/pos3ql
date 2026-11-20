@@ -511,28 +511,6 @@ pub(super) fn groups_for_mask<'a>(
         }
         (ng, &rep_keys_buf[..ng])
     };
-    if n_keys > 0
-        && let Some(sizing) = aggregate.hash_agg_sizing()
-    {
-        let mut columns = [0usize; crate::sql::parser::MAX_GROUP_TERMS];
-        let mut count = 0;
-        for key in (0..n_keys).filter(|&key| mask.contains(key)) {
-            columns[count] = key;
-            count += 1;
-        }
-        record_hash_agg_memory(
-            aggregate,
-            sizing,
-            &group_of[..row_count],
-            rep_keys,
-            &columns[..count],
-            grouping_sort_is_keys(statement, agg_nodes, mask),
-            storage,
-            txid,
-            arena,
-        )?;
-    }
-
     // Correlated subquery nodes appearing in the select list, HAVING, or the
     // ORDER BY keys re-evaluate per group (their outer references resolve to
     // the group's keys); the rest were WHERE-level and already applied.
@@ -595,6 +573,21 @@ pub(super) fn groups_for_mask<'a>(
             }
         }
     }
+    // A hash aggregate's memory follows what its transition functions
+    // allocate per input row, which the aggregate pass replays.
+    let mut transition_model = match modelled_transitions(
+        statement,
+        agg_nodes,
+        storage,
+        txid,
+        aggregate_columns,
+        arena,
+    )? {
+        Some(modelled) if n_keys > 0 => Some(super::transition_memory::TransitionModel::new(
+            arena, modelled, n_groups, row_count,
+        )?),
+        _ => None,
+    };
     let partial_execution = storage.spill_attached()
         && states[..n_groups * n_aggs]
             .iter()
@@ -688,6 +681,16 @@ pub(super) fn groups_for_mask<'a>(
                     states[index].update(node, arena, params, row, row_hooks)?;
                 }
             }
+            if let Some(model) = transition_model.as_mut() {
+                model.row(g, |i| {
+                    let index = g * n_aggs + i;
+                    if partial_execution && states[index].supports_partial() {
+                        partial_states[index].observed()
+                    } else {
+                        states[index].observed()
+                    }
+                })?;
+            }
             at += 1;
             partial_rows += 1;
             if partial_execution && partial_rows == 256 {
@@ -757,6 +760,29 @@ pub(super) fn groups_for_mask<'a>(
     }
 
     drop(input_sort_loop);
+    let transitions = transition_model.as_ref().map(|model| model.log());
+    if n_keys > 0
+        && let Some(sizing) = aggregate.hash_agg_sizing()
+    {
+        let mut columns = [0usize; crate::sql::parser::MAX_GROUP_TERMS];
+        let mut count = 0;
+        for key in (0..n_keys).filter(|&key| mask.contains(key)) {
+            columns[count] = key;
+            count += 1;
+        }
+        record_hash_agg_memory(
+            aggregate,
+            sizing,
+            &group_of[..row_count],
+            rep_keys,
+            &columns[..count],
+            grouping_sort_is_keys(statement, agg_nodes, mask),
+            transitions,
+            storage,
+            txid,
+            arena,
+        )?;
+    }
     let empty_group: &[&[u8]] = &[];
     let per_group: &mut [&[&[u8]]] = arena
         .alloc_slice_with(n_groups, |_| empty_group)
@@ -778,10 +804,19 @@ pub(super) fn groups_for_mask<'a>(
                 group_of,
                 rep_keys,
                 group_collations,
+                transitions,
             )? {
                 Some(order) => Some(order),
                 None => hashed_table_group_order(
-                    storage, scope, from, txid, statement, arena, group_of, rep_keys,
+                    storage,
+                    scope,
+                    from,
+                    txid,
+                    statement,
+                    arena,
+                    group_of,
+                    rep_keys,
+                    transitions,
                 )?,
             }
         }
@@ -1053,12 +1088,92 @@ fn group_hashes<'a>(
     Ok(Some(hashes))
 }
 
+/// The transition states of `statement`'s aggregates (`agg_nodes`) whose
+/// memory a hash aggregate's model replays from their input, in the order
+/// PostgreSQL numbers them (its target list, then `HAVING`); `None` when no
+/// state allocates as its input arrives, or one's memory is not modelled.
+fn modelled_transitions<'a>(
+    statement: &'a Select<'a>,
+    agg_nodes: &[(*const Expr<'a>, &'a Expr<'a>)],
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    arena: &'a Arena,
+) -> Result<Option<&'a [super::transition_memory::ModelledState]>, SqlError> {
+    use super::transition_memory::ModelledState;
+    if agg_nodes.is_empty() {
+        return Ok(None);
+    }
+    let mut expressions = ArenaList::new(arena);
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            expressions.push(*expression).map_err(|_| arena_full())?;
+        }
+    }
+    for order in statement.order_by {
+        expressions
+            .push(order.expression)
+            .map_err(|_| arena_full())?;
+    }
+    if let Some(having) = statement.having {
+        expressions.push(having).map_err(|_| arena_full())?;
+    }
+    let Some((costs, transitions)) = super::index_paths::aggregate::aggregate_transitions(
+        expressions.as_slice(),
+        storage,
+        txid,
+        columns,
+        arena,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !costs.input_driven || costs.unsized_states {
+        return Ok(None);
+    }
+    let mut states = ArenaList::new(arena);
+    for transition in transitions {
+        let Some(memory) = transition.memory else {
+            return Ok(None);
+        };
+        let aggregate = agg_nodes
+            .iter()
+            .position(|&(node, _)| core::ptr::eq(node, transition.call))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "an aggregate's transition state has no aggregate to feed it"
+                )
+            })?;
+        let argument = match transition.call {
+            Expr::Call { args, .. } => args.first().copied(),
+            _ => None,
+        };
+        let input_type = match argument {
+            Some(argument) => {
+                crate::sql::exec::infer_routine_argument_oid(argument, columns).unwrap_or(0)
+            }
+            None => 0,
+        };
+        states
+            .push(ModelledState {
+                memory,
+                aggregate,
+                input_type,
+                computed: !matches!(argument, Some(Expr::Column { .. })),
+            })
+            .map_err(|_| arena_full())?;
+    }
+    Ok(Some(states.as_slice()))
+}
+
 /// Puts `order` (each group's index) in the order a `HashAggregate` sized
 /// by `sizing` returns the groups: inserted in the order their first row
 /// arrives, spilling as PostgreSQL's does. `group_of` gives each input
 /// row's group and `keys` each group's key row, whose `positions` are its
-/// key columns in hashing order. Returns what `EXPLAIN ANALYZE` reports,
-/// or `None` when a key's type has no ported hash function.
+/// key columns in hashing order; `transitions` the steps each row's
+/// transition functions took. Returns what `EXPLAIN ANALYZE` reports, or
+/// `None` when a key's type has no ported hash function.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(super) fn hashed_order(
     storage: &Storage,
@@ -1068,6 +1183,7 @@ pub(super) fn hashed_order(
     keys: &[&[u8]],
     positions: &[usize],
     sizing: super::postgres_memory::HashAggSizing,
+    transitions: Option<super::transition_memory::TransitionLog<'_>>,
     order: &mut [u32],
 ) -> Result<Option<super::hashagg::HashAggFigures>, SqlError> {
     let Some(hashes) = group_hashes(storage, txid, arena, keys, positions)? else {
@@ -1101,6 +1217,7 @@ pub(super) fn hashed_order(
         hashes,
         entry_lens,
         None,
+        transitions,
         order,
     )
     .map(Some)
@@ -1800,6 +1917,46 @@ pub(super) fn hash_row_keys(
 /// returns them when it hashes: `None` when it sorts them (their order
 /// then), or when the grouping is outside the planner model.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+/// Whether the general executor returns the groups of `statement` in key
+/// order: no grouping, an order PostgreSQL's plan does not show, or one
+/// table whose grouping PostgreSQL's planner sorts. A reader that forms the
+/// groups in key order itself leaves any other grouping to the general
+/// executor, which follows a hashed grouping's order.
+pub(super) fn groups_in_key_order<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    txid: u32,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    if statement.group_by.is_empty()
+        || order_unobserved(statement)
+        || grouping_order_irrelevant(storage, txid, statement, statement.group_by, scope, arena)?
+    {
+        return Ok(true);
+    }
+    let Some(from) = statement.from.as_ref() else {
+        return Ok(true);
+    };
+    if !one_plain_table(storage, scope, txid) {
+        return Ok(false);
+    }
+    let planned = planner_statement(statement, scope, storage, txid, arena)?;
+    let columns = super::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    Ok(matches!(
+        crate::sql::explain::grouping_strategy(
+            storage, txid, planned, false, scope, from, &columns, arena,
+        )?,
+        crate::sql::explain::GroupingStrategy::Sorted
+    ))
+}
+
 fn hashed_table_group_order<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
@@ -1809,6 +1966,7 @@ fn hashed_table_group_order<'a>(
     arena: &'a Arena,
     group_of: &[u32],
     keys: &[&[u8]],
+    transitions: Option<super::transition_memory::TransitionLog<'_>>,
 ) -> Result<Option<&'a [u32]>, SqlError> {
     if statement.group_by.is_empty() || !one_plain_table(storage, scope, txid) {
         return Ok(None);
@@ -1859,6 +2017,7 @@ fn hashed_table_group_order<'a>(
         keys,
         &positions[..hashed.len],
         hashed.sizing,
+        transitions,
         order,
     )?;
     // Every key type was checked to have a ported hash function.
@@ -1883,6 +2042,7 @@ fn modeled_group_order<'a>(
     group_of: &[u32],
     keys: &[&[u8]],
     group_collations: &[Collation],
+    transitions: Option<super::transition_memory::TransitionLog<'_>>,
 ) -> Result<Option<&'a [u32]>, SqlError> {
     let Some(model) = planned.get(storage, txid, statement, scope, params, arena)? else {
         return Ok(None);
@@ -1897,24 +2057,23 @@ fn modeled_group_order<'a>(
         let positions = arena
             .alloc_slice_with(group.keys.len(), |at| group.keys[at].0)
             .map_err(|_| arena_full())?;
-        let not_modeled = || {
+        let sizing = group.hash_agg.ok_or_else(|| {
             sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
-                "a hashed grouping over a join that spills transition states of unmodeled size is not supported"
+                "the row order of a hashed grouping over a join whose transition states have no modelled size is not supported; order the rows by every grouping key"
             )
-        };
-        let sizing = group
-            .hash_agg
-            .or(group.order_sizing)
-            .ok_or_else(not_modeled)?;
+        })?;
         let figures = hashed_order(
-            storage, txid, arena, group_of, keys, positions, sizing, order,
+            storage,
+            txid,
+            arena,
+            group_of,
+            keys,
+            positions,
+            sizing,
+            transitions,
+            order,
         )?;
-        // Without every state sized the model's memory is a lower bound:
-        // its order holds only while even that bound does not spill.
-        if group.hash_agg.is_none() && figures.is_some_and(|figures| figures.batches > 1) {
-            return Err(not_modeled());
-        }
         if figures.is_none() {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2923,6 +3082,7 @@ pub(super) fn record_hash_agg_memory(
     rep_keys: &[&[u8]],
     columns: &[usize],
     keys_spill: bool,
+    transitions: Option<super::transition_memory::TransitionLog<'_>>,
     storage: &Storage,
     txid: u32,
     arena: &Arena,
@@ -2931,7 +3091,15 @@ pub(super) fn record_hash_agg_memory(
         .alloc_slice_with(rep_keys.len(), |_| 0u32)
         .map_err(|_| arena_full())?;
     let Some(figures) = hashed_order(
-        storage, txid, arena, group_of, rep_keys, columns, sizing, order,
+        storage,
+        txid,
+        arena,
+        group_of,
+        rep_keys,
+        columns,
+        sizing,
+        transitions,
+        order,
     )?
     else {
         return Err(sql_err!(
@@ -3018,6 +3186,7 @@ pub(super) fn record_distinct_hash_memory(
         &keys[..groups as usize],
         columns,
         true,
+        None,
         storage,
         txid,
         arena,

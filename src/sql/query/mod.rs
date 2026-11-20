@@ -153,6 +153,7 @@ mod outer_joins;
 pub(crate) mod postgres_memory;
 pub(crate) mod postgres_values;
 mod pullup;
+pub(crate) mod transition_memory;
 pub(crate) mod write_buffers;
 pub(crate) use cte::expand_dml_ctes_schema;
 use cte::expand_set_tree_exec;

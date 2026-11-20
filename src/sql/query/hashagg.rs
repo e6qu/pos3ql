@@ -27,8 +27,11 @@ use std::sync::Arc;
 use super::index_paths::aggregate::{hash_agg_set_limits, hash_choose_num_partitions};
 use crate::mem::lease_pool::{LeaseError, LeasePool, MutableSlice};
 use crate::sql::eval::{SqlError, sqlstate};
-use crate::sql::query::postgres_memory::{HashAggMemory, HashAggSizing};
+use crate::sql::query::postgres_memory::{
+    HashAggMemory, HashAggSizing, MemoryStep, UnknownChunkLimit,
+};
 use crate::sql::query::simplehash::SimpleHash;
+use crate::sql::query::transition_memory::TransitionLog;
 use crate::sql_err;
 
 /// `sizeof(TupleHashEntryData)`, which `hash_agg_update_metrics` adds to a
@@ -59,22 +62,28 @@ fn pool_full(error: LeaseError) -> SqlError {
     )
 }
 
-/// How a hash aggregate's groups are keyed.
-/// Fails once the meta context's bucket array outgrows the chunk limit of
-/// a context PostgreSQL's freelist may hand it: after a hash aggregate built
-/// under `work_mem` below 1MB earlier in the session, aset.c reuses that
-/// aggregate's work context, smaller chunk limit and all, and pos3ql does
-/// not track which context the freelist returns.
+/// Fails once a context whose chunk limit the model does not know took a
+/// request that limit decides for. After a hash aggregate built under
+/// `work_mem` below 1MB earlier in the session, aset.c may hand the meta
+/// context that aggregate's work context, smaller chunk limit and all; the
+/// transition values' context is a work context of its own, whose limit
+/// `work_mem` gives when aset.c creates it and an earlier context's when it
+/// recycles one. pos3ql does not track which context the freelist returns.
 fn check_context_reuse(memory: &HashAggMemory) -> Result<(), SqlError> {
-    if memory.reuse_unmodeled() {
-        return Err(sql_err!(
+    match memory.unknown_chunk_limit() {
+        None => Ok(()),
+        Some(UnknownChunkLimit::Meta) => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "the memory of a hash aggregate after an earlier hash aggregate of this session ran with work_mem below 1MB is not supported: PostgreSQL reuses that aggregate's memory context, which pos3ql does not model; start a new session, or run every hash aggregate of the session with work_mem of at least 1MB"
-        ));
+        )),
+        Some(UnknownChunkLimit::Transition) => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "the memory of a hash aggregate whose transition values take more than 1kB under work_mem below 1MB, or after an earlier hash aggregate of this session ran with work_mem below 1MB, is not supported: PostgreSQL may reuse another memory context for them, which pos3ql does not model; run the hash aggregates of the session with work_mem of at least 1MB"
+        )),
     }
-    Ok(())
 }
 
+/// How a hash aggregate's groups are keyed.
 pub(super) trait GroupKeys {
     /// The hash `TupleHashTableHash` gives the row's keys.
     fn hash(&mut self, row: &[u8]) -> Result<u32, SqlError>;
@@ -85,6 +94,15 @@ pub(super) trait GroupKeys {
     /// The `t_len` of the minimal tuple `hashagg_spill_tuple` writes for
     /// `row`.
     fn spill_len(&mut self, row: &[u8]) -> Result<usize, SqlError>;
+    /// What the transition functions did in the group's memory for `row`,
+    /// when the keys know.
+    fn transition_steps(&self, _row: &[u8]) -> Option<&[MemoryStep]> {
+        None
+    }
+    /// Whether [`Self::transition_steps`] knows the rows' steps.
+    fn knows_transition_steps(&self) -> bool {
+        false
+    }
 }
 
 /// One tape being written.
@@ -483,6 +501,12 @@ impl<K: GroupKeys> HashAgg<K> {
                 sizing.columns
             )
         })?;
+        if sizing.input_driven && !keys.knows_transition_steps() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "the memory of a hash aggregate whose transition states allocate as their input arrives is not modelled here"
+            ));
+        }
         crate::sql::guc::note_hash_aggregate();
         check_context_reuse(&memory)?;
         Ok(Self {
@@ -535,7 +559,12 @@ impl<K: GroupKeys> HashAgg<K> {
             )
         };
         if self.spill_mode {
-            if !table.contains(hash, &mut same)? {
+            if table.contains(hash, &mut same)? {
+                if let Some(steps) = self.keys.transition_steps(row) {
+                    self.memory.advance(steps);
+                }
+                check_context_reuse(&self.memory)?;
+            } else {
                 self.spill_row(hash, row)?;
             }
             return Ok(());
@@ -561,6 +590,9 @@ impl<K: GroupKeys> HashAgg<K> {
         // probe run grown too long, which no fill factor announces.
         self.memory.grow_buckets_to(self.table.buckets());
         self.memory.lookup(new);
+        if let Some(steps) = self.keys.transition_steps(row) {
+            self.memory.advance(steps);
+        }
         check_context_reuse(&self.memory)?;
         if new.is_some() && self.memory.spilled() {
             self.enter_spill_mode()?;
@@ -819,6 +851,9 @@ struct IndexedKeys<'k> {
     /// Each row's spilled tuple's `t_len`, when it holds more than its
     /// group's keys.
     spill_lens: Option<&'k [usize]>,
+    /// Each row's transition steps, when the aggregates allocate as their
+    /// input arrives.
+    transitions: Option<TransitionLog<'k>>,
 }
 
 impl IndexedKeys<'_> {
@@ -847,14 +882,24 @@ impl GroupKeys for IndexedKeys<'_> {
             None => self.entry_lens[self.group_of[index] as usize],
         })
     }
+
+    fn transition_steps(&self, row: &[u8]) -> Option<&[MemoryStep]> {
+        self.transitions.map(|log| log.row(Self::index(row)))
+    }
+
+    fn knows_transition_steps(&self) -> bool {
+        self.transitions.is_some()
+    }
 }
 
 /// Runs rows whose groups are known through PostgreSQL's hash aggregate:
 /// row `r` (in arrival order) belongs to group `group_of[r]`, whose table
 /// hash is `hashes[g]` and representative tuple `entry_lens[g]` bytes; the
-/// tuple a row spills is `spill_lens[r]` bytes, or its group's. Writes
-/// each group, in the order the aggregate returns it, to `order` and
-/// returns what `EXPLAIN ANALYZE` reports.
+/// tuple a row spills is `spill_lens[r]` bytes, or its group's, and its
+/// transitions take `transitions`' steps. Writes each group, in the order
+/// the aggregate returns it, to `order` and returns what `EXPLAIN ANALYZE`
+/// reports.
+#[expect(clippy::too_many_arguments, reason = "the hash aggregate's inputs")]
 pub(super) fn hashed_group_order(
     pool: &Arc<LeasePool>,
     sizing: HashAggSizing,
@@ -862,6 +907,7 @@ pub(super) fn hashed_group_order(
     hashes: &[u32],
     entry_lens: &[usize],
     spill_lens: Option<&[usize]>,
+    transitions: Option<TransitionLog<'_>>,
     order: &mut [u32],
 ) -> Result<HashAggFigures, SqlError> {
     let mut aggregate = HashAgg::new(
@@ -870,6 +916,7 @@ pub(super) fn hashed_group_order(
             hashes,
             entry_lens,
             spill_lens,
+            transitions,
         },
         sizing,
         pool,

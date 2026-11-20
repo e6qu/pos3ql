@@ -231,6 +231,10 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 
 - [x] Full join merged keys: a `COALESCE` of a full join's compared columns
   equated with a constant (PR #779, `975`).
+- [ ] A hash join whose inner side PostgreSQL splits into batches under a
+  small `work_mem` (two 5,000-row tables joined on an integer key under
+  `64kB`) fails with `query result exceeds the statement arena` instead of
+  returning its rows.
 - [ ] *In progress:* self-join removal (`remove_useless_self_joins`; `EXPLAIN`
   of such joins fails with `0A000` today, `949`).
 - [ ] *In progress:* plan joins of never-analyzed tables by PostgreSQL's
@@ -394,9 +398,9 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 #### Sorting, hashing and grouping state
 
 - [ ] *In progress:* aggregate transition states without a PostgreSQL size:
-  size them, so a join's hashed `GROUP BY` that spills and `EXPLAIN ANALYZE`
-  of hash aggregates with `numeric` sums, text `min`/`max`, collecting
-  aggregates or more than seven grouping columns stop failing with `0A000`.
+  hash aggregates over more than seven grouping columns, and the states of
+  `json_agg`, `range_agg`, ordered-set aggregates, `array_agg` of arrays and
+  `min`/`max` of arrays, records and bit strings (`0A000`).
 - [ ] *In progress:* `GROUP BY` state streams instead of materializing.
 - [ ] *In progress:* route every sort through the `tuplesort` model: the
   modeled-join grouping sort and incremental sort batches are charged against
@@ -410,9 +414,10 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 - [ ] *In progress:* pglz compression and TOAST sizes, so hash, sort and
   statistics figures match for values PostgreSQL compresses or stores out of
   line (rows over about 2 kB).
-- [ ] Hash aggregates inherit `aset.c`'s recycled executor context after a
-  session's hash aggregate under `work_mem` below 1MB (`0A000` from the next
-  statement on while the bucket array is within 8 kB).
+- [ ] Hash aggregates inherit `aset.c`'s recycled executor and transition
+  contexts after a session's hash aggregate under `work_mem` below 1MB
+  (`0A000` from the next statement on while the bucket array is within 8 kB
+  or a transition value takes more than 1 kB).
 - [ ] `EXPLAIN ANALYZE` of a hash aggregate that spills rows holding columns
   besides its keys, or whose group estimate lies outside the cost model
   (`0A000`).

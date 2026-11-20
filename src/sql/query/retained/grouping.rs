@@ -22,7 +22,8 @@
 //! input is never read twice, and a group folds its rows in input order with
 //! the general executor's aggregate states. Results, the order of groups
 //! (keys ascending, NULLs last) and the key a group reports (its first input
-//! row's, as PostgreSQL's hashed grouping keeps) match the general executor.
+//! row's, as PostgreSQL's hashed grouping keeps) match the general executor;
+//! a grouping whose groups PostgreSQL returns in another order is left to it.
 //! Folding calls no routine body. `HAVING` and the output list run per group
 //! as its row is returned, so a routine call there hands off on its row.
 
@@ -114,7 +115,7 @@ fn aggregate_folds_here<'a>(
 /// which also reports any error in it.
 pub(super) fn admit_grouping<'a>(
     statement: &'a Select<'a>,
-    columns: &CatalogScopeCols<'_, 'a, '_, '_>,
+    columns: &CatalogScopeCols<'_, 'a, '_, 'a>,
     catalog: &dyn crate::sql::eval::CatalogAccess,
     arena: &'a Arena,
 ) -> Result<Option<Grouping<'a>>, SqlError> {
@@ -196,6 +197,11 @@ pub(super) fn admit_grouping<'a>(
         statement
     };
     if super::check_key_types(statement, scope, arena, storage, txid).is_err() {
+        return Ok(None);
+    }
+    // The groups come in key order here; a grouping PostgreSQL hashes
+    // returns them in its table's order, which the general executor follows.
+    if !crate::sql::query::group::groups_in_key_order(storage, scope, txid, statement, arena)? {
         return Ok(None);
     }
     let aggregates = aggregates.as_slice();

@@ -253,6 +253,20 @@ OID as `hashenum` does, but those OIDs come from pos3ql's own identity band
 (`925` sorts its groups). `Batches`, `Memory Usage` and `Disk Usage` follow
 `hash_agg_update_metrics` for one to seven grouping columns.
 
+The transition values count as PostgreSQL's transition functions allocate
+them in `aset.c`'s chunks and freelists (`963`): `min` and `max` of `text`,
+`character`, `bytea`, `inet`, `numeric`, `interval`, `time with time zone`
+and `tid` keep a copy of the value they return; `sum`, `avg` and the
+variances of `numeric` and `bigint` keep a 144-byte `NumericAggState` whose
+digit buffers grow with the inputs' weights and scales; `string_agg` keeps
+a 1kB buffer it doubles, `array_agg` an array of eight elements it doubles
+and a copy of each element passed by reference; the integer and interval
+sums allocate their state on their first call, so a group whose `FILTER`
+rejects every row takes none. Other aggregates that allocate per group
+(`json_agg`, `range_agg`, `array_agg` of arrays, `min` and `max` of arrays,
+records and bit strings, ordered-set aggregates) leave the memory, and so a
+hashed grouping's order, unmodelled: `0A000` where the order shows.
+
 A one-table `GROUP BY` or `DISTINCT` of expressions plans as PostgreSQL's
 does (`929`); a `DISTINCT` takes its `ORDER BY` items first
 (`transformDistinctClause`) and `EXPLAIN` shows the `HashAggregate` over the
@@ -283,7 +297,11 @@ chunk limit, so after a hash aggregate under `work_mem` below 1MB
 `work_mem` (on PostgreSQL 18.6 a later `string_agg` grouping reported other
 figures at 1MB, 4MB and 16MB). pos3ql records that per session and fails a
 later hash aggregate whose bucket array falls between the lower limit and
-8 kB with `0A000` (`926`, `928`).
+8 kB with `0A000` (`926`, `928`). The transition values' context is itself
+a work context: a fresh one takes `work_mem`'s limit, one recycled after a
+statement that freed many contexts (on PostgreSQL 18.6, a five-way join)
+keeps 8 kB. A transition value between the lower limit and 8 kB therefore
+fails with `0A000` under `work_mem` below 1MB, or after such an aggregate.
 
 A hash join's `Hash` node reports the table PostgreSQL builds: at least 1,024
 buckets, doubled while rows outnumber them, and `Memory Usage` from each row's

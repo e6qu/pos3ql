@@ -1041,7 +1041,7 @@ impl Tuplestore {
 const TUPLE_HASH_ENTRY: usize = 16;
 /// `sizeof(AggStatePerGroupData)`.
 const PER_GROUP_STATE: usize = 16;
-/// The most by-reference transition states a modelled hash aggregate keeps.
+/// The most initial values a modelled hash aggregate copies per group.
 pub(crate) const MAX_SIZED_STATES: usize = 8;
 
 /// What sizes a hash aggregate's memory, decided when it is planned.
@@ -1061,10 +1061,13 @@ pub(crate) struct HashAggSizing {
     pub(crate) columns: usize,
     /// The transition states (`numtrans`).
     pub(crate) transitions: usize,
-    /// The bytes each group's by-reference transition states allocate
-    /// when the group starts.
+    /// The bytes each by-reference initial value `initialize_aggregate`
+    /// copies when a group starts.
     pub(crate) per_group: [u16; MAX_SIZED_STATES],
-    pub(crate) per_group_count: usize,
+    pub(crate) per_group_count: u8,
+    /// A transition function allocates per input row, as the steps the
+    /// aggregate's input hands the table (see `transition_memory`).
+    pub(crate) input_driven: bool,
 }
 
 /// What `BuildTupleHashTable` and the expressions and expression context
@@ -1094,62 +1097,112 @@ impl HashAggSizing {
     }
 }
 
-/// The memory a hash aggregate reports (`hash_agg_update_metrics` when its
-/// input ends): its meta context with the bucket array, the bump context of
-/// its entries and the context of its by-reference transition values.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct HashAggMemory {
-    sizing: HashAggSizing,
-    /// `simplehash`'s bucket count and entries.
-    buckets: usize,
-    entries: usize,
-    /// The bump context's allocated blocks and the space left in the
-    /// current one.
-    entry_blocks: usize,
-    entry_free: usize,
-    entry_next_block: usize,
-    entry_max_block: usize,
-    /// The meta context's blocks besides a dedicated bucket array's.
-    meta: AllocSetBlocks,
-    /// The transition values' context.
-    transition: AllocSetBlocks,
-    /// A new group put the table past its limits, so PostgreSQL's aggregate
-    /// spills the groups after it to partitions.
-    spilled: bool,
-    /// The smallest chunk limit the meta context may carry from the
-    /// session's freelist ([`crate::sql::guc::reused_context_chunk_limit`]),
-    /// and whether a bucket array outgrew it while staying within the
-    /// default limit, so the context it lands in is not known.
-    reused_limit: usize,
-    reuse_unmodeled: bool,
+/// `ALLOCSET_NUM_FREELISTS`: the chunk sizes, 8 bytes shifted by the
+/// list's index, up to the default chunk limit.
+const FREELISTS: usize = 11;
+/// `ALLOC_CHUNK_FRACTION`.
+const ALLOC_CHUNK_FRACTION: usize = 4;
+
+/// `AllocSetFreeIndex`: the freelist of a chunk of `size` requested bytes.
+const fn free_index(size: usize) -> usize {
+    if size > 8 {
+        (usize::BITS - (size - 1).leading_zeros()) as usize - 3
+    } else {
+        0
+    }
 }
 
-/// The blocks an aset.c context with the default first block size
-/// allocates for chunks that are never freed.
+/// The `allocChunkLimit` an aset.c context created with blocks up to
+/// `max_block` bytes computes.
+pub(crate) const fn alloc_chunk_limit(max_block: usize) -> usize {
+    let mut limit = ALLOC_CHUNK_LIMIT;
+    while limit + CHUNK_HEADER > (max_block - ALLOC_BLOCK_HEADER) / ALLOC_CHUNK_FRACTION {
+        limit >>= 1;
+    }
+    limit
+}
+
+/// An aset.c context with the default first block size, as `AllocSetAlloc`,
+/// `AllocSetFree` and `AllocSetRealloc` charge it: chunks of a power of two
+/// from the active block or a freelist, a block of its own for a request
+/// past the chunk limit.
+///
+/// A context aset.c recycles from its freelist keeps the chunk limit of the
+/// context it was, so the limit is known only to lie between `floor` and
+/// `limit`; a request between the two is marked ambiguous.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct AllocSetBlocks {
+pub(crate) struct AllocSet {
+    /// `mem_allocated`.
     allocated: usize,
+    /// The space left in the active block.
     free: usize,
     next_block: usize,
     max_block: usize,
+    limit: usize,
+    floor: usize,
+    /// The chunks on each freelist.
+    freelists: [u32; FREELISTS],
+    ambiguous: bool,
 }
 
-impl AllocSetBlocks {
-    const fn new(max_block: usize) -> Self {
+impl AllocSet {
+    /// A context whose blocks grow up to `max_block` bytes and whose chunk
+    /// limit lies between `floor` and `limit`.
+    pub(crate) const fn new(max_block: usize, limit: usize, floor: usize) -> Self {
         Self {
             allocated: DEFAULT_INIT_BLOCK,
             free: DEFAULT_INIT_BLOCK - ALLOC_SET_CONTEXT - ALLOC_BLOCK_HEADER,
             next_block: DEFAULT_INIT_BLOCK,
             max_block,
+            limit,
+            floor: if floor < limit { floor } else { limit },
+            freelists: [0; FREELISTS],
+            ambiguous: false,
         }
     }
 
-    /// Takes `bytes` of chunks from the current block, or a new one.
-    fn take(&mut self, bytes: usize) {
+    /// `AllocSetReset`: back to the keeper block, every freelist emptied.
+    pub(crate) fn reset(&mut self) {
+        *self = Self {
+            ambiguous: self.ambiguous,
+            ..Self::new(self.max_block, self.limit, self.floor)
+        };
+    }
+
+    /// `mem_allocated`.
+    pub(crate) fn allocated(&self) -> usize {
+        self.allocated
+    }
+
+    /// A request fell between the chunk limits the context may have.
+    pub(crate) fn ambiguous(&self) -> bool {
+        self.ambiguous
+    }
+
+    /// Whether a request of `size` bytes gets a block of its own.
+    fn large(&mut self, size: usize) -> bool {
+        self.ambiguous |= size > self.floor && size <= self.limit;
+        size > self.limit
+    }
+
+    /// The block a request past the chunk limit gets.
+    const fn large_block(size: usize) -> usize {
+        maxalign(size) + ALLOC_BLOCK_HEADER + CHUNK_HEADER
+    }
+
+    /// Takes `bytes` (chunks with their headers) from the active block, or
+    /// from a new one after the rest of the active block was carved into
+    /// freelist chunks (`AllocSetAllocFromNewBlock`).
+    pub(crate) fn take(&mut self, bytes: usize) {
         if bytes > self.free {
-            // The rest of the block goes to the free lists; the new block
-            // is the next size, doubled up to the maximum, or larger for
-            // the chunk.
+            while self.free >= 8 + CHUNK_HEADER {
+                let mut index = free_index(self.free - CHUNK_HEADER);
+                if self.free - CHUNK_HEADER != 8 << index {
+                    index -= 1;
+                }
+                self.freelists[index] += 1;
+                self.free -= (8 << index) + CHUNK_HEADER;
+            }
             let mut block = self.next_block;
             self.next_block = (self.next_block * 2).min(self.max_block);
             while block < bytes + ALLOC_BLOCK_HEADER {
@@ -1161,13 +1214,39 @@ impl AllocSetBlocks {
         self.free -= bytes;
     }
 
-    /// Allocates `size` bytes (`AllocSetAlloc`).
+    /// `AllocSetAlloc` of `size` bytes.
     pub(crate) fn alloc(&mut self, size: usize) {
-        if size > ALLOC_CHUNK_LIMIT {
-            self.allocated += maxalign(size) + ALLOC_BLOCK_HEADER + CHUNK_HEADER;
+        if self.large(size) {
+            self.allocated += Self::large_block(size);
             return;
         }
-        self.take(allocset_chunk_space(size));
+        let index = free_index(size);
+        if self.freelists[index] > 0 {
+            self.freelists[index] -= 1;
+            return;
+        }
+        self.take((8 << index) + CHUNK_HEADER);
+    }
+
+    /// `AllocSetFree` of a chunk `size` bytes were requested for.
+    pub(crate) fn free(&mut self, size: usize) {
+        if self.large(size) {
+            self.allocated -= Self::large_block(size);
+        } else {
+            self.freelists[free_index(size)] += 1;
+        }
+    }
+
+    /// `AllocSetRealloc` of a chunk `old` bytes were requested for to `new`
+    /// bytes: a dedicated block is resized, a chunk kept when its power of
+    /// two holds the new size, else replaced by a new allocation.
+    pub(crate) fn realloc(&mut self, old: usize, new: usize) {
+        if self.large(old) {
+            self.allocated = self.allocated - Self::large_block(old) + Self::large_block(new);
+        } else if 8 << free_index(old) < new {
+            self.alloc(new);
+            self.free(old);
+        }
     }
 }
 
@@ -1192,11 +1271,49 @@ fn simplehash_size(elements: usize) -> usize {
     usize::try_from(size.max(2).next_power_of_two()).unwrap_or(usize::MAX)
 }
 
+/// The memory a hash aggregate reports (`hash_agg_update_metrics` when its
+/// input ends): its meta context with the bucket array, the bump context of
+/// its entries and the context of its by-reference transition values.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HashAggMemory {
+    sizing: HashAggSizing,
+    /// `simplehash`'s bucket count and entries.
+    buckets: usize,
+    entries: usize,
+    /// The bump context's allocated blocks and the space left in the
+    /// current one.
+    entry_blocks: usize,
+    entry_free: usize,
+    entry_next_block: usize,
+    entry_max_block: usize,
+    /// The meta context, which holds the bucket array.
+    meta: AllocSet,
+    /// The transition values' context (`CreateWorkExprContext`).
+    transition: AllocSet,
+    /// A new group put the table past its limits, so PostgreSQL's aggregate
+    /// spills the groups after it to partitions.
+    spilled: bool,
+}
+
+/// Why a hash aggregate's memory cannot be modelled: the chunk limit of a
+/// context it allocates in is not known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnknownChunkLimit {
+    /// The meta context may be one aset.c recycled from an earlier hash
+    /// aggregate's work context.
+    Meta,
+    /// The transition values' context may be fresh, with the chunk limit
+    /// `work_mem` gives it, or recycled with another's.
+    Transition,
+}
+
 impl HashAggMemory {
     /// The contexts once `build_hash_table` made the table; `None` past
     /// the grouping columns the model covers.
     pub(crate) fn new(sizing: HashAggSizing) -> Option<Self> {
         let rest = *META_REST.get(sizing.columns.checked_sub(1)?)?;
+        let reused = crate::sql::guc::reused_context_chunk_limit() as usize;
+        let work_block = work_mem_block();
         let mut memory = Self {
             sizing,
             buckets: 0,
@@ -1204,49 +1321,43 @@ impl HashAggMemory {
             entry_blocks: DEFAULT_INIT_BLOCK,
             entry_free: DEFAULT_INIT_BLOCK - BUMP_CONTEXT - BUMP_BLOCK_HEADER,
             entry_next_block: DEFAULT_INIT_BLOCK,
-            entry_max_block: work_mem_block(),
-            meta: AllocSetBlocks::new(DEFAULT_MAX_BLOCK),
-            transition: AllocSetBlocks::new(work_mem_block()),
+            entry_max_block: work_block,
+            meta: AllocSet::new(DEFAULT_MAX_BLOCK, ALLOC_CHUNK_LIMIT, reused),
+            // A fresh work context's limit follows `work_mem`; one recycled
+            // keeps the default limit or an earlier work context's.
+            transition: AllocSet::new(
+                work_block,
+                ALLOC_CHUNK_LIMIT,
+                alloc_chunk_limit(work_block).min(reused),
+            ),
             spilled: false,
-            reused_limit: crate::sql::guc::reused_context_chunk_limit() as usize,
-            reuse_unmodeled: false,
         };
         memory.meta.take(META_HEADERS);
-        memory.allocate_buckets(simplehash_size(sizing.buckets));
+        let buckets = simplehash_size(sizing.buckets);
+        memory.meta.alloc(buckets * TUPLE_HASH_ENTRY);
+        memory.buckets = buckets;
         memory.meta.take(rest);
         Some(memory)
     }
 
-    fn allocate_buckets(&mut self, size: usize) {
-        let bytes = size * TUPLE_HASH_ENTRY;
-        // A meta context aset.c recycled from an earlier statement's work
-        // context keeps that context's lower chunk limit: such an array is a
-        // block of its own there, a chunk of a default context's block.
-        self.reuse_unmodeled |= bytes > self.reused_limit && bytes <= ALLOC_CHUNK_LIMIT;
-        if bytes <= ALLOC_CHUNK_LIMIT {
-            self.meta.take(allocset_chunk_space(bytes));
-        }
-        self.buckets = size;
-    }
-
-    /// A dedicated block holding the current bucket array, when it is past
-    /// the chunk limit; an older one was freed when the table grew.
-    fn bucket_block(&self) -> usize {
-        let bytes = self.buckets * TUPLE_HASH_ENTRY;
-        if bytes > ALLOC_CHUNK_LIMIT {
-            maxalign(bytes) + ALLOC_BLOCK_HEADER + CHUNK_HEADER
-        } else {
-            0
-        }
+    /// `SH_GROW`: the doubled bucket array is allocated, then the old one
+    /// freed.
+    fn grow(&mut self) {
+        let old = self.buckets * TUPLE_HASH_ENTRY;
+        self.buckets *= 2;
+        self.meta.alloc(self.buckets * TUPLE_HASH_ENTRY);
+        self.meta.free(old);
     }
 
     /// Looks an input row up (`SH_INSERT`, which grows the table when its
     /// entries reached its fill factor, whether or not the key is new);
-    /// `new` is the `t_len` of the representative tuple of a new group.
+    /// `new` is the `t_len` of the representative tuple of a new group,
+    /// which `initialize_hash_entry` checks the limits for before it copies
+    /// the group's initial values.
     pub(crate) fn lookup(&mut self, new: Option<usize>) {
         let threshold = (self.buckets as f64 * FILL_FACTOR) as usize;
         if self.entries >= threshold {
-            self.allocate_buckets(self.buckets * 2);
+            self.grow();
         }
         let Some(length) = new else {
             return;
@@ -1267,14 +1378,28 @@ impl HashAggMemory {
             }
             self.entry_free -= chunk;
         }
-        for &bytes in &self.sizing.per_group[..self.sizing.per_group_count] {
-            self.transition.alloc(usize::from(bytes));
-        }
         // `hash_agg_check_limits` after each new group.
         if self.peak() as f64 > self.sizing.memory_limit
             || self.entries as u64 > self.sizing.groups_limit
         {
             self.spilled = true;
+        }
+        for &bytes in &self.sizing.per_group[..usize::from(self.sizing.per_group_count)] {
+            self.transition.alloc(usize::from(bytes));
+        }
+    }
+
+    /// What a transition function did in the group's memory for one input
+    /// row.
+    pub(crate) fn advance(&mut self, steps: &[MemoryStep]) {
+        for step in steps {
+            match *step {
+                MemoryStep::Alloc(size) => self.transition.alloc(size as usize),
+                MemoryStep::Free(size) => self.transition.free(size as usize),
+                MemoryStep::Realloc(old, new) => {
+                    self.transition.realloc(old as usize, new as usize);
+                }
+            }
         }
     }
 
@@ -1282,7 +1407,7 @@ impl HashAggMemory {
     /// for a run that grew too long, which no fill factor announced.
     pub(crate) fn grow_buckets_to(&mut self, size: usize) {
         while self.buckets < size {
-            self.allocate_buckets(self.buckets * 2);
+            self.grow();
         }
     }
 
@@ -1294,7 +1419,7 @@ impl HashAggMemory {
         self.entry_blocks = DEFAULT_INIT_BLOCK;
         self.entry_free = DEFAULT_INIT_BLOCK - BUMP_CONTEXT - BUMP_BLOCK_HEADER;
         self.entry_next_block = DEFAULT_INIT_BLOCK;
-        self.transition = AllocSetBlocks::new(work_mem_block());
+        self.transition.reset();
         self.sizing.memory_limit = memory_limit;
         self.sizing.groups_limit = groups_limit;
         self.spilled = false;
@@ -1308,14 +1433,19 @@ impl HashAggMemory {
     /// The bytes the by-reference transition values' context holds
     /// (`hashkey_mem` of `hash_agg_update_metrics`).
     pub(crate) fn transition_allocated(&self) -> usize {
-        self.transition.allocated
+        self.transition.allocated()
     }
 
-    /// Whether a bucket array outgrew the chunk limit of a context the
-    /// session's freelist may hand the meta context, which pos3ql does not
-    /// track.
-    pub(crate) fn reuse_unmodeled(&self) -> bool {
-        self.reuse_unmodeled
+    /// A context whose chunk limit is not known took a request the limit
+    /// decides for.
+    pub(crate) fn unknown_chunk_limit(&self) -> Option<UnknownChunkLimit> {
+        if self.meta.ambiguous() {
+            Some(UnknownChunkLimit::Meta)
+        } else if self.transition.ambiguous() {
+            Some(UnknownChunkLimit::Transition)
+        } else {
+            None
+        }
     }
 
     /// Whether the aggregate spilled (`hash_agg_enter_spill_mode`).
@@ -1327,12 +1457,17 @@ impl HashAggMemory {
     /// context (with the expression context `BuildTupleHashTable` creates
     /// under it), the entries and the transition values.
     pub(crate) fn peak(&self) -> usize {
-        self.meta.allocated
-            + self.bucket_block()
-            + DEFAULT_INIT_BLOCK
-            + self.entry_blocks
-            + self.transition.allocated
+        self.meta.allocated() + DEFAULT_INIT_BLOCK + self.entry_blocks + self.transition.allocated()
     }
+}
+
+/// One step a transition function takes in its aggregate's memory: a
+/// `palloc`, `pfree` or `repalloc` of the requested bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemoryStep {
+    Alloc(u32),
+    Free(u32),
+    Realloc(u32, u32),
 }
 
 #[cfg(all(test, not(feature = "sql-fixture-suite")))]
@@ -1393,6 +1528,45 @@ mod tests {
         assert_eq!(bytes % 8192, 0);
         assert_eq!(tuplesort_merge_order(4 << 20), 15);
         assert_eq!(tuplesort_merge_order(64 << 10), 6);
+    }
+
+    #[test]
+    fn allocsets_reuse_freed_chunks_and_carve_their_blocks() {
+        let mut set = AllocSet::new(DEFAULT_MAX_BLOCK, ALLOC_CHUNK_LIMIT, ALLOC_CHUNK_LIMIT);
+        // 7952 bytes fit 198 chunks of 32 bytes and their headers; the
+        // next takes a second block of 8192 bytes after the 32 bytes left
+        // were carved into a 16-byte chunk.
+        for _ in 0..199 {
+            set.alloc(20);
+        }
+        assert_eq!(set.allocated(), 16_384);
+        assert_eq!(set.freelists[..2], [0, 1]);
+        // A freed chunk serves the next request of its size.
+        set.free(30);
+        set.alloc(17);
+        assert_eq!(set.freelists[2], 0);
+        // A chunk that holds the new size is kept; a larger one is moved.
+        set.realloc(20, 32);
+        set.realloc(20, 33);
+        assert_eq!(set.freelists[2], 1);
+        // A request past the chunk limit is a block of its own, resized in
+        // place and freed with its block.
+        set.alloc(10_000);
+        assert_eq!(set.allocated(), 16_384 + 10_000 + 48);
+        set.realloc(10_000, 20_000);
+        assert_eq!(set.allocated(), 16_384 + 20_000 + 48);
+        set.free(20_000);
+        assert_eq!(set.allocated(), 16_384);
+        assert!(!set.ambiguous());
+        // Under a recycled context's possibly lower limit a request between
+        // the two limits is ambiguous.
+        let mut set = AllocSet::new(8192, ALLOC_CHUNK_LIMIT, alloc_chunk_limit(8192));
+        assert_eq!(alloc_chunk_limit(8192), 1024);
+        assert_eq!(alloc_chunk_limit(65_536), 8192);
+        set.alloc(1024);
+        assert!(!set.ambiguous());
+        set.alloc(1025);
+        assert!(set.ambiguous());
     }
 
     #[test]

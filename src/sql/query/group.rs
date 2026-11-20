@@ -1916,17 +1916,21 @@ pub(super) fn hash_row_keys(
 /// The groups of one table's grouping in the order PostgreSQL's plan
 /// returns them when it hashes: `None` when it sorts them (their order
 /// then), or when the grouping is outside the planner model.
-#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 /// Whether the general executor returns the groups of `statement` in key
-/// order: no grouping, an order PostgreSQL's plan does not show, or one
-/// table whose grouping PostgreSQL's planner sorts. A reader that forms the
-/// groups in key order itself leaves any other grouping to the general
-/// executor, which follows a hashed grouping's order.
+/// order: no grouping, an order PostgreSQL's plan does not show, one FROM
+/// item that is not a plain table, or one table whose grouping PostgreSQL's
+/// planner sorts. A reader that forms the groups in key order itself leaves
+/// any other grouping to the general executor, which follows a hashed
+/// grouping's order and a modelled join's.
+///
+/// `statement` groups by its keys; `source` is the statement as written,
+/// a `DISTINCT` (`distinct`) the planner models as such.
 pub(super) fn groups_in_key_order<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     statement: &'a Select<'a>,
+    (source, distinct): (&'a Select<'a>, bool),
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
     if statement.group_by.is_empty()
@@ -1938,10 +1942,13 @@ pub(super) fn groups_in_key_order<'a>(
     let Some(from) = statement.from.as_ref() else {
         return Ok(true);
     };
-    if !one_plain_table(storage, scope, txid) {
+    if scope.n > 1 {
         return Ok(false);
     }
-    let planned = planner_statement(statement, scope, storage, txid, arena)?;
+    if !one_plain_table(storage, scope, txid) {
+        return Ok(true);
+    }
+    let planned = planner_statement(source, scope, storage, txid, arena)?;
     let columns = super::CatalogScopeCols {
         scope,
         outer: None,
@@ -1951,12 +1958,13 @@ pub(super) fn groups_in_key_order<'a>(
     };
     Ok(matches!(
         crate::sql::explain::grouping_strategy(
-            storage, txid, planned, false, scope, from, &columns, arena,
+            storage, txid, planned, distinct, scope, from, &columns, arena,
         )?,
         crate::sql::explain::GroupingStrategy::Sorted
     ))
 }
 
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn hashed_table_group_order<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,

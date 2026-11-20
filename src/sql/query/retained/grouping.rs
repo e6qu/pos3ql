@@ -177,6 +177,7 @@ pub(super) fn admit_grouping<'a>(
     else {
         return Ok(None);
     };
+    let source = (statement, statement.distinct);
     let statement = if statement.distinct {
         let keys = arena
             .alloc_slice_with(statement.items.len(), |index| {
@@ -201,7 +202,9 @@ pub(super) fn admit_grouping<'a>(
     }
     // The groups come in key order here; a grouping PostgreSQL hashes
     // returns them in its table's order, which the general executor follows.
-    if !crate::sql::query::group::groups_in_key_order(storage, scope, txid, statement, arena)? {
+    if !crate::sql::query::group::groups_in_key_order(
+        storage, scope, txid, statement, source, arena,
+    )? {
         return Ok(None);
     }
     let aggregates = aggregates.as_slice();

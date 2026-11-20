@@ -942,7 +942,7 @@ fn grouped_results_stream_rows_as_the_client_reads() {
         ),
         (
             "SELECT b.id, t.label, count(t.k), max(b.payload) FROM big b \
-             LEFT JOIN tags t ON t.k = b.id % 4 GROUP BY b.id, t.label",
+             LEFT JOIN tags t ON t.k = b.id % 4 GROUP BY b.id, t.label ORDER BY 1, 2",
             5000,
         ),
         (

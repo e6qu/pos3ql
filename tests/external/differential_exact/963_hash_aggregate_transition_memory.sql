@@ -5,10 +5,23 @@
 -- spill, and so the order of the groups, follows that memory.
 \set origin :DBNAME
 CREATE TABLE t963 (g int, t text, n numeric, i int, b bigint, iv interval, c char(6), y bytea);
+-- Inserted in parts, each within a small memtable.
 INSERT INTO t963
 SELECT i % 50, 'v' || (i * 7 % 1000), (i * 3 % 997) / 10.0, i, i::bigint * 1000003,
   make_interval(secs => i), 'c' || (i % 13), decode(to_hex(i * 31), 'escape')
-FROM generate_series(1, 5000) i;
+FROM generate_series(1, 1250) i;
+INSERT INTO t963
+SELECT i % 50, 'v' || (i * 7 % 1000), (i * 3 % 997) / 10.0, i, i::bigint * 1000003,
+  make_interval(secs => i), 'c' || (i % 13), decode(to_hex(i * 31), 'escape')
+FROM generate_series(1251, 2500) i;
+INSERT INTO t963
+SELECT i % 50, 'v' || (i * 7 % 1000), (i * 3 % 997) / 10.0, i, i::bigint * 1000003,
+  make_interval(secs => i), 'c' || (i % 13), decode(to_hex(i * 31), 'escape')
+FROM generate_series(2501, 3750) i;
+INSERT INTO t963
+SELECT i % 50, 'v' || (i * 7 % 1000), (i * 3 % 997) / 10.0, i, i::bigint * 1000003,
+  make_interval(secs => i), 'c' || (i % 13), decode(to_hex(i * 31), 'escape')
+FROM generate_series(3751, 5000) i;
 ANALYZE t963;
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
 SELECT g, min(t), max(t) FROM t963 GROUP BY g;

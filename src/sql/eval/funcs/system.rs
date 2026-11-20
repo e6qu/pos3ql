@@ -1344,6 +1344,7 @@ pub(crate) fn dispatch<'a>(
                 | "pg_xact_status"
                 | "txid_status"
                 | "pg_typeof"
+                | "pg_column_size"
                 | "current_setting"
                 | "set_config"
                 | "acldefault"
@@ -3339,6 +3340,78 @@ pub(crate) fn dispatch<'a>(
             "getdatabaseencoding" => {
                 arity(0)?;
                 Ok(Datum::Text("UTF8"))
+            }
+            // The bytes a value takes in a tuple (`toast_raw_datum_size`'s
+            // stored size): a stored column's short varlena has a one-byte
+            // header, a computed value the four-byte one. A column long
+            // enough to be compressed is refused, as its size depends on
+            // pglz.
+            "pg_column_size" => {
+                arity(1)?;
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                if value.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let unsized_value = || {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "pg_column_size of a value with no PostgreSQL size here is not supported"
+                    )
+                };
+                let hint = match super::super::expression_type_identity(args[0], row, hooks)? {
+                    super::super::ExpressionTypeIdentity::Known(oid) => Some(oid),
+                    super::super::ExpressionTypeIdentity::Unresolved => None,
+                };
+                let sizing = crate::sql::query::postgres_memory::Sizing {
+                    catalog: None,
+                    scratch: arena,
+                };
+                let stored =
+                    crate::sql::query::postgres_memory::stored(Some(&sizing), hint, &value)
+                        .ok_or_else(unsized_value)?;
+                // A cast to the operand's own type, without a modifier, is
+                // no function call: the column reaches the function as is.
+                let mut operand = args[0];
+                while let crate::sql::ast::Expr::Cast {
+                    operand: inner,
+                    type_mod: -1,
+                    ..
+                } = operand
+                {
+                    let same = matches!(
+                        (
+                            super::super::expression_type_identity(operand, row, hooks)?,
+                            super::super::expression_type_identity(inner, row, hooks)?,
+                        ),
+                        (
+                            super::super::ExpressionTypeIdentity::Known(outer),
+                            super::super::ExpressionTypeIdentity::Known(source),
+                        ) if outer == source
+                    );
+                    if !same {
+                        break;
+                    }
+                    operand = inner;
+                }
+                // A whole-row reference forms a new composite datum.
+                let column = matches!(operand, crate::sql::ast::Expr::Column { .. })
+                    && !matches!(value, Datum::Record(_) | Datum::Composite { .. });
+                let layout = stored.layout;
+                let size = if layout.length > 0 {
+                    layout.length as usize
+                } else if layout.length == -1 {
+                    if column && stored.payload > 2000 {
+                        return Err(unsized_value());
+                    }
+                    if column && layout.storage != b'p' && stored.payload < 127 {
+                        stored.payload + 1
+                    } else {
+                        stored.payload + 4
+                    }
+                } else {
+                    return Err(unsized_value());
+                };
+                Ok(Datum::Int4(size as i32))
             }
             "pg_typeof" => {
                 arity(1)?;

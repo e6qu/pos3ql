@@ -6721,6 +6721,7 @@ fn infer_type_unpositioned(
                 (crate::sql::types::ArrElem::Text.array_oid(), -1)
             }
             "pg_typeof" => (oid::REGTYPE, 4),
+            "pg_column_size" => of(ColType::Int4),
             "pg_current_xact_id"
             | "pg_current_xact_id_if_assigned"
             | "pg_snapshot_xmin"

@@ -1249,17 +1249,33 @@ index fails with `0A000`, and its join's costs refuse to print), a
 `LATERAL` subquery (PostgreSQL may cache it in a `Memoize`; `EXPLAIN` of
 one the search does not plan fails with `0A000` while `enable_memoize` is
 on), a correlated subplan in an `OR` or compared with a column (`0A000`),
-`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), and more than
+`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), a query
+whose join conditions pass the search's fixed clause capacities (32
+clauses of one join, 48 conditions, 64 clauses): a chain of 34 `USING`
+joins on one column (33 conditions) already does, so its `EXPLAIN (COSTS
+OFF)` prints pos3ql's join order where PostgreSQL filters each join by the
+class's equality, and `join_capacity_diff.py` compares only the analyzed
+128-relation GEQO plan's text; and more than
 128 relations in one query, past which the search holds no plan and such
 queries run pos3ql's join order. An `ORDER BY` over a join keeps every joined row in
 the statement arena before sorting, so a join of millions of rows (seven
 8-row tables cross joined, `ORDER BY 1 LIMIT 1`) fails with `54000` where
 PostgreSQL runs a bounded top-N sort; the join's rows must feed the
-spilling sort instead. A join estimated past 2^64 rows refuses
-`EXPLAIN` with costs (`0A000`), since plan rows are kept as integers where
-PostgreSQL prints its double in full. Joins of never-analyzed tables keep
-pos3ql's join order: modeling them matches PostgreSQL on probe joins but moves 24 lib
-tests (streaming of cold joins, hash-plan expectations) off their plans. A parameterized index scan's cost reads its index's pages:
+spilling sort instead. Plan rows are doubles, printed in full as
+PostgreSQL's `%.0f` prints them, and every row estimate clamps at
+`MAXIMUM_ROWCOUNT` (1e100) as `clamp_row_est` does, so a cross product past
+the largest double keeps finite costs and GEQO finds PostgreSQL's plan
+(`differential_exact/970`, `971`). A `UNION ALL`'s `EXPLAIN` keeps one
+leaf's planning memory at a time. Joins of never-analyzed tables keep
+pos3ql's join order. Modeling them matches PostgreSQL on probe joins but
+moves the joins of the result-stream and cursor tests to PostgreSQL's
+plans (merge joins over sorts, hash joins over hash aggregates), which run
+in the general executor: it holds no retained position, so such a result
+cannot stream as the client reads, nor yield on a cold read after its
+first row. Removing the gate needs a retained executor for those plans
+(merge join, sort, hash and hash aggregate nodes keeping their state
+between rows, as the retained nested-loop and hash levels do). The
+hash/merge plan tests then take PostgreSQL's plans. A parameterized index scan's cost reads its index's pages:
 an index built over loaded rows is sized as `_bt_buildadd` fills its
 pages (a page closes when its free space and its last tuple's posting
 list fall under the fill factor's reserve, that tuple moving on), but one
@@ -1594,13 +1610,46 @@ no size prediction (`differential_exact/911`, `912`). With a spill store
 attached, the first clause's sort is charged while the source is counted, and
 when it outgrows `work_mem` the windows stream through external runs instead
 of the arena; arena exhaustion is the named error, never a switch of path.
-Not yet done: the external window path (each clause sorted from a fresh scan
-of the source, tied rows restitched by rank) does not return tied rows in
-`tuplesort.c`'s run and merge order, and its sorts carry no lower clause's
-results; a clause whose tuples hold a value of no PostgreSQL size here
-(`jsonb`, arrays, records) is not accounted and sorts as one quicksort; and
-`ORDER BY` and the other sorts still sort in one quicksort when PostgreSQL's
-would spill, where tied rows come out in a different order. A bounded sort
+Every sort that orders rows the client sees (`ORDER BY`, `DISTINCT ON`,
+a grouping's or a set operation's `ORDER BY`, a window clause's input, the
+merge join and semi join input sorts, a modeled `DISTINCT`) now runs one
+`tuplesort.c` state machine (`SortTuples::sort_rows`): each tuple is charged
+as it arrives, a sort that outgrows `work_mem` forms its runs where
+`dumptuples` does and merges them through `pg_tuplesort_runs`, a limit
+directly above bounds a heap, and the `EXPLAIN ANALYZE` `Sort Method`,
+`Memory` and `Disk` come from the same model (`differential_exact/915` to
+`921`). A value is charged at its PostgreSQL size: jsonb (`convertToJsonb`),
+arrays, records, whole rows, named composites (decoded through the catalog),
+ranges, multiranges, `tsquery`, `jsonpath`, snapshots, `bit` and paths, with
+`pg_column_size` reporting the same sizes (`differential_exact/919`); a value
+with no size here (a column wider than the sort's 1664 columns, vectors of
+other types) fails with `0A000` rather than sorting unaccounted. jsonb orders
+as `compareJsonbContainers` does. A window over a USING-merged column reads
+the join alias variable's columns and `(expr).*` reads the record's own.
+With a spill store attached, a sort whose rows fit the external sorter's one
+256 KiB chunk is ordered as PostgreSQL does; rows beyond that chunk still
+merge in arrival order for ties (PostgreSQL's order needs work_mem sized run
+buffers and a streaming merge over up to 500 tapes). The sorter holds no
+pointer to the storage: each push and `keep_least` takes the `&Storage` that
+sizes its rows. Not yet done: the
+modeled-join grouping sort and an incremental sort's batches are not charged
+against `work_mem`; a `DISTINCT` of the columns of one table that PostgreSQL
+hashes returns its rows in `simplehash` order, holding every scanned row in the
+statement arena even with an object store attached (`differential_exact/924`; a
+DISTINCT of expressions, or with an `ORDER BY`, is outside the model and still
+sorts), and a one-table `GROUP BY` the
+planner model does not cover (expression keys, aggregates without a sized
+transition state) likewise (a modeled one hashes in `simplehash` order,
+`differential_exact/922`; one whose key type has no ported hash function
+(arrays, records, ranges, jsonb, bit strings, money) and whose
+`ORDER BY` does not name every key fails with `0A000`; an enum key hashes its
+label's `pg_enum` OID as `hashenum` does, but those OIDs come from pos3ql's
+own identity band, not PostgreSQL's cluster counter, so an enum grouping's
+order is deterministic yet cannot match a PostgreSQL cluster's
+(`differential_exact/925` sorts its groups)); `DISTINCT` with an `ORDER BY` on some of its
+columns sorts by the rest in select-list order (`differential_exact/923`); the arrival order of a table
+whose rows vary in width differs from PostgreSQL's where its free space map
+places a later, smaller tuple on an earlier page. A bounded sort
 (`LIMIT`) that outgrows its heap in `EXPLAIN ANALYZE` still fails with `0A000`.
 A `CTE Scan` prints its query's tuplestore
 (`tuplestore_get_stats`: 2048 row pointers, doubled when a row reaches the

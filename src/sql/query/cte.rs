@@ -7530,6 +7530,7 @@ fn external_recursive_tree(
             storage
                 .with_block_store(|blocks| {
                     sorter.push_projected_by(
+                        storage,
                         blocks,
                         values.len(),
                         |column| values[column],
@@ -7580,7 +7581,7 @@ fn external_decorate_recursive_run(
         let (row, is_cycle) = decorate_recursive_row(source, decoration, base, arena)?;
         if !exclude_cycles || !is_cycle {
             storage
-                .with_block_store(|blocks| sorter.push_encoded(blocks, row, &mut compare))
+                .with_block_store(|blocks| sorter.push_encoded(storage, blocks, row, &mut compare))
                 .expect("recursive work table has a block store")?;
         }
         storage
@@ -7627,7 +7628,7 @@ fn external_recursive_noncycle_run(
         let cycle_mark = crate::sql::exec::decode_projected_col_record(row, cycle.mark, arena)?;
         if crate::sql::eval::membership_eq(&cycle_mark, &cycle.mark_value, None)? != Some(true) {
             storage
-                .with_block_store(|blocks| sorter.push_encoded(blocks, row, &mut compare))
+                .with_block_store(|blocks| sorter.push_encoded(storage, blocks, row, &mut compare))
                 .expect("recursive work table has a block store")?;
         }
         storage
@@ -7671,7 +7672,7 @@ fn external_unique_run(
         if keep {
             let row = reader.row().expect("checked");
             storage
-                .with_block_store(|blocks| sorter.push_encoded(blocks, row, &mut compare))
+                .with_block_store(|blocks| sorter.push_encoded(storage, blocks, row, &mut compare))
                 .expect("recursive work table has a block store")?;
         }
         storage
@@ -7720,7 +7721,9 @@ fn external_recursive_difference(
         }
         if !compare_seen(seen_reader.row(), candidate)?.is_some_and(|order| order.is_eq()) {
             storage
-                .with_block_store(|blocks| sorter.push_encoded(blocks, candidate, &mut compare))
+                .with_block_store(|blocks| {
+                    sorter.push_encoded(storage, blocks, candidate, &mut compare)
+                })
                 .expect("recursive work table has a block store")?;
         }
         storage
@@ -7755,7 +7758,7 @@ fn external_recursive_union(
             .expect("recursive work table has a block store")?;
         while let Some(row) = reader.row() {
             storage
-                .with_block_store(|blocks| sorter.push_encoded(blocks, row, &mut compare))
+                .with_block_store(|blocks| sorter.push_encoded(storage, blocks, row, &mut compare))
                 .expect("recursive work table has a block store")?;
             storage
                 .with_block_store(|blocks| reader.advance(blocks))

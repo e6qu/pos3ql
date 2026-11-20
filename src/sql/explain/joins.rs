@@ -76,8 +76,7 @@ pub(super) fn join_plan<'a>(
             depth,
             startup_cost: startup,
             total_cost: total,
-            rows: rows as u64,
-            unmodeled_costs: unprintable_rows(rows),
+            rows,
             width,
             output_unprintable: stage_output(stages).is_none(),
             output: stage_output(stages).unwrap_or_default(),
@@ -99,8 +98,7 @@ pub(super) fn join_plan<'a>(
             depth,
             startup_cost: startup,
             total_cost: total,
-            rows: rows as u64,
-            unmodeled_costs: unprintable_rows(rows),
+            rows,
             width,
             keys: sort_keys,
             output_unprintable: stage_output(sort_stage).is_none(),
@@ -163,12 +161,6 @@ struct Writer<'w, 'm, 's, 'a> {
     targets: Option<&'w BlockTargets<'w>>,
 }
 
-/// An estimate past `u64`, which PostgreSQL prints in full from its
-/// double and EXPLAIN here cannot: its costs are refused, not clamped.
-fn unprintable_rows(rows: f64) -> bool {
-    rows >= u64::MAX as f64
-}
-
 /// The paths of the plan under path `id`.
 fn plan_paths(plan: &query::index_paths::joins::JoinPlan<'_>, id: u32) -> usize {
     1 + match plan.path(id).kind {
@@ -213,8 +205,7 @@ impl Writer<'_, '_, '_, '_> {
             } else {
                 path.total
             },
-            rows: path.rows as u64,
-            unmodeled_costs: unprintable_rows(path.rows),
+            rows: path.rows,
             // The top relation's paths carry the query's output
             // (`apply_scanjoin_target_to_paths`).
             width: if depth == self.top_depth {
@@ -294,7 +285,7 @@ impl Writer<'_, '_, '_, '_> {
         match path.kind {
             PathKind::Dummy => {
                 let node = PlanNode {
-                    rows: 0,
+                    rows: 0.0,
                     ..self.node("Result", &path, depth)
                 };
                 plan.push(

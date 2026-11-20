@@ -422,6 +422,11 @@ fn validate_table_sample<'a>(
 pub struct MergedColumn<'d> {
     pub name: &'d str,
     pub parts: &'d [(usize, usize)],
+    /// The columns PostgreSQL's planner reads for the merged column's join
+    /// alias variable (`flatten_join_alias_vars`): the left side's for an
+    /// inner or left join, the right side's for a right join, both for a
+    /// full join, whose alias is their `COALESCE`.
+    pub vars: &'d [(usize, usize)],
     /// The merged column's type: the common type of the contributors.
     pub ctype: ColType,
 }
@@ -1563,6 +1568,7 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(0, |_| MergedColumn {
                 name: "",
                 parts: &[],
+                vars: &[],
                 ctype: ColType::Bool,
             })
             .map_err(|_| arena_full())?;
@@ -2645,6 +2651,7 @@ impl<'d> QueryScope<'d> {
                     storage
                         .with_block_store(|blocks| {
                             sorter.push_projected_by(
+                                storage,
                                 blocks,
                                 values.len(),
                                 |column| values[column],
@@ -3483,6 +3490,7 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(merged_capacity, |_| MergedColumn {
                 name: "",
                 parts: &[],
+                vars: &[],
                 ctype: ColType::Bool,
             })
             .map_err(|_| arena_full())?;
@@ -3597,7 +3605,40 @@ impl<'d> QueryScope<'d> {
                         },
                     )
                     .map_err(|_| arena_full())?;
-                let merge = MergedColumn { name, parts, ctype };
+                let left_vars: &[(usize, usize)] = match left {
+                    ResolvedColumn::Table(..) => core::slice::from_ref(
+                        first_part
+                            .as_ref()
+                            .expect("a table column is the first part"),
+                    ),
+                    _ => {
+                        self.merged[match left {
+                            ResolvedColumn::Merged(m) => m,
+                            _ => unreachable!("checked above"),
+                        }]
+                        .vars
+                    }
+                };
+                let right_var = (right_t, right_c);
+                let vars = scratch_arena
+                    .alloc_slice_with(
+                        match join.kind {
+                            crate::sql::ast::JoinKind::Right => 1,
+                            crate::sql::ast::JoinKind::Full => left_vars.len() + 1,
+                            _ => left_vars.len(),
+                        },
+                        |index| match join.kind {
+                            crate::sql::ast::JoinKind::Right => right_var,
+                            _ => left_vars.get(index).copied().unwrap_or(right_var),
+                        },
+                    )
+                    .map_err(|_| arena_full())?;
+                let merge = MergedColumn {
+                    name,
+                    parts,
+                    vars,
+                    ctype,
+                };
                 self.merged[self.n_merged] = merge;
                 self.n_merged += 1;
                 // Remove the consumed left entry; the merged column is
@@ -3896,6 +3937,11 @@ impl<'d> QueryScope<'d> {
                     .map_err(|_| arena_full())?)
             }
         }
+    }
+
+    /// The columns the planner reads for merged column `merged`'s join alias.
+    pub(crate) fn merged_vars(&self, merged: usize) -> &[(usize, usize)] {
+        self.merged[merged].vars
     }
 
     /// Number of `SELECT *` output columns: merged join-tree output when

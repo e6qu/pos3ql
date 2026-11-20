@@ -5976,6 +5976,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
                 storage
                     .with_block_store(|blocks| {
                         sorter.push_projected_by(
+                            storage,
                             blocks,
                             width,
                             |column| values[column],
@@ -6056,6 +6057,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
                 storage
                     .with_block_store(|blocks| {
                         sorter.push_projected_by(
+                            storage,
                             blocks,
                             width,
                             |column| values[column],
@@ -6161,6 +6163,7 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
             storage
                 .with_block_store(|blocks| {
                     sorter.push_projected_by(
+                        storage,
                         blocks,
                         values.len(),
                         |column| values[column],
@@ -6335,6 +6338,7 @@ fn record_external_match(
     storage
         .with_block_store(|blocks| {
             writer.push_projected_by(
+                storage,
                 blocks,
                 2,
                 |column| {
@@ -6437,7 +6441,7 @@ fn combine_external_match_runs(
             .expect("external match map has a block store")?;
         while let Some(row) = reader.row() {
             storage
-                .with_block_store(|blocks| sorter.push_encoded(blocks, row, &mut compare))
+                .with_block_store(|blocks| sorter.push_encoded(storage, blocks, row, &mut compare))
                 .expect("external match map has a block store")?;
             storage
                 .with_block_store(|blocks| reader.advance(blocks))

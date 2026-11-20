@@ -498,7 +498,7 @@ fn external_list_subquery<'a>(
             }
             storage
                 .with_block_store(|blocks| {
-                    sorter.push_projected_by(blocks, 1, |_| value, &mut compare)
+                    sorter.push_projected_by(storage, blocks, 1, |_| value, &mut compare)
                 })
                 .expect("external subquery run has a block store")
         },
@@ -654,7 +654,7 @@ fn streaming_scalar_subquery<'a>(
             let value = values[0];
             storage
                 .with_block_store(|blocks| {
-                    sorter.push_projected_by(blocks, 1, |_| value, &mut compare)
+                    sorter.push_projected_by(storage, blocks, 1, |_| value, &mut compare)
                 })
                 .expect("external scalar-subquery run has a block store")
         },
@@ -720,7 +720,7 @@ fn streaming_array_subquery<'a>(
             count += 1;
             storage
                 .with_block_store(|blocks| {
-                    sorter.push_projected_by(blocks, 1, |_| values[0], &mut compare)
+                    sorter.push_projected_by(storage, blocks, 1, |_| values[0], &mut compare)
                 })
                 .expect("external array-subquery run has a block store")
         },

@@ -10,7 +10,7 @@ use crate::sql::types::Datum;
 use crate::sql_err;
 
 use super::postgres_memory::{
-    SortTuples, TuplesortModel, TuplesortSpace, datum_written_size, minimal_tuple_len_with_tids,
+    SortTuples, TuplesortModel, TuplesortSpace, minimal_tuple_len_with_tids, value_written_size,
 };
 use super::window_store::{Frame, Function, Window};
 use super::{QueryScope, ResolvedColumn, arena_full, instrument};
@@ -20,6 +20,11 @@ fn unsupported(what: &str) -> SqlError {
         sqlstate::FEATURE_NOT_SUPPORTED,
         "EXPLAIN ANALYZE of {what} is not supported"
     )
+}
+
+/// A window whose input tuple pos3ql cannot charge against `work_mem`.
+fn refused(what: &str) -> SqlError {
+    sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "{what} is not supported")
 }
 
 /// One column of the tuple a window's input sort holds.
@@ -51,22 +56,24 @@ fn resolve(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<(usize, usiz
 fn pull_columns<'a>(
     scope: &QueryScope<'_>,
     expression: &'a Expr<'a>,
-    out: &mut ArenaList<'a, (usize, usize)>,
-    unmodeled: &mut Option<&'static str>,
+    out: &mut ArenaList<'a, InputColumn<'a>>,
 ) -> Result<(), SqlError> {
     match expression {
-        Expr::Column { .. } => {
-            if let Some(column) = resolve(scope, expression)
-                && !out.as_slice().contains(&column)
-            {
-                out.push(column).map_err(|_| arena_full())?;
+        Expr::Column { qualifier, name } => match scope.find_column_unsuggested(*qualifier, name) {
+            Ok(ResolvedColumn::Table(table, column)) => {
+                push_once(out, InputColumn::Column(table, column))
             }
-            Ok(())
-        }
-        Expr::WholeRow(_) => {
-            *unmodeled = Some("a window over a whole-row reference");
-            Ok(())
-        }
+            Ok(ResolvedColumn::TableOid(_)) => push_once(out, InputColumn::Expression(expression)),
+            Ok(ResolvedColumn::Merged(merged)) => {
+                for &(table, column) in scope.merged_vars(merged) {
+                    push_once(out, InputColumn::Column(table, column))?;
+                }
+                Ok(())
+            }
+            Err(_) => Ok(()),
+        },
+        // A whole-row reference is one column: a composite datum.
+        Expr::WholeRow(_) => push_once(out, InputColumn::Expression(expression)),
         Expr::Call {
             args,
             order_by,
@@ -75,20 +82,36 @@ fn pull_columns<'a>(
             ..
         } => {
             for argument in *args {
-                pull_columns(scope, argument, out, unmodeled)?;
+                pull_columns(scope, argument, out)?;
             }
             for order in *order_by {
-                pull_columns(scope, order.expression, out, unmodeled)?;
+                pull_columns(scope, order.expression, out)?;
             }
             if let Some(filter) = filter {
-                pull_columns(scope, filter, out, unmodeled)?;
+                pull_columns(scope, filter, out)?;
             }
             Ok(())
         }
-        _ => super::subquery::walk_children(expression, &mut |child| {
-            pull_columns(scope, child, out, unmodeled)
-        }),
+        _ => {
+            super::subquery::walk_children(expression, &mut |child| pull_columns(scope, child, out))
+        }
     }
+}
+
+/// Adds `column` to a tuple's columns unless it holds it.
+fn push_once<'a>(
+    columns: &mut ArenaList<'a, InputColumn<'a>>,
+    column: InputColumn<'a>,
+) -> Result<(), SqlError> {
+    let held = columns.as_slice().iter().any(|held| match (held, &column) {
+        (InputColumn::Column(a, b), InputColumn::Column(c, d)) => (a, b) == (c, d),
+        (InputColumn::Expression(a), InputColumn::Expression(b)) => a == b,
+        _ => false,
+    });
+    if held {
+        return Ok(());
+    }
+    columns.push(column).map_err(|_| arena_full())
 }
 
 #[derive(Clone, Copy)]
@@ -96,32 +119,23 @@ struct Target<'a> {
     column: Option<(usize, usize)>,
     expression: Option<&'a Expr<'a>>,
     window: bool,
-}
-
-/// [`input_target`] for `EXPLAIN ANALYZE`, which fails where the tuple is
-/// not modelled.
-pub(crate) fn explain_target<'a>(
-    scope: &QueryScope<'a>,
-    statement: &'a Select<'a>,
-    win_nodes: &[&'a Expr<'a>],
-    arena: &'a Arena,
-) -> Result<&'a [InputColumn<'a>], SqlError> {
-    input_target(scope, statement, win_nodes, arena)?.map_err(unsupported)
+    /// A USING-merged column, whose alias variable the planner expands.
+    merged: Option<usize>,
 }
 
 /// The tuple of a window's input (`make_window_input_target`): the entries
 /// of the processed target list that are window keys, then the columns the
-/// others read, each once; or why a select list's tuple is not modelled.
+/// others read, each once. A query whose select list the planner reads
+/// differently from pos3ql fails with `0A000`, as its sort cannot be charged.
 pub(crate) fn input_target<'a>(
     scope: &QueryScope<'a>,
     statement: &'a Select<'a>,
     win_nodes: &[&'a Expr<'a>],
     arena: &'a Arena,
-) -> Result<Result<&'a [InputColumn<'a>], &'static str>, SqlError> {
-    if !statement.locking.is_empty() {
-        return Ok(Err("a window under row locks"));
-    }
-    let mut unmodeled = None;
+) -> Result<&'a [InputColumn<'a>], SqlError> {
+    // PostgreSQL refuses a window under `FOR UPDATE`, so the tuple holds no
+    // row identity.
+    debug_assert!(statement.locking.is_empty());
     let mut targets = ArenaList::new(arena);
     for item in statement.items {
         match item {
@@ -130,23 +144,36 @@ pub(crate) fn input_target<'a>(
                     column: resolve(scope, expression),
                     expression: Some(expression),
                     window: false,
+                    merged: None,
                 })
                 .map_err(|_| arena_full())?,
             SelectItem::Wildcard(_) => {
                 for index in 0..scope.star_columns() {
-                    let ResolvedColumn::Table(table, column) = scope.star_entry(index) else {
-                        return Ok(Err("a window over a derived column list"));
-                    };
                     targets
-                        .push(Target {
-                            column: Some((table, column)),
-                            expression: None,
-                            window: false,
-                        })
+                        .push(star_target(scope, scope.star_entry(index), arena)?)
                         .map_err(|_| arena_full())?;
                 }
             }
-            _ => return Ok(Err("a window under this select list")),
+            SelectItem::TableWildcard(name) => {
+                for index in 0..scope.qualified_star_columns(name)? {
+                    targets
+                        .push(star_target(
+                            scope,
+                            scope.qualified_star_entry(name, index)?,
+                            arena,
+                        )?)
+                        .map_err(|_| arena_full())?;
+                }
+            }
+            // The fields are read from the record's own columns.
+            SelectItem::RecordStar(base) => targets
+                .push(Target {
+                    column: None,
+                    expression: Some(base),
+                    window: false,
+                    merged: None,
+                })
+                .map_err(|_| arena_full())?,
         }
     }
     let item_count = targets.len();
@@ -187,6 +214,7 @@ pub(crate) fn input_target<'a>(
                 column: resolve(scope, key),
                 expression: Some(key),
                 window: false,
+                merged: None,
             })
             .map_err(|_| arena_full())?;
         Ok(targets.len() - 1)
@@ -235,32 +263,53 @@ pub(crate) fn input_target<'a>(
     }
     let mut columns = ArenaList::new(arena);
     for target in targets.as_slice().iter().filter(|target| !target.window) {
+        if let Some(merged) = target.merged {
+            for &(table, column) in scope.merged_vars(merged) {
+                push_once(&mut columns, InputColumn::Column(table, column))?;
+            }
+            continue;
+        }
         match (target.column, target.expression) {
-            (Some(column), _) => {
-                if !columns.as_slice().contains(&column) {
-                    columns.push(column).map_err(|_| arena_full())?;
-                }
+            (Some((table, column)), _) => {
+                push_once(&mut columns, InputColumn::Column(table, column))?
             }
-            (None, Some(expression)) => {
-                pull_columns(scope, expression, &mut columns, &mut unmodeled)?
-            }
+            (None, Some(expression)) => pull_columns(scope, expression, &mut columns)?,
             (None, None) => unreachable!("a target is a column or an expression"),
         }
     }
-    for &(table, column) in columns.as_slice() {
-        let held = input.as_slice().iter().any(|entry| {
-            matches!(entry, InputColumn::Column(held_table, held_column)
-                if (*held_table, *held_column) == (table, column))
-        });
-        if !held {
-            input
-                .push(InputColumn::Column(table, column))
-                .map_err(|_| arena_full())?;
-        }
+    for &column in columns.as_slice() {
+        push_once(&mut input, column)?;
     }
-    Ok(match unmodeled {
-        Some(reason) => Err(reason),
-        None => Ok(input.as_slice()),
+    Ok(input.as_slice())
+}
+
+/// The target-list entry a `*` or `t.*` position expands to.
+fn star_target<'a>(
+    scope: &QueryScope<'a>,
+    entry: ResolvedColumn,
+    arena: &'a Arena,
+) -> Result<Target<'a>, SqlError> {
+    Ok(match entry {
+        ResolvedColumn::Table(table, column) => Target {
+            column: Some((table, column)),
+            expression: None,
+            window: false,
+            merged: None,
+        },
+        ResolvedColumn::TableOid(_) => Target {
+            column: None,
+            expression: Some(scope.copied_output_expression(entry, arena)?),
+            window: false,
+            merged: None,
+        },
+        // The planner reads the alias variable's columns, not the merged
+        // value: an expression stands for it as a window key.
+        ResolvedColumn::Merged(merged) => Target {
+            column: None,
+            expression: Some(scope.copied_output_expression(entry, arena)?),
+            window: false,
+            merged: Some(merged),
+        },
     })
 }
 
@@ -345,6 +394,7 @@ pub(crate) struct RowSize {
 /// Sizes the input row `value` yields the columns of, as the sort and the
 /// window's buffer hold it; `None` when a value has no PostgreSQL size here.
 pub(crate) fn row_size<'a>(
+    source: super::postgres_memory::SizeSource<'_>,
     target: &[InputColumn<'a>],
     arena: &'a Arena,
     mut value: impl FnMut(&InputColumn<'a>) -> Result<Datum<'a>, SqlError>,
@@ -355,20 +405,24 @@ pub(crate) fn row_size<'a>(
     for (slot, column) in values.iter_mut().zip(target) {
         *slot = value(column)?;
     }
-    let Some(length) = minimal_tuple_len_with_tids(values.iter().copied(), 0) else {
-        return Ok(None);
-    };
-    let written = if let [only] = values {
-        4 + datum_written_size(only, matches!(target[0], InputColumn::Expression(_)))
-    } else {
-        length - 10 + 4
-    };
-    Ok(Some(RowSize { length, written }))
+    Ok(source.with(|sizing| {
+        let length = minimal_tuple_len_with_tids(Some(sizing), values.iter().copied(), 0)?;
+        let written = if let [only] = &*values {
+            4 + value_written_size(
+                Some(sizing),
+                only,
+                matches!(target[0], InputColumn::Expression(_)),
+            )?
+        } else {
+            length - 10 + 4
+        };
+        Some(RowSize { length, written })
+    }))
 }
 
 /// The error of `EXPLAIN ANALYZE` over a row with no PostgreSQL size here.
 pub(crate) fn unsized_row() -> SqlError {
-    unsupported("a window over a value with no PostgreSQL size here")
+    refused("a window over a value with no PostgreSQL size here")
 }
 
 /// A sort's accounting of a window's input, fed in the scan's order.

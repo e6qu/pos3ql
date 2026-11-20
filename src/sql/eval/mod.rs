@@ -221,6 +221,9 @@ enum ErrorOrigin {
     /// A cast's length coercion (see [`SqlError::type_modifier_coercion`]).
     TypeModifierCoercion,
     Control(InternalControl),
+    /// An [`InternalControl::IoWait`] for cache space that checkpoint cleanup
+    /// frees, rather than for an object read.
+    CacheSpaceWait,
     /// A retained plan node's build did not fit `plan_build_bytes`; the
     /// statement can still run the general executor's way.
     PlanBuild,
@@ -291,9 +294,15 @@ impl SqlState {
         code.into()
     }
 
+    /// Whether this internal I/O wait resumes on freed cache space.
+    pub(crate) fn awaits_cache_space(self) -> bool {
+        self.1 == ErrorOrigin::CacheSpaceWait
+    }
+
     pub(crate) fn internal_control(self) -> Option<InternalControl> {
         match self.1 {
             ErrorOrigin::Control(control) => Some(control),
+            ErrorOrigin::CacheSpaceWait => Some(InternalControl::IoWait),
             ErrorOrigin::Sql
             | ErrorOrigin::InputExpression
             | ErrorOrigin::TypeModifierCoercion
@@ -438,6 +447,18 @@ impl SqlError {
     /// the general executor can run it instead.
     pub(crate) fn is_plan_build_exhausted(&self) -> bool {
         self.sqlstate.1 == ErrorOrigin::PlanBuild
+    }
+
+    /// An internal I/O wait that resumes when checkpoint cleanup frees cache
+    /// space. Every path treats it as [`InternalControl::IoWait`]; only the
+    /// parked connection's wake condition differs.
+    pub(crate) fn cache_space_wait(args: core::fmt::Arguments<'_>) -> Self {
+        let mut error = Self::formatted(sqlstate::INTERNAL_IO_WAIT.into(), args);
+        // A message the error text pool cannot hold stays its own `54000`.
+        if error.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+            error.sqlstate.1 = ErrorOrigin::CacheSpaceWait;
+        }
+        error
     }
 
     /// Marks a `0A000` raised because a routine needs the resumable

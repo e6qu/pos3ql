@@ -30,6 +30,12 @@ impl Checkpointer {
         self.garbage_scratch.clear();
     }
 
+    /// Collection has captured its keep-set: until it finishes or yields,
+    /// no producer may write a block that set does not name.
+    pub(super) fn file_gc_holds_keep_set(&self) -> bool {
+        !matches!(self.file_gc, FileGcProgress::Unloaded)
+    }
+
     pub(crate) fn file_io_ready(&self) -> bool {
         self.file_io.ready()
     }
@@ -383,6 +389,9 @@ impl Checkpointer {
             }
             FileGcProgress::Delete { next } => {
                 for _ in 0..self.delete_objects_per_beat.min(self.doomed_blocks.len()) {
+                    if self.gc_yields_to_capture && !self.file_io.busy() {
+                        return Ok(false);
+                    }
                     let key = *self.doomed_blocks.last().expect("staged block deletion");
                     if self.file_io.delete(key.as_str())?.is_pending() {
                         return Ok(false);

@@ -18688,6 +18688,9 @@ pub struct Storage {
     /// checkpointer, plus owned reader scratch. `None` without object storage
     /// — then rows never spill and the heap-full error stands.
     spill: Option<std::sync::Arc<SpillReader>>,
+    /// A row write waits for overlay or history slots that the next
+    /// checkpoint's cleanup frees. Paced checkpoint beats capture first.
+    row_capacity_wait: std::sync::atomic::AtomicBool,
     /// Startup-allocated value indexes shared by every table's enforcers.
     /// Retained leases keep a cache valid through replacement and row walks.
     value_indexes: ValueIndexPool,
@@ -25273,6 +25276,7 @@ impl Storage {
             lsn: log_positions::LogPositions::new(budget)?,
             replay_table_rewrite: None,
             spill: None,
+            row_capacity_wait: std::sync::atomic::AtomicBool::new(false),
             value_indexes,
             index_arena: Mutex::new(index_arena),
             comparison_arena: Mutex::new(comparison_arena),
@@ -40798,17 +40802,62 @@ impl Storage {
     }
 
     pub(crate) fn durable_map_pressure(&self) -> bool {
-        self.map_pressure()
-            && self.tables.iter().any(|table| {
-                table.live()
-                    && table.dirty()
-                    && table.definition().persistence != RelationPersistence::Temporary
-                    && table
-                        .rows
-                        .read()
-                        .iter()
-                        .any(|(_, state)| state.checkpoint_change_lsn != 0)
-            })
+        self.map_pressure() && self.checkpoint_reclaims_rows()
+    }
+
+    /// Whether a durable table holds committed resident changes. The next
+    /// checkpoint captures them, and its cleanup then releases their overlay
+    /// and history slots.
+    pub(crate) fn checkpoint_reclaims_rows(&self) -> bool {
+        self.tables.iter().any(|table| {
+            table.live()
+                && table.dirty()
+                && table.definition().persistence != RelationPersistence::Temporary
+                && table
+                    .rows
+                    .read()
+                    .iter()
+                    .any(|(_, state)| state.checkpoint_change_lsn != 0)
+        })
+    }
+
+    /// A row write found its overlay or history slots exhausted. While the
+    /// statement can still yield and a checkpoint can free slots, it waits
+    /// for that checkpoint as PostgreSQL waits for buffer space; otherwise
+    /// the named capacity error stands.
+    pub(super) fn row_capacity_exhausted(&self, error: SqlError) -> SqlError {
+        let restartable = self
+            .spill
+            .as_ref()
+            .and_then(|reader| reader.blocks.as_ref())
+            .is_some_and(|blocks| {
+                blocks
+                    .lock()
+                    .expect("block store lock poisoned")
+                    .async_gets_enabled()
+            });
+        if !restartable || !self.checkpoint_reclaims_rows() {
+            return error;
+        }
+        self.row_capacity_wait
+            .store(true, std::sync::atomic::Ordering::Release);
+        SqlError::cache_space_wait(format_args!(
+            "row write waits for checkpoint cleanup: {}",
+            error.message.as_str()
+        ))
+    }
+
+    /// Whether a row write waits for checkpoint cleanup.
+    pub(crate) fn row_capacity_waiting(&self) -> bool {
+        self.row_capacity_wait
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Checkpoint cleanup finished, or no maintenance can free slots: a
+    /// waiting write runs again and either fits or reports the named error.
+    pub(crate) fn release_row_capacity_wait(&self) {
+        self.row_capacity_wait
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn temporary_map_pressure(&self) -> bool {

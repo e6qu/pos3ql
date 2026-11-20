@@ -394,10 +394,20 @@ With object storage on, a write that finds the memtable full no longer fails
 while committed rows can spill: the statement rolls back, waits for a
 checkpoint the reactor drives, and runs again. Only a statement (with its
 transaction) whose own uncommitted rows exceed `memtable_bytes` fails, with
-`54000`.
+`54000`. A write that finds `row_overlay_slots` or `row_history_slots`
+exhausted while committed changes await a checkpoint waits for that
+checkpoint's cleanup and resumes at its row. Writers waiting for cache space
+or a requested checkpoint pause saved-file cleanup at its next request
+boundary, so the capture that frees space runs first; a waiter whose
+maintenance ends without freeing space runs again at once and fits or gets
+the named error.
 
 **Remaining:**
 
+- A write that cannot yield (`COPY FROM`, a statement after its first
+  unreplayable effect) still fails with `54000` when `row_overlay_slots` or
+  `row_history_slots` are exhausted, even while a checkpoint could free them;
+  it needs the same checkpoint wait without a restart.
 - Reserve forward progress for commit, rollback, required reads and maintenance;
   reclaim in bounded steps; report pinned capacity and named exhaustion.
   Replacements are reserved before effects. For example, if analyzing `orders`

@@ -1475,6 +1475,11 @@ pub(crate) struct Checkpointer {
     commit_prune_next: Option<u64>,
     legacy_garbage_pending: bool,
     block_garbage_pending: bool,
+    /// Set for one paced beat when a foreground writer waits for cache space
+    /// or a requested checkpoint, and a sweep is due. Garbage collection then issues no further request
+    /// and is discarded at its next idle point, so the capture that frees the
+    /// cache runs first. Collection restarts after that capture publishes.
+    gc_yields_to_capture: bool,
     sliced_generation: Vec<u64>,
     /// WAL boundary and physical decoder captured by each current slice.
     /// Compatible re-slices append only versions committed after this LSN.
@@ -1533,6 +1538,14 @@ pub(crate) struct Checkpointer {
     writer_token: WriterToken,
     writer_fence_etag: Option<EntityTag>,
     writer_fenced: bool,
+}
+
+/// Whether a paced beat serves foreground writers waiting for cache space.
+/// Such a beat starts a due capture ahead of pending garbage collection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CapturePriority {
+    Ordinary,
+    CacheWaiters,
 }
 
 /// One beat's outcome: nothing to publish, a slice written, or the manifest
@@ -2558,6 +2571,7 @@ impl Checkpointer {
             commit_prune_next: None,
             legacy_garbage_pending: false,
             block_garbage_pending: false,
+            gc_yields_to_capture: false,
             sliced_generation: vec![0; table_capacity],
             sliced_lsn: vec![0; table_capacity],
             sliced_layout: vec![SliceLayout::EMPTY; table_capacity],
@@ -2598,6 +2612,23 @@ impl Checkpointer {
             writer_fence_etag: None,
             writer_fenced: false,
         })
+    }
+
+    /// Writes `count` distinct blocks that no root names: garbage for the
+    /// next collection to list and delete.
+    #[cfg(test)]
+    pub(crate) fn put_orphan_blocks_for_test(&mut self, count: u32) -> Vec<String> {
+        let mut blocks = self.blocks.lock().expect("block store lock poisoned");
+        (0..count)
+            .map(|index| {
+                let id = blocks
+                    .put(&index.to_le_bytes(), BlockType::SstData, 0)
+                    .expect("orphan block upload");
+                let mut hex = [0; 64];
+                id.write_key(&mut hex);
+                format!("blocks/{}", core::str::from_utf8(&hex).unwrap())
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -3388,7 +3419,7 @@ impl Checkpointer {
 
     pub(crate) fn retained_output_ready(&self) -> bool {
         self.block_output.is_empty()
-            && !self.published_maintenance_pending()
+            && !self.file_gc_holds_keep_set()
             && self.retained_output_pending()
     }
 
@@ -10205,7 +10236,7 @@ impl Checkpointer {
             ));
         }
         loop {
-            match self.checkpoint_step(storage)? {
+            match self.checkpoint_step(storage, CapturePriority::Ordinary)? {
                 CheckpointStep::Idle => return Ok(None),
                 CheckpointStep::Working => {
                     if self.manifest_publication_pending() {
@@ -10221,6 +10252,16 @@ impl Checkpointer {
                 CheckpointStep::Published { lsn } => return Ok(Some(lsn)),
             }
         }
+    }
+
+    /// Whether the next sweep has anything to capture or publish.
+    fn sweep_due(&self, storage: &Storage) -> bool {
+        self.sweep_active()
+            || storage.lsn() != self.manifest_lsn
+            || !self.manifest_present
+            || self.merge_done.iter().any(Option::is_some)
+            || self.value_index_schedule_pending(storage)
+            || storage.statistics_dirty()
     }
 
     /// Whether a sweep is mid-flight — once true, every beat advances it
@@ -10253,6 +10294,7 @@ impl Checkpointer {
                 "maintenance waits for validated credential installation"
             ));
         }
+        self.gc_yields_to_capture = false;
         self.observe_retained_root_release(storage);
         while self.published_lsn_pending_maintenance.is_some() || self.commit_cleanup_pending() {
             self.metadata_io.wait_ready()?;
@@ -10285,7 +10327,9 @@ impl Checkpointer {
     pub(crate) fn checkpoint_step(
         &mut self,
         storage: &mut Storage,
+        priority: CapturePriority,
     ) -> Result<CheckpointStep, SqlError> {
+        self.gc_yields_to_capture = false;
         if self.manifest_publication_pending() {
             return self.advance_manifest_publication(storage);
         }
@@ -10306,17 +10350,29 @@ impl Checkpointer {
             self.merge_beat(storage)?;
             return Ok(CheckpointStep::Working);
         }
-        if self.published_lsn_pending_maintenance.is_some() {
-            if self.legacy_garbage_pending {
-                self.legacy_garbage_pending = !self.collect_garbage_batch()?;
+        // Collection deletes every listed block its keep-set misses, so it
+        // never runs beside a sweep's unpublished blocks. Writers waiting for
+        // cache space or for a requested checkpoint need the next capture:
+        // collection then yields at a request boundary, and the published
+        // capture schedules it again.
+        self.gc_yields_to_capture = (priority == CapturePriority::CacheWaiters
+            || self.requested_checkpoint_epoch > self.published_checkpoint_epoch)
+            && self.sweep_due(storage);
+        if self.published_lsn_pending_maintenance.is_some() && !self.sweeping {
+            if self.gc_yields_to_capture && !self.file_io.busy() {
+                self.reset_file_gc();
+            } else {
+                if self.legacy_garbage_pending {
+                    self.legacy_garbage_pending = !self.collect_garbage_batch()?;
+                    return Ok(CheckpointStep::Working);
+                }
+                if self.block_garbage_pending {
+                    self.block_garbage_pending = !self.collect_block_garbage_batch(storage)?;
+                    return Ok(CheckpointStep::Working);
+                }
+                self.published_lsn_pending_maintenance = None;
                 return Ok(CheckpointStep::Working);
             }
-            if self.block_garbage_pending {
-                self.block_garbage_pending = !self.collect_block_garbage_batch(storage)?;
-                return Ok(CheckpointStep::Working);
-            }
-            self.published_lsn_pending_maintenance = None;
-            return Ok(CheckpointStep::Working);
         }
         self.reconcile_published_spill_lists(storage);
         let dirty_full_list = (0..storage.physical_table_count()).any(|slot| {
@@ -10346,13 +10402,7 @@ impl Checkpointer {
         // long merge cannot starve publishes. A finished merge makes a
         // sweep due even at an unchanged lsn: its install needs a publish.
         let merge_due = self.merge_job.is_some() || self.merge_candidate(storage).is_some();
-        let value_index_due = self.value_index_schedule_pending(storage);
-        let sweep_due = self.sweep_active()
-            || storage.lsn() != self.manifest_lsn
-            || !self.manifest_present
-            || self.merge_done.iter().any(Option::is_some)
-            || value_index_due
-            || storage.statistics_dirty();
+        let sweep_due = self.sweep_due(storage);
         if merge_due && (self.merge_turn || !sweep_due) {
             self.merge_turn = false;
             self.merge_beat(storage)?;
@@ -16256,6 +16306,9 @@ impl Checkpointer {
         #[cfg(feature = "checkpoint-profile")]
         let mut deleted = 0;
         for _ in 0..self.delete_objects_per_beat.min(self.garbage_scratch.len()) {
+            if self.gc_yields_to_capture && !self.file_io.busy() {
+                return Ok(false);
+            }
             let key = *self
                 .garbage_scratch
                 .last()
@@ -21092,7 +21145,9 @@ mod stored_dependency_tests {
                 break;
             }
             assert!(matches!(
-                checkpoint.checkpoint_step(&mut storage).unwrap(),
+                checkpoint
+                    .checkpoint_step(&mut storage, CapturePriority::Ordinary)
+                    .unwrap(),
                 super::CheckpointStep::Working
             ));
         }
@@ -21418,7 +21473,9 @@ mod stored_dependency_tests {
             checkpoint.block_garbage_pending = true;
             if finish_before_cleanup {
                 assert!(matches!(
-                    checkpoint.checkpoint_step(&mut storage).unwrap(),
+                    checkpoint
+                        .checkpoint_step(&mut storage, CapturePriority::Ordinary)
+                        .unwrap(),
                     CheckpointStep::Working
                 ));
             }
@@ -22214,7 +22271,9 @@ mod stored_dependency_tests {
         let mut published = false;
         for _ in 0..128 {
             if matches!(
-                checkpoint.checkpoint_step(&mut storage).unwrap(),
+                checkpoint
+                    .checkpoint_step(&mut storage, CapturePriority::Ordinary)
+                    .unwrap(),
                 CheckpointStep::Published { .. }
             ) {
                 published = true;
@@ -22560,7 +22619,9 @@ mod stored_dependency_tests {
         let mut published = false;
         for _ in 0..128 {
             if matches!(
-                checkpoint.checkpoint_step(&mut storage).unwrap(),
+                checkpoint
+                    .checkpoint_step(&mut storage, CapturePriority::Ordinary)
+                    .unwrap(),
                 CheckpointStep::Published { .. }
             ) {
                 published = true;

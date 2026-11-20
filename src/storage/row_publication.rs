@@ -226,12 +226,16 @@ impl Storage {
                 PendingPublication::Retry => continue,
                 PendingPublication::OverlayFull(error) => {
                     if !self.reclaim_row_overlay_slot(table_index) {
-                        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error));
+                        return Err(self.row_capacity_exhausted(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "{}",
+                            error
+                        )));
                     }
                 }
                 PendingPublication::HistoryFull(error) => {
                     if reclaimed_history {
-                        return Err(error);
+                        return Err(self.row_capacity_exhausted(error));
                     }
                     reclaimed_history = true;
                     // Bound foreground cleanup and retain its shared cursor.
@@ -239,7 +243,7 @@ impl Storage {
                     if self.advance_history_cleanup(super::snapshot_reclamation::SLOTS_PER_BATCH)
                         != HistoryReclamation::Advanced
                     {
-                        return Err(error);
+                        return Err(self.row_capacity_exhausted(error));
                     }
                 }
                 PendingPublication::DefinitionBusy => {

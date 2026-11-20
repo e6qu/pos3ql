@@ -154,7 +154,9 @@ plan. Covered:
 - Constants propagated through classes (`845`, `853`, `872`, `876`, `877`);
   an equality of two columns of one relation joins their classes, as
   `process_equivalence` does, so the join clause a class derives names the
-  members PostgreSQL's does (`976`);
+  members PostgreSQL's does, and a column compared with an expression of its
+  own relation's columns (`b = a - 1`) takes the operator's default
+  selectivity, as no side is a pseudoconstant (`976`);
   `remove_useless_joins` (`851`); `remove_useless_self_joins`, which merges
   two scans of one table joined on a unique key into one scan whose filter
   holds both scans' conditions and `IS NOT NULL` of each joined column not

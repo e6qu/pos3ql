@@ -2399,16 +2399,22 @@ impl Prep<'_, '_> {
                 }
                 previous[rel] = Some(member);
             }
+            // `add_vars_to_targetlist` at the class's relations: a column
+            // only its own relation's class reads is needed by no join.
             let relids = self.class_relids(at as u8);
             for &member in members {
                 // An expression's columns (`pull_var_clause` of `em_expr`).
                 if let Some(id) = member.expression_id() {
                     for &var in self.tree.expression_vars[id].as_slice() {
-                        self.note_needed(var, relids, NO_QUAL)?;
+                        if relids & !Relids::of(var.0) != Relids::EMPTY {
+                            self.note_needed(var, relids, NO_QUAL)?;
+                        }
                     }
                     continue;
                 }
-                self.note_needed((member.rel, member.column), relids, NO_QUAL)?;
+                if relids & !Relids::of(member.rel) != Relids::EMPTY {
+                    self.note_needed((member.rel, member.column), relids, NO_QUAL)?;
+                }
             }
         }
         Ok(())

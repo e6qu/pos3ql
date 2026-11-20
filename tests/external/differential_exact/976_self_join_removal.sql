@@ -13,6 +13,17 @@ ANALYZE sjo;
 EXPLAIN (COSTS OFF) SELECT p.* FROM sj p, sj q WHERE q.a = p.a AND q.b < 2;
 SELECT p.* FROM sj p, sj q WHERE q.a = p.a AND q.b < 2;
 EXPLAIN SELECT p.* FROM sj p, sj q WHERE q.a = p.a AND q.b < 2;
+EXPLAIN (COSTS OFF) SELECT p.* FROM sj p, sj q WHERE q.a = p.a AND q.b = q.a - 1;
+SELECT p.* FROM sj p, sj q WHERE q.a = p.a AND q.b = q.a - 1;
+EXPLAIN SELECT p.* FROM sj p, sj q WHERE q.a = p.a AND q.b = q.a - 1;
+SET enable_self_join_elimination = off;
+EXPLAIN SELECT p.* FROM sj p, sj q WHERE q.a = p.a AND q.b = q.a - 1;
+RESET enable_self_join_elimination;
+-- A column compared with an expression of its own relation's columns.
+EXPLAIN SELECT * FROM sjk WHERE v = id - 1;
+EXPLAIN SELECT * FROM sjk WHERE v < id + 1 AND id > 150;
+EXPLAIN SELECT * FROM sjk WHERE id = v * 2;
+SELECT count(*) FROM sjk WHERE v = id % 5;
 -- Different unique columns: no removal.
 EXPLAIN (COSTS OFF) SELECT * FROM sj t1, sj t2 WHERE t1.a = t2.c AND t1.b IS NOT NULL;
 -- Classes equating two columns of one scan.

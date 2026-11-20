@@ -1272,8 +1272,8 @@ grouped by that column (PostgreSQL groups by its `COALESCE`), and a
 chain's merged column equated with a constant, which
 `reconsider_full_join_clause` pushes into each lower join's sides. The
 search's capacities follow the 128-relation maximum: 256 conditions, 64
-equivalence classes of up to 255 members, 512 columns joins read, 32
-clauses of one join and 65535 clauses, its lists kept in the statement
+equivalence classes of up to 255 members, 32 clauses of one join and
+65535 clauses, its lists and the columns joins read kept in the statement
 arena (`sql_arena_bytes`); past any of them a query fails with `54000`
 naming the capacity rather than running pos3ql's join order. The search
 keeps its paths (288 bytes each, as PostgreSQL's path nodes and their

@@ -29,8 +29,6 @@ pub(crate) const MAX_QUAL_VARS: usize = 8;
 /// Equivalence classes of one query: a pathkey names its class in six
 /// bits ([`super::joins::KEY_CLASS`]).
 pub(crate) const MAX_CLASSES: usize = super::joins::KEY_CLASS as usize + 1;
-/// Columns some join reads, as a two-column `USING` chain's joins do.
-pub(crate) const MAX_NEEDED: usize = 2 * MAX_QUALS;
 /// Outer, semi and anti joins of one query.
 pub(crate) const MAX_SPECIALS: usize = MAX_JOIN_RELS;
 /// A qual's number among its query's quals.
@@ -306,8 +304,7 @@ pub(crate) struct Prepared<'a> {
     /// Each column some join reads (`attr_needed`), with the qual that
     /// reads it there ([`NO_QUAL`] for a class's); a removed join's column
     /// is needed only by its own relation.
-    pub(crate) needed: [(Var, Relids, QualId); MAX_NEEDED],
-    pub(crate) needed_count: usize,
+    pub(crate) needed: ArenaList<'a, (Var, Relids, QualId)>,
     /// A class equates two different constants in the query's join
     /// domain: the query returns no rows.
     pub(crate) contradictory: bool,
@@ -383,8 +380,9 @@ impl<'a> Prepared<'a> {
         }
         self.placed.truncate(kept);
         let mut kept = 0;
-        for index in 0..self.needed_count {
-            let (var, relids, qual) = self.needed[index];
+        let needed = self.needed.as_mut_slice().map_err(|_| ARENA)?;
+        for index in 0..needed.len() {
+            let (var, relids, qual) = needed[index];
             if Relids::of(var.0) & info.min_right != Relids::EMPTY {
                 continue;
             }
@@ -395,10 +393,10 @@ impl<'a> Prepared<'a> {
             } else {
                 relids & !gone
             };
-            self.needed[kept] = (var, relids, qual);
+            needed[kept] = (var, relids, qual);
             kept += 1;
         }
-        self.needed_count = kept;
+        self.needed.truncate(kept);
         for index in at..self.special_count - 1 {
             self.specials[index] = self.specials[index + 1];
         }
@@ -439,7 +437,8 @@ impl<'a> Prepared<'a> {
     /// The relations and outer joins that need column `var` above its
     /// scan.
     pub(crate) fn needed_by(&self, var: Var) -> Relids {
-        self.needed[..self.needed_count]
+        self.needed
+            .borrowed_slice()
             .iter()
             .filter(|(held, ..)| *held == var)
             .fold(Relids::EMPTY, |relids, (_, needed, _)| relids | *needed)
@@ -509,8 +508,7 @@ struct Prep<'t, 'a> {
     placed: ArenaList<'a, Placed>,
     sources: [(QualId, u8); MAX_QUALS],
     source_count: usize,
-    needed: [(Var, Relids, QualId); MAX_NEEDED],
-    needed_count: usize,
+    needed: ArenaList<'a, (Var, Relids, QualId)>,
     left_join: ArenaList<'a, Pending>,
     right_join: ArenaList<'a, Pending>,
     full_join: ArenaList<'a, Pending>,
@@ -602,8 +600,7 @@ pub(crate) fn prepare<'a>(tree: &Tree, arena: &'a Arena) -> Result<Prepared<'a>,
         placed: ArenaList::new(arena),
         sources: [(0, 0); MAX_QUALS],
         source_count: 0,
-        needed: [((0, 0), Relids::EMPTY, NO_QUAL); MAX_NEEDED],
-        needed_count: 0,
+        needed: ArenaList::new(arena),
         left_join: ArenaList::new(arena),
         right_join: ArenaList::new(arena),
         full_join: ArenaList::new(arena),
@@ -700,7 +697,6 @@ pub(crate) fn prepare<'a>(tree: &Tree, arena: &'a Arena) -> Result<Prepared<'a>,
         class_constant,
         placed,
         needed: prep.needed,
-        needed_count: prep.needed_count,
         contradictory: prep.contradictory,
         false_relids: prep.false_relids,
     })
@@ -1638,9 +1634,7 @@ impl Prep<'_, '_> {
     }
 
     fn note_needed(&mut self, var: Var, relids: Relids, qual: QualId) -> Result<(), Outside> {
-        *self.needed.get_mut(self.needed_count).ok_or(FULL)? = (var, relids, qual);
-        self.needed_count += 1;
-        Ok(())
+        self.needed.push((var, relids, qual)).map_err(|_| ARENA)
     }
 
     /// `check_redundant_nullability_qual`: `column IS NULL` of a column an

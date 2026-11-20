@@ -3668,7 +3668,7 @@ fn modeled_join_over<'a>(
     // The columns above each relation's scan: the output's and those a join
     // or outer join reads (`attr_needed`).
     let mut join_columns = [0u64; MAX_JOIN_RELS];
-    for &((rel, column), relids, _) in &prepared.needed[..prepared.needed_count] {
+    for &((rel, column), relids, _) in prepared.needed.borrowed_slice() {
         if relids != Relids::EMPTY && column < 64 {
             join_columns[usize::from(rel)] |= 1 << column;
             note(usize::from(rel), usize::from(column));
@@ -4989,7 +4989,9 @@ fn join_is_removable(
     let inputs = info.min_left | info.min_right;
     let joinrelids = inputs | info.oj;
     if output != 0
-        || prepared.needed[..prepared.needed_count]
+        || prepared
+            .needed
+            .borrowed_slice()
             .iter()
             .any(|&((rel, _), relids, _)| {
                 usize::from(rel) == table && relids & !inputs != Relids::EMPTY
@@ -5169,11 +5171,10 @@ fn join_params_full() -> SqlError {
 fn preparation_full() -> SqlError {
     crate::sql_err!(
         crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        "join search capacity exceeded: a query holds at most {} conditions, {} equivalence classes of {} members and {} columns joins read",
+        "join search capacity exceeded: a query holds at most {} conditions and {} equivalence classes of {} members",
         join_tree::MAX_QUALS,
         join_tree::MAX_CLASSES,
-        super::joins::MAX_MEMBERS,
-        join_tree::MAX_NEEDED
+        super::joins::MAX_MEMBERS
     )
 }
 

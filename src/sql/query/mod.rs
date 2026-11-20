@@ -14954,15 +14954,17 @@ pub(crate) fn select_query_resumable<'a>(
     };
     // A parenthesized join's query runs only when the join search does not
     // run the query's relations itself.
+    let mut planned_join = index_paths::join_query::PlannedJoin::new();
     if scope.has_deferred_joins() {
-        let planned =
-            index_paths::join_query::modeled_join(storage, txid, statement, &scope, params, arena);
+        let planned = planned_join.get(storage, txid, statement, &scope, params, arena);
         match planned {
             Ok(Some(_)) => {}
             Ok(None) => {
                 if let Err(error) = scope.run_deferred_joins(storage, txid, arena, params, seq) {
                     return sql_fail(error);
                 }
+                // The scope now reads the joins' rows: plan it anew.
+                planned_join = index_paths::join_query::PlannedJoin::new();
             }
             Err(error) => return sql_fail(error),
         }
@@ -15316,6 +15318,7 @@ pub(crate) fn select_query_resumable<'a>(
             &hooks,
             None,
             pax_columns,
+            &planned_join,
             &mut |row| {
                 if emitted >= limit {
                     return Ok(false);
@@ -17278,8 +17281,9 @@ fn select_into_rows_mode<'a>(
     // Sorting, deduplication and row locks need a materialized source. Plain
     // LIMIT/OFFSET use the streaming path so later rows are never evaluated.
     if statement.distinct || !statement.order_by.is_empty() || !statement.locking.is_empty() {
+        let planned = index_paths::join_query::PlannedJoin::new();
         if materialize::externally_materialized(
-            storage, txid, statement, &scope, params, arena, outer,
+            storage, txid, statement, &scope, params, arena, outer, &planned,
         )? {
             external_materialized_into(
                 storage,
@@ -17323,6 +17327,7 @@ fn select_into_rows_mode<'a>(
             .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
             materialize::locked_scan_window(statement, limit, offset),
             &stages,
+            &planned,
         )?;
         materialize::materialized_rows_into(
             storage,
@@ -17455,6 +17460,7 @@ fn select_into_rows_mode<'a>(
         &hooks,
         outer,
         pax_columns,
+        &index_paths::join_query::PlannedJoin::new(),
         &mut visit,
     )
 }

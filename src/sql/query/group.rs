@@ -6,6 +6,7 @@
 //! `GROUPING SETS` (and the `ROLLUP` / `CUBE` spellings) run this per set, with
 //! the columns a set collapses reading NULL.
 
+use super::index_paths::join_query::PlannedJoin;
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, FromClause, GroupingSet, Select, SelectItem};
@@ -195,6 +196,7 @@ pub(super) fn groups_for_mask<'a>(
     n_order: usize,
     pax_demand: super::PaxReadDemand,
     group_bound: Option<usize>,
+    planned: &PlannedJoin<'a>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
     let aggregate = instrument::node(instrument::Role::Aggregate);
@@ -260,6 +262,7 @@ pub(super) fn groups_for_mask<'a>(
             hooks,
             outer,
             pax_demand,
+            planned,
             &mut |row| {
                 if !row_passes_correlated_where(
                     where_correlated,
@@ -382,6 +385,7 @@ pub(super) fn groups_for_mask<'a>(
                 hooks,
                 outer,
                 pax_demand,
+                planned,
                 &mut |row| {
                     if !row_passes_correlated_where(
                         where_correlated,
@@ -728,6 +732,7 @@ pub(super) fn groups_for_mask<'a>(
             hooks,
             outer,
             pax_demand,
+            planned,
             &mut visit,
         )?;
         if recycling_safe || hold_values {
@@ -768,6 +773,7 @@ pub(super) fn groups_for_mask<'a>(
                 statement,
                 params,
                 arena,
+                planned,
                 group_of,
                 rep_keys,
                 group_collations,
@@ -970,6 +976,7 @@ pub(super) fn groups_for_mask<'a>(
                 hooks,
                 outer,
                 pax_demand,
+                planned,
                 &mut |row| {
                     if !row_passes_correlated_where(
                         where_correlated,
@@ -1352,14 +1359,12 @@ fn modeled_group_order<'a>(
     statement: &'a Select<'a>,
     params: &[Datum<'a>],
     arena: &'a Arena,
+    planned: &PlannedJoin<'a>,
     group_of: &[u32],
     keys: &[&[u8]],
     group_collations: &[Collation],
 ) -> Result<Option<&'a [u32]>, SqlError> {
-    let Some(model) = super::index_paths::join_query::modeled_join(
-        storage, txid, statement, scope, params, arena,
-    )?
-    else {
+    let Some(model) = planned.get(storage, txid, statement, scope, params, arena)? else {
         return Ok(None);
     };
     let Some(group) = model.group else {
@@ -1480,6 +1485,12 @@ pub(super) fn grouped_rows<'a>(
         count += 1;
     }
     let pax_columns = pax_column_demand(scope, from, &expressions[..count]);
+    // Every pass reads the one plan, planned before the grouping sets'
+    // scratch, which each set reclaims.
+    let planned = PlannedJoin::new();
+    if outer.is_none() {
+        planned.get(storage, txid, statement, scope, params, arena)?;
+    }
 
     // Pass 1: count rows, so group storage can be arena-allocated. WHERE
     // with correlated subqueries is applied per row here too, so every pass
@@ -1505,6 +1516,7 @@ pub(super) fn grouped_rows<'a>(
             hooks,
             outer,
             pax_columns,
+            &planned,
             &mut |row| {
                 if !row_passes_correlated_where(
                     where_correlated,
@@ -1635,6 +1647,7 @@ pub(super) fn grouped_rows<'a>(
             n_order,
             pax_columns,
             group_bound,
+            &planned,
         )?;
         for &row in rows {
             let saved = arena
@@ -1724,10 +1737,9 @@ pub(super) fn grouped_rows<'a>(
         // its tuplesort, over the groups in their grouping's order.
         let modeled = outer.is_none()
             && scope.n > 1
-            && super::index_paths::join_query::modeled_join(
-                storage, txid, statement, scope, params, arena,
-            )?
-            .is_some_and(|model| model.group.is_some());
+            && planned
+                .get(storage, txid, statement, scope, params, arena)?
+                .is_some_and(|model| model.group.is_some());
         if modeled {
             let tuples = instrument::SortTuples::new(Some(&columns[..count]), 0, bounded.is_some())
                 .ok_or_else(instrument::unsized_value)?

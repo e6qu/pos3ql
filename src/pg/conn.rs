@@ -184,14 +184,17 @@ fn set_startup_parameter(
     value: &str,
     may_set: &dyn Fn(&str) -> bool,
 ) -> Result<(), SqlError> {
-    if crate::sql::guc::requires_set_privilege(name) && !may_set(name) {
+    if (crate::sql::guc::requires_set_privilege(name)
+        || crate::sql::guc::is_connection_start_parameter(name))
+        && !may_set(name)
+    {
         return Err(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "permission denied to set parameter \"{}\"",
             name
         ));
     }
-    guc.set_config(name, Some(value), false).map(|_| ())
+    guc.set_startup_config(name, value)
 }
 
 struct Prepared {

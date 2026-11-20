@@ -331,9 +331,11 @@ impl<'a> BlockTargets<'a> {
         let resolve = |expression: &Expr<'_>| -> Option<(usize, usize)> {
             match expression {
                 Expr::Column { qualifier, name } => {
-                    match scope?.find_column_unsuggested(*qualifier, name).ok()? {
+                    let scope = scope?;
+                    match scope.find_column_unsuggested(*qualifier, name).ok()? {
                         ResolvedColumn::Table(table, column) => Some((table, column)),
-                        _ => None,
+                        ResolvedColumn::Merged(merged) => scope.merged_plain_var(merged),
+                        ResolvedColumn::TableOid(_) => None,
                     }
                 }
                 _ => None,
@@ -344,22 +346,6 @@ impl<'a> BlockTargets<'a> {
                 (Some(left), Some(right)) => left == right,
                 _ => left == right,
             }
-        };
-        let deparse = |expression: &Expr<'_>| -> Result<Entry<'a>, Fail> {
-            let expression = crate::sql::catalog::deparse::planned(expression);
-            let text = crate::sql::catalog::deparse::deparse_expression(
-                &context,
-                expression,
-                Destination::Value,
-                arena,
-            )?
-            .ok_or_else(unsupported)?;
-            Ok(Entry {
-                text,
-                var: matches!(expression, Expr::Column { .. } | Expr::WholeRow(_)),
-                referenced: false,
-                shown: crate::sql::catalog::deparse::deparse_shown(&context, expression, arena)?,
-            })
         };
         let column_expression = |table: usize, column: usize| -> Result<&'a Expr<'a>, Fail> {
             let scope = scope.ok_or_else(unsupported)?;
@@ -374,6 +360,37 @@ impl<'a> BlockTargets<'a> {
                     name: arena.alloc_str(name).map_err(|_| arena_full())?,
                 })
                 .map_err(|_| arena_full())?)
+        };
+        let deparse = |expression: &Expr<'_>| -> Result<Entry<'a>, Fail> {
+            // A merged `USING` column reads its join alias variable's
+            // column (`flatten_join_alias_vars`).
+            let merged = match expression {
+                Expr::Column { qualifier, name } => scope.and_then(|scope| {
+                    match scope.find_column_unsuggested(*qualifier, name).ok()? {
+                        ResolvedColumn::Merged(merged) => scope.merged_plain_var(merged),
+                        _ => None,
+                    }
+                }),
+                _ => None,
+            };
+            let expression = match merged {
+                Some((table, column)) => column_expression(table, column)?,
+                None => expression,
+            };
+            let expression = crate::sql::catalog::deparse::planned(expression);
+            let text = crate::sql::catalog::deparse::deparse_expression(
+                &context,
+                expression,
+                Destination::Value,
+                arena,
+            )?
+            .ok_or_else(unsupported)?;
+            Ok(Entry {
+                text,
+                var: matches!(expression, Expr::Column { .. } | Expr::WholeRow(_)),
+                referenced: false,
+                shown: crate::sql::catalog::deparse::deparse_shown(&context, expression, arena)?,
+            })
         };
         let column_entry = |table: usize, column: usize| -> Result<Entry<'a>, Fail> {
             deparse(column_expression(table, column)?)

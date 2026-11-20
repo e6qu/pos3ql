@@ -6854,6 +6854,7 @@ fn infer_type_unpositioned(
             | "macaddr8_or" => of(ColType::Macaddr8),
             "array_dims" => of(ColType::Text),
             "current_schemas" => of(ColType::Array(crate::sql::types::ArrElem::Name)),
+            "pg_settings_get_flags" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
             "array_to_json" => of(ColType::Json),
             "json_populate_record"
             | "jsonb_populate_record"
@@ -7779,7 +7780,7 @@ fn infer_type_unpositioned(
                 }
             }
             "current_date" => of(ColType::Date),
-            "pg_is_in_recovery" | "pg_reload_conf" => of(ColType::Bool),
+            "pg_is_in_recovery" | "pg_jit_available" | "pg_reload_conf" => of(ColType::Bool),
             // The identifier-returning functions are `name`-typed in PostgreSQL.
             "current_user" | "session_user" | "user" | "current_role" | "current_schema"
             | "current_database" | "current_catalog" => of(ColType::Name),

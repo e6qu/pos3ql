@@ -132,12 +132,16 @@ def probe(host, port):
             "UPDATE join_capacity_target SET note='after' FROM "
             f"{sources} WHERE t0.id=t127.id RETURNING join_capacity_target.note"
         )
-        # Analyzed, the FROM list is planned by PostgreSQL's GEQO search:
-        # the full plan text must match. The USING chain's 127 join
-        # conditions exceed the search's clause capacities, so its plan is
-        # pos3ql's order and is not compared.
+        # Analyzed, the FROM list and the USING chains (34 relations, past
+        # the 33 an earlier fixed clause capacity held, and 128) are planned
+        # by PostgreSQL's GEQO search: the full plan texts must match.
         analyzed = connection.query("ANALYZE jcj")
-        cross_plan = connection.query(f"EXPLAIN (COSTS OFF) {cross}")
+        plans = [connection.query(f"EXPLAIN (COSTS OFF) {cross}")]
+        for count in (34, relation_count):
+            chain = "SELECT id FROM jcj t0" + "".join(
+                f" JOIN jcj t{index} USING (id)" for index in range(1, count)
+            )
+            plans.append(connection.query(f"EXPLAIN (COSTS OFF) {chain}"))
         teardown = connection.query(
             "DROP VIEW join_capacity_view; DROP TABLE jcj, join_capacity_target"
         )
@@ -153,7 +157,7 @@ def probe(host, port):
             update_rows,
             analyzed,
             teardown,
-        ), cross_plan
+        ), plans
     finally:
         connection.close()
 
@@ -185,12 +189,15 @@ def main():
         print(f"PostgreSQL: {postgresql!r}")
         print(f"pos3ql:     {pos3ql!r}")
         return 1
-    if not isinstance(postgresql_plans, list) or pos3ql_plans != postgresql_plans:
-        print("analyzed cross join plan differs")
+    if (
+        not all(isinstance(plan, list) for plan in postgresql_plans)
+        or pos3ql_plans != postgresql_plans
+    ):
+        print("analyzed cross join or USING chain plan differs")
         print(f"PostgreSQL: {postgresql_plans!r}")
         print(f"pos3ql:     {pos3ql_plans!r}")
         return 1
-    print("128-relation joins, USING chain, analyzed GEQO plan, view, window, and DML match PostgreSQL")
+    print("128-relation joins, USING chains, analyzed GEQO plans, view, window, and DML match PostgreSQL")
     return 0
 
 

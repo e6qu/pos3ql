@@ -1076,8 +1076,17 @@ pub(super) fn hashed_order(
     let entry_lens = arena
         .alloc_slice_with(keys.len(), |_| 0usize)
         .map_err(|_| arena_full())?;
+    // A composite value's fields are sized through the catalog.
+    let value_sizing = super::postgres_memory::Sizing {
+        catalog: Some((storage, txid)),
+        scratch: arena,
+    };
     for (length, key) in entry_lens.iter_mut().zip(keys) {
-        *length = super::postgres_memory::projected_tuple_len(None, key, Some(positions))
+        *length = super::postgres_memory::projected_tuple_len(
+            Some(&value_sizing),
+            key,
+            Some(positions),
+        )
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,

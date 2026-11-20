@@ -1231,11 +1231,17 @@ the join reads its member's column, a merged column the left member's
 (`FULL`), as `flatten_join_alias_vars` reads `buildMergedJoinVar`'s
 variables, and a member named as an earlier FROM item prints PostgreSQL's
 suffix (`nb nb_1`); windows read each joined row's member columns
-(`differential_exact/947`). Remaining there: a merged column that needs a
-coercion (`int` with `bigint`) or merges more than two columns, a member
-named as a later FROM item, a whole-row reference to the join, an outer
-`USING` join of a parenthesized one, and nested aliased joins; `EXPLAIN` of
-any parenthesized join the search does not plan fails with `0A000`. A
+(`differential_exact/947`). A `USING` or `NATURAL` join beside a
+parenthesized one joins on its equalities, read through the members'
+columns, and a merged column of it reads its join alias variable's
+expression (`differential_exact/975`). Remaining there: a merged column
+that needs a coercion (`int` with `bigint`) or merges more than two
+columns, a member named as a later FROM item, a whole-row reference to the
+join, a `USING` join nested in a parenthesized join inside another, a
+`USING ... AS` alias, and nested aliased joins. A query of plain analyzed
+tables with such a `USING` or `NATURAL` join fails with `0A000` rather than
+run pos3ql's join order; `EXPLAIN` of any parenthesized join the search
+does not plan fails with `0A000`. A
 query of a parenthesized inner join that the search does not plan runs the
 old executor over the flattened chain. With only inner joins in the FROM
 the outer join's condition joins the `WHERE` conditions, so the executor
@@ -1251,7 +1257,8 @@ members without reading its rows first (`differential_exact/937`). A
 scan's filter testing a subplan (`[NOT] IN`, `ANY`, `ALL`) costs what
 `cost_subplan` charges and keeps half the rows (`differential_exact/950`).
 Remaining for that search:
-`GROUP BY` of an expression (`0A000` when costs print), conditions
+`GROUP BY` of an expression other than a full join's merged column
+(`0A000` when costs print), conditions
 comparing expressions of several relations other than by a mergeable
 equality (`COALESCE(a.id, 0) < b.id`), an `OR`
 of join conditions that a semi or anti join evaluates
@@ -1275,12 +1282,21 @@ column, a right join's right one, a full join's `COALESCE`, each coerced
 to the merged type), so a chain's joins compare the first relation's
 column and every column joins one class, and a full join chain's later
 joins hash or merge by the lower joins' `COALESCE`, as
-`flatten_join_alias_vars` leaves it (`differential_exact/972`). A query of
-analyzed tables reading a full join's merged column that the search does
-not plan fails with `0A000` rather than run pos3ql's join order: one
-grouped by that column (PostgreSQL groups by its `COALESCE`), and a
-chain's merged column equated with a constant, which
-`reconsider_full_join_clause` pushes into each lower join's sides. The
+`flatten_join_alias_vars` leaves it (`differential_exact/972`). Grouped
+or made distinct, a full join's merged column is its `COALESCE`, an
+expression key whose class the join of its relations computes (a sorted
+grouping prints it parenthesized, as read from its input). Equated with a
+constant it joins that constant's equivalence class:
+`reconsider_full_join_clause` equates each side of the full join with the
+constant in that side's join domain, through each lower full join's own
+`COALESCE`, and drops the `COALESCE` member, while an outer join's clause
+of it moves the constant to the inner side (`differential_exact/975`). It
+matches only a two-argument `COALESCE` of the clause's written left then
+right operand; any other `COALESCE` equated with a constant (operands
+swapped, other columns, a third argument) stays the full join's filter. A
+query of analyzed tables reading a full join's merged column that the
+search does not plan still fails with `0A000` rather than run pos3ql's
+join order. The
 search's capacities follow the 128-relation maximum: 256 conditions, 64
 equivalence classes of up to 255 members, 32 clauses of one join and
 65535 clauses, its lists and the columns joins read kept in the statement

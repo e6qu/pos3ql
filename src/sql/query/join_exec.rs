@@ -1104,6 +1104,17 @@ fn run_modeled_sorted<'a>(
     visit: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     let group = model.group.expect("a sorted grouping");
+    // Each grouping key's column (`None` for an expression, which each row
+    // evaluates), collation and direction.
+    let mut keys =
+        [(None::<(usize, usize)>, Collation::None, 0u8); super::index_paths::joins::MAX_KEYS];
+    for (slot, &(position, flags)) in keys.iter_mut().zip(group.keys) {
+        let expression = statement.group_by[position];
+        let column = super::index_paths::join_query::column_of(scope, expression);
+        let collation = scope.expression_collation(storage, arena, expression)?;
+        *slot = (column, collation, flags);
+    }
+    let keys = &keys[..group.keys.len()];
     let mut held = crate::mem::arena::ArenaList::new(arena);
     let mut offsets: &[usize] = &[];
     run_modeled(
@@ -1125,28 +1136,36 @@ fn run_modeled_sorted<'a>(
             offsets = arena
                 .alloc_slice_copy(row_offsets)
                 .map_err(|_| arena_full())?;
+            let key_values = arena
+                .alloc_slice_with(keys.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for ((value, &(column, ..)), &(position, _)) in
+                key_values.iter_mut().zip(keys).zip(group.keys)
+            {
+                *value = match column {
+                    Some((table, column)) => values[row_offsets[table] + column],
+                    None => crate::sql::eval::eval_full(
+                        statement.group_by[position],
+                        arena,
+                        params,
+                        row,
+                        hooks,
+                    )?,
+                };
+            }
             let values = arena.alloc_slice_copy(values).map_err(|_| arena_full())?;
             let rowids = arena
                 .alloc_slice_copy(row.rowids)
                 .map_err(|_| arena_full())?;
-            held.push((&*values, &*rowids)).map_err(|_| arena_full())?;
+            held.push((&*values, &*rowids, &*key_values))
+                .map_err(|_| arena_full())?;
             Ok(true)
         },
     )?;
     let rows = held.as_slice();
-    // Each grouping key's place in a flat row, collation and direction.
-    let mut keys = [(0usize, Collation::None, 0u8); super::index_paths::joins::MAX_KEYS];
-    for (slot, &(position, flags)) in keys.iter_mut().zip(group.keys) {
-        let (table, column) =
-            super::index_paths::join_query::column_of(scope, statement.group_by[position])
-                .expect("a modeled grouping key is a column");
-        let collation = scope.expression_collation(storage, arena, statement.group_by[position])?;
-        *slot = (offsets[table] + column, collation, flags);
-    }
-    let keys = &keys[..group.keys.len()];
-    let compare_key = |key: &(usize, Collation, u8), left: u32, right: u32| {
-        let (at, collation, flags) = *key;
-        let (left, right) = (&rows[left as usize].0[at], &rows[right as usize].0[at]);
+    let compare_key = |at: usize, left: u32, right: u32| {
+        let (_, collation, flags) = keys[at];
+        let (left, right) = (&rows[left as usize].2[at], &rows[right as usize].2[at]);
         let nulls_first = flags & super::index_paths::joins::KEY_NULLS_FIRST != 0;
         Ok::<_, SqlError>(match (left.is_null(), right.is_null()) {
             (true, true) => Ordering::Equal,
@@ -1167,7 +1186,7 @@ fn run_modeled_sorted<'a>(
         })
     };
     let compare = &mut |left: u32, right: u32| -> Result<Ordering, SqlError> {
-        for key in keys {
+        for key in 0..keys.len() {
             let ordering = compare_key(key, left, right)?;
             if !ordering.is_eq() {
                 return Ok(ordering);
@@ -1182,7 +1201,7 @@ fn run_modeled_sorted<'a>(
         crate::sql::pg_qsort::pg_tuplesort(input, None, compare)?;
         input
     } else {
-        let prefix = &keys[..usize::from(presorted)];
+        let prefix = usize::from(presorted);
         let scratch = arena
             .alloc_slice_with(rows.len() * 2, |_| 0u32)
             .map_err(|_| arena_full())?;
@@ -1195,7 +1214,7 @@ fn run_modeled_sorted<'a>(
             out,
             None,
             &mut |left, right| {
-                for key in prefix {
+                for key in 0..prefix {
                     if !compare_key(key, left, right)?.is_eq() {
                         return Ok(false);
                     }
@@ -1208,7 +1227,7 @@ fn run_modeled_sorted<'a>(
         out
     };
     for &at in order {
-        let (values, rowids) = rows[at as usize];
+        let (values, rowids, _) = rows[at as usize];
         if !visit(&JoinRow {
             scope,
             values: JoinRowValues::Flat { values, offsets },

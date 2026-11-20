@@ -620,6 +620,7 @@ pub(crate) fn datum_type_hashable(ctype: crate::sql::types::ColType) -> bool {
             | ColType::Int4
             | ColType::Int8
             | ColType::Oid
+            | ColType::Cid
             | ColType::Date
             | ColType::Bool
             | ColType::Char

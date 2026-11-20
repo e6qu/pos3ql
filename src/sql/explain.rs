@@ -4701,8 +4701,35 @@ pub(crate) fn distinct_as_grouping<'a>(
                     _ => return Ok(None),
                 }
             }
+            // An output name names its entry before any input column.
+            Expr::Column {
+                qualifier: None,
+                name,
+            } if statement.items.iter().any(
+                |item| matches!(item, SelectItem::Expr { alias: Some(alias), .. } if alias == name),
+            ) =>
+            {
+                let mut named = statement.items.iter().filter_map(|item| match item {
+                    SelectItem::Expr {
+                        expression,
+                        alias: Some(alias),
+                    } if alias == name => Some(*expression),
+                    _ => None,
+                });
+                match (named.next(), named.next()) {
+                    (Some(expression), None) => expression,
+                    _ => return Ok(None),
+                }
+            }
             expression => expression,
         };
+        // An `ORDER BY` of a `DISTINCT` naming no select-list entry is an
+        // error the query reports, not a grouping key.
+        if !statement.items.iter().any(
+            |item| matches!(item, SelectItem::Expr { expression: item, .. } if **item == *expression),
+        ) {
+            return Ok(None);
+        }
         if !keys
             .as_slice()
             .iter()
@@ -6901,8 +6928,13 @@ fn plan_pulled_select<'a>(
     // A one-table `DISTINCT` PostgreSQL hashes is explained as the grouping
     // `create_distinct_paths` plans: a `HashAggregate` over its keys (the
     // `ORDER BY` items first), then any sort its `ORDER BY` needs.
+    // A pseudoconstant condition gates the scan; PostgreSQL then plans the
+    // `DISTINCT` over a relation it may prove empty, outside the model.
+    let gated = split_gating(storage, txid, statement.where_clause, arena)?
+        .0
+        .is_some();
     let distinct_grouping = match (scope.as_ref(), statement.from.as_ref()) {
-        (Some(scope), Some(from)) if foreign_scan.is_none() => {
+        (Some(scope), Some(from)) if foreign_scan.is_none() && !gated => {
             match distinct_as_grouping(statement, scope, arena)? {
                 Some(derived) => grouped_scan_path(
                     storage, txid, derived, true, scope, from, columns, width, arena,

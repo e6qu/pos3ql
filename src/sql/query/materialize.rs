@@ -3211,6 +3211,9 @@ pub(crate) fn external_materialized_into<'a>(
     };
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
+    // A `DISTINCT` whose order the planner model does not decide is
+    // refused once a second distinct row shows it has an order.
+    let mut unmodeled_distinct = None;
     let mut hashed = if statement.distinct
         && plan.n_on == 0
         && plan.n_keys == 0
@@ -3248,7 +3251,8 @@ pub(crate) fn external_materialized_into<'a>(
                 )?)
             }
             Some(super::group::DistinctPlan::Unmodeled(unmodeled)) => {
-                return Err(unmodeled.error());
+                unmodeled_distinct = Some(unmodeled);
+                None
             }
             Some(super::group::DistinctPlan::Sorted) | None => None,
         }
@@ -3607,6 +3611,12 @@ pub(crate) fn external_materialized_into<'a>(
             } else {
                 false
             };
+            if !duplicate
+                && previous.is_some()
+                && let Some(unmodeled) = unmodeled_distinct
+            {
+                return Err(unmodeled.error());
+            }
             if duplicate {
                 true
             } else {

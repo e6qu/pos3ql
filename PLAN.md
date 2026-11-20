@@ -1750,7 +1750,17 @@ expand into the table's columns, and a field of a row constructor (cast
 to a composite type or not) is the argument it selects when their types
 agree, so ordinals count expanded columns. A named composite key, and an
 array of one, hashes with `hash_record` when every field type hashes and
-sorts when one cannot (`differential_exact/962`). pos3ql's heap page estimate does not compress values as
+sorts when one cannot (`differential_exact/962`). The `Sort` above a
+hashed one-table grouping whose `ORDER BY` names only some keys runs the
+same `tuplesort` model over the groups in hash table order, so tied groups
+come out as PostgreSQL's quicksort leaves them (it used to sort them
+stably in key order). `EXPLAIN` of a one-table `DISTINCT` PostgreSQL hashes
+shows that grouping (`differential_exact/961`): a `HashAggregate` over the
+computed keys, the `ORDER BY` items first, under the `Sort` an `ORDER BY`
+needs. With a spill store attached, a `DISTINCT` the model leaves out fails
+with `0A000` only once a second distinct row arrives, as in memory, and an
+`ORDER BY` naming no select-list entry is left to the error the query
+reports. pos3ql's heap page estimate does not compress values as
 `pglz` does, so the row estimate of an unanalyzed table of compressible
 wide values, and the hash order planned from it, can differ from
 PostgreSQL's (ported with `pg_column_size` over 2000 bytes). An enum key hashes its label's `pg_enum` OID as `hashenum` does,

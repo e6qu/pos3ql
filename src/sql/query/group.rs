@@ -2599,7 +2599,17 @@ pub(super) fn planner_statement<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    let expanded = expand_grouped_stars(statement, scope, None, storage, txid, arena)?;
+    // A record the scope alone cannot type (a routine's row variable) stays
+    // unexpanded, so the model leaves the statement out.
+    let expanded = match expand_grouped_stars(statement, scope, None, storage, txid, arena) {
+        Err(error)
+            if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
+        {
+            return Ok(statement);
+        }
+        expanded => expanded?,
+    };
     let resolver = super::CatalogScopeCols {
         scope,
         outer: None,
@@ -2614,7 +2624,7 @@ pub(super) fn planner_statement<'a>(
         .map_err(|_| arena_full())?;
     for item in items.iter_mut() {
         if let SelectItem::Expr { expression, .. } = item {
-            let current: &'a Expr<'a> = *expression;
+            let current = *expression;
             let simplified = simplify(current)?;
             changed |= !core::ptr::eq(simplified, current);
             *expression = simplified;
@@ -2624,7 +2634,7 @@ pub(super) fn planner_statement<'a>(
         .alloc_slice_copy(expanded.group_by)
         .map_err(|_| arena_full())?;
     for key in group_by.iter_mut() {
-        let current: &'a Expr<'a> = *key;
+        let current = *key;
         let simplified = simplify(current)?;
         changed |= !core::ptr::eq(simplified, current);
         *key = simplified;

@@ -349,8 +349,10 @@ pub(crate) struct ModeledJoin<'a> {
     pub(crate) nested: Option<NestedMembers<'a>>,
     /// Two scans of one table joined on columns a unique index covers,
     /// which PostgreSQL 18's `remove_useless_self_joins` may merge into
-    /// one scan; the search does not model that removal.
+    /// one scan, and which the search does not remove.
     pub(crate) self_join: bool,
+    /// The scan read in each removed self-join relation's place.
+    pub(crate) kept_for: KeptFor,
 }
 
 /// The base relations of a FROM clause holding parenthesized joins
@@ -1196,7 +1198,7 @@ fn analyze_qual<'a>(
                 (
                     Some((one, left_type, left_collation)),
                     Some((two, right_type, right_collation)),
-                ) if one.base_relids() & two.base_relids() == Relids::EMPTY => {
+                ) if one != two => {
                     if comparable_types(left_type, right_type)
                         && joinable(left_type)
                         && left_collation == right_collation
@@ -2106,9 +2108,10 @@ fn modeled_join_over<'a>(
     // Each relation's columns in the order its target list takes them:
     // the output's first, then those the joins need
     // (`build_base_rel_tlists`, then `add_vars_to_targetlist`).
-    let mut appearance = [[0u8; 64]; MAX_JOIN_RELS];
-    let mut appeared = [0usize; MAX_JOIN_RELS];
-    let mut note = |table: usize, column: usize| {
+    let appearance =
+        core::cell::RefCell::new(([[0u8; 64]; MAX_JOIN_RELS], [0usize; MAX_JOIN_RELS]));
+    let note = |table: usize, column: usize| {
+        let (appearance, appeared) = &mut *appearance.borrow_mut();
         if column < 64 && !appearance[table][..appeared[table]].contains(&(column as u8)) {
             appearance[table][appeared[table]] = column as u8;
             appeared[table] += 1;
@@ -2692,7 +2695,6 @@ fn modeled_join_over<'a>(
             join.qual = tree.qual_count as join_tree::QualId;
         }
     }
-    let quals = &quals[..=tree.qual_count];
     // `remove_useless_joins`: a left join to one relation no row above
     // reads, which a unique index makes match at most one row, is dropped
     // with it.
@@ -2721,7 +2723,81 @@ fn modeled_join_over<'a>(
         }
         break;
     }
-    let self_join = removable_self_join(storage, txid, scope, &prepared, removed);
+    // `remove_useless_self_joins`, unless a subquery reads the scans.
+    let self_joins = if reads_subquery(statement, from) {
+        SelfJoins {
+            kept_for: [None; MAX_JOIN_RELS],
+            removed: Relids::EMPTY,
+            declined: removable_self_join(storage, txid, scope, &prepared, removed),
+        }
+    } else {
+        remove_self_joins(
+            storage,
+            txid,
+            scope,
+            &mut prepared,
+            &mut quals[..=tree.qual_count],
+            &expressions,
+            removed,
+            arena,
+        )?
+    };
+    let quals = &quals[..=tree.qual_count];
+    removed |= self_joins.removed;
+    let self_join = self_joins.declined;
+    let kept_for = self_joins.kept_for;
+    // The query reads each removed scan's columns from the kept one.
+    let kept = |table: usize| kept_for[table].map_or(table, usize::from);
+    let statement = rename_self_joined(scope, &kept_for, statement, arena)?;
+    let rename_target = |target: SortTarget<'a>| -> Result<SortTarget<'a>, SqlError> {
+        Ok(match target {
+            SortTarget::Column(table, column) => SortTarget::Column(kept(table), column),
+            SortTarget::Expression(expression) => SortTarget::Expression(rename_relations(
+                scope,
+                &|table| kept_for[table].map(usize::from),
+                expression,
+                arena,
+            )?),
+        })
+    };
+    for table in 0..n {
+        if kept(table) == table {
+            continue;
+        }
+        output[kept(table)] |= output[table];
+        output[table] = 0;
+        let (columns, count) = {
+            let held = appearance.borrow();
+            (held.0[table], held.1[table])
+        };
+        for &column in &columns[..count] {
+            note(kept(table), usize::from(column));
+        }
+    }
+    let mut renamed_group_columns = [(0usize, 0usize); super::joins::MAX_KEYS];
+    for (at, &(table, column)) in group_columns.iter().enumerate() {
+        renamed_group_columns[at] = (kept(table), column);
+    }
+    let group_columns = &renamed_group_columns[..group_columns.len()];
+    let mut renamed_group_targets = [(SortTarget::Column(0, 0), 0usize); super::joins::MAX_KEYS];
+    for (at, &(target, position)) in group_targets.iter().enumerate() {
+        renamed_group_targets[at] = (rename_target(target)?, position);
+    }
+    let group_targets = &renamed_group_targets[..group_targets.len()];
+    let mut renamed_distinct = [(SortTarget::Column(0, 0), 0usize); super::joins::MAX_KEYS];
+    for (at, &(target, position)) in distinct_targets.iter().enumerate() {
+        renamed_distinct[at] = (rename_target(target)?, position);
+    }
+    let distinct_targets = &renamed_distinct[..distinct_targets.len()];
+    let mut renamed_sort =
+        [(SortTarget::Expression(&Expr::Null), 0u8, 0u8); super::joins::MAX_KEYS];
+    for (at, &(target, flags, item)) in sort_entries.iter().enumerate() {
+        renamed_sort[at] = (rename_target(target)?, flags, item);
+    }
+    let sort_entries = &renamed_sort[..sort_entries.len()];
+    for junk in &mut junk_columns[..junk_count] {
+        junk.0 = kept(junk.0);
+    }
     let classes = prepared.classes();
     let class_count = classes.len();
     // The constant a class equates its members with.
@@ -2757,6 +2833,10 @@ fn modeled_join_over<'a>(
             Placed::Equated { left, right } => (
                 usize::from(left.rel),
                 equality(scope, &expressions, left, right, arena)?,
+            ),
+            Placed::NotNull { member, .. } => (
+                usize::from(member.rel),
+                placed_restriction(scope, &expressions, &prepared, quals, *placed, arena)?.0,
             ),
             Placed::Join(_) => continue,
         };
@@ -4076,6 +4156,7 @@ fn modeled_join_over<'a>(
             }
             planned_paths[table] = Some(paths);
             let slot = scope.slots[table];
+            let (appearance, appeared) = *appearance.borrow();
             for column in appearance[table][..appeared[table]]
                 .iter()
                 .map(|&column| usize::from(column))
@@ -5196,6 +5277,7 @@ fn modeled_join_over<'a>(
         expressions: expressions.alloc()?,
         nested: None,
         self_join,
+        kept_for,
     }))
 }
 
@@ -5305,6 +5387,566 @@ fn join_is_removable(
         });
     });
     distinct
+}
+
+/// What `remove_useless_self_joins` removed: the relation kept in each
+/// removed relation's place.
+pub(crate) type KeptFor = [Option<u8>; MAX_JOIN_RELS];
+
+/// The self-joins removed and whether one the model does not remove
+/// (an expression or subquery reads a scan) may be one PostgreSQL removes.
+struct SelfJoins {
+    kept_for: KeptFor,
+    removed: Relids,
+    declined: bool,
+}
+
+/// `expression` reading each relation `kept` maps to another from that
+/// one (`ChangeVarNodes`): its columns, named or a merged `USING` column
+/// of one relation, become the other's, named by it.
+fn rename_relations<'a>(
+    scope: &QueryScope<'a>,
+    kept: &dyn Fn(usize) -> Option<usize>,
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    struct Failed(SqlError);
+    impl From<crate::mem::arena::ArenaFull> for Failed {
+        fn from(_: crate::mem::arena::ArenaFull) -> Self {
+            Self(crate::sql::eval::arena_full())
+        }
+    }
+    crate::sql::ast::rewrite_expression(expression, arena, &mut |node: &'a Expr<'a>| -> Result<
+        Option<&'a Expr<'a>>,
+        Failed,
+    > {
+        let Some((table, column)) = column_of(scope, node) else {
+            return Ok(None);
+        };
+        let Some(target) = kept(table) else {
+            return Ok(None);
+        };
+        let definition = scope.defs.stored(target).expect("plain table");
+        let name = arena.alloc_str(definition.columns()[column].name.as_str())?;
+        Ok(Some(&*arena.alloc(Expr::Column {
+            qualifier: Some(scope.names[target]),
+            name,
+        })?))
+    })
+    .map_err(|Failed(error)| error)
+}
+
+/// The query level `statement` reading each removed self-join's relation
+/// as the relation kept in its place, as PostgreSQL's planner rewrites the
+/// query (`remove_self_join_rel`): its output, conditions, grouping,
+/// windows and ordering.
+pub(crate) fn rename_self_joined<'a>(
+    scope: &QueryScope<'a>,
+    kept_for: &KeptFor,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    if kept_for.iter().all(Option::is_none) {
+        return Ok(statement);
+    }
+    let kept = |table: usize| kept_for.get(table).copied().flatten().map(usize::from);
+    let rename = |expression| rename_relations(scope, &kept, expression, arena);
+    let full = |_| crate::sql::eval::arena_full();
+    let items = arena.alloc_slice_copy(statement.items).map_err(full)?;
+    for item in items.iter_mut() {
+        match item {
+            SelectItem::Expr { expression, .. } => *expression = rename(*expression)?,
+            SelectItem::TableWildcard(qualifier) => {
+                if let Some(table) = (0..scope.n).find(|&table| scope.names[table] == *qualifier)
+                    && let Some(target) = kept(table)
+                {
+                    *qualifier = scope.names[target];
+                }
+            }
+            _ => {}
+        }
+    }
+    let group_by = arena.alloc_slice_copy(statement.group_by).map_err(full)?;
+    for expression in group_by.iter_mut() {
+        *expression = rename(*expression)?;
+    }
+    let order_by = arena.alloc_slice_copy(statement.order_by).map_err(full)?;
+    for order in order_by.iter_mut() {
+        order.expression = rename(order.expression)?;
+    }
+    let windows = arena.alloc_slice_copy(statement.windows).map_err(full)?;
+    for window in windows.iter_mut() {
+        let partition_by = arena.alloc_slice_copy(window.partition_by).map_err(full)?;
+        for expression in partition_by.iter_mut() {
+            *expression = rename(*expression)?;
+        }
+        let order_by = arena.alloc_slice_copy(window.order_by).map_err(full)?;
+        for order in order_by.iter_mut() {
+            order.expression = rename(order.expression)?;
+        }
+        *window = arena
+            .alloc(crate::sql::ast::WindowSpec {
+                partition_by,
+                order_by,
+                ..**window
+            })
+            .map_err(full)?;
+    }
+    let renamed = Select {
+        items,
+        group_by,
+        order_by,
+        windows,
+        where_clause: statement.where_clause.map(rename).transpose()?,
+        having: statement.having.map(rename).transpose()?,
+        ..*statement
+    };
+    Ok(&*arena.alloc(renamed).map_err(full)?)
+}
+
+/// Whether the query level reads a subquery anywhere, whose columns of a
+/// removed relation the model does not rename.
+fn reads_subquery(statement: &Select<'_>, from: &FromClause<'_>) -> bool {
+    statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(statement.where_clause)
+        .chain(statement.having)
+        .chain(statement.group_by.iter().copied())
+        .chain(statement.order_by.iter().map(|order| order.expression))
+        .chain(from.joins.iter().filter_map(|join| join.on))
+        .any(|expression| expression.contains_subquery())
+        || statement.windows.iter().any(|window| {
+            window
+                .partition_by
+                .iter()
+                .copied()
+                .chain(window.order_by.iter().map(|order| order.expression))
+                .any(|expression| expression.contains_subquery())
+        })
+}
+
+/// The restriction `placed` is, as an expression of the query's columns,
+/// and the class whose join equality it is derived from (`parent_ec`; the
+/// classes' equalities within one relation have none, as
+/// `process_implied_equality` builds them).
+fn placed_restriction<'a>(
+    scope: &QueryScope<'a>,
+    expressions: &Expressions<'a>,
+    prepared: &join_tree::Prepared<'a>,
+    quals: &[&'a Expr<'a>],
+    placed: Placed,
+    arena: &'a Arena,
+) -> Result<(&'a Expr<'a>, Option<u8>), SqlError> {
+    Ok(match placed {
+        Placed::Restriction { qual, .. } => (quals[usize::from(qual)], None),
+        Placed::Join(join) => (quals[usize::from(join.qual)], None),
+        Placed::Implied { member, class } => {
+            let value =
+                class_constant(prepared, quals, usize::from(class)).ok_or_else(preparation_full)?;
+            (
+                equals_constant(scope, expressions, member, value, arena)?,
+                None,
+            )
+        }
+        Placed::Equated { left, right } => {
+            (equality(scope, expressions, left, right, arena)?, None)
+        }
+        Placed::NotNull { member, class } => (
+            &*arena
+                .alloc(Expr::IsNull {
+                    operand: column_expression(scope, expressions, member, arena)?,
+                    negated: true,
+                })
+                .map_err(|_| crate::sql::eval::arena_full())?,
+            Some(class),
+        ),
+    })
+}
+
+/// The constant class `class` equates its members with.
+fn class_constant<'a>(
+    prepared: &join_tree::Prepared<'_>,
+    quals: &[&'a Expr<'a>],
+    class: usize,
+) -> Option<&'a Expr<'a>> {
+    let qual = prepared.class_constant[class]?;
+    let Expr::Binary { left, right, .. } = quals[usize::from(qual)] else {
+        return None;
+    };
+    Some(if plain_constant(right).is_some() {
+        right
+    } else {
+        left
+    })
+}
+
+/// A restriction `column = constant` of relation `table` with a mergeable
+/// operator: its column and its sides, the column's first.
+fn constant_equality<'a>(
+    scope: &QueryScope<'a>,
+    table: usize,
+    restriction: &'a Expr<'a>,
+) -> Option<(usize, &'a Expr<'a>, &'a Expr<'a>)> {
+    let Expr::Binary {
+        operator: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = restriction
+    else {
+        return None;
+    };
+    for (own, other) in [(*left, *right), (*right, *left)] {
+        if let Some((rel, column)) = column_of(scope, own)
+            && rel == table
+            && plain_constant(other).is_some()
+        {
+            return Some((column, own, other));
+        }
+    }
+    None
+}
+
+/// `remove_useless_self_joins`: within each join list, the scans of one
+/// table that no outer join separates, that a class equates, and whose
+/// later one a unique index makes match at most one row of the earlier one
+/// (its keys each equated with the same column or with a constant the
+/// earlier one shares, `innerrel_is_unique_ext` and
+/// `match_unique_clauses`), merge into the later scan until no more do.
+#[allow(clippy::too_many_arguments)]
+fn remove_self_joins<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'a>,
+    prepared: &mut join_tree::Prepared<'a>,
+    quals: &mut [&'a Expr<'a>],
+    expressions: &Expressions<'a>,
+    removed: Relids,
+    arena: &'a Arena,
+) -> Result<SelfJoins, SqlError> {
+    let mut joins = SelfJoins {
+        kept_for: [None; MAX_JOIN_RELS],
+        removed: Relids::EMPTY,
+        declined: false,
+    };
+    if crate::sql::guc::planner_value("enable_self_join_elimination") == 0.0 {
+        return Ok(joins);
+    }
+    // The pairs found not unique when all their join clauses were
+    // self-join clauses (`non_unique_for_rels`), by kept relation.
+    let mut non_unique = [Relids::EMPTY; MAX_JOIN_RELS];
+    for problem in 0..prepared.subproblem_count {
+        let super::joins::Subproblem { first, count } = prepared.subproblems[problem];
+        let mut candidates = Relids::EMPTY;
+        for &item in &prepared.subproblem_items[usize::from(first)..usize::from(first + count)] {
+            if item.count_ones() == 1
+                && item & !BASE_RELIDS == Relids::EMPTY
+                && item & removed == Relids::EMPTY
+            {
+                candidates |= item;
+            }
+        }
+        // Each table's scans, a group (`self_join_candidates_cmp`).
+        while candidates.count_ones() >= 2 {
+            let lead = candidates.trailing_zeros() as usize;
+            let mut group = Relids::EMPTY;
+            for rel in 0..scope.n {
+                if candidates & Relids::of(rel) != Relids::EMPTY
+                    && scope.slots[rel] == scope.slots[lead]
+                {
+                    group |= Relids::of(rel);
+                }
+            }
+            candidates &= !group;
+            while group.count_ones() >= 2 {
+                let gone = remove_self_joins_one_group(
+                    storage,
+                    txid,
+                    scope,
+                    prepared,
+                    quals,
+                    expressions,
+                    group,
+                    &mut joins,
+                    &mut non_unique,
+                    arena,
+                )?;
+                group &= !gone;
+                if gone == Relids::EMPTY {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(joins)
+}
+
+/// `remove_self_joins_one_group` of `group`, scans of one table: the
+/// relations removed.
+#[allow(clippy::too_many_arguments)]
+fn remove_self_joins_one_group<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'a>,
+    prepared: &mut join_tree::Prepared<'a>,
+    quals: &mut [&'a Expr<'a>],
+    expressions: &Expressions<'a>,
+    group: Relids,
+    joins: &mut SelfJoins,
+    non_unique: &mut [Relids; MAX_JOIN_RELS],
+    arena: &'a Arena,
+) -> Result<Relids, SqlError> {
+    let mut result = Relids::EMPTY;
+    let members =
+        |relids: Relids| (0..scope.n).filter(move |&rel| relids & Relids::of(rel) != Relids::EMPTY);
+    for r in members(group) {
+        for k in members(group).filter(|&k| k > r) {
+            let (r_bit, k_bit): (Relids, Relids) = (Relids::of(r), Relids::of(k));
+            // Both on the same side of every outer join.
+            if prepared.specials[..prepared.special_count]
+                .iter()
+                .any(|info| {
+                    (info.syn_left & r_bit != Relids::EMPTY)
+                        != (info.syn_left & k_bit != Relids::EMPTY)
+                        || (info.syn_right & r_bit != Relids::EMPTY)
+                            != (info.syn_right & k_bit != Relids::EMPTY)
+                })
+            {
+                continue;
+            }
+            // `generate_join_implied_equalities` of the two: each class
+            // without a constant, its first member of each; those of one
+            // column of both are self-join clauses.
+            let mut joined = false;
+            let mut other_clauses = false;
+            let mut self_columns = 0u64;
+            let mut unmodeled = false;
+            for class in prepared.classes().iter().filter(|class| !class.has_const) {
+                let first = |bit: Relids| {
+                    class
+                        .members()
+                        .iter()
+                        .find(|member| member.relids() == bit)
+                        .copied()
+                };
+                let (Some(outer), Some(inner)) = (first(r_bit), first(k_bit)) else {
+                    continue;
+                };
+                joined = true;
+                unmodeled |= outer.expression_id().is_some() || inner.expression_id().is_some();
+                if outer.column == inner.column && inner.column < 64 {
+                    self_columns |= 1 << inner.column;
+                } else {
+                    other_clauses = true;
+                }
+            }
+            if !joined {
+                continue;
+            }
+            // An expression reading the removed scan, which the model does
+            // not rename.
+            unmodeled |= (0..expressions.count).any(|id| {
+                let expression = expressions.get(id);
+                (Relids::of(expression.rel) | expression.reads) & r_bit != Relids::EMPTY
+            });
+            if unmodeled {
+                joins.declined = true;
+                continue;
+            }
+            if non_unique[k] & r_bit != Relids::EMPTY {
+                continue;
+            }
+            // `k`'s restrictions `column = constant`, in order
+            // (`relation_has_unique_index_ext` adds them).
+            let mut constants = [None::<(usize, &'a Expr<'a>, &'a Expr<'a>)>; 64];
+            for &placed in prepared.placed() {
+                let held = match placed {
+                    Placed::Restriction { rel, .. } if usize::from(rel) == k => placed,
+                    Placed::Implied { member, .. }
+                        if member.relids() == k_bit && member.expression_id().is_none() =>
+                    {
+                        placed
+                    }
+                    _ => continue,
+                };
+                let (restriction, _) =
+                    placed_restriction(scope, expressions, prepared, quals, held, arena)?;
+                if let Some((column, own, value)) = constant_equality(scope, k, restriction)
+                    && column < 64
+                    && constants[column].is_none()
+                {
+                    constants[column] = Some((column, own, value));
+                }
+            }
+            // The first unique index whose keys the clauses match decides,
+            // with the constants it used (`uclauses`).
+            let mut decided = None::<[Option<(usize, &'a Expr<'a>, &'a Expr<'a>)>; 8]>;
+            crate::sql::catalog::planner_indexes(storage, txid, scope.slots[k], &mut |index| {
+                if decided.is_some()
+                    || !index.unique
+                    || !index.immediate
+                    || index.partial
+                    || index.method != crate::sql::ast::IndexAccessMethod::Btree
+                    || index.n_cols > 8
+                {
+                    return;
+                }
+                let mut used = [None; 8];
+                for position in 0..index.n_cols {
+                    let column = usize::from(index.columns[position]);
+                    if index.expression_keys[position]
+                        || index.pattern_keys[position]
+                        || column >= 64
+                    {
+                        return;
+                    }
+                    if self_columns & 1 << column != 0 {
+                        continue;
+                    }
+                    let Some(constant) = constants[column] else {
+                        return;
+                    };
+                    used[position] = Some(constant);
+                }
+                decided = Some(used);
+            });
+            let Some(used) = decided else {
+                if !other_clauses {
+                    non_unique[k] |= r_bit;
+                }
+                continue;
+            };
+            // `match_unique_clauses`: each constant restriction used is
+            // `r`'s as well.
+            let mut shared = true;
+            for &(_, own, value) in used.iter().flatten() {
+                let own = rename_relations(scope, &|table| (table == k).then_some(r), own, arena)?;
+                let mut matched = false;
+                for &placed in prepared.placed() {
+                    let held = match placed {
+                        Placed::Restriction { rel, .. } if usize::from(rel) == r => placed,
+                        Placed::Implied { member, .. }
+                            if member.relids() == r_bit && member.expression_id().is_none() =>
+                        {
+                            placed
+                        }
+                        _ => continue,
+                    };
+                    let (restriction, _) =
+                        placed_restriction(scope, expressions, prepared, quals, held, arena)?;
+                    if let Some((_, other_own, other_value)) =
+                        constant_equality(scope, r, restriction)
+                        && *other_own == *own
+                        && *other_value == *value
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+                shared &= matched;
+            }
+            if !shared {
+                continue;
+            }
+            // `remove_self_join_rel`.
+            joins.kept_for[r] = Some(k as u8);
+            for kept in joins.kept_for.iter_mut() {
+                if *kept == Some(r as u8) {
+                    *kept = Some(k as u8);
+                }
+            }
+            let rename = |table: usize| (table == r).then_some(k);
+            for qual in quals.iter_mut() {
+                *qual = rename_relations(scope, &rename, qual, arena)?;
+            }
+            let (restrictions, join_clauses) =
+                match prepared.remove_self_join(r as u8, k as u8, arena) {
+                    Ok(moved) => moved,
+                    Err(join_tree::ARENA) => return Err(crate::sql::eval::arena_full()),
+                    Err(reason) => {
+                        return Err(crate::sql_err!(
+                            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                            "removing a self-join ({reason}) is not supported"
+                        ));
+                    }
+                };
+            // `add_non_redundant_clauses`: each restriction unless `k`
+            // holds it or one of its class, and unless it is `IS NOT NULL`
+            // of a column declared `NOT NULL` (`restriction_is_always_true`).
+            for &candidate in restrictions.borrowed_slice() {
+                if let Placed::NotNull { member, .. } = candidate
+                    && member.nulling == Relids::EMPTY
+                    && member.expression_id().is_none()
+                    && scope.defs.stored(k).is_some_and(|definition| {
+                        let meta = &definition.columns()[usize::from(member.column)];
+                        meta.not_null != crate::storage::NotNullOrigin::Nullable
+                            && meta.not_null_validated
+                    })
+                {
+                    continue;
+                }
+                let (expression, class) =
+                    placed_restriction(scope, expressions, prepared, quals, candidate, arena)?;
+                let mut redundant = false;
+                for &held in prepared.placed() {
+                    let own = match held {
+                        Placed::Restriction { rel, .. } => usize::from(rel) == k,
+                        Placed::Implied { member, .. } | Placed::NotNull { member, .. } => {
+                            member.relids() == k_bit
+                        }
+                        Placed::Equated { left, .. } => left.relids() == k_bit,
+                        Placed::Join(_) => false,
+                    };
+                    if !own {
+                        continue;
+                    }
+                    let (held_expression, held_class) =
+                        placed_restriction(scope, expressions, prepared, quals, held, arena)?;
+                    if (class.is_some() && class == held_class) || *held_expression == *expression {
+                        redundant = true;
+                        break;
+                    }
+                }
+                if !redundant {
+                    prepared
+                        .placed
+                        .push(candidate)
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                }
+            }
+            for &candidate in join_clauses.borrowed_slice() {
+                let Placed::Join(join) = candidate else {
+                    continue;
+                };
+                let redundant = prepared.placed().iter().any(|&held| {
+                    matches!(held, Placed::Join(other)
+                        if other.required & k_bit != Relids::EMPTY
+                            && other.relids == join.relids
+                            && other.required == join.required
+                            && other.pushed_down == join.pushed_down
+                            && other.clone == join.clone
+                            && other.outer_relids == join.outer_relids
+                            && other.incompatible == join.incompatible
+                            && *quals[usize::from(other.qual)] == *quals[usize::from(join.qual)])
+                });
+                if !redundant {
+                    prepared
+                        .placed
+                        .push(candidate)
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                }
+            }
+            result |= r_bit;
+            break;
+        }
+    }
+    joins.removed |= result;
+    Ok(result)
 }
 
 /// Whether `remove_useless_self_joins` may remove one of two scans of the

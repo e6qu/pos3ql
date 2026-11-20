@@ -2026,7 +2026,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     .map(Some);
             }
         }
-        let rows = self.statistics.groups(keys, rel.rows)?;
+        let rows = self.statistics.num_groups(keys, rel.rows)?;
         let columns = keys.len() as f64;
         let costs = settings.costs;
         let sorted = info.semi_can_btree.then(|| {

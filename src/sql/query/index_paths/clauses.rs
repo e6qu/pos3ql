@@ -774,11 +774,20 @@ impl<'a> Analyzer<'_, '_, 'a> {
                         Some(value) => Some(value),
                         None => match self.stable_value(operand, column) {
                             Some(value) => Some(value),
+                            // An expression of the relation's columns: no
+                            // side is a pseudoconstant
+                            // (`get_restriction_variable`), so the operator's
+                            // estimator takes its default.
                             None => {
-                                return Ok(Ok(other(
-                                    self,
-                                    "a comparison with an expression that is not a constant",
-                                )));
+                                return Ok(Ok(
+                                    match self.expression_comparison(left, *operator, right)? {
+                                        Some(clause) => clause,
+                                        None => other(
+                                            self,
+                                            "a comparison with an expression that is not a constant",
+                                        ),
+                                    },
+                                ));
                             }
                         },
                     }

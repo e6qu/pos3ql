@@ -137,6 +137,47 @@ pub(crate) fn sort(value: Datum<'_>, storage: &Storage, txid: u32) -> Result<f64
     member.map(|member| member.sort).ok_or_else(corrupt)
 }
 
+/// The `pg_enum` OID of the label `value` holds, which `hashenum` hashes.
+pub(crate) fn member_oid(value: &Datum<'_>, storage: &Storage, txid: u32) -> Result<u32, SqlError> {
+    let Datum::Enum {
+        slot,
+        member,
+        label,
+        ..
+    } = *value
+    else {
+        unreachable!("member_oid of a value that is not an enum")
+    };
+    let corrupt = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored enum member has no catalog identity"
+        )
+    };
+    let definition = storage
+        .read_enum_definition(
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage,
+                crate::storage::NamedTypeKind::Enum,
+                slot,
+            )?,
+            txid,
+        )?
+        .ok_or_else(corrupt)?;
+    let selected = match member {
+        Some(index) => definition.members().nth(index.ordinal() as usize),
+        None => definition.members().find(|member| {
+            member
+                .legacy_label
+                .is_some_and(|legacy| legacy.as_str() == label)
+        }),
+    };
+    let identity = selected
+        .and_then(|member| member.identity)
+        .ok_or_else(corrupt)?;
+    Ok(identity.oid() as u32)
+}
+
 // The prefix is not SQL. Only catalog writers create this durable grammar;
 // client comments cannot forge a binding.
 const QUERY_HEADER: &str = "pos3ql-bound-query-v1\n";

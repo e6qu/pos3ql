@@ -4542,6 +4542,56 @@ pub(crate) fn hashed_grouping<'a>(
     }))
 }
 
+/// A `SELECT DISTINCT` of columns of one table with no ordering, as the
+/// grouping by those columns PostgreSQL's `create_distinct_paths` plans in
+/// the same way (a `HashAggregate` over the scan, or a sort and `Unique`).
+/// `None` for any other query.
+pub(crate) fn distinct_as_grouping<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a Select<'a>>, SqlError> {
+    if !statement.distinct
+        || !statement.distinct_on.is_empty()
+        || !statement.group_by.is_empty()
+        || !statement.grouping_sets.is_empty()
+        || statement.having.is_some()
+        || !statement.order_by.is_empty()
+        || scope.n != 1
+        || statement.items.is_empty()
+        || statement.items.len() > query::index_paths::MAX_ORDER_KEYS
+    {
+        return Ok(None);
+    }
+    let all_columns = statement.items.iter().all(|item| match item {
+        SelectItem::Expr {
+            expression: Expr::Column { qualifier, name },
+            ..
+        } => matches!(
+            scope.find_column(*qualifier, name),
+            Ok(query::ResolvedColumn::Table(0, _))
+        ),
+        _ => false,
+    });
+    if !all_columns {
+        return Ok(None);
+    }
+    let keys = arena
+        .alloc_slice_with(statement.items.len(), |at| match statement.items[at] {
+            SelectItem::Expr { expression, .. } => expression,
+            _ => &Expr::Null,
+        })
+        .map_err(|_| arena_full())?;
+    let derived = &*arena
+        .alloc(Select {
+            group_by: keys,
+            distinct: false,
+            ..*statement
+        })
+        .map_err(|_| arena_full())?;
+    Ok(Some(derived))
+}
+
 /// The grouping sets of a query of one plain table as PostgreSQL's
 /// `consider_groupingsets_paths` plans them, with the scan they read, or
 /// `None` outside the model: the shapes [`grouped_scan_path`] leaves out,

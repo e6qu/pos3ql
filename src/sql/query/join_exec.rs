@@ -701,6 +701,25 @@ pub(crate) fn datum_hash(value: &Datum<'_>) -> Option<u32> {
     })
 }
 
+/// [`datum_hash`] of a grouping or distinct key, which also hashes an enum
+/// value (`hashenum`: `hash_uint32` of its label's `pg_enum` OID).
+pub(crate) fn key_hash(
+    value: &Datum<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<Option<u32>, SqlError> {
+    if matches!(value, Datum::Enum { .. }) {
+        let oid = crate::sql::enum_values::member_oid(value, storage, txid)?;
+        return Ok(Some(crate::sql::identity::hash_uint32(oid)));
+    }
+    Ok(datum_hash(value))
+}
+
+/// Whether [`key_hash`] hashes a key of type `ctype`.
+pub(crate) fn key_type_hashable(ctype: crate::sql::types::ColType) -> bool {
+    matches!(ctype, crate::sql::types::ColType::Enum(_)) || datum_type_hashable(ctype)
+}
+
 /// Whether two values equal by their type's equality have the same stored
 /// image (`datum_image_eq`).
 fn same_image(left: &Datum<'_>, right: &Datum<'_>) -> bool {

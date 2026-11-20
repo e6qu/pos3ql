@@ -1633,13 +1633,20 @@ buffers and a streaming merge over up to 500 tapes). The sorter holds no
 pointer to the storage: each push and `keep_least` takes the `&Storage` that
 sizes its rows. Not yet done: the
 modeled-join grouping sort and an incremental sort's batches are not charged
-against `work_mem`; a hashed `DISTINCT` returns
-groups in sort order, not `simplehash` order, and a one-table `GROUP BY` the
+against `work_mem`; a `DISTINCT` of the columns of one table that PostgreSQL
+hashes returns its rows in `simplehash` order, holding every scanned row in the
+statement arena even with an object store attached (`differential_exact/924`; a
+DISTINCT of expressions, or with an `ORDER BY`, is outside the model and still
+sorts), and a one-table `GROUP BY` the
 planner model does not cover (expression keys, aggregates without a sized
 transition state) likewise (a modeled one hashes in `simplehash` order,
 `differential_exact/922`; one whose key type has no ported hash function
-(arrays, records, ranges, jsonb, enums, bit strings, money) and whose
-`ORDER BY` does not name every key fails with `0A000`); `DISTINCT` with an `ORDER BY` on some of its
+(arrays, records, ranges, jsonb, bit strings, money) and whose
+`ORDER BY` does not name every key fails with `0A000`; an enum key hashes its
+label's `pg_enum` OID as `hashenum` does, but those OIDs come from pos3ql's
+own identity band, not PostgreSQL's cluster counter, so an enum grouping's
+order is deterministic yet cannot match a PostgreSQL cluster's
+(`differential_exact/925` sorts its groups)); `DISTINCT` with an `ORDER BY` on some of its
 columns sorts by the rest in select-list order (`differential_exact/923`); the arrival order of a table
 whose rows vary in width differs from PostgreSQL's where its free space map
 places a later, smaller tuple on an earlier page. A bounded sort

@@ -1004,7 +1004,10 @@ pub(super) fn groups_for_mask<'a>(
 /// and the groups are inserted in the order their first row arrives.
 /// `positions` are the key columns of `keys` in hashing order. Returns
 /// `false` when a key's type has no ported hash function.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn hashed_order(
+    storage: &Storage,
+    txid: u32,
     arena: &Arena,
     group_of: &[u32],
     keys: &[&[u8]],
@@ -1021,7 +1024,7 @@ fn hashed_order(
             combined = combined.rotate_left(1);
             let value = crate::sql::exec::decode_projected_col_record(key, position, arena)?;
             if !matches!(value, Datum::Null) {
-                let Some(hashed) = super::join_exec::datum_hash(&value) else {
+                let Some(hashed) = super::join_exec::key_hash(&value, storage, txid)? else {
                     return Ok(false);
                 };
                 combined ^= hashed;
@@ -1040,6 +1043,168 @@ fn hashed_order(
         *slot = group_of[row as usize];
     }
     Ok(true)
+}
+
+/// Whether the hash order of `hashed`'s key types is known: `false` when
+/// PostgreSQL sorts the rows to group them (`tsvector` and `tsquery` have
+/// no hash operator class), an error when a type's hash function is not
+/// ported.
+fn hash_order_supported(
+    scope: &QueryScope<'_>,
+    hashed: &crate::sql::explain::HashedGrouping,
+) -> Result<bool, SqlError> {
+    use crate::sql::types::ColType;
+    let definition = scope.defs.stored(0).expect("a plain table");
+    for &column in &hashed.columns[..hashed.len] {
+        let ctype = definition.columns()[column].ctype;
+        if matches!(ctype, ColType::TsVector | ColType::TsQuery) {
+            return Ok(false);
+        }
+        if !super::join_exec::key_type_hashable(ctype) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "the hash order of a key of type {} is not supported; order the rows by every key column",
+                ctype.name()
+            ));
+        }
+    }
+    Ok(true)
+}
+
+/// The hash table a one-table `SELECT DISTINCT` of columns plans when
+/// PostgreSQL hashes it and the order of its key types is known: the
+/// output columns it hashes, in hashing order, and its starting buckets.
+/// `None` when the plan sorts or the query is outside the planner model.
+pub(super) fn hashed_distinct_plan<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    txid: u32,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<Option<([usize; super::index_paths::MAX_ORDER_KEYS], usize, usize)>, SqlError> {
+    let Some(grouping) = crate::sql::explain::distinct_as_grouping(statement, scope, arena)? else {
+        return Ok(None);
+    };
+    let Some(from) = statement.from.as_ref() else {
+        return Ok(None);
+    };
+    let from = &*arena.alloc(*from).map_err(|_| arena_full())?;
+    let columns = super::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    let Some(hashed) = crate::sql::explain::hashed_grouping(
+        storage, txid, grouping, scope, from, &columns, arena,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !hash_order_supported(scope, &hashed)? {
+        return Ok(None);
+    }
+    // Each hashed column's position among the output columns: the first
+    // item naming it.
+    let mut positions = [0usize; super::index_paths::MAX_ORDER_KEYS];
+    for (slot, &column) in positions.iter_mut().zip(&hashed.columns[..hashed.len]) {
+        *slot = statement
+            .items
+            .iter()
+            .position(|item| match item {
+                SelectItem::Expr {
+                    expression: Expr::Column { qualifier, name },
+                    ..
+                } => matches!(
+                    scope.find_column(*qualifier, name),
+                    Ok(super::ResolvedColumn::Table(0, found)) if found == column
+                ),
+                _ => false,
+            })
+            .expect("a hashed column is an output column");
+    }
+    Ok(Some((positions, hashed.len, hashed.buckets)))
+}
+
+/// Puts the distinct rows of a one-table `SELECT DISTINCT` of columns in
+/// the order PostgreSQL's `HashAggregate` returns them, when its plan
+/// hashes: each row's hash is its columns' hashes combined as in a
+/// grouping, and the rows are inserted in arrival order. Returns the
+/// number of distinct rows now leading `rows`, or `None` when the plan
+/// sorts (or the query is outside the planner model) and the caller
+/// deduplicates by sorting.
+pub(super) fn hashed_distinct_rows<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    txid: u32,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    rows: &mut [&'a [u8]],
+    collations: &[Collation],
+) -> Result<Option<usize>, SqlError> {
+    let Some((positions, len, buckets)) =
+        hashed_distinct_plan(storage, scope, txid, statement, arena)?
+    else {
+        return Ok(None);
+    };
+    let positions = &positions[..len];
+    super::materialize::validate_row_collations(storage, rows, statement.items.len(), collations)?;
+    let hashes = arena
+        .alloc_slice_with(rows.len(), |_| 0u32)
+        .map_err(|_| arena_full())?;
+    for (hash, row) in hashes.iter_mut().zip(rows.iter()) {
+        *hash = super::simplehash::murmur32(hash_row_keys(storage, txid, row, positions, arena)?);
+    }
+    let width = statement.items.len();
+    let firsts = super::simplehash::iteration_order(
+        rows.len(),
+        buckets,
+        arena,
+        &mut |row| Ok(hashes[row]),
+        &mut |left, right| {
+            for (index, &collation) in collations.iter().take(width).enumerate() {
+                let ordering = super::materialize::compare_materialized_key(
+                    storage,
+                    txid,
+                    collation,
+                    crate::sql::exec::ProjectedValue::column(rows[left], index),
+                    crate::sql::exec::ProjectedValue::column(rows[right], index),
+                )?;
+                if !ordering.is_eq() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        },
+    )?;
+    let ordered = arena
+        .alloc_slice_with(firsts.len(), |at| rows[firsts[at] as usize])
+        .map_err(|_| arena_full())?;
+    rows[..ordered.len()].copy_from_slice(ordered);
+    Ok(Some(ordered.len()))
+}
+
+/// A row's keys combined as `ExecBuildHash32FromAttrs` does: each earlier
+/// hash rotated left a bit, a null key hashing to zero. Every key type was
+/// checked to have a ported hash function.
+fn hash_row_keys(
+    storage: &Storage,
+    txid: u32,
+    row: &[u8],
+    positions: &[usize],
+    arena: &Arena,
+) -> Result<u32, SqlError> {
+    let mut combined = 0u32;
+    for &position in positions {
+        combined = combined.rotate_left(1);
+        let value = crate::sql::exec::decode_projected_col_record(row, position, arena)?;
+        if !matches!(value, Datum::Null) {
+            combined ^= super::join_exec::key_hash(&value, storage, txid)?
+                .expect("a hashed key type has a ported hash function");
+        }
+    }
+    Ok(combined)
 }
 
 /// The groups of one table's grouping in the order PostgreSQL's plan
@@ -1112,27 +1277,15 @@ fn hashed_table_group_order<'a>(
     }) {
         return Ok(None);
     }
-    let definition = scope.defs.stored(0).expect("a plain table");
-    for &column in &hashed.columns[..hashed.len] {
-        use crate::sql::types::ColType;
-        let ctype = definition.columns()[column].ctype;
-        // `tsvector` and `tsquery` have no hash operator class: PostgreSQL
-        // sorts the rows to group them.
-        if matches!(ctype, ColType::TsVector | ColType::TsQuery) {
-            return Ok(None);
-        }
-        if !super::join_exec::datum_type_hashable(ctype) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "the hash order of a grouping key of type {} is not supported; order the groups by every grouping column",
-                ctype.name()
-            ));
-        }
+    if !hash_order_supported(scope, &hashed)? {
+        return Ok(None);
     }
     let order = arena
         .alloc_slice_with(keys.len(), |at| at as u32)
         .map_err(|_| arena_full())?;
     let hashed_all = hashed_order(
+        storage,
+        txid,
         arena,
         group_of,
         keys,
@@ -1178,7 +1331,16 @@ fn modeled_group_order<'a>(
         let positions = arena
             .alloc_slice_with(group.keys.len(), |at| group.keys[at].0)
             .map_err(|_| arena_full())?;
-        if !hashed_order(arena, group_of, keys, positions, group.buckets, order)? {
+        if !hashed_order(
+            storage,
+            txid,
+            arena,
+            group_of,
+            keys,
+            positions,
+            group.buckets,
+            order,
+        )? {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "the hash order of this grouping key type is not supported"

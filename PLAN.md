@@ -1283,8 +1283,11 @@ execution state is per plan node, as `create_plan` copies only those; one
 execution of a statement plans its join once, the passes that size,
 aggregate and order its groups or rows reading that plan; and a check of
 whether the search plans a statement plans in a region of the arena it
-then reclaims. A 34-relation two-column `USING` chain's search builds
-31,901 paths in about 10 MB. Remaining
+then reclaims. A nested loop's inner `Material` path is built once per
+input path, as its costs are the input's alone, where each join pair
+built its own (92% of an all-equated chain's paths). The `EXPLAIN` of a
+64-relation `USING` chain's search takes about 4 MB of the arena and a
+128-relation chain's GEQO search about 8 MB. Remaining
 there: a relation with a btree index holds 16 join parameters (one per
 other member of its classes and per movable outer join clause), bounded by
 the single-relation planner's 32 conditions and 64-bit restriction sets,

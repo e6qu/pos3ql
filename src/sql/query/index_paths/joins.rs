@@ -1171,6 +1171,8 @@ struct Search<'p, 'a, 's> {
     arena: &'a Arena,
     clauses: ArenaList<'a, Clause>,
     paths: ArenaChunks<'a, Path>,
+    /// Each `Material` path built, by the path it reads.
+    materials: ArenaList<'a, (u32, u32)>,
     /// The members of Unique and Memoize paths, kept apart so a path stays
     /// small.
     member_keys: ArenaList<'a, [Member; MAX_KEYS]>,
@@ -1232,6 +1234,7 @@ pub(crate) fn search<'a>(
         arena,
         clauses: ArenaList::new(arena),
         paths: ArenaChunks::new(arena, SEARCH_CHUNK),
+        materials: ArenaList::new(arena),
         member_keys: ArenaList::new(arena),
         rels: ArenaChunks::new(arena, SEARCH_CHUNK),
         rel_buckets: arena_slice(arena, REL_BUCKETS, |_| NO_REL)?,
@@ -1496,6 +1499,7 @@ fn arena_slice<T: Copy>(
 struct SavedJoins {
     rels: usize,
     paths: usize,
+    materials: usize,
     member_keys: usize,
     memoize_rescans: usize,
     param_rows: usize,
@@ -1619,6 +1623,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         SavedJoins {
             rels: self.rels.len(),
             paths: self.paths.len(),
+            materials: self.materials.len(),
             member_keys: self.member_keys.len(),
             memoize_rescans: self.memoize_rescans.len(),
             param_rows: self.param_rows.len(),
@@ -1653,6 +1658,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             }
         }
         self.paths.truncate(saved.paths);
+        self.materials.truncate(saved.materials);
         self.member_keys.truncate(saved.member_keys);
         self.memoize_rescans.truncate(saved.memoize_rescans);
         self.param_rows.truncate(saved.param_rows);
@@ -4345,19 +4351,35 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         matches!(self.path(id).kind, PathKind::Material { .. })
     }
 
-    /// `create_material_path` with `cost_material`.
+    /// `create_material_path` with `cost_material`: one path per input, as
+    /// its costs and rows are the input's alone (PostgreSQL builds one per
+    /// join pair and never frees it). A relation's path appears once in a
+    /// plan, so no plan reads the shared path twice.
     fn material_path(&mut self, input: u32) -> Result<u32, SqlError> {
+        if let Some(&(_, material)) = self
+            .materials
+            .borrowed_slice()
+            .iter()
+            .rev()
+            .find(|(over, _)| *over == input)
+        {
+            return Ok(material);
+        }
         let path = self.path(input);
         let settings = self.problem.settings;
         let (startup, total) =
             material_cost(path.startup, path.total, path.rows, path.width, settings);
-        self.push_path(Path {
+        let material = self.push_path(Path {
             kind: PathKind::Material { input },
             startup,
             total,
             disabled: path.disabled + u32::from(!settings.material),
             ..path
-        })
+        })?;
+        self.materials
+            .push((input, material))
+            .map_err(|_| arena_full())?;
+        Ok(material)
     }
 
     /// `generate_mergejoin_paths`.

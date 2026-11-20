@@ -53,6 +53,9 @@ jobs:
           docker exec "$postgres_container" psql -U postgres -X -v ON_ERROR_STOP=1 \
             -c "ALTER SYSTEM SET max_prepared_transactions = 8" \
             -c "ALTER SYSTEM SET wal_level = logical"
+          # pos3ql has no JIT compiler, like a PostgreSQL built without LLVM; remove the
+          # provider so the reference prints no JIT section for expensive plans.
+          docker exec "$postgres_container" rm /usr/lib/postgresql/18/lib/llvmjit.so
           docker restart "$postgres_container"
           for _ in $(seq 1 50); do
             pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && exit 0

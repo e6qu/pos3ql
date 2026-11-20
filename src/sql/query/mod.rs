@@ -14667,16 +14667,22 @@ fn enter_scan_context<'a>(
     resolved_columns: &dyn super::exec::ColTypeResolver,
     arena: &'a Arena,
 ) -> Result<Option<index_paths::ScanContextScope>, SqlError> {
-    // A grouping of one table's columns scans by the path its plan reads.
+    // A grouping of one table's columns, or a `DISTINCT` of them (planned
+    // as that grouping), scans by the path its plan reads.
+    let grouping = if statement.group_by.is_empty() {
+        crate::sql::explain::distinct_as_grouping(statement, scope, arena)?
+    } else {
+        Some(statement)
+    };
     if scope.n == 1
-        && !statement.group_by.is_empty()
+        && let Some(grouping) = grouping
         && statement
             .where_clause
             .is_none_or(|condition| !condition.contains_subquery())
         && let Some((shape, needed)) = crate::sql::explain::grouped_scan_context(
             storage,
             txid,
-            statement,
+            grouping,
             scope,
             from,
             resolved_columns,
@@ -17275,11 +17281,9 @@ fn select_into_rows_mode<'a>(
     // LIMIT/OFFSET use the streaming path so later rows are never evaluated.
     if statement.distinct || !statement.order_by.is_empty() || !statement.locking.is_empty() {
         let planned = index_paths::join_query::PlannedJoin::new();
-        if storage.spill_attached()
-            && !materialize::sorts_modeled_join(
-                storage, txid, statement, &scope, params, arena, outer, &planned,
-            )?
-        {
+        if materialize::externally_materialized(
+            storage, txid, statement, &scope, params, arena, outer, &planned,
+        )? {
             external_materialized_into(
                 storage,
                 &scope,

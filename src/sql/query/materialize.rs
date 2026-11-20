@@ -1714,12 +1714,13 @@ fn modeled_distinct<'a>(
                 combined = combined.rotate_left(1);
                 let value = crate::sql::exec::decode_projected_col_record(row, position, arena)?;
                 if !matches!(value, Datum::Null) {
-                    combined ^= super::join_exec::datum_hash(&value).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "the hash order of this DISTINCT key type is not supported"
-                        )
-                    })?;
+                    combined ^=
+                        super::join_exec::key_hash(&value, storage, txid)?.ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "the hash order of this DISTINCT key type is not supported"
+                            )
+                        })?;
                 }
             }
             *hash = super::simplehash::murmur32(combined);
@@ -1815,6 +1816,25 @@ fn modeled_distinct<'a>(
     Ok(kept)
 }
 
+/// Fails when a text column of any row cannot be compared under its
+/// collation.
+pub(super) fn validate_row_collations(
+    storage: &Storage,
+    rows: &[&[u8]],
+    width: usize,
+    collations: &[Collation],
+) -> Result<(), SqlError> {
+    for row in rows {
+        for (index, &collation) in collations.iter().take(width).enumerate() {
+            storage.validate_text_collation(
+                collation,
+                &crate::sql::exec::decode_projected_pub(row, index),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn sort_dedup_collated(
     storage: &Storage,
     txid: u32,
@@ -1823,14 +1843,7 @@ fn sort_dedup_collated(
     width: usize,
     collations: &[Collation],
 ) -> Result<usize, SqlError> {
-    for row in rows.iter() {
-        for (index, &collation) in collations.iter().take(width).enumerate() {
-            storage.validate_text_collation(
-                collation,
-                &crate::sql::exec::decode_projected_pub(row, index),
-            )?;
-        }
-    }
+    validate_row_collations(storage, rows, width, collations)?;
     let compare = |left: &[u8], right: &[u8]| {
         for (index, &collation) in collations.iter().take(width).enumerate() {
             let ordering = compare_materialized_key(
@@ -2466,7 +2479,22 @@ pub(crate) fn materialized_rows<'a>(
                     .and_then(|model| model.plan.upper.group)
                     .and_then(|chosen| chosen.input_sort),
             )?,
-            None => sort_dedup_collated(storage, txid, arena, rows, width, &visible_collations)?,
+            None => {
+                match super::group::hashed_distinct_rows(
+                    storage,
+                    scope,
+                    txid,
+                    statement,
+                    arena,
+                    rows,
+                    &visible_collations,
+                )? {
+                    Some(hashed) => hashed,
+                    None => {
+                        sort_dedup_collated(storage, txid, arena, rows, width, &visible_collations)?
+                    }
+                }
+            }
         };
     }
     let rows = &mut rows[..live];
@@ -3597,6 +3625,32 @@ pub(crate) fn external_materialized_into<'a>(
     Ok(emitted)
 }
 
+/// Whether the rows of `statement` are sorted through the external sorter
+/// (an object store is attached): not those of a join PostgreSQL sorts
+/// within its modeled plan, nor of a hashed `DISTINCT`, whose rows return
+/// in its hash table's order and so are all held in the statement arena.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+pub(super) fn externally_materialized<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    params: &[Datum<'a>],
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    planned: &PlannedJoin<'a>,
+) -> Result<bool, SqlError> {
+    if !storage.spill_attached()
+        || sorts_modeled_join(
+            storage, txid, statement, scope, params, arena, outer, planned,
+        )?
+    {
+        return Ok(false);
+    }
+    Ok(!(statement.distinct
+        && super::group::hashed_distinct_plan(storage, scope, txid, statement, arena)?.is_some()))
+}
+
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn external_materialized_select<'a>(
     storage: &'a Storage,
@@ -3742,14 +3796,12 @@ pub(crate) fn materialized_select<'a>(
     responder: &mut Responder,
 ) -> Outcome {
     let planned = PlannedJoin::new();
-    if storage.spill_attached()
-        && !match sorts_modeled_join(
-            storage, txid, statement, scope, params, arena, None, &planned,
-        ) {
-            Ok(sorts) => sorts,
-            Err(error) => return sql_fail(error),
-        }
-    {
+    if match externally_materialized(
+        storage, txid, statement, scope, params, arena, None, &planned,
+    ) {
+        Ok(external) => external,
+        Err(error) => return sql_fail(error),
+    } {
         return external_materialized_select(
             storage, scope, from, txid, statement, arena, params, hooks, correlated, base, limit,
             offset, responder,

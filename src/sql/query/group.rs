@@ -1002,7 +1002,8 @@ pub(super) fn groups_for_mask<'a>(
 /// one rotated left a bit, a null key hashing to zero
 /// (`ExecBuildHash32FromAttrs`), then `murmurhash32` (`TupleHashTableHash`),
 /// and the groups are inserted in the order their first row arrives.
-/// `positions` are the key columns of `keys` in hashing order.
+/// `positions` are the key columns of `keys` in hashing order. Returns
+/// `false` when a key's type has no ported hash function.
 fn hashed_order(
     arena: &Arena,
     group_of: &[u32],
@@ -1010,7 +1011,7 @@ fn hashed_order(
     positions: &[usize],
     buckets: usize,
     order: &mut [u32],
-) -> Result<(), SqlError> {
+) -> Result<bool, SqlError> {
     let hashes = arena
         .alloc_slice_with(keys.len(), |_| 0u32)
         .map_err(|_| arena_full())?;
@@ -1020,12 +1021,10 @@ fn hashed_order(
             combined = combined.rotate_left(1);
             let value = crate::sql::exec::decode_projected_col_record(key, position, arena)?;
             if !matches!(value, Datum::Null) {
-                combined ^= super::join_exec::datum_hash(&value).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "the hash order of this grouping key type is not supported"
-                    )
-                })?;
+                let Some(hashed) = super::join_exec::datum_hash(&value) else {
+                    return Ok(false);
+                };
+                combined ^= hashed;
             }
         }
         *hash = super::simplehash::murmur32(combined);
@@ -1040,7 +1039,7 @@ fn hashed_order(
     for (slot, &row) in order.iter_mut().zip(firsts) {
         *slot = group_of[row as usize];
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The groups of one table's grouping in the order PostgreSQL's plan
@@ -1099,7 +1098,8 @@ fn hashed_table_group_order<'a>(
     let order = arena
         .alloc_slice_with(keys.len(), |at| at as u32)
         .map_err(|_| arena_full())?;
-    hashed_order(
+    // Key types without a ported hash function keep the sort order.
+    let hashed_all = hashed_order(
         arena,
         group_of,
         keys,
@@ -1107,7 +1107,7 @@ fn hashed_table_group_order<'a>(
         hashed.buckets,
         order,
     )?;
-    Ok(Some(order))
+    Ok(hashed_all.then_some(&*order))
 }
 
 /// The order a join's grouping PostgreSQL's planner plans returns its
@@ -1143,7 +1143,12 @@ fn modeled_group_order<'a>(
         let positions = arena
             .alloc_slice_with(group.keys.len(), |at| group.keys[at].0)
             .map_err(|_| arena_full())?;
-        hashed_order(arena, group_of, keys, positions, group.buckets, order)?;
+        if !hashed_order(arena, group_of, keys, positions, group.buckets, order)? {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "the hash order of this grouping key type is not supported"
+            ));
+        }
     } else {
         crate::util::try_sort_unstable_by(order, |&left, &right| {
             for &(position, flags) in group.keys {

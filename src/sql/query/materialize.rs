@@ -2494,9 +2494,16 @@ pub(crate) fn materialized_rows<'a>(
                 width,
                 n_order,
                 n_on,
-                // A `DISTINCT`'s sort keys are the `ORDER BY` items, then the
-                // rest of the output columns (`transformDistinctClause`).
-                statement.distinct && n_on == 0,
+                // A sorted `DISTINCT`'s sort keys are the `ORDER BY` items,
+                // then the rest of the output columns
+                // (`transformDistinctClause`); a hashed one's rows reach the
+                // sort in the hash table's order.
+                statement.distinct
+                    && n_on == 0
+                    && !modeled
+                        .as_ref()
+                        .and_then(|model| model.group)
+                        .is_some_and(|group| group.distinct && group.hashed),
                 a,
                 b,
             )

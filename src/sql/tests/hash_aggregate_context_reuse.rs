@@ -8,11 +8,18 @@
 use super::compatibility_diagnostics::with_engine;
 use super::*;
 
-const SETUP: [&str; 4] = [
+/// The rows after the statistics go in by 1000, under the test
+/// transaction's row limit.
+const SETUP: [&str; 9] = [
     "CREATE TABLE reuse (a int) WITH (autovacuum_enabled = off)",
     "INSERT INTO reuse SELECT i % 20 FROM generate_series(1, 200) i",
     "ANALYZE reuse",
-    "INSERT INTO reuse SELECT (i * 7919) % 5000 FROM generate_series(201, 6200) i",
+    "INSERT INTO reuse SELECT (i * 7919) % 5000 FROM generate_series(201, 1200) i",
+    "INSERT INTO reuse SELECT (i * 7919) % 5000 FROM generate_series(1201, 2200) i",
+    "INSERT INTO reuse SELECT (i * 7919) % 5000 FROM generate_series(2201, 3200) i",
+    "INSERT INTO reuse SELECT (i * 7919) % 5000 FROM generate_series(3201, 4200) i",
+    "INSERT INTO reuse SELECT (i * 7919) % 5000 FROM generate_series(4201, 5200) i",
+    "INSERT INTO reuse SELECT (i * 7919) % 5000 FROM generate_series(5201, 6200) i",
 ];
 
 const REUSE: &str = "the memory of a hash aggregate after an earlier hash aggregate of this session ran with work_mem below 1MB is not supported: PostgreSQL reuses that aggregate's memory context, which pos3ql does not model; start a new session, or run every hash aggregate of the session with work_mem of at least 1MB";
@@ -43,7 +50,10 @@ fn work_contexts_take_the_chunk_limit_of_their_largest_block() {
 fn a_hash_aggregate_after_a_small_work_mem_one_fails_until_a_new_session() {
     with_engine("hash-aggregate-context-reuse", |engine, budget| {
         for sql in SETUP {
-            run_with(engine, budget, sql);
+            assert!(
+                error_sqlstates(&run_with(engine, budget, sql)).is_empty(),
+                "{sql}"
+            );
         }
         let query = "SELECT DISTINCT a FROM reuse";
         for (work_mem, earlier) in [

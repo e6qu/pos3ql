@@ -4500,6 +4500,46 @@ pub(crate) fn grouped_scan_context<'a>(
     )
 }
 
+/// A grouping PostgreSQL's planner hashes: the table columns its keys
+/// name, in the order `ExecBuildHash32FromAttrs` combines them, and the
+/// buckets its table starts with.
+pub(crate) struct HashedGrouping {
+    pub(crate) columns: [usize; query::index_paths::MAX_ORDER_KEYS],
+    pub(crate) len: usize,
+    pub(crate) buckets: usize,
+}
+
+/// The hashed grouping PostgreSQL's planner plans over the scan of one
+/// table, or `None` when it sorts the rows or the shape is outside
+/// [`grouped_scan_path`]'s model.
+pub(crate) fn hashed_grouping<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    arena: &'a Arena,
+) -> Result<Option<HashedGrouping>, SqlError> {
+    let (width, _) = projected_shape(statement, Some(scope), None, storage, txid, arena)?;
+    let Some(grouped) =
+        grouped_scan_path(storage, txid, statement, scope, from, columns, width, arena)?
+    else {
+        return Ok(None);
+    };
+    let (Some(path), Some(grouping)) = (grouped.path.grouped, grouped.shape.grouping) else {
+        return Ok(None);
+    };
+    let Some(sizing) = path.hash_agg else {
+        return Ok(None);
+    };
+    Ok(path.hashed.then_some(HashedGrouping {
+        columns: grouping.columns,
+        len: grouping.len,
+        buckets: sizing.buckets,
+    }))
+}
+
 /// The grouping sets of a query of one plain table as PostgreSQL's
 /// `consider_groupingsets_paths` plans them, with the scan they read, or
 /// `None` outside the model: the shapes [`grouped_scan_path`] leaves out,
@@ -7899,6 +7939,44 @@ fn plan_pulled_select<'a>(
         &*arena
             .alloc_slice_with(count, |index| kept[index].expect("kept key"))
             .map_err(|_| arena_full())?
+    } else if statement.distinct
+        && statement.distinct_on.is_empty()
+        && statement.group_by.is_empty()
+        && !statement.order_by.is_empty()
+        && statement
+            .items
+            .iter()
+            .all(|item| matches!(item, SelectItem::Expr { .. }))
+    {
+        // The `Unique` over this sort needs its rows ordered by every output
+        // column: the `ORDER BY` items, then the others in select-list order
+        // (`transformDistinctClause`).
+        let keys = order_keys(statement, arena)?;
+        let rest = statement.items.iter().filter(|item| {
+            matches!(item, SelectItem::Expr { expression, .. }
+                if !keys.iter().any(|key| *key.0 == **expression))
+        });
+        let all = arena
+            .alloc_slice_with(keys.len() + statement.items.len(), |at| {
+                keys.get(at).copied().unwrap_or((&Expr::Null, None))
+            })
+            .map_err(|_| arena_full())?;
+        let mut count = keys.len();
+        for item in rest {
+            let SelectItem::Expr { expression, .. } = item else {
+                continue;
+            };
+            // An output column named twice sorts once.
+            if all[keys.len()..count]
+                .iter()
+                .any(|key| *key.0 == **expression)
+            {
+                continue;
+            }
+            all[count] = (expression, Some((false, false)));
+            count += 1;
+        }
+        &all[..count]
     } else {
         order_keys(statement, arena)?
     };

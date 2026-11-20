@@ -757,17 +757,24 @@ pub(super) fn groups_for_mask<'a>(
     // above takes the first ones, and PostgreSQL never finishes, filters
     // or projects the others.
     let order = match outer {
-        None if statement.grouping_sets.is_empty() => modeled_group_order(
-            storage,
-            scope,
-            txid,
-            statement,
-            params,
-            arena,
-            group_of,
-            rep_keys,
-            group_collations,
-        )?,
+        None if statement.grouping_sets.is_empty() => {
+            match modeled_group_order(
+                storage,
+                scope,
+                txid,
+                statement,
+                params,
+                arena,
+                group_of,
+                rep_keys,
+                group_collations,
+            )? {
+                Some(order) => Some(order),
+                None => hashed_table_group_order(
+                    storage, scope, from, txid, statement, arena, group_of, rep_keys,
+                )?,
+            }
+        }
         _ => None,
     };
     let mut output_count = 0usize;
@@ -990,6 +997,119 @@ pub(super) fn groups_for_mask<'a>(
     Ok(out_rows)
 }
 
+/// Puts `order` (each group's index) in the order a `HashAggregate`'s table
+/// returns the groups: each group's hash is its keys' hashes, each earlier
+/// one rotated left a bit, a null key hashing to zero
+/// (`ExecBuildHash32FromAttrs`), then `murmurhash32` (`TupleHashTableHash`),
+/// and the groups are inserted in the order their first row arrives.
+/// `positions` are the key columns of `keys` in hashing order.
+fn hashed_order(
+    arena: &Arena,
+    group_of: &[u32],
+    keys: &[&[u8]],
+    positions: &[usize],
+    buckets: usize,
+    order: &mut [u32],
+) -> Result<(), SqlError> {
+    let hashes = arena
+        .alloc_slice_with(keys.len(), |_| 0u32)
+        .map_err(|_| arena_full())?;
+    for (hash, key) in hashes.iter_mut().zip(keys) {
+        let mut combined = 0u32;
+        for &position in positions {
+            combined = combined.rotate_left(1);
+            let value = crate::sql::exec::decode_projected_col_record(key, position, arena)?;
+            if !matches!(value, Datum::Null) {
+                combined ^= super::join_exec::datum_hash(&value).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "the hash order of this grouping key type is not supported"
+                    )
+                })?;
+            }
+        }
+        *hash = super::simplehash::murmur32(combined);
+    }
+    let firsts = super::simplehash::iteration_order(
+        group_of.len(),
+        buckets,
+        arena,
+        &mut |row| Ok(hashes[group_of[row] as usize]),
+        &mut |left, right| Ok(group_of[left] == group_of[right]),
+    )?;
+    for (slot, &row) in order.iter_mut().zip(firsts) {
+        *slot = group_of[row as usize];
+    }
+    Ok(())
+}
+
+/// The groups of one table's grouping in the order PostgreSQL's plan
+/// returns them when it hashes: `None` when it sorts them (their order
+/// then), or when the grouping is outside the planner model.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+fn hashed_table_group_order<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    group_of: &[u32],
+    keys: &[&[u8]],
+) -> Result<Option<&'a [u32]>, SqlError> {
+    if scope.n != 1 || statement.group_by.is_empty() {
+        return Ok(None);
+    }
+    let columns = super::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    let Some(hashed) = crate::sql::explain::hashed_grouping(
+        storage, txid, statement, scope, from, &columns, arena,
+    )?
+    else {
+        return Ok(None);
+    };
+    // Each hashed column's position among the stored group keys: the first
+    // `GROUP BY` entry naming it.
+    let mut positions = [0usize; super::index_paths::MAX_ORDER_KEYS];
+    for (slot, &column) in positions.iter_mut().zip(&hashed.columns[..hashed.len]) {
+        *slot = statement
+            .group_by
+            .iter()
+            .position(|key| {
+                let key = match key {
+                    Expr::Int(ordinal) if *ordinal >= 1 => {
+                        match statement.items.get(*ordinal as usize - 1) {
+                            Some(SelectItem::Expr { expression, .. }) => *expression,
+                            _ => key,
+                        }
+                    }
+                    _ => key,
+                };
+                matches!(key, Expr::Column { qualifier, name }
+                    if matches!(scope.find_column(*qualifier, name),
+                        Ok(super::ResolvedColumn::Table(0, found)) if found == column))
+            })
+            .expect("a hashed grouping column has its GROUP BY entry");
+    }
+    let order = arena
+        .alloc_slice_with(keys.len(), |at| at as u32)
+        .map_err(|_| arena_full())?;
+    hashed_order(
+        arena,
+        group_of,
+        keys,
+        &positions[..hashed.len],
+        hashed.buckets,
+        order,
+    )?;
+    Ok(Some(order))
+}
+
 /// The order a join's grouping PostgreSQL's planner plans returns its
 /// groups in: a `HashAggregate` its hash table's (`TupleHashTableHash` of
 /// the keys, inserted in the join's row order), a `GroupAggregate` its
@@ -1020,37 +1140,10 @@ fn modeled_group_order<'a>(
         .alloc_slice_with(keys.len(), |at| at as u32)
         .map_err(|_| arena_full())?;
     if group.hashed {
-        // Each group's hash: its keys' hashes, each earlier one rotated left
-        // a bit, a null key hashing to zero (`ExecBuildHash32FromAttrs`).
-        let hashes = arena
-            .alloc_slice_with(keys.len(), |_| 0u32)
+        let positions = arena
+            .alloc_slice_with(group.keys.len(), |at| group.keys[at].0)
             .map_err(|_| arena_full())?;
-        for (hash, key) in hashes.iter_mut().zip(keys) {
-            let mut combined = 0u32;
-            for &(position, _) in group.keys {
-                combined = combined.rotate_left(1);
-                let value = crate::sql::exec::decode_projected_col_record(key, position, arena)?;
-                if !matches!(value, Datum::Null) {
-                    combined ^= super::join_exec::datum_hash(&value).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "the hash order of this grouping key type is not supported"
-                        )
-                    })?;
-                }
-            }
-            *hash = super::simplehash::murmur32(combined);
-        }
-        let firsts = super::simplehash::iteration_order(
-            group_of.len(),
-            group.buckets,
-            arena,
-            &mut |row| Ok(hashes[group_of[row] as usize]),
-            &mut |left, right| Ok(group_of[left] == group_of[right]),
-        )?;
-        for (slot, &row) in order.iter_mut().zip(firsts) {
-            *slot = group_of[row as usize];
-        }
+        hashed_order(arena, group_of, keys, positions, group.buckets, order)?;
     } else {
         crate::util::try_sort_unstable_by(order, |&left, &right| {
             for &(position, flags) in group.keys {

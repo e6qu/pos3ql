@@ -2494,7 +2494,9 @@ pub(crate) fn materialized_rows<'a>(
                 width,
                 n_order,
                 n_on,
-                false,
+                // A `DISTINCT`'s sort keys are the `ORDER BY` items, then the
+                // rest of the output columns (`transformDistinctClause`).
+                statement.distinct && n_on == 0,
                 a,
                 b,
             )

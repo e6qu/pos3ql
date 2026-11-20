@@ -1624,8 +1624,12 @@ buffers and a streaming merge over up to 500 tapes). The sorter holds no
 pointer to the storage: each push and `keep_least` takes the `&Storage` that
 sizes its rows. Not yet done: the
 modeled-join grouping sort and an incremental sort's batches are not charged
-against `work_mem`; a one-table `GROUP BY` and a hashed `DISTINCT` return
-groups in sort order, not `simplehash` order; the arrival order of a table
+against `work_mem`; a hashed `DISTINCT` returns
+groups in sort order, not `simplehash` order, and a one-table `GROUP BY` the
+planner model does not cover (expression keys, aggregates without a sized
+transition state) likewise (a modeled one hashes in `simplehash` order,
+`differential_exact/922`); `DISTINCT` with an `ORDER BY` on some of its
+columns sorts by the rest in select-list order (`differential_exact/923`); the arrival order of a table
 whose rows vary in width differs from PostgreSQL's where its free space map
 places a later, smaller tuple on an earlier page. A bounded sort
 (`LIMIT`) that outgrows its heap in `EXPLAIN ANALYZE` still fails with `0A000`.

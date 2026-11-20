@@ -30,6 +30,7 @@ mod constraint_index_identity;
 mod cursor_execution;
 mod deparsed_expressions;
 mod dependency_rows;
+mod distinct_order_keys;
 mod drop_dependency_reports;
 mod error_report_fields;
 mod evaluation_timing;

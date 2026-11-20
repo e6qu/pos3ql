@@ -1045,8 +1045,18 @@ fn explain_refuses_joins_postgresql_plans_unlike_the_join_search() {
     let refused = |session: &mut ConfiguredTransactionSession, engine: &mut Engine, sql: &str| {
         String::from_utf8_lossy(&session.execute(engine, sql, true)).into_owned()
     };
-    // PostgreSQL 18 scans `pn_k` once.
-    let self_join = "EXPLAIN (COSTS OFF) SELECT a.v, b.k FROM pn_k a JOIN pn_k b \
+    // PostgreSQL 18 scans `pn_k` once (`remove_useless_self_joins`).
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "COSTS OFF",
+            "SELECT a.v, b.k FROM pn_k a JOIN pn_k b ON a.id = b.id WHERE b.k = 3"
+        ),
+        ["Seq Scan on pn_k b", "  Filter: (k = 3)"]
+    );
+    // A subquery reading the removed scan is not renamed.
+    let self_join = "EXPLAIN (COSTS OFF) SELECT a.v, (SELECT a.k) FROM pn_k a JOIN pn_k b \
                      ON a.id = b.id WHERE b.k = 3";
     let error = refused(&mut session, &mut engine, self_join);
     assert!(error.contains("remove_useless_self_joins"), "{error}");

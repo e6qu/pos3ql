@@ -235,8 +235,7 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   small `work_mem` (two 5,000-row tables joined on an integer key under
   `64kB`) fails with `query result exceeds the statement arena` instead of
   returning its rows.
-- [ ] *In progress:* self-join removal (`remove_useless_self_joins`; `EXPLAIN`
-  of such joins fails with `0A000` today, `949`).
+- [x] Self-join removal (`remove_useless_self_joins`, `976`).
 - [ ] *In progress:* plan joins of never-analyzed tables by PostgreSQL's
   search (they keep pos3ql's join order today). Needs the retained pull-based
   executor below so the result-stream and cursor tests keep streaming.

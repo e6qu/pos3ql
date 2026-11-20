@@ -1352,6 +1352,14 @@ pub(super) fn run_modeled<'a>(
         for table in 0..n {
             let start = offsets[table];
             let columns = scope.stored_width(table);
+            // A removed self-join's relation reads the row of the scan kept
+            // in its place.
+            if let Some(kept) = model.kept_for[table] {
+                let row = bound[usize::from(kept)].expect("the top join binds every relation");
+                values[start..start + columns].copy_from_slice(&row.values[..columns]);
+                rowids[table] = row.rowid;
+                continue;
+            }
             // A removed join's relation reads as NULLs, which nothing reads.
             if model.plan.removed & Relids::of(table) != Relids::EMPTY {
                 values[start..start + columns].copy_from_slice(&nulls[table][..columns]);

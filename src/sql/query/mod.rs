@@ -50,7 +50,7 @@ pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
 pub(crate) mod generator;
-mod join_exec;
+pub(crate) mod join_exec;
 pub(crate) use join_exec::{
     node_number as join_exec_node_number, scan_segment as join_exec_scan_segment,
 };
@@ -14684,6 +14684,7 @@ fn enter_scan_context<'a>(
             storage,
             txid,
             grouping,
+            statement.group_by.is_empty(),
             scope,
             from,
             resolved_columns,
@@ -14948,6 +14949,7 @@ pub(crate) fn select_query_resumable<'a>(
         None,
         pushed.as_ref(),
         true,
+        Some(statement),
     ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),

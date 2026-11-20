@@ -1793,10 +1793,11 @@ pub use describe::{
     visit_record_shape_metadata as visit_record_shape_metadata_pub,
 };
 pub(crate) use describe::{
-    StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
-    infer_type_catalog, intrinsic_record_field_meta, record_shape_metadata,
-    record_shape_pool_bytes, routine_result_metadata, row_expansion_error, unify_numeric_tower,
-    user_routine_call_result, visit_array_constructor_conversions, with_temporary_record_shapes,
+    StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, expression_static_metadata,
+    infer_routine_argument_oid, infer_type_catalog, intrinsic_record_field_meta,
+    record_shape_metadata, record_shape_pool_bytes, routine_result_metadata, row_expansion_error,
+    unify_numeric_tower, user_routine_call_result, visit_array_constructor_conversions,
+    with_temporary_record_shapes,
 };
 pub(crate) use describe::{
     bound_parameter_context_active, bound_parameter_type_oid, enter_routine_parameter_types,

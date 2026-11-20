@@ -2101,6 +2101,14 @@ pub struct GucState {
     seq_session: SeqSession,
     random: Cell<PrngState>,
     custom: CustomNames,
+    /// The smallest aset.c chunk limit of a hash aggregate's work context
+    /// PostgreSQL may have returned to its backend's freelist of contexts
+    /// with default sizes in an earlier statement of this session
+    /// ([`DEFAULT_CHUNK_LIMIT`] while none can have been), and that limit
+    /// for this statement's hash aggregates, which reach the freelist when
+    /// it ends.
+    reused_chunk_limit: Cell<u32>,
+    pending_chunk_limit: Cell<u32>,
 }
 
 pub(crate) struct RoutineConfigScope {
@@ -2198,6 +2206,16 @@ impl Default for GucState {
 }
 
 impl GucState {
+    /// A statement starts: the work contexts of the hash aggregates the
+    /// statements before it built are on the session's freelist now.
+    pub(crate) fn begin_statement(&self) {
+        self.reused_chunk_limit.set(
+            self.reused_chunk_limit
+                .get()
+                .min(self.pending_chunk_limit.get()),
+        );
+    }
+
     pub(crate) fn statement_settings(&self) -> StatementSettings {
         let state = self.store.borrow();
         StatementSettings {
@@ -2584,6 +2602,8 @@ impl GucState {
             seq_session: SeqSession::new(),
             random: Cell::new(PrngState::UNINITIALIZED),
             custom: CustomNames::new(),
+            reused_chunk_limit: Cell::new(DEFAULT_CHUNK_LIMIT),
+            pending_chunk_limit: Cell::new(DEFAULT_CHUNK_LIMIT),
         }
     }
 
@@ -4762,6 +4782,62 @@ pub(crate) fn planner_setting_metadata(name: &str) -> Option<PlannerSettingMetad
 /// bytes.
 pub(crate) fn hash_memory_bytes() -> f64 {
     f64::from(work_mem_kilobytes()) * 1024.0 * planner_value("hash_mem_multiplier")
+}
+
+/// aset.c's `ALLOC_CHUNK_LIMIT`: the chunk limit of a context made with
+/// the default block sizes.
+pub(crate) const DEFAULT_CHUNK_LIMIT: u32 = 8192;
+
+/// The chunk limit aset.c gives the work context `CreateWorkExprContext`
+/// makes under `work_mem` kilobytes: its largest block is
+/// `pg_prevpower2_size_t(work_mem * 1024 / 16)` clamped to 8 kB to 8 MB, and
+/// the limit halves from 8192 until a chunk and its header fit a quarter of
+/// that block less its header (`ALLOC_CHUNK_FRACTION`).
+pub(crate) fn work_context_chunk_limit(work_mem: i32) -> u32 {
+    let bytes = u64::try_from(work_mem).unwrap_or(0) * 1024 / 16;
+    let previous = if bytes == 0 { 0 } else { 1u64 << bytes.ilog2() };
+    let block = previous.clamp(8 * 1024, 8 * 1024 * 1024);
+    let mut limit = u64::from(DEFAULT_CHUNK_LIMIT);
+    while limit + 16 > (block - 40) / 4 {
+        limit >>= 1;
+    }
+    limit as u32
+}
+
+/// Records that PostgreSQL initializes a hashed or mixed `Agg` in the
+/// running statement (run or explained) under the current `work_mem`: its
+/// work context joins the session's freelist when the statement ends, and
+/// aset.c keeps its chunk limit when a later context with default sizes
+/// reuses it.
+pub(crate) fn note_hash_aggregate() {
+    let limit = work_context_chunk_limit(work_mem_kilobytes());
+    if limit == DEFAULT_CHUNK_LIMIT {
+        return;
+    }
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return;
+        }
+        // SAFETY: `enter_eval_scope` owns the pointer's dynamic extent.
+        let state = unsafe { &*pointer };
+        state
+            .pending_chunk_limit
+            .set(state.pending_chunk_limit.get().min(limit));
+    });
+}
+
+/// The smallest chunk limit a context with default sizes this statement
+/// creates may carry from the session's freelist ([`note_hash_aggregate`]).
+pub(crate) fn reused_context_chunk_limit() -> u32 {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return DEFAULT_CHUNK_LIMIT;
+        }
+        // SAFETY: `enter_eval_scope` owns the pointer's dynamic extent.
+        unsafe { &*pointer }.reused_chunk_limit.get()
+    })
 }
 
 pub(crate) fn work_mem_kilobytes() -> i32 {

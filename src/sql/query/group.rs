@@ -11,7 +11,7 @@ use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, FromClause, GroupingSet, Select, SelectItem};
 use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
-use crate::sql::types::Datum;
+use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::stack_format;
 
@@ -197,7 +197,7 @@ pub(super) fn groups_for_mask<'a>(
     pax_demand: super::PaxReadDemand,
     group_bound: Option<usize>,
     planned: &PlannedJoin<'a>,
-) -> Result<&'a [&'a [u8]], SqlError> {
+) -> Result<(&'a [&'a [u8]], bool), SqlError> {
     let n_keys = statement.group_by.len();
     let aggregate = instrument::node(instrument::Role::Aggregate);
     // A `GroupAggregate` reads its input from a sort by the grouping keys,
@@ -764,6 +764,7 @@ pub(super) fn groups_for_mask<'a>(
     // The groups in the order the plan returns them; a limit directly
     // above takes the first ones, and PostgreSQL never finishes, filters
     // or projects the others.
+    let one_table = one_plain_table(storage, scope, txid);
     let order = match outer {
         None if statement.grouping_sets.is_empty() => {
             match modeled_group_order(
@@ -786,6 +787,17 @@ pub(super) fn groups_for_mask<'a>(
         }
         _ => None,
     };
+    // Outside one plain table and a modeled join, PostgreSQL may hash the
+    // grouping (a correlated subquery's, grouping sets', one over a derived
+    // table, function or `VALUES`): its work context may join the session's
+    // freelist. The model cannot tell, so it is noted.
+    if n_keys > 0
+        && (outer.is_some()
+            || !statement.grouping_sets.is_empty()
+            || (order.is_none() && !one_table))
+    {
+        crate::sql::guc::note_hash_aggregate();
+    }
     let mut output_count = 0usize;
     let mut consumed = 0usize;
     for at in 0..n_groups {
@@ -1004,7 +1016,9 @@ pub(super) fn groups_for_mask<'a>(
         out_rows[output..output + rows.len()].copy_from_slice(rows);
         output += rows.len();
     }
-    Ok(out_rows)
+    // Whether the groups come in the hash table order PostgreSQL's plan
+    // returns them in, rather than in key order.
+    Ok((out_rows, one_table && order.is_some()))
 }
 
 /// Each group's table hash: its keys' hashes, each earlier one rotated left
@@ -1028,7 +1042,7 @@ fn group_hashes<'a>(
             combined = combined.rotate_left(1);
             let value = crate::sql::exec::decode_projected_col_record(key, position, arena)?;
             if !matches!(value, Datum::Null) {
-                let Some(hashed) = super::join_exec::key_hash(&value, storage, txid)? else {
+                let Some(hashed) = super::join_exec::key_hash(&value, storage, txid, arena)? else {
                     return Ok(None);
                 };
                 combined ^= hashed;
@@ -1084,56 +1098,498 @@ pub(super) fn hashed_order(
 }
 
 /// Whether the hash order of `hashed`'s key types is known: `false` when
-/// PostgreSQL sorts the rows to group them (`tsvector` and `tsquery` have
-/// no hash operator class), an error when a type's hash function is not
-/// ported.
+/// PostgreSQL sorts the rows to group them (a key type without a hash
+/// operator class), an error when a type's hash function is not ported.
 fn hash_order_supported(
-    scope: &QueryScope<'_>,
     hashed: &crate::sql::explain::HashedGrouping,
-) -> Result<bool, SqlError> {
-    use crate::sql::types::ColType;
-    let definition = scope.defs.stored(0).expect("a plain table");
-    for &column in &hashed.columns[..hashed.len] {
-        let ctype = definition.columns()[column].ctype;
-        if matches!(ctype, ColType::TsVector | ColType::TsQuery) {
+    storage: &Storage,
+    txid: u32,
+) -> Result<bool, ColType> {
+    for &ctype in &hashed.types[..hashed.len] {
+        if !key_type_hash_order(ctype, storage, txid)? {
             return Ok(false);
-        }
-        if !super::join_exec::key_type_hashable(ctype) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "the hash order of a key of type {} is not supported; order the rows by every key column",
-                ctype.name()
-            ));
         }
     }
     Ok(true)
 }
 
-/// The hash table a one-table `SELECT DISTINCT` of columns plans when
-/// PostgreSQL hashes it and the order of its key types is known: the
-/// output columns it hashes, in hashing order, and its starting buckets.
-/// `None` when the plan sorts or the query is outside the planner model.
+/// [`hash_order_supported`] for one key type. A named composite hashes
+/// with `hash_record` when every field type has a hash function, and
+/// sorts when one has none (the type cache's field hashing flag); an
+/// array of one hashes as its element type does (`hash_array`).
+fn key_type_hash_order(ctype: ColType, storage: &Storage, txid: u32) -> Result<bool, ColType> {
+    if let ColType::Composite(creation) = ctype {
+        let mut fields = [ColType::Bool; MAX_PROJ];
+        let mut count = 0usize;
+        let mut overflow = false;
+        crate::sql::exec::visit_catalog_composite_fields(
+            storage,
+            txid,
+            creation,
+            &mut |_, meta| {
+                if count < fields.len() {
+                    fields[count] = meta.ctype;
+                    count += 1;
+                } else {
+                    overflow = true;
+                }
+            },
+        )
+        .filter(|_| !overflow)
+        .ok_or(ctype)?;
+        for &field in &fields[..count] {
+            if !key_type_hash_order(field, storage, txid)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    if let ColType::Array(element) = ctype
+        && let element @ ColType::Composite(_) = element.to_coltype()
+    {
+        return key_type_hash_order(element, storage, txid);
+    }
+    if super::join_exec::key_type_sorts_only(ctype) {
+        return Ok(false);
+    }
+    if !super::join_exec::key_type_hashable(ctype) {
+        return Err(ctype);
+    }
+    Ok(true)
+}
+
+std::thread_local! {
+    /// The select list of the statement a consumer reads as a set (an `IN`,
+    /// `ANY` or `ALL` subquery's rows), whose groups' order no one observes.
+    static UNOBSERVED_ORDER: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Runs `run` with the row order of `statement`'s grouping unobserved: its
+/// consumer reads the rows as a set.
+pub(super) fn with_unobserved_order<R>(statement: &Select<'_>, run: impl FnOnce() -> R) -> R {
+    let held = UNOBSERVED_ORDER.with(|cell| cell.replace(statement.items.as_ptr() as usize));
+    let result = run();
+    UNOBSERVED_ORDER.with(|cell| cell.set(held));
+    result
+}
+
+/// Whether no one observes the order of `statement`'s groups: its consumer
+/// reads its rows as a set, and no `LIMIT` or `OFFSET` picks among them.
+fn order_unobserved(statement: &Select<'_>) -> bool {
+    statement.limit.is_none()
+        && statement.offset.is_none()
+        && !statement.items.is_empty()
+        && UNOBSERVED_ORDER.with(|cell| cell.get()) == statement.items.as_ptr() as usize
+}
+
+/// Whether the statement reading a derived table can tell the order of the
+/// rows the derived table's query returns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowOrder {
+    Observed,
+    /// The reader's own `ORDER BY` or aggregation fixes its output whatever
+    /// order the rows arrive in.
+    Unobserved,
+}
+
+/// Whether two equal values of type `ctype` (under `collation`) always
+/// print alike, so rows equal on such columns are indistinguishable.
+/// `numeric`, floats, `interval`, `jsonb` and `bpchar` have equal values
+/// that print differently (`1.0` and `1.00`, `-0` and `0`, `1 day` and
+/// `24:00:00`); a catalog collation may be nondeterministic.
+pub(super) fn equal_values_print_alike(ctype: ColType, collation: Collation) -> bool {
+    match ctype {
+        ColType::Int2
+        | ColType::Int4
+        | ColType::Int8
+        | ColType::Oid
+        | ColType::Bool
+        | ColType::Char
+        | ColType::Bytea
+        | ColType::Uuid
+        | ColType::Date
+        | ColType::Timestamp
+        | ColType::Timestamptz
+        | ColType::Time
+        | ColType::Timetz
+        | ColType::Money
+        | ColType::PgLsn
+        | ColType::Macaddr
+        | ColType::Macaddr8
+        | ColType::Enum(_) => true,
+        ColType::Text | ColType::Varchar | ColType::Name => {
+            !matches!(collation, Collation::Catalog(_))
+        }
+        ColType::Array(element) => equal_values_print_alike(element.to_coltype(), collation),
+        _ => false,
+    }
+}
+
+/// How `consumer`, whose only FROM item is the derived table `alias` with
+/// output `columns`, can observe the order of that table's rows. They are
+/// unobserved when the consumer's output is the derived table's columns
+/// and its `ORDER BY` names every output column of a type whose equal
+/// values print alike, or when it aggregates them into one row with `count`,
+/// or `min` and `max` of such columns. Anything else (a filter, a function,
+/// a window, a grouping) is taken to observe the order.
+pub(crate) fn derived_row_order(
+    consumer: &Select<'_>,
+    alias: &str,
+    columns: &[crate::storage::ColumnMeta],
+) -> RowOrder {
+    let sole_reader = consumer
+        .from
+        .as_ref()
+        .is_some_and(|from| from.joins.is_empty())
+        && consumer.set_body.is_none()
+        && consumer.where_clause.is_none()
+        && consumer.group_by.is_empty()
+        && consumer.grouping_sets.is_empty()
+        && consumer.having.is_none()
+        && consumer.windows.is_empty()
+        && consumer.distinct_on.is_empty()
+        && consumer.locking.is_empty();
+    if !sole_reader {
+        return RowOrder::Observed;
+    }
+    // The derived column a plain reference names, if its name is unique.
+    let column = |expression: &Expr<'_>| match expression {
+        Expr::Column { qualifier, name } if qualifier.is_none_or(|q| q == alias) => {
+            let mut found = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, meta)| meta.name.as_str() == *name);
+            match (found.next(), found.next()) {
+                (Some((at, _)), None) => Some(at),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let alike = |at: usize| equal_values_print_alike(columns[at].ctype, columns[at].collation);
+    // The output: each column the select list shows, or each aggregate.
+    let mut shown = [usize::MAX; MAX_PROJ];
+    let mut n_shown = 0usize;
+    let mut aggregates = 0usize;
+    for item in consumer.items {
+        let range = match item {
+            SelectItem::Wildcard(_) => 0..columns.len(),
+            SelectItem::TableWildcard(q) if *q == alias => 0..columns.len(),
+            SelectItem::Expr { expression, .. } => match (column(expression), expression) {
+                (Some(at), _) => at..at + 1,
+                (
+                    None,
+                    Expr::Call {
+                        name,
+                        args,
+                        star,
+                        distinct: false,
+                        order_by: [],
+                        over: None,
+                        filter: None,
+                        bound_oid: None,
+                        ..
+                    },
+                ) => {
+                    let insensitive = match *name {
+                        "count" => *star || args.len() == 1,
+                        "min" | "max" => {
+                            matches!(args, [argument] if column(argument).is_some_and(alike))
+                        }
+                        _ => false,
+                    };
+                    if !insensitive {
+                        return RowOrder::Observed;
+                    }
+                    aggregates += 1;
+                    continue;
+                }
+                _ => return RowOrder::Observed,
+            },
+            _ => return RowOrder::Observed,
+        };
+        for at in range {
+            if n_shown == MAX_PROJ {
+                return RowOrder::Observed;
+            }
+            shown[n_shown] = at;
+            n_shown += 1;
+        }
+    }
+    if aggregates > 0 {
+        // One aggregated row; a bare column beside the aggregates is an
+        // error the grouping reports.
+        return if n_shown == 0 {
+            RowOrder::Unobserved
+        } else {
+            RowOrder::Observed
+        };
+    }
+    let shown = &shown[..n_shown];
+    // An `ORDER BY` ordinal or output name names a select-list entry (an
+    // output alias before an input column), any other name a column.
+    let named_by_alias = |name: &str| {
+        consumer.items.iter().find_map(|item| match item {
+            SelectItem::Expr {
+                expression,
+                alias: Some(alias),
+            } if *alias == name => Some(column(expression)),
+            _ => None,
+        })
+    };
+    let ordered = |at: usize| {
+        consumer
+            .order_by
+            .iter()
+            .any(|order| match order.expression {
+                Expr::Int(ordinal) if *ordinal >= 1 => {
+                    shown.get(*ordinal as usize - 1) == Some(&at)
+                }
+                Expr::Column {
+                    qualifier: None,
+                    name,
+                } if named_by_alias(name).is_some() => named_by_alias(name) == Some(Some(at)),
+                expression => column(expression) == Some(at),
+            })
+    };
+    if !shown.is_empty() && shown.iter().all(|&at| alike(at) && ordered(at)) {
+        RowOrder::Unobserved
+    } else {
+        RowOrder::Observed
+    }
+}
+
+/// Whether `scope` reads one plain local table, the planner model's domain:
+/// no derived table, function or foreign table.
+fn one_plain_table(storage: &Storage, scope: &QueryScope<'_>, txid: u32) -> bool {
+    scope.n == 1
+        && scope.slots[0] != usize::MAX
+        && scope.defs.stored(0).is_some()
+        && u16::try_from(scope.slots[0])
+            .is_ok_and(|slot| storage.foreign_table(slot, txid).is_none())
+}
+
+/// The error for a grouping of one table whose order PostgreSQL's plan
+/// decides and the planner model does not: `reason` names what is not
+/// modelled.
+fn unmodeled_grouping(reason: &str) -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "the row order of {} is not supported; order the rows by every grouping key",
+        reason
+    )
+}
+
+/// How a one-table `SELECT DISTINCT` forms its rows.
+pub(super) enum DistinctPlan {
+    /// A sort and `Unique`: the rows in key order.
+    Sorted,
+    /// A `HashAggregate`: the output columns it hashes, in hashing order,
+    /// and what sizes its table.
+    Hashed {
+        positions: [usize; super::index_paths::MAX_ORDER_KEYS],
+        len: usize,
+        sizing: super::postgres_memory::HashAggSizing,
+    },
+    /// A `DISTINCT` whose hash order is not modelled: more than one
+    /// distinct row fails with `0A000`.
+    Unmodeled(UnmodeledOrder),
+}
+
+/// Why a `DISTINCT`'s hash order is not modelled.
+#[derive(Clone, Copy)]
+pub(super) enum UnmodeledOrder {
+    /// The planner model leaves the query out.
+    Plan(&'static str),
+    /// A key of this type has no ported hash function.
+    KeyType(ColType),
+}
+
+impl UnmodeledOrder {
+    pub(super) fn error(self) -> SqlError {
+        match self {
+            Self::Plan(reason) => unmodeled_grouping(reason),
+            Self::KeyType(ctype) => unhashed_key_type(ctype),
+        }
+    }
+}
+
+fn unhashed_key_type(ctype: ColType) -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "the hash order of a key of type {} is not supported; order the rows by every key column",
+        ctype.name()
+    )
+}
+
+/// Whether `statement`'s `ORDER BY` orders its rows totally whatever order
+/// the grouping returns them in: it names every one of `keys`.
+fn order_names_every_key<'a>(
+    statement: &'a Select<'a>,
+    keys: &[&'a Expr<'a>],
+    scope: &QueryScope<'a>,
+) -> bool {
+    keys.iter().all(|&key| {
+        // A grouping key names an input column before an output alias.
+        let key = output_expression(statement, key, scope, false);
+        statement
+            .order_by
+            .iter()
+            .any(|order| *output_expression(statement, order.expression, scope, true) == *key)
+    })
+}
+
+/// The select-list expression an ordinal or a bare output-column name in
+/// `ORDER BY` or `GROUP BY` stands for; an `ORDER BY` name prefers the
+/// output column (`prefer_output`), a `GROUP BY` name the input column.
+fn output_expression<'a>(
+    statement: &'a Select<'a>,
+    expression: &'a Expr<'a>,
+    scope: &QueryScope<'a>,
+    prefer_output: bool,
+) -> &'a Expr<'a> {
+    match expression {
+        Expr::Int(ordinal) if *ordinal >= 1 => match statement.items.get(*ordinal as usize - 1) {
+            Some(SelectItem::Expr { expression, .. }) => expression,
+            _ => expression,
+        },
+        Expr::Column {
+            qualifier: None,
+            name,
+        } if prefer_output || scope.probe_column(None, name).is_none() => {
+            let mut named = statement.items.iter().filter_map(|item| match item {
+                SelectItem::Expr {
+                    expression,
+                    alias: Some(alias),
+                } if alias == name => Some(*expression),
+                _ => None,
+            });
+            match (named.next(), named.next()) {
+                (Some(item), None) => item,
+                _ => expression,
+            }
+        }
+        _ => expression,
+    }
+}
+
+/// Whether the rows a grouping returns, in whatever order, leave the
+/// statement's output order fixed: its `ORDER BY` names every grouping key
+/// or every output column (rows equal on all of them are alike), or a
+/// `WHERE` equality with a constant fixes every key, so at most one group
+/// forms.
+fn grouping_order_irrelevant<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    keys: &[&'a Expr<'a>],
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    let mut items = ArenaList::new(arena);
+    let mut all_items = true;
+    for item in statement.items {
+        match item {
+            SelectItem::Expr { expression, .. } => {
+                items.push(*expression).map_err(|_| arena_full())?;
+            }
+            _ => all_items = false,
+        }
+    }
+    if order_names_every_key(statement, keys, scope)
+        || (all_items && order_names_every_key(statement, items.as_slice(), scope))
+    {
+        return Ok(true);
+    }
+    let conjuncts = super::partition_prune::conjuncts(statement.where_clause, arena)?;
+    let column = |expression: &Expr<'_>| match expression {
+        Expr::Column { qualifier, name } => match scope.probe_column(*qualifier, name) {
+            Some(super::ResolvedColumn::Table(0, column)) => Some(column),
+            _ => None,
+        },
+        _ => None,
+    };
+    let resolver = super::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    for &key in keys {
+        let key = output_expression(statement, key, scope, false);
+        let mut reads_column = false;
+        key.for_each_column_reference(&mut |_, _| reads_column = true);
+        if !reads_column && !key.contains_subquery() {
+            // A key reading no column, calling nothing volatile or
+            // set-returning, is one value for every row.
+            if super::srf::expression_has_project_set(key, storage, txid)
+                || super::predicate_safety::expression_properties(
+                    key,
+                    &resolver,
+                    storage,
+                    txid,
+                    super::predicate_safety::AnalysisStage::RuntimeProjection,
+                    arena,
+                )?
+                .volatile
+            {
+                return Ok(false);
+            }
+            continue;
+        }
+        let Some(key) = column(key) else {
+            return Ok(false);
+        };
+        let fixed = conjuncts.iter().any(|conjunct| match conjunct {
+            Expr::Binary {
+                operator: crate::sql::ast::BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } => {
+                (column(left) == Some(key) && right.is_constant(false))
+                    || (column(right) == Some(key) && left.is_constant(false))
+            }
+            _ => false,
+        });
+        if !fixed {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// How a one-table `SELECT DISTINCT` PostgreSQL's planner plans forms its
+/// rows, `None` for any other query. A `DISTINCT` whose hash order the
+/// model does not decide fails with `0A000` unless its `ORDER BY` names
+/// every output column.
 pub(super) fn hashed_distinct_plan<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     statement: &'a Select<'a>,
     arena: &'a Arena,
-) -> Result<
-    Option<(
-        [usize; super::index_paths::MAX_ORDER_KEYS],
-        usize,
-        super::postgres_memory::HashAggSizing,
-    )>,
-    SqlError,
-> {
-    let Some(grouping) = crate::sql::explain::distinct_as_grouping(statement, scope, arena)? else {
+) -> Result<Option<DistinctPlan>, SqlError> {
+    if !statement.distinct || !statement.distinct_on.is_empty() {
         return Ok(None);
-    };
+    }
+    if !statement.group_by.is_empty()
+        || !statement.grouping_sets.is_empty()
+        || statement.having.is_some()
+        || !one_plain_table(storage, scope, txid)
+    {
+        // PostgreSQL may hash a `DISTINCT` the model leaves out (over a join,
+        // a grouping, a derived table or a function): its work context may
+        // join the session's freelist.
+        crate::sql::guc::note_hash_aggregate();
+        return Ok(None);
+    }
+    let unobserved = order_unobserved(statement);
+    let statement = planner_statement(statement, scope, storage, txid, arena)?;
     let Some(from) = statement.from.as_ref() else {
         return Ok(None);
     };
-    let from = &*arena.alloc(*from).map_err(|_| arena_full())?;
     let columns = super::CatalogScopeCols {
         scope,
         outer: None,
@@ -1141,35 +1597,96 @@ pub(super) fn hashed_distinct_plan<'a>(
         txid,
         arena,
     };
-    let Some(hashed) = crate::sql::explain::hashed_grouping(
-        storage, txid, grouping, scope, from, &columns, arena,
-    )?
-    else {
-        return Ok(None);
-    };
-    if !hash_order_supported(scope, &hashed)? {
-        return Ok(None);
+    // A subquery item may read the outer query's columns, which the model
+    // does not resolve.
+    let subquery_item = statement.items.iter().any(
+        |item| matches!(item, SelectItem::Expr { expression, .. } if expression.contains_subquery()),
+    );
+    // An aggregate without a grouping returns one row, whatever its order.
+    if !subquery_item {
+        for item in statement.items {
+            if let SelectItem::Expr { expression, .. } = item
+                && super::expr_has_aggregate(expression, storage, txid, &columns)?
+            {
+                return Ok(None);
+            }
+        }
     }
-    // Each hashed column's position among the output columns: the first
-    // item naming it.
+    let from = &*arena.alloc(*from).map_err(|_| arena_full())?;
+    let strategy = match (
+        subquery_item,
+        crate::sql::explain::distinct_as_grouping(statement, scope, arena)?,
+    ) {
+        (false, Some(grouping)) => crate::sql::explain::grouping_strategy(
+            storage, txid, grouping, true, scope, from, &columns, arena,
+        )?,
+        _ => {
+            crate::sql::guc::note_hash_aggregate();
+            crate::sql::explain::GroupingStrategy::Unmodeled("a DISTINCT outside the planner model")
+        }
+    };
+    let mut items = ArenaList::new(arena);
+    let mut all_items = true;
+    for item in statement.items {
+        match item {
+            SelectItem::Expr { expression, .. } => {
+                items.push(*expression).map_err(|_| arena_full())?;
+            }
+            _ => all_items = false,
+        }
+    }
+    // Rows equal on every output column are alike, whatever order the
+    // `DISTINCT` returns them in.
+    let irrelevant = unobserved
+        || (all_items
+            && grouping_order_irrelevant(
+                storage,
+                txid,
+                statement,
+                items.as_slice(),
+                scope,
+                arena,
+            )?);
+    let hashed = match strategy {
+        crate::sql::explain::GroupingStrategy::Sorted => return Ok(Some(DistinctPlan::Sorted)),
+        crate::sql::explain::GroupingStrategy::Hashed(hashed) => hashed,
+        crate::sql::explain::GroupingStrategy::Unmodeled(_) if irrelevant => {
+            return Ok(Some(DistinctPlan::Sorted));
+        }
+        crate::sql::explain::GroupingStrategy::Unmodeled(reason) => {
+            return Ok(Some(DistinctPlan::Unmodeled(UnmodeledOrder::Plan(reason))));
+        }
+    };
+    match hash_order_supported(&hashed, storage, txid) {
+        Ok(true) => {}
+        Ok(false) => return Ok(Some(DistinctPlan::Sorted)),
+        Err(_) if irrelevant => return Ok(Some(DistinctPlan::Sorted)),
+        Err(ctype) => {
+            return Ok(Some(DistinctPlan::Unmodeled(UnmodeledOrder::KeyType(
+                ctype,
+            ))));
+        }
+    }
+    let grouping = crate::sql::explain::distinct_as_grouping(statement, scope, arena)?
+        .expect("a hashed DISTINCT is a grouping");
+    // Each hashed key's position among the output columns: the first item
+    // computing it.
     let mut positions = [0usize; super::index_paths::MAX_ORDER_KEYS];
-    for (slot, &column) in positions.iter_mut().zip(&hashed.columns[..hashed.len]) {
+    for (slot, &entry) in positions.iter_mut().zip(&hashed.entries[..hashed.len]) {
+        let key = grouping.group_by[entry];
         *slot = statement
             .items
             .iter()
-            .position(|item| match item {
-                SelectItem::Expr {
-                    expression: Expr::Column { qualifier, name },
-                    ..
-                } => matches!(
-                    scope.find_column(*qualifier, name),
-                    Ok(super::ResolvedColumn::Table(0, found)) if found == column
-                ),
-                _ => false,
-            })
-            .expect("a hashed column is an output column");
+            .position(
+                |item| matches!(item, SelectItem::Expr { expression, .. } if **expression == *key),
+            )
+            .expect("a hashed key is an output column");
     }
-    Ok(Some((positions, hashed.len, hashed.sizing)))
+    Ok(Some(DistinctPlan::Hashed {
+        positions,
+        len: hashed.len,
+        sizing: hashed.sizing,
+    }))
 }
 
 /// Puts the distinct rows of a one-table `SELECT DISTINCT` of columns in
@@ -1188,12 +1705,27 @@ pub(super) fn hashed_distinct_rows<'a>(
     rows: &mut [&'a [u8]],
     collations: &[Collation],
 ) -> Result<Option<usize>, SqlError> {
-    let Some((positions, len, sizing)) =
-        hashed_distinct_plan(storage, scope, txid, statement, arena)?
-    else {
-        return Ok(None);
-    };
-    let width = statement.items.len();
+    let (positions, len, sizing) =
+        match hashed_distinct_plan(storage, scope, txid, statement, arena)? {
+            Some(DistinctPlan::Hashed {
+                positions,
+                len,
+                sizing,
+            }) => (positions, len, sizing),
+            Some(DistinctPlan::Unmodeled(unmodeled)) => {
+                // One distinct row has one order. Rows with equal images are
+                // equal; unequal images may still be equal values, which fails
+                // as several rows.
+                if rows.iter().any(|row| *row != rows[0]) {
+                    return Err(unmodeled.error());
+                }
+                return Ok(None);
+            }
+            Some(DistinctPlan::Sorted) | None => return Ok(None),
+        };
+    let width = planner_statement(statement, scope, storage, txid, arena)?
+        .items
+        .len();
     let columns = arena
         .alloc_slice_with(width, |column| column)
         .map_err(|_| arena_full())?;
@@ -1248,7 +1780,7 @@ pub(super) fn hash_row_keys(
         combined = combined.rotate_left(1);
         let value = crate::sql::exec::decode_projected_col_record(row, position, arena)?;
         if !matches!(value, Datum::Null) {
-            combined ^= super::join_exec::key_hash(&value, storage, txid)?
+            combined ^= super::join_exec::key_hash(&value, storage, txid, arena)?
                 .expect("a hashed key type has a ported hash function");
         }
     }
@@ -1269,9 +1801,11 @@ fn hashed_table_group_order<'a>(
     group_of: &[u32],
     keys: &[&[u8]],
 ) -> Result<Option<&'a [u32]>, SqlError> {
-    if scope.n != 1 || statement.group_by.is_empty() {
+    if statement.group_by.is_empty() || !one_plain_table(storage, scope, txid) {
         return Ok(None);
     }
+    let unobserved = order_unobserved(statement);
+    let statement = planner_statement(statement, scope, storage, txid, arena)?;
     let columns = super::CatalogScopeCols {
         scope,
         outer: None,
@@ -1279,55 +1813,32 @@ fn hashed_table_group_order<'a>(
         txid,
         arena,
     };
-    let Some(hashed) = crate::sql::explain::hashed_grouping(
-        storage, txid, statement, scope, from, &columns, arena,
-    )?
-    else {
+    let strategy = crate::sql::explain::grouping_strategy(
+        storage, txid, statement, false, scope, from, &columns, arena,
+    )?;
+    // An `ORDER BY` over every grouping key orders the groups whatever
+    // the table's order was.
+    if keys.len() <= 1
+        || unobserved
+        || grouping_order_irrelevant(storage, txid, statement, statement.group_by, scope, arena)?
+    {
         return Ok(None);
-    };
-    // The table column a `GROUP BY` or `ORDER BY` entry names (an ordinal
-    // names a select-list item).
-    let column_of = |key: &'a Expr<'a>| -> Option<usize> {
-        let key = match key {
-            Expr::Int(ordinal) if *ordinal >= 1 => {
-                match statement.items.get(*ordinal as usize - 1) {
-                    Some(SelectItem::Expr { expression, .. }) => *expression,
-                    _ => key,
-                }
-            }
-            _ => key,
-        };
-        match key {
-            Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
-                Ok(super::ResolvedColumn::Table(0, found)) => Some(found),
-                _ => None,
-            },
-            _ => None,
+    }
+    let hashed = match strategy {
+        crate::sql::explain::GroupingStrategy::Sorted => return Ok(None),
+        crate::sql::explain::GroupingStrategy::Hashed(hashed) => hashed,
+        crate::sql::explain::GroupingStrategy::Unmodeled(reason) => {
+            return Err(unmodeled_grouping(reason));
         }
     };
-    // Each hashed column's position among the stored group keys: the first
+    match hash_order_supported(&hashed, storage, txid) {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(ctype) => return Err(unhashed_key_type(ctype)),
+    }
+    // Each hashed key's position among the stored group keys: the first
     // `GROUP BY` entry naming it.
-    let mut positions = [0usize; super::index_paths::MAX_ORDER_KEYS];
-    for (slot, &column) in positions.iter_mut().zip(&hashed.columns[..hashed.len]) {
-        *slot = statement
-            .group_by
-            .iter()
-            .position(|&key| column_of(key) == Some(column))
-            .expect("a hashed grouping column has its GROUP BY entry");
-    }
-    // An `ORDER BY` over every grouping column orders the groups whatever
-    // the table's order was.
-    if hashed.columns[..hashed.len].iter().all(|&column| {
-        statement
-            .order_by
-            .iter()
-            .any(|order| column_of(order.expression) == Some(column))
-    }) {
-        return Ok(None);
-    }
-    if !hash_order_supported(scope, &hashed)? {
-        return Ok(None);
-    }
+    let positions = &hashed.entries;
     let order = arena
         .alloc_slice_with(keys.len(), |at| at as u32)
         .map_err(|_| arena_full())?;
@@ -1630,9 +2141,10 @@ pub(super) fn grouped_rows<'a>(
     // self-contained encoded rows in the persistent tail, then recycle front
     // scratch before the next set so 4,096 sets do not multiply workspace.
     let mut combined_rows = ArenaList::new_persistent(arena);
+    let mut hash_ordered = false;
     for &mask in masks {
         let scratch = arena.mark();
-        let rows = groups_for_mask(
+        let (rows, ordered) = groups_for_mask(
             storage,
             scope,
             from,
@@ -1657,6 +2169,7 @@ pub(super) fn grouped_rows<'a>(
             group_bound,
             &planned,
         )?;
+        hash_ordered = ordered && masks.len() == 1 && !statement.distinct;
         for &row in rows {
             let saved = arena
                 .alloc_persistent_slice_with(row.len(), |index| row[index])
@@ -1748,7 +2261,9 @@ pub(super) fn grouped_rows<'a>(
             && planned
                 .get(storage, txid, statement, scope, params, arena)?
                 .is_some_and(|model| model.group.is_some());
-        if modeled {
+        // So is the `Sort` over a one-table grouping returned in its hash
+        // table's order.
+        if modeled || hash_ordered {
             let tuples = instrument::SortTuples::new(Some(&columns[..count]), 0, bounded.is_some())
                 .ok_or_else(instrument::unsized_value)?
                 .computed(computed);
@@ -1758,9 +2273,8 @@ pub(super) fn grouped_rows<'a>(
             stages.sort.sorted(space);
             return Ok((out_rows, width));
         }
-        // A one-table grouping reaches the sort in sort order, not the hash
-        // order PostgreSQL's planner may give it, so equal groups keep that
-        // order; the figures are the tuplesort's.
+        // A sorted one-table grouping reaches the sort in key order, which
+        // its `Sort` keeps for equal groups; the figures are the tuplesort's.
         let space = match bounded {
             Some(bound) if stages.sort.measured() => instrument::SortSpace::postgres_top_n(
                 source,
@@ -1991,6 +2505,25 @@ fn expand_grouped_stars<'a>(
                     )?;
                 }
             }
+            // `(t).*` of a whole-row reference is the table's columns
+            // (`ExpandRowReference`), which a grouping can read.
+            SelectItem::RecordStar(Expr::WholeRow(table))
+            | SelectItem::RecordStar(Expr::Column {
+                qualifier: None,
+                name: table,
+            }) if scope.probe_column(None, table).is_none() && scope.has_entry_named(table) => {
+                for index in 0..scope.qualified_star_columns(table)? {
+                    let expression =
+                        scope.star_expression(scope.qualified_star_entry(table, index)?, arena)?;
+                    push(
+                        SelectItem::Expr {
+                            expression,
+                            alias: None,
+                        },
+                        &mut n,
+                    )?;
+                }
+            }
             SelectItem::RecordStar(base) => {
                 let mut error = None;
                 let resolver = super::CatalogScopeCols {
@@ -2041,6 +2574,155 @@ fn expand_grouped_stars<'a>(
         })
         .map_err(|_| arena_full())?;
     Ok(&*out)
+}
+
+/// `statement` as PostgreSQL's planner sees it, for the planner model: its
+/// stars expanded into columns (`(t).*` of a whole-row reference into the
+/// table's columns, as `ExpandRowReference` does), and each select-list,
+/// `GROUP BY` or `ORDER BY` field of a whole-row reference or of a row
+/// constructor simplified to the column or argument it selects, as
+/// `eval_const_expressions` simplifies a `FieldSelect` of a `RowExpr`. Its
+/// select-list positions are the output columns'.
+pub(super) fn planner_statement<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let expanded = expand_grouped_stars(statement, scope, None, storage, txid, arena)?;
+    let resolver = super::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    let simplify = |expression: &'a Expr<'a>| simplified_field(expression, scope, &resolver, arena);
+    let mut changed = !core::ptr::eq(expanded, statement);
+    let items = arena
+        .alloc_slice_copy(expanded.items)
+        .map_err(|_| arena_full())?;
+    for item in items.iter_mut() {
+        if let SelectItem::Expr { expression, .. } = item {
+            let current: &'a Expr<'a> = *expression;
+            let simplified = simplify(current)?;
+            changed |= !core::ptr::eq(simplified, current);
+            *expression = simplified;
+        }
+    }
+    let group_by = arena
+        .alloc_slice_copy(expanded.group_by)
+        .map_err(|_| arena_full())?;
+    for key in group_by.iter_mut() {
+        let current: &'a Expr<'a> = *key;
+        let simplified = simplify(current)?;
+        changed |= !core::ptr::eq(simplified, current);
+        *key = simplified;
+    }
+    let order_by = arena
+        .alloc_slice_copy(expanded.order_by)
+        .map_err(|_| arena_full())?;
+    for order in order_by.iter_mut() {
+        let simplified = simplify(order.expression)?;
+        changed |= !core::ptr::eq(simplified, order.expression);
+        order.expression = simplified;
+    }
+    if !changed {
+        return Ok(statement);
+    }
+    let planned: &'a Select<'a> = arena
+        .alloc(Select {
+            items,
+            group_by,
+            order_by,
+            ..*expanded
+        })
+        .map_err(|_| arena_full())?;
+    Ok(planned)
+}
+
+/// The column or row-constructor argument the field selection `expression`
+/// reads, or `expression` itself when it is no such selection or the
+/// argument's type is not the field's.
+fn simplified_field<'a>(
+    expression: &'a Expr<'a>,
+    scope: &QueryScope<'a>,
+    resolver: &dyn crate::sql::exec::ColTypeResolver,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let Expr::Field { base, field } = expression else {
+        return Ok(expression);
+    };
+    let base = simplified_field(base, scope, resolver, arena)?;
+    // A whole-row reference: the table's column.
+    let table = match base {
+        Expr::WholeRow(table) => Some(*table),
+        Expr::Column {
+            qualifier: None,
+            name,
+        } if scope.probe_column(None, name).is_none() && scope.has_entry_named(name) => Some(*name),
+        _ => None,
+    };
+    if let Some(table) = table {
+        if scope.probe_column(Some(table), field).is_none() {
+            return Ok(expression);
+        }
+        let column: &'a Expr<'a> = arena
+            .alloc(Expr::Column {
+                qualifier: Some(table),
+                name: field,
+            })
+            .map_err(|_| arena_full())?;
+        return Ok(column);
+    }
+    // A row constructor, or one cast to a composite type: the argument at
+    // the field's position, when it has the field's type already.
+    let (row, typed) = match base {
+        Expr::Cast { operand, .. } if operand.is_row_constructor() => (*operand, true),
+        row if row.is_row_constructor() => (row, false),
+        _ => return Ok(expression),
+    };
+    let Expr::Call { args, .. } = row else {
+        return Ok(expression);
+    };
+    if args
+        .iter()
+        .any(|arg| matches!(arg, Expr::WholeRow(_) | Expr::Field { field: "*", .. }))
+    {
+        return Ok(expression);
+    }
+    let mut position = None;
+    let mut field_type = None;
+    let mut at = 0usize;
+    crate::sql::exec::record_shape_metadata(
+        if typed { base } else { row },
+        resolver,
+        |name, meta| {
+            if position.is_none() && name.eq_ignore_ascii_case(field) {
+                position = Some(at);
+                field_type = Some(meta);
+            }
+            at += 1;
+        },
+    )?;
+    let (Some(position), Some(field_type)) = (position, field_type) else {
+        return Ok(expression);
+    };
+    let Some(&argument) = args.get(position) else {
+        return Ok(expression);
+    };
+    let same_type =
+        crate::sql::exec::expression_static_metadata(argument, resolver).is_some_and(|meta| {
+            meta.ctype == field_type.ctype
+                && meta.type_mod == field_type.type_mod
+                && meta.collation == field_type.collation
+        });
+    if same_type {
+        simplified_field(argument, scope, resolver, arena)
+    } else {
+        Ok(expression)
+    }
 }
 
 /// Non-aggregate select items and `HAVING` must read only grouped columns.

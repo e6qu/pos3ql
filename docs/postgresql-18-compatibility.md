@@ -1247,6 +1247,33 @@ A `Materialize` node reports the memory PostgreSQL's tuplestore holds:
 `Storage: Memory  Maximum Storage: 18kB` for 40 small rows, mostly its
 initial array of 2048 row pointers.
 
+A hash aggregate (`HashAggregate`: a hashed `GROUP BY` or `DISTINCT`)
+returns its groups in the order PostgreSQL's hash table and spill would,
+and that order depends on how much memory PostgreSQL counts for it. One
+part of that count pos3ql cannot follow across statements. When a session
+has run or explained a hash aggregate under `work_mem` below 1MB,
+PostgreSQL may later reuse that aggregate's memory context, whose chunk
+limit is smaller (1024 bytes at `64kB` and `128kB`, 2048 at `256kB`, 4096 at
+`512kB`), for a later hash aggregate's table; which context it reuses
+depends on every earlier statement of the session. From the next statement
+on, a hash aggregate whose bucket array (16 bytes per bucket) grows past
+that smaller limit, but not past 8 kB, fails with `0A000` ("the memory of a
+hash aggregate after an earlier hash aggregate of this session ran with
+work_mem below 1MB is not supported"). For example:
+
+```sql
+SET work_mem = '64kB';
+EXPLAIN SELECT DISTINCT a FROM big;   -- builds a 64kB hash aggregate
+SELECT DISTINCT a FROM big;           -- 0A000 once its table outgrows 1 kB
+```
+
+Starting a new session clears the condition, and so does running every
+hash aggregate of the session with `work_mem` of at least 1MB. Statements
+without such an aggregate (sorts, hash joins, sorted groupings, filters) do
+not cause it. pos3ql counts a `GROUP BY` or `DISTINCT` it cannot plan as
+PostgreSQL does, a distinct `UNION` and an `IN` subquery as such an
+aggregate, since PostgreSQL may hash them.
+
 An `UPDATE ... FROM` or `DELETE ... USING` of one analyzed table joins the
 way PostgreSQL's costs choose: for example, `UPDATE accounts SET rate =
 r.rate FROM rates r WHERE accounts.tier = r.tier` hashes the smaller

@@ -702,22 +702,109 @@ pub(crate) fn datum_hash(value: &Datum<'_>) -> Option<u32> {
 }
 
 /// [`datum_hash`] of a grouping or distinct key, which also hashes an enum
-/// value (`hashenum`: `hash_uint32` of its label's `pg_enum` OID).
+/// value (`hashenum`: `hash_uint32` of its label's `pg_enum` OID), an array
+/// (`hash_array`), a record (`hash_record`), a range (`hash_range`), a
+/// multirange (`hash_multirange`) and a `jsonb` document (`jsonb_hash`).
+/// `arena` holds a parsed number or decoded string while it is hashed.
 pub(crate) fn key_hash(
     value: &Datum<'_>,
     storage: &Storage,
     txid: u32,
+    arena: &crate::mem::arena::Arena,
 ) -> Result<Option<u32>, SqlError> {
-    if matches!(value, Datum::Enum { .. }) {
-        let oid = crate::sql::enum_values::member_oid(value, storage, txid)?;
-        return Ok(Some(crate::sql::identity::hash_uint32(oid)));
-    }
-    Ok(datum_hash(value))
+    // `hash_array` and `hash_record` hash a null member as zero and combine
+    // the members' hashes as `result * 31 + hash`.
+    let combine = |result: u32, member: &Datum<'_>| -> Result<Option<u32>, SqlError> {
+        let hashed = if matches!(member, Datum::Null) {
+            0
+        } else {
+            match key_hash(member, storage, txid, arena)? {
+                Some(hashed) => hashed,
+                None => return Ok(None),
+            }
+        };
+        Ok(Some(result.wrapping_mul(31).wrapping_add(hashed)))
+    };
+    Ok(match value {
+        Datum::Enum { .. } => {
+            let oid = crate::sql::enum_values::member_oid(value, storage, txid)?;
+            Some(crate::sql::identity::hash_uint32(oid))
+        }
+        Datum::Array { element, raw } => {
+            let mut result = 1u32;
+            for member in crate::sql::array::structured_elements(raw, *element, arena) {
+                match combine(result, &member?)? {
+                    Some(next) => result = next,
+                    None => return Ok(None),
+                }
+            }
+            Some(result)
+        }
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => {
+            let decoded = crate::sql::exec::decode_stored_composite_text(
+                text,
+                *slot,
+                *physical_fields,
+                storage,
+                txid,
+                arena,
+            )?;
+            return key_hash(&decoded, storage, txid, arena);
+        }
+        Datum::Record(fields) | Datum::Composite { fields, .. } => {
+            let mut result = 0u32;
+            for field in *fields {
+                match combine(result, &field.value)? {
+                    Some(next) => result = next,
+                    None => return Ok(None),
+                }
+            }
+            Some(result)
+        }
+        Datum::Range { text, kind } => {
+            Some(crate::sql::range::hash_range(text, *kind, None, arena)? as u32)
+        }
+        Datum::Multirange { text, kind } => {
+            Some(crate::sql::range::hash_multirange(text, *kind, None, arena)? as u32)
+        }
+        Datum::Json { text, jsonb: true } => {
+            Some(crate::sql::json::compare::hash_jsonb(text, arena)?)
+        }
+        _ => datum_hash(value),
+    })
 }
 
 /// Whether [`key_hash`] hashes a key of type `ctype`.
 pub(crate) fn key_type_hashable(ctype: crate::sql::types::ColType) -> bool {
-    matches!(ctype, crate::sql::types::ColType::Enum(_)) || datum_type_hashable(ctype)
+    use crate::sql::types::ColType;
+    match ctype {
+        ColType::Enum(_) | ColType::Jsonb => true,
+        ColType::Array(element) => key_type_hashable(element.to_coltype()),
+        ColType::Range(kind) | ColType::Multirange(kind) => key_type_hashable(kind.elem_type()),
+        _ => datum_type_hashable(ctype),
+    }
+}
+
+/// Whether PostgreSQL has no hash operator class for a key of type `ctype`,
+/// so it always sorts to group it: `tsvector`, `tsquery`, `money`, bit
+/// strings, an anonymous record (whose field types the type cache cannot
+/// vouch for), and arrays, ranges and multiranges of such elements.
+pub(crate) fn key_type_sorts_only(ctype: crate::sql::types::ColType) -> bool {
+    use crate::sql::types::ColType;
+    match ctype {
+        ColType::TsVector
+        | ColType::TsQuery
+        | ColType::Money
+        | ColType::Bit { .. }
+        | ColType::Record => true,
+        ColType::Array(element) => key_type_sorts_only(element.to_coltype()),
+        ColType::Range(kind) | ColType::Multirange(kind) => key_type_sorts_only(kind.elem_type()),
+        _ => false,
+    }
 }
 
 /// Whether two values equal by their type's equality have the same stored
@@ -741,7 +828,7 @@ fn same_image(left: &Datum<'_>, right: &Datum<'_>) -> bool {
 /// `hash_numeric`: the base-10000 digits between the first and last
 /// nonzero ones, in native byte order, the weight mixed in by XOR; NaN and
 /// the infinities hash to zero and zero to all ones.
-fn numeric_hash(value: &crate::sql::numeric::Numeric<'_>) -> u32 {
+pub(crate) fn numeric_hash(value: &crate::sql::numeric::Numeric<'_>) -> u32 {
     use crate::sql::numeric::Sign;
     if matches!(value.sign, Sign::NaN | Sign::PosInf | Sign::NegInf) {
         return 0;

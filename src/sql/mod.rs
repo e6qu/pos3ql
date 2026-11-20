@@ -22813,6 +22813,7 @@ impl Engine {
         responder: &mut Responder,
         timeout_entry: StatementTimeoutEntry,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        guc.begin_statement();
         // PL/pgSQL loads before a DO block or a PL/pgSQL routine's validator
         // runs, and after any other statement that first ran PL/pgSQL.
         guc::take_plpgsql_use();

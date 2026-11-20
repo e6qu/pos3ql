@@ -4189,6 +4189,10 @@ struct GroupedScan<'a> {
     /// The width of the rows the grouping returns, each column of the
     /// table its analyzed width.
     width: u32,
+    /// Each key of the shape's grouping, in its order: the `GROUP BY` entry
+    /// naming it first and its type.
+    entries: [usize; query::index_paths::MAX_ORDER_KEYS],
+    types: [crate::sql::types::ColType; query::index_paths::MAX_ORDER_KEYS],
 }
 
 /// [`GroupedScan`] of `statement`, or `None` when the query is outside the
@@ -4202,6 +4206,7 @@ fn grouped_scan_path<'a>(
     storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
+    distinct: bool,
     scope: &QueryScope<'a>,
     from: &'a crate::sql::ast::FromClause<'a>,
     columns: &dyn crate::sql::exec::ColTypeResolver,
@@ -4258,19 +4263,36 @@ fn grouped_scan_path<'a>(
             _ => None,
         }
     };
+    // Each grouping key by its number (a column, an expression variable or
+    // a free expression's), with the first `GROUP BY` entry naming it and
+    // how `estimate_num_groups` reads it.
+    let Some(mut resolver) =
+        query::index_paths::GroupKeys::new(storage, txid, scope, columns, arena)?
+    else {
+        return Ok(None);
+    };
     let mut group = [0usize; MAX_ORDER_KEYS];
+    let mut group_entries = [0usize; MAX_ORDER_KEYS];
+    let mut group_variables =
+        [query::index_paths::GroupVariable::Boolean(ColumnSet::EMPTY); MAX_ORDER_KEYS];
+    let mut group_types = [crate::sql::types::ColType::Bool; MAX_ORDER_KEYS];
     let mut group_len = 0;
-    for &key in statement.group_by {
-        let Some(column) = column_of(key) else {
+    let mut expression_keys = false;
+    for (entry, &key) in statement.group_by.iter().enumerate() {
+        let Some(key) = resolver.resolve(resolve(key))? else {
             return Ok(None);
         };
-        if !group[..group_len].contains(&column) {
-            group[group_len] = column;
+        expression_keys |= key.expression;
+        if !group[..group_len].contains(&key.number) {
+            group[group_len] = key.number;
+            group_entries[group_len] = entry;
+            group_variables[group_len] = key.variable;
+            group_types[group_len] = key.ctype;
             group_len += 1;
         }
     }
     // `preprocess_groupclause`: the grouping takes the `ORDER BY`'s order
-    // and directions when its keys lead with grouping columns.
+    // and directions when its keys lead with grouping keys.
     let mut ordered = [None::<(usize, (bool, bool))>; MAX_ORDER_KEYS];
     let mut ordered_len = 0;
     let mut order = if statement.order_by.is_empty() {
@@ -4279,7 +4301,10 @@ fn grouped_scan_path<'a>(
         GroupOrder::Grouped
     };
     for (at, key) in statement.order_by.iter().enumerate() {
-        let column = column_of(key.expression).filter(|column| group[..group_len].contains(column));
+        let column = resolver
+            .resolve(resolve(key.expression))?
+            .map(|key| key.number)
+            .filter(|number| group[..group_len].contains(number));
         match column {
             Some(column) if order == GroupOrder::Grouped => {
                 if !ordered[..ordered_len]
@@ -4292,7 +4317,7 @@ fn grouped_scan_path<'a>(
                 }
             }
             // The groups are sorted above the grouping by whatever keys
-            // follow a leading key that is not a grouping column.
+            // follow a leading key that is not a grouping key.
             Some(_) | None if order == GroupOrder::Other => {}
             Some(_) => return Ok(None),
             None if at == 0 => order = GroupOrder::Other,
@@ -4303,6 +4328,8 @@ fn grouped_scan_path<'a>(
         ordered_len = 0;
     }
     let mut columns_in_order = [0usize; MAX_ORDER_KEYS];
+    let mut variables_in_order =
+        [query::index_paths::GroupVariable::Boolean(ColumnSet::EMPTY); MAX_ORDER_KEYS];
     let mut directions = [None::<(bool, bool)>; MAX_ORDER_KEYS];
     for (at, (column, direction)) in ordered[..ordered_len].iter().flatten().enumerate() {
         columns_in_order[at] = *column;
@@ -4314,6 +4341,15 @@ fn grouped_scan_path<'a>(
             columns_in_order[count] = column;
             count += 1;
         }
+    }
+    let position_of = |number: usize| {
+        group[..group_len]
+            .iter()
+            .position(|&key| key == number)
+            .expect("an ordered key is a grouping key")
+    };
+    for at in 0..count {
+        variables_in_order[at] = group_variables[position_of(columns_in_order[at])];
     }
     // A column of a variable-length type is as wide as ANALYZE measured.
     let mut output_width = output_width;
@@ -4352,16 +4388,6 @@ fn grouped_scan_path<'a>(
         let SelectItem::Expr { expression, .. } = item else {
             return Ok(None);
         };
-        if !matches!(expression, Expr::Call { .. } | Expr::Column { .. })
-            && !expression.is_constant(false)
-        {
-            return Ok(None);
-        }
-        if matches!(expression, Expr::Call { .. })
-            && query::aggregate_routine(expression, storage, txid, columns)?.is_none()
-        {
-            return Ok(None);
-        }
         *slot = expression;
     }
     for (slot, key) in expressions[statement.items.len()..]
@@ -4376,9 +4402,31 @@ fn grouped_scan_path<'a>(
     else {
         return Ok(None);
     };
+    // The target list each group evaluates: the select list and the
+    // `ORDER BY` entries it lacks.
+    let target_per_group = {
+        let mut targets = crate::mem::arena::ArenaList::new(arena);
+        for (at, &expression) in expressions[..statement.items.len() + statement.order_by.len()]
+            .iter()
+            .enumerate()
+        {
+            let listed = at >= statement.items.len()
+                && expressions[..statement.items.len()]
+                    .iter()
+                    .any(|item| **item == *expression);
+            if !listed {
+                targets.push(expression).map_err(|_| arena_full())?;
+            }
+        }
+        query::index_paths::target_cost(targets.as_slice(), storage, txid, columns, arena)?
+    };
     let mut group_mask = ColumnSet::EMPTY;
-    for &column in &columns_in_order[..count] {
-        group_mask.insert(column);
+    for variable in &variables_in_order[..count] {
+        match *variable {
+            query::index_paths::GroupVariable::Variable { columns, .. }
+            | query::index_paths::GroupVariable::Columns(columns)
+            | query::index_paths::GroupVariable::Boolean(columns) => group_mask.union_with(columns),
+        }
     }
     let output = query::streaming_pax_columns_ordered(
         scope,
@@ -4410,11 +4458,53 @@ fn grouped_scan_path<'a>(
             output_width: f64::from(output_width),
             order,
             having,
+            variables: expression_keys.then_some(variables_in_order),
+            target_per_group,
+            distinct,
         }),
         limit,
         order_len: count,
         ..QueryShape::default()
     };
+    // An expression key is computed by the scan, whose target list then
+    // holds the keys and the columns the rest of the query reads.
+    if expression_keys {
+        let keys = arena
+            .alloc_slice_with(group_len, |at| {
+                resolve(statement.group_by[group_entries[at]])
+            })
+            .map_err(|_| arena_full())?;
+        let mut others = crate::mem::arena::ArenaList::new(arena);
+        let mut other = |expression: &'a Expr<'a>| -> Result<(), SqlError> {
+            if !keys.iter().any(|key| **key == *expression) {
+                others.push(expression).map_err(|_| arena_full())?;
+            }
+            Ok(())
+        };
+        for item in statement.items {
+            if let SelectItem::Expr { expression, .. } = item {
+                other(expression)?;
+            }
+        }
+        if let Some(having) = statement.having {
+            other(having)?;
+        }
+        for key in statement.order_by {
+            other(resolve(key.expression))?;
+        }
+        let Some(projection) = query::index_paths::grouping_projection(
+            storage,
+            txid,
+            scope,
+            keys,
+            others.as_slice(),
+            arena,
+        )?
+        else {
+            return Ok(None);
+        };
+        shape.projection = Some(projection);
+    }
     for at in 0..count {
         let (descending, nulls_first) = directions[at].unwrap_or((false, false));
         shape.order[at] = query::index_paths::OrderKey::Column {
@@ -4436,19 +4526,18 @@ fn grouped_scan_path<'a>(
     let query::index_paths::Planned::Chosen(path) = planned else {
         return Ok(None);
     };
-    if path.grouped.is_none() {
+    let Some(chosen) = path.grouped else {
         return Ok(None);
+    };
+    // PostgreSQL builds this plan's `HashAggregate` whether it runs or
+    // explains the statement.
+    if chosen.hashed {
+        crate::sql::guc::note_hash_aggregate();
     }
     // The keys as the plan prints them: each grouping column by the
     // `GROUP BY` entry naming it.
-    let entry = |column: usize| -> &'a Expr<'a> {
-        statement
-            .group_by
-            .iter()
-            .copied()
-            .find(|key| column_of(key) == Some(column))
-            .expect("a grouping column has its entry")
-    };
+    let entry =
+        |number: usize| -> &'a Expr<'a> { statement.group_by[group_entries[position_of(number)]] };
     let keys = path
         .grouped
         .map_or(columns_in_order, |grouped| grouped.keys);
@@ -4466,6 +4555,13 @@ fn grouped_scan_path<'a>(
     let group_keys = arena
         .alloc_slice_with(count, |at| (entry(keys[at]), None))
         .map_err(|_| arena_full())?;
+    let mut entries = [0usize; MAX_ORDER_KEYS];
+    let mut types = [crate::sql::types::ColType::Bool; MAX_ORDER_KEYS];
+    for at in 0..columns_in_order.len().min(group_len) {
+        let position = position_of(columns_in_order[at]);
+        entries[at] = group_entries[position];
+        types[at] = group_types[position];
+    }
     Ok(Some(GroupedScan {
         path,
         shape,
@@ -4473,6 +4569,8 @@ fn grouped_scan_path<'a>(
         sort_keys,
         group_keys,
         width: output_width,
+        entries,
+        types,
     }))
 }
 
@@ -4480,10 +4578,12 @@ fn grouped_scan_path<'a>(
 /// by its columns, when PostgreSQL's planner plans its scan and grouping
 /// ([`grouped_scan_path`]): its execution scans by that path, counting
 /// what the path reads.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(crate) fn grouped_scan_context<'a>(
     storage: &'a Storage,
     txid: u32,
     statement: &'a Select<'a>,
+    distinct: bool,
     scope: &QueryScope<'a>,
     from: &'a crate::sql::ast::FromClause<'a>,
     columns: &dyn crate::sql::exec::ColTypeResolver,
@@ -4496,56 +4596,85 @@ pub(crate) fn grouped_scan_context<'a>(
     SqlError,
 > {
     let (width, _) = projected_shape(statement, Some(scope), None, storage, txid, arena)?;
-    Ok(
-        grouped_scan_path(storage, txid, statement, scope, from, columns, width, arena)?
-            .map(|grouped| (grouped.shape, grouped.needed)),
-    )
+    Ok(grouped_scan_path(
+        storage, txid, statement, distinct, scope, from, columns, width, arena,
+    )?
+    .map(|grouped| (grouped.shape, grouped.needed)))
 }
 
-/// A grouping PostgreSQL's planner hashes: the table columns its keys
-/// name, in the order `ExecBuildHash32FromAttrs` combines them, and the
-/// buckets its table starts with.
+/// A grouping PostgreSQL's planner hashes: its keys in the order
+/// `ExecBuildHash32FromAttrs` combines them (each the `GROUP BY` entry
+/// naming it first, and its type), and the buckets its table starts with.
 pub(crate) struct HashedGrouping {
-    pub(crate) columns: [usize; query::index_paths::MAX_ORDER_KEYS],
+    pub(crate) entries: [usize; query::index_paths::MAX_ORDER_KEYS],
+    pub(crate) types: [crate::sql::types::ColType; query::index_paths::MAX_ORDER_KEYS],
     pub(crate) len: usize,
     pub(crate) sizing: query::postgres_memory::HashAggSizing,
 }
 
-/// The hashed grouping PostgreSQL's planner plans over the scan of one
-/// table, or `None` when it sorts the rows or the shape is outside
-/// [`grouped_scan_path`]'s model.
-pub(crate) fn hashed_grouping<'a>(
+/// How PostgreSQL's planner forms the groups of a query of one table.
+pub(crate) enum GroupingStrategy {
+    /// A sort and a `GroupAggregate`, `Group` or `Unique`: the groups come
+    /// in key order.
+    Sorted,
+    /// A `HashAggregate` whose memory the model sizes.
+    Hashed(HashedGrouping),
+    /// Outside the planner model, or a `HashAggregate` whose memory (and
+    /// so its spill and order) the model does not size: the reason.
+    Unmodeled(&'static str),
+}
+
+/// How PostgreSQL's planner groups the rows of `statement` (a `DISTINCT`
+/// when `distinct`, then derived by [`distinct_as_grouping`]) over the scan
+/// of one table.
+#[expect(clippy::too_many_arguments, reason = "planner inputs are explicit")]
+pub(crate) fn grouping_strategy<'a>(
     storage: &'a Storage,
     txid: u32,
     statement: &'a Select<'a>,
+    distinct: bool,
     scope: &QueryScope<'a>,
     from: &'a crate::sql::ast::FromClause<'a>,
     columns: &dyn crate::sql::exec::ColTypeResolver,
     arena: &'a Arena,
-) -> Result<Option<HashedGrouping>, SqlError> {
+) -> Result<GroupingStrategy, SqlError> {
     let (width, _) = projected_shape(statement, Some(scope), None, storage, txid, arena)?;
-    let Some(grouped) =
-        grouped_scan_path(storage, txid, statement, scope, from, columns, width, arena)?
+    let Some(grouped) = grouped_scan_path(
+        storage, txid, statement, distinct, scope, from, columns, width, arena,
+    )?
     else {
-        return Ok(None);
+        // PostgreSQL may hash a grouping the model leaves out.
+        crate::sql::guc::note_hash_aggregate();
+        return Ok(GroupingStrategy::Unmodeled(
+            "a grouping outside the planner model",
+        ));
     };
     let (Some(path), Some(grouping)) = (grouped.path.grouped, grouped.shape.grouping) else {
-        return Ok(None);
+        return Ok(GroupingStrategy::Unmodeled(
+            "a grouping outside the planner model",
+        ));
     };
+    if !path.hashed {
+        return Ok(GroupingStrategy::Sorted);
+    }
     let Some(sizing) = path.hash_agg else {
-        return Ok(None);
+        return Ok(GroupingStrategy::Unmodeled(
+            "a hash aggregate whose transition states have no modelled size",
+        ));
     };
-    Ok(path.hashed.then_some(HashedGrouping {
-        columns: grouping.columns,
+    Ok(GroupingStrategy::Hashed(HashedGrouping {
+        entries: grouped.entries,
+        types: grouped.types,
         len: grouping.len,
         sizing,
     }))
 }
 
-/// A `SELECT DISTINCT` of columns of one table with no ordering, as the
-/// grouping by those columns PostgreSQL's `create_distinct_paths` plans in
-/// the same way (a `HashAggregate` over the scan, or a sort and `Unique`).
-/// `None` for any other query.
+/// A `SELECT DISTINCT` of one table, as the grouping PostgreSQL's
+/// `create_distinct_paths` plans in the same way (a `HashAggregate` over
+/// the scan, or a sort and `Unique`): its keys are the `ORDER BY` entries,
+/// then the other select-list entries (`transformDistinctClause`), and its
+/// `ORDER BY` stays. `None` for any other query.
 pub(crate) fn distinct_as_grouping<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
@@ -4556,35 +4685,46 @@ pub(crate) fn distinct_as_grouping<'a>(
         || !statement.group_by.is_empty()
         || !statement.grouping_sets.is_empty()
         || statement.having.is_some()
-        || !statement.order_by.is_empty()
         || scope.n != 1
         || statement.items.is_empty()
         || statement.items.len() > query::index_paths::MAX_ORDER_KEYS
     {
         return Ok(None);
     }
-    let all_columns = statement.items.iter().all(|item| match item {
-        SelectItem::Expr {
-            expression: Expr::Column { qualifier, name },
-            ..
-        } => matches!(
-            scope.find_column(*qualifier, name),
-            Ok(query::ResolvedColumn::Table(0, _))
-        ),
-        _ => false,
-    });
-    if !all_columns {
+    let mut keys = crate::mem::arena::ArenaList::new(arena);
+    for order in statement.order_by {
+        // An `ORDER BY` of a `DISTINCT` names select-list entries.
+        let expression = match order.expression {
+            Expr::Int(position) if *position >= 1 => {
+                match statement.items.get(*position as usize - 1) {
+                    Some(SelectItem::Expr { expression, .. }) => *expression,
+                    _ => return Ok(None),
+                }
+            }
+            expression => expression,
+        };
+        if !keys
+            .as_slice()
+            .iter()
+            .any(|key: &&Expr<'_>| **key == *expression)
+        {
+            keys.push(expression).map_err(|_| arena_full())?;
+        }
+    }
+    for item in statement.items {
+        let SelectItem::Expr { expression, .. } = item else {
+            return Ok(None);
+        };
+        if !keys.as_slice().iter().any(|key| **key == **expression) {
+            keys.push(*expression).map_err(|_| arena_full())?;
+        }
+    }
+    if keys.len() > query::index_paths::MAX_ORDER_KEYS {
         return Ok(None);
     }
-    let keys = arena
-        .alloc_slice_with(statement.items.len(), |at| match statement.items[at] {
-            SelectItem::Expr { expression, .. } => expression,
-            _ => &Expr::Null,
-        })
-        .map_err(|_| arena_full())?;
     let derived = &*arena
         .alloc(Select {
-            group_by: keys,
+            group_by: keys.as_slice(),
             distinct: false,
             ..*statement
         })
@@ -4753,6 +4893,9 @@ fn grouping_sets_scan_path<'a>(
                 output_width: f64::from(output_width),
                 order: GroupOrder::None,
                 having: None,
+                variables: None,
+                target_per_group: 0.0,
+                distinct: false,
             }),
             ..QueryShape::default()
         };
@@ -6755,6 +6898,23 @@ fn plan_pulled_select<'a>(
             (None, Some(columns)) => columns,
             (None, None) => &empty_columns,
         };
+    // A one-table `DISTINCT` PostgreSQL hashes is explained as the grouping
+    // `create_distinct_paths` plans: a `HashAggregate` over its keys (the
+    // `ORDER BY` items first), then any sort its `ORDER BY` needs.
+    let distinct_grouping = match (scope.as_ref(), statement.from.as_ref()) {
+        (Some(scope), Some(from)) if foreign_scan.is_none() => {
+            match distinct_as_grouping(statement, scope, arena)? {
+                Some(derived) => grouped_scan_path(
+                    storage, txid, derived, true, scope, from, columns, width, arena,
+                )?
+                .filter(|grouped| grouped.path.grouped.is_some_and(|path| path.hashed))
+                .map(|_| derived),
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    let statement = distinct_grouping.unwrap_or(statement);
     let aggregate = has_aggregate(statement, storage, txid, columns)?;
     // A join PostgreSQL's join search plans is explained as that plan; a
     // query of one relation planned there for its windows takes its scan,
@@ -7336,9 +7496,17 @@ fn plan_pulled_select<'a>(
     };
     // The grouping PostgreSQL's planner chooses over the scan of one table.
     let grouped = match (scope.as_ref(), statement.from.as_ref()) {
-        (Some(scope), Some(from)) if chosen_path.is_none() => {
-            grouped_scan_path(storage, txid, statement, scope, from, columns, width, arena)?
-        }
+        (Some(scope), Some(from)) if chosen_path.is_none() => grouped_scan_path(
+            storage,
+            txid,
+            statement,
+            distinct_grouping.is_some(),
+            scope,
+            from,
+            columns,
+            width,
+            arena,
+        )?,
         _ => None,
     };
     let grouped_path = grouped.map(|grouped| grouped.path);
@@ -7795,7 +7963,15 @@ fn plan_pulled_select<'a>(
             &mut stage_count,
             PlanNode {
                 name: StackStr::from_str(aggregate_name),
-                key: Some(NodeKey::new(aggregated_block, Role::Aggregate)),
+                // Execution measures a hashed `DISTINCT` as its `Unique`.
+                key: Some(NodeKey::new(
+                    aggregated_block,
+                    if distinct_grouping.is_some() {
+                        Role::Unique
+                    } else {
+                        Role::Aggregate
+                    },
+                )),
                 planned_partitions,
                 hash_agg,
                 analyze_unsupported: hash_agg_unsupported,
@@ -8178,9 +8354,11 @@ fn plan_pulled_select<'a>(
                     ..*statement
                 })
                 .map_err(|_| arena_full())?;
-            grouped_scan_path(storage, txid, derived, scope, from, columns, width, arena)?
-                .and_then(|grouped| grouped.path.grouped)
-                .map(|grouped| grouped.rows)
+            grouped_scan_path(
+                storage, txid, derived, true, scope, from, columns, width, arena,
+            )?
+            .and_then(|grouped| grouped.path.grouped)
+            .map(|grouped| grouped.rows)
         } else {
             None
         };
@@ -17028,6 +17206,13 @@ fn accesses_pages(node: &PlanNode) -> bool {
 /// and a `VERBOSE` plan holding a target list outside the deparser's
 /// coverage, rather than print wrong estimates or a wrong `Output:`.
 fn printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), SqlError> {
+    // `ExecutorStart` builds every hashed `Agg` an explained plan shows.
+    if plan.nodes[..plan.count]
+        .iter()
+        .any(|node| matches!(node.name.as_str(), "HashAggregate" | "MixedAggregate"))
+    {
+        crate::sql::guc::note_hash_aggregate();
+    }
     if options.costs
         && let Some(node) = plan.nodes[..plan.count]
             .iter()

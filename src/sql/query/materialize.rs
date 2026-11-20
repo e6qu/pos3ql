@@ -1714,8 +1714,8 @@ fn modeled_distinct<'a>(
                 combined = combined.rotate_left(1);
                 let value = crate::sql::exec::decode_projected_col_record(row, position, arena)?;
                 if !matches!(value, Datum::Null) {
-                    combined ^=
-                        super::join_exec::key_hash(&value, storage, txid)?.ok_or_else(|| {
+                    combined ^= super::join_exec::key_hash(&value, storage, txid, arena)?
+                        .ok_or_else(|| {
                             sql_err!(
                                 sqlstate::FEATURE_NOT_SUPPORTED,
                                 "the hash order of this DISTINCT key type is not supported"
@@ -2252,14 +2252,20 @@ pub(crate) fn materialized_rows<'a>(
         None
     };
     let join_sort = modeled.as_ref().map(|model| model.plan.upper.sort);
-    // A limit bounds the sort, which a join's modeled `DISTINCT` runs
-    // below.
+    // A limit bounds the sort, which a join's modeled `DISTINCT` and a
+    // one-table hashed one run below.
     let sort_bounded = n_on == 0
         && (!statement.distinct
             || modeled
                 .as_ref()
                 .and_then(|model| model.group)
-                .is_some_and(|group| group.distinct));
+                .is_some_and(|group| group.distinct)
+            || (modeled.is_none()
+                && n_order > 0
+                && matches!(
+                    super::group::hashed_distinct_plan(storage, scope, txid, statement, arena)?,
+                    Some(super::group::DistinctPlan::Hashed { .. })
+                )));
     let join_presorted = join_sort.is_some_and(|sort| sort.is_none());
     let stored_width = width + n_keys + n_raw + n_identities;
     let mut rows = ArenaList::new_persistent(arena);
@@ -2471,6 +2477,9 @@ pub(crate) fn materialized_rows<'a>(
     // row per key in ORDER BY order survives.
     let mut live = rows.len();
     let scanned = live;
+    // A one-table `DISTINCT` PostgreSQL hashes, whose rows reach an
+    // `ORDER BY`'s sort in the hash table's order.
+    let mut hashed_distinct = false;
     if statement.distinct && n_on == 0 {
         super::group::record_distinct_hash_memory(
             stages.unique,
@@ -2507,7 +2516,10 @@ pub(crate) fn materialized_rows<'a>(
                     rows,
                     &visible_collations,
                 )? {
-                    Some(hashed) => hashed,
+                    Some(hashed) => {
+                        hashed_distinct = true;
+                        hashed
+                    }
                     None => {
                         sort_dedup_collated(storage, txid, arena, rows, width, &visible_collations)?
                     }
@@ -2546,6 +2558,7 @@ pub(crate) fn materialized_rows<'a>(
                 // sort in the hash table's order.
                 statement.distinct
                     && n_on == 0
+                    && !hashed_distinct
                     && !modeled
                         .as_ref()
                         .and_then(|model| model.group)
@@ -3205,7 +3218,11 @@ pub(crate) fn external_materialized_into<'a>(
         && statement.locking.is_empty()
     {
         match super::group::hashed_distinct_plan(storage, scope, txid, statement, arena)? {
-            Some((positions, len, sizing)) => {
+            Some(super::group::DistinctPlan::Hashed {
+                positions,
+                len,
+                sizing,
+            }) => {
                 let positions = &*arena
                     .alloc_slice_copy(&positions[..len])
                     .map_err(|_| arena_full())?;
@@ -3230,7 +3247,10 @@ pub(crate) fn external_materialized_into<'a>(
                     storage.plan_build(),
                 )?)
             }
-            None => None,
+            Some(super::group::DistinctPlan::Unmodeled(unmodeled)) => {
+                return Err(unmodeled.error());
+            }
+            Some(super::group::DistinctPlan::Sorted) | None => None,
         }
     } else {
         None
@@ -3728,7 +3748,8 @@ pub(crate) fn external_materialized_into<'a>(
 /// Whether the rows of `statement` are sorted through the external sorter
 /// (an object store is attached): not those of a join PostgreSQL sorts
 /// within its modeled plan, nor of a hashed `DISTINCT` measured by
-/// `EXPLAIN ANALYZE`. An unmeasured hashed `DISTINCT` streams its rows
+/// `EXPLAIN ANALYZE` or sorted by an `ORDER BY`. Any other hashed
+/// `DISTINCT` streams its rows
 /// through a hash table that spills as PostgreSQL's does.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(super) fn externally_materialized<'a>(
@@ -3749,13 +3770,18 @@ pub(super) fn externally_materialized<'a>(
         return Ok(false);
     }
     // `EXPLAIN ANALYZE` of a hashed `DISTINCT` measures its table from rows
-    // all held in the statement arena.
+    // all held in the statement arena, and an `ORDER BY` sorts the rows a
+    // hashed one returns there.
     Ok(!(statement.distinct
-        && instrument::Stages::current()
-            .unique
-            .hash_agg_sizing()
-            .is_some()
-        && super::group::hashed_distinct_plan(storage, scope, txid, statement, arena)?.is_some()))
+        && matches!(
+            super::group::hashed_distinct_plan(storage, scope, txid, statement, arena)?,
+            Some(super::group::DistinctPlan::Hashed { .. })
+        )
+        && (!statement.order_by.is_empty()
+            || instrument::Stages::current()
+                .unique
+                .hash_agg_sizing()
+                .is_some())))
 }
 
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]

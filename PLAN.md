@@ -1639,19 +1639,28 @@ blocks and a spill that outgrows the pool fails with `54000`. The same
 aggregate streams a one-table hashed `DISTINCT` (with or without an
 object store), orders a hashed one-table or join `GROUP BY`, a join's
 hashed `DISTINCT` and a hashed unique-ified relation, and measures
-`EXPLAIN ANALYZE`. Still open: PostgreSQL's meta context may be a context
-`aset.c` recycles from its per-backend freelist without resetting its block
-sizes. After a statement whose plan created its contexts in another order
-(an `EXPLAIN` without `ANALYZE` of a hash aggregate, a filter's expression
-context), a hash aggregate under a small `work_mem` (below 1MB, whose work
-context's 8 kB to 32 kB largest block lowers the chunk limit) can inherit
-that context: its bucket arrays become dedicated blocks freed on growth, it
-counts less memory and holds more groups before it spills. pos3ql models a
-meta context with default block sizes, so such a statement returns its
-groups in another order and reports other figures than PostgreSQL's (a 64kB
-`SELECT DISTINCT` of 5000 groups after an `EXPLAIN` holds 676 rather than
-461 in its first table); matching it needs the session's freelist of
-executor contexts modelled. `EXPLAIN ANALYZE` of a hash aggregate with another
+`EXPLAIN ANALYZE`. PostgreSQL's `aset.c` keeps freed contexts of the
+default sizes on a per-backend freelist and reuses them without
+recomputing their chunk limit; the only such context with a lower limit is
+a hash aggregate's work context under `work_mem` below 1MB
+(`CreateWorkExprContext`: 1024 bytes at 64kB and 128kB, 2048 at 256kB,
+4096 at 512kB). A later hash aggregate's meta context may reuse it, its
+bucket arrays then becoming blocks of their own, so its memory, spill
+point and order change. pos3ql records, per session, the lowest limit of
+the hash aggregates PostgreSQL may have built (exactly where the planner
+model decides a `HashAggregate`, run or explained; conservatively for a
+grouping or `DISTINCT` it leaves out, a distinct `UNION` and an `IN`
+subquery), from the next statement on; a later hash aggregate whose
+bucket array outgrows that limit within 8 kB fails with `0A000`, and a new
+session starts clean (`differential_exact/928` keeps the sequences that
+leave the freelist alone, `926` runs each aggregate in a session of its
+own). Which context the freelist hands out depends on every earlier
+statement's context order, which is not modelled. The reuse shows at any
+later `work_mem`, not only below 1MB: on PostgreSQL 18.6, after a `SELECT
+DISTINCT ... LIMIT 1` at 64kB, a later `string_agg` grouping reports other
+batches and memory in `EXPLAIN ANALYZE` at 1MB, 4MB and 16MB than in a fresh
+session (a later `DISTINCT` of integers changes order only at 64kB to
+256kB), so the guard fires whatever the later `work_mem`. `EXPLAIN ANALYZE` of a hash aggregate with another
 by-reference state (`numeric` sums, text `min`/`max`, collecting
 aggregates) or more than seven grouping columns fails with `0A000`, as does
 one that spills rows holding columns besides its keys (their tape bytes
@@ -1700,18 +1709,44 @@ buffers and a streaming merge over up to 500 tapes). The sorter holds no
 pointer to the storage: each push and `keep_least` takes the `&Storage` that
 sizes its rows. Not yet done: the
 modeled-join grouping sort and an incremental sort's batches are not charged
-against `work_mem`; a DISTINCT of expressions, or with an `ORDER BY`, is
-outside the model and still sorts, and a one-table `GROUP BY` the
-planner model does not cover (expression keys, aggregates without a sized
-transition state) likewise (a modeled one hashes in `simplehash` order,
-`differential_exact/922`; one whose key type has no ported hash function
-(arrays, records, ranges, jsonb, bit strings, money) and whose
-`ORDER BY` does not name every key fails with `0A000`; an enum key hashes its
-label's `pg_enum` OID as `hashenum` does, but those OIDs come from pos3ql's
-own identity band, not PostgreSQL's cluster counter, so an enum grouping's
-order is deterministic yet cannot match a PostgreSQL cluster's
-(`differential_exact/925` sorts its groups)); `DISTINCT` with an `ORDER BY` on some of its
-columns sorts by the rest in select-list order (`differential_exact/923`); the arrival order of a table
+against `work_mem`. A one-table `GROUP BY` or `DISTINCT` of expressions is planned
+as PostgreSQL plans it (`differential_exact/929`): `estimate_num_groups`
+reads an expression an index or statistics object holds as its own
+variable when it has statistics, else the columns it reads, a boolean key
+makes two groups, the scan computes the keys (its width and cost), and
+each group evaluates the select list; a `DISTINCT` with an `ORDER BY` takes
+the `ORDER BY` items first (`transformDistinctClause`) and, when hashed,
+sorts the groups it returns, a `LIMIT` bounding that sort. Arrays, records,
+ranges, multiranges and `jsonb` hash as `hash_array`, `hash_record`,
+`hash_range`, `hash_multirange` and `jsonb_hash`; `money`, bit strings and
+anonymous records have no hash operator class, so they sort. A one-table
+grouping or `DISTINCT` the planner model leaves out, or a hashed one whose
+transition states have no modelled size (text and `numeric` states,
+collecting aggregates, user-defined aggregates), fails with `0A000` unless
+its order cannot show: its `ORDER BY` names every key or every output
+column (ordinals and output names resolved as PostgreSQL resolves them),
+every key is a constant or fixed by a `WHERE` equality with one, it forms at
+most one group, or it is an `IN`, `ANY` or `ALL` subquery without `LIMIT`
+or `OFFSET`. A key type without a ported hash function fails the same way.
+A derived table's order cannot show either when the query reading it
+(its only FROM item, with no filter, grouping or window) orders by every
+column it shows, each of a type whose equal values print alike (not
+`numeric`, floats, `interval`, `jsonb`, `bpchar` or a catalog collation's
+text), or aggregates it into one row with `count`, `min` or `max`; the
+reading query passes that to the derived table's execution explicitly
+(`differential_exact/960`). The planner model reads a select list as
+PostgreSQL's planner does: stars and `(t).*` of a whole-row reference
+expand into the table's columns, and a field of a row constructor (cast
+to a composite type or not) is the argument it selects when their types
+agree, so ordinals count expanded columns. A named composite key, and an
+array of one, hashes with `hash_record` when every field type hashes and
+sorts when one cannot (`differential_exact/962`). pos3ql's heap page estimate does not compress values as
+`pglz` does, so the row estimate of an unanalyzed table of compressible
+wide values, and the hash order planned from it, can differ from
+PostgreSQL's (ported with `pg_column_size` over 2000 bytes). An enum key hashes its label's `pg_enum` OID as `hashenum` does,
+but those OIDs come from pos3ql's own identity band, not PostgreSQL's
+cluster counter, so an enum grouping's order is deterministic yet cannot
+match a PostgreSQL cluster's (`differential_exact/925` sorts its groups); the arrival order of a table
 whose rows vary in width differs from PostgreSQL's where its free space map
 places a later, smaller tuple on an earlier page. A bounded sort
 (`LIMIT`) that outgrows its heap in `EXPLAIN ANALYZE` still fails with `0A000`.

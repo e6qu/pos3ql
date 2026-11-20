@@ -1037,7 +1037,7 @@ impl RowHeapState {
         if len > self.capacity - start {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "{MEMTABLE_FULL} ({} bytes) of rows that cannot spill yet; raise memtable_bytes or split the transaction",
+                "{MEMTABLE_FULL} ({} bytes) of rows that cannot spill yet: one transaction's uncommitted rows must fit memtable_bytes; raise memtable_bytes in the server configuration file and restart the server, or split the transaction",
                 self.capacity
             ));
         }

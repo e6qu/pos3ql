@@ -2214,6 +2214,14 @@ impl GucState {
                 .get()
                 .min(self.pending_chunk_limit.get()),
         );
+        self.pending_chunk_limit.set(DEFAULT_CHUNK_LIMIT);
+    }
+
+    /// The running attempt of a statement stops to wait and will run again
+    /// from its start: the hash aggregates it noted do not reach the
+    /// freelist before that rerun, which notes them anew.
+    pub(crate) fn discard_statement_attempt(&self) {
+        self.pending_chunk_limit.set(DEFAULT_CHUNK_LIMIT);
     }
 
     pub(crate) fn statement_settings(&self) -> StatementSettings {
@@ -5301,6 +5309,20 @@ fn invalid_setting_value(param: &str, v: &str) -> SqlError {
 #[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod ownership_tests {
     use super::*;
+
+    #[test]
+    fn a_waiting_attempts_hash_aggregates_reach_the_freelist_only_after_its_rerun() {
+        let guc = GucState::new();
+        guc.begin_statement();
+        guc.pending_chunk_limit.set(1024);
+        // The attempt waits for a block and runs again from its start.
+        guc.discard_statement_attempt();
+        guc.begin_statement();
+        assert_eq!(guc.reused_chunk_limit.get(), DEFAULT_CHUNK_LIMIT);
+        guc.pending_chunk_limit.set(1024);
+        guc.begin_statement();
+        assert_eq!(guc.reused_chunk_limit.get(), 1024);
+    }
 
     #[test]
     fn routine_exit_keeps_unlisted_local_settings_and_publishes_restored_values() {

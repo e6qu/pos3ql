@@ -22841,12 +22841,19 @@ impl Engine {
             let txid = txn.txid;
             guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
         }
-        match result {
+        let result = match result {
             Ok(Err(error)) if crate::storage::is_memtable_full(&error) => {
                 Ok(Err(self.wait_for_memtable_room(txn, error)))
             }
             result => result,
+        };
+        if let Ok(Err(error)) = &result
+            && (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+        {
+            guc.discard_statement_attempt();
         }
+        result
     }
 
     /// A write found the memtable full. PostgreSQL has no such limit, so a

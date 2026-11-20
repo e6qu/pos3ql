@@ -415,13 +415,17 @@ fn validate_table_sample<'a>(
 }
 
 /// A `USING`/NATURAL join output column: the merged sides in join order. Its
-/// value is the first non-null contributor (PostgreSQL's join output
-/// variable — a COALESCE across the joined sides, observable with outer
-/// joins).
+/// value is PostgreSQL's join output variable (`buildMergedJoinVar`): the
+/// left side's for an inner or left join, the right side's for a right
+/// join, and their `COALESCE` for a full join.
 #[derive(Clone, Copy)]
 pub struct MergedColumn<'d> {
     pub name: &'d str,
     pub parts: &'d [(usize, usize)],
+    /// The left side's column, a table's or a lower join's merged one.
+    pub left: ResolvedColumn,
+    /// The merging join's kind.
+    pub kind: crate::sql::ast::JoinKind,
     /// The columns PostgreSQL's planner reads for the merged column's join
     /// alias variable (`flatten_join_alias_vars`): the left side's for an
     /// inner or left join, the right side's for a right join, both for a
@@ -1568,6 +1572,8 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(0, |_| MergedColumn {
                 name: "",
                 parts: &[],
+                left: ResolvedColumn::Table(0, 0),
+                kind: crate::sql::ast::JoinKind::Inner,
                 vars: &[],
                 ctype: ColType::Bool,
             })
@@ -3490,6 +3496,8 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(merged_capacity, |_| MergedColumn {
                 name: "",
                 parts: &[],
+                left: ResolvedColumn::Table(0, 0),
+                kind: crate::sql::ast::JoinKind::Inner,
                 vars: &[],
                 ctype: ColType::Bool,
             })
@@ -3636,6 +3644,8 @@ impl<'d> QueryScope<'d> {
                 let merge = MergedColumn {
                     name,
                     parts,
+                    left,
+                    kind: join.kind,
                     vars,
                     ctype,
                 };
@@ -3845,37 +3855,14 @@ impl<'d> QueryScope<'d> {
                     name: "tableoid",
                 })
                 .map_err(|_| arena_full())?),
-            ResolvedColumn::Merged(m) => {
-                let mc = &self.merged[m];
-                let args = arena
-                    .alloc_slice_with(mc.parts.len(), |_| &Expr::Null as &'d Expr<'d>)
-                    .map_err(|_| arena_full())?;
-                for (i, &(t, c)) in mc.parts.iter().enumerate() {
-                    args[i] = &*arena
-                        .alloc(Expr::Column {
-                            qualifier: Some(self.names[t]),
-                            name: self.defs.column_name(t, c),
-                        })
-                        .map_err(|_| arena_full())?;
-                }
+            ResolvedColumn::Merged(merged) => self.merged_expression(merged, arena, &mut |t, c| {
                 Ok(&*arena
-                    .alloc(Expr::Call {
-                        kind: crate::sql::ast::CallKind::SqlSyntax,
-                        bound_oid: None,
-                        bound_strict: None,
-                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-                        name: "coalesce",
-                        args,
-                        argument_names: &[],
-                        variadic: false,
-                        star: false,
-                        distinct: false,
-                        order_by: &[],
-                        over: None,
-                        filter: None,
+                    .alloc(Expr::Column {
+                        qualifier: Some(self.names[t]),
+                        name: self.defs.column_name(t, c),
                     })
                     .map_err(|_| arena_full())?)
-            }
+            }),
         }
     }
 
@@ -3911,31 +3898,96 @@ impl<'d> QueryScope<'d> {
                     .map_err(|_| arena_full())?)
             }
             ResolvedColumn::Merged(merged) => {
-                let parts = self.merged[merged].parts;
-                let args = arena
-                    .alloc_slice_with(parts.len(), |_| &Expr::Null as &'a Expr<'a>)
-                    .map_err(|_| arena_full())?;
-                for (argument, &(table, index)) in args.iter_mut().zip(parts) {
-                    *argument = column(table, index)?;
-                }
-                Ok(&*arena
-                    .alloc(Expr::Call {
-                        kind: crate::sql::ast::CallKind::SqlSyntax,
-                        bound_oid: None,
-                        bound_strict: None,
-                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-                        name: "coalesce",
-                        args,
-                        argument_names: &[],
-                        variadic: false,
-                        star: false,
-                        distinct: false,
-                        order_by: &[],
-                        over: None,
-                        filter: None,
-                    })
-                    .map_err(|_| arena_full())?)
+                self.merged_expression(merged, arena, &mut |table, index| column(table, index))
             }
+        }
+    }
+
+    /// Merged column `merged` as PostgreSQL's join alias variable
+    /// (`buildMergedJoinVar`): a full join's `COALESCE` of its sides,
+    /// another join's left side (a right join's right side), each side
+    /// coerced to the merged type. `column` builds a table column.
+    fn merged_expression<'a>(
+        &self,
+        merged: usize,
+        arena: &'a Arena,
+        column: &mut dyn FnMut(usize, usize) -> Result<&'a Expr<'a>, SqlError>,
+    ) -> Result<&'a Expr<'a>, SqlError> {
+        let mc = &self.merged[merged];
+        let &(right_table, right_column) = mc.parts.last().expect("a merged column has parts");
+        let mut side = |entry: ResolvedColumn| -> Result<&'a Expr<'a>, SqlError> {
+            let expression = match entry {
+                ResolvedColumn::Table(table, index) => column(table, index)?,
+                ResolvedColumn::Merged(lower) => self.merged_expression(lower, arena, column)?,
+                ResolvedColumn::TableOid(_) => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a join's output has a system column"
+                    ));
+                }
+            };
+            if self.output_type(entry) == mc.ctype {
+                return Ok(expression);
+            }
+            Ok(&*arena
+                .alloc(Expr::Cast {
+                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                    operand: expression,
+                    type_name: mc.ctype.name(),
+                    type_mod: -1,
+                    binding: crate::sql::ast::CastBinding::Builtin,
+                    context: crate::sql::ast::CastContext::Implicit,
+                })
+                .map_err(|_| arena_full())?)
+        };
+        let right = ResolvedColumn::Table(right_table, right_column);
+        match mc.kind {
+            crate::sql::ast::JoinKind::Right => return side(right),
+            crate::sql::ast::JoinKind::Full => {}
+            _ => return side(mc.left),
+        }
+        let args = arena
+            .alloc_slice_copy(&[side(mc.left)?, side(right)?])
+            .map_err(|_| arena_full())?;
+        Ok(&*arena
+            .alloc(Expr::Call {
+                kind: crate::sql::ast::CallKind::SqlSyntax,
+                bound_oid: None,
+                bound_strict: None,
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                name: "coalesce",
+                args,
+                argument_names: &[],
+                variadic: false,
+                star: false,
+                distinct: false,
+                order_by: &[],
+                over: None,
+                filter: None,
+            })
+            .map_err(|_| arena_full())?)
+    }
+
+    /// Whether a full join merges a column, whose join alias variable is a
+    /// `COALESCE` of its sides.
+    pub(crate) fn has_full_merged(&self) -> bool {
+        self.merged[..self.n_merged]
+            .iter()
+            .any(|merged| merged.kind == crate::sql::ast::JoinKind::Full)
+    }
+
+    /// The one column merged column `merged`'s join alias variable is, when
+    /// it is a column of the merged type rather than a `COALESCE` or a
+    /// coercion.
+    pub(crate) fn merged_plain_var(&self, merged: usize) -> Option<(usize, usize)> {
+        match self.merged[merged].vars {
+            &[var]
+                if self.output_type(ResolvedColumn::Table(var.0, var.1))
+                    == self.merged[merged].ctype =>
+            {
+                Some(var)
+            }
+            _ => None,
         }
     }
 

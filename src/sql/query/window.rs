@@ -2341,6 +2341,7 @@ pub(crate) fn project_window_rows<'a>(
                     hooks,
                     outer,
                     pax_columns,
+                    &super::index_paths::join_query::PlannedJoin::new(),
                     visit,
                 )
             } else {
@@ -3164,6 +3165,7 @@ fn external_window_source<'a>(
             hooks,
             outer,
             pax_columns,
+            &super::index_paths::join_query::PlannedJoin::new(),
             visit,
         )
     } else {

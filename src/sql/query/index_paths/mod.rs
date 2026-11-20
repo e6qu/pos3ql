@@ -2276,7 +2276,7 @@ pub(crate) struct JoinScan {
     /// else [`NO_CLASS`].
     pub(crate) classes: [u8; 64],
     /// The classes useful for merging, by bit.
-    pub(crate) merging: u32,
+    pub(crate) merging: u64,
     /// The query's pathkeys (`query_pathkeys`).
     pub(crate) order: joins::Keys,
     /// Each relation's rows by FROM position (`get_loop_count`).

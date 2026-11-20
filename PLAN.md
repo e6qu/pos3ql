@@ -1257,15 +1257,41 @@ index fails with `0A000`, and its join's costs refuse to print), a
 `LATERAL` subquery (PostgreSQL may cache it in a `Memoize`; `EXPLAIN` of
 one the search does not plan fails with `0A000` while `enable_memoize` is
 on), a correlated subplan in an `OR` or compared with a column (`0A000`),
-`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), a query
-whose join conditions pass the search's fixed clause capacities (32
-clauses of one join, 48 conditions, 64 clauses): a chain of 34 `USING`
-joins on one column (33 conditions) already does, so its `EXPLAIN (COSTS
-OFF)` prints pos3ql's join order where PostgreSQL filters each join by the
-class's equality, and `join_capacity_diff.py` compares only the analyzed
-128-relation GEQO plan's text; and more than
+`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), and more than
 128 relations in one query, past which the search holds no plan and such
-queries run pos3ql's join order. An `ORDER BY` over a join keeps every joined row in
+queries run pos3ql's join order. A `USING` or `NATURAL` join's merged
+column is PostgreSQL's join alias variable (`buildMergedJoinVar`: the left
+column, a right join's right one, a full join's `COALESCE`, each coerced
+to the merged type), so a chain's joins compare the first relation's
+column and every column joins one class, and a full join chain's later
+joins hash or merge by the lower joins' `COALESCE`, as
+`flatten_join_alias_vars` leaves it (`differential_exact/972`). A query of
+analyzed tables reading a full join's merged column that the search does
+not plan fails with `0A000` rather than run pos3ql's join order: one
+grouped by that column (PostgreSQL groups by its `COALESCE`), and a
+chain's merged column equated with a constant, which
+`reconsider_full_join_clause` pushes into each lower join's sides. The
+search's capacities follow the 128-relation maximum: 256 conditions, 64
+equivalence classes of up to 255 members, 512 columns joins read, 32
+clauses of one join and 65535 clauses, its lists kept in the statement
+arena (`sql_arena_bytes`); past any of them a query fails with `54000`
+naming the capacity rather than running pos3ql's join order. The search
+keeps its paths (288 bytes each, as PostgreSQL's path nodes and their
+clause lists take) and relations in fixed chunks of that arena, which grow
+without copying; the plan it returns holds only the chosen paths, so its
+execution state is per plan node, as `create_plan` copies only those; one
+execution of a statement plans its join once, the passes that size,
+aggregate and order its groups or rows reading that plan; and a check of
+whether the search plans a statement plans in a region of the arena it
+then reclaims. A 34-relation two-column `USING` chain's search builds
+31,901 paths in about 10 MB. Remaining
+there: a relation with a btree index holds 16 join parameters (one per
+other member of its classes and per movable outer join clause), bounded by
+the single-relation planner's 32 conditions and 64-bit restriction sets,
+so an indexed relation equated with more than 16 others fails with
+`54000`; and
+`join_capacity_diff.py` compares the analyzed 34- and 128-relation `USING`
+chains' GEQO plans with PostgreSQL's. An `ORDER BY` over a join keeps every joined row in
 the statement arena before sorting, so a join of millions of rows (seven
 8-row tables cross joined, `ORDER BY 1 LIMIT 1`) fails with `54000` where
 PostgreSQL runs a bounded top-N sort; the join's rows must feed the

@@ -977,6 +977,72 @@ impl<'a, T: Copy + 'a> ArenaList<'a, T> {
     }
 }
 
+/// A list whose entries live in fixed-size chunks of one arena. Growth adds
+/// a chunk and never copies, so the arena holds the entries and one partly
+/// filled chunk, where an [`ArenaList`] leaves every outgrown buffer behind.
+/// Truncating keeps the chunks for the entries pushed next.
+pub(crate) struct ArenaChunks<'a, T: Copy> {
+    chunks: ArenaList<'a, *mut T>,
+    chunk: usize,
+    len: usize,
+}
+
+impl<'a, T: Copy + 'a> ArenaChunks<'a, T> {
+    /// A list of chunks of `chunk` entries each.
+    pub(crate) const fn new(arena: &'a Arena, chunk: usize) -> Self {
+        assert!(chunk > 0);
+        Self {
+            chunks: ArenaList::new(arena),
+            chunk,
+            len: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, value: T) -> Result<(), ArenaFull> {
+        let (chunk, at) = (self.len / self.chunk, self.len % self.chunk);
+        if chunk == self.chunks.len() {
+            let entries = self.chunks.arena.alloc_slice_with(self.chunk, |_| value)?;
+            self.chunks.push(entries.as_mut_ptr())?;
+        }
+        // SAFETY: each chunk holds `self.chunk` initialized entries for the
+        // arena's lifetime, and this list alone writes them.
+        unsafe { self.chunks.borrowed_slice()[chunk].add(at).write(value) };
+        self.len += 1;
+        Ok(())
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Entry `index`, which must be below the length.
+    pub(crate) fn get(&self, index: usize) -> T {
+        *self.entry(index)
+    }
+
+    pub(crate) fn entry(&self, index: usize) -> &T {
+        assert!(index < self.len);
+        // SAFETY: the entry is initialized and within its chunk.
+        unsafe { &*self.chunks.borrowed_slice()[index / self.chunk].add(index % self.chunk) }
+    }
+
+    pub(crate) fn entry_mut(&mut self, index: usize) -> &mut T {
+        assert!(index < self.len);
+        // SAFETY: as for `entry`; `&mut self` excludes every other borrow.
+        unsafe { &mut *self.chunks.borrowed_slice()[index / self.chunk].add(index % self.chunk) }
+    }
+
+    /// Drops the entries past `len`, which must not exceed the length.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        assert!(len <= self.len);
+        self.len = len;
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> + '_ {
+        (0..self.len).map(|index| self.entry(index))
+    }
+}
+
 /// A growable UTF-8 string built in the arena, so text results are bounded by
 /// statement memory rather than a fixed stack buffer. Exhaustion surfaces as
 /// `Err` from the `fmt::Write` methods.

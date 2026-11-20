@@ -1489,9 +1489,7 @@ fn retained_join_scope<'a>(
     }
     // A join PostgreSQL's join search plans runs in the general executor,
     // which follows that plan.
-    if super::index_paths::join_query::modeled_join(storage, txid, statement, &scope, &[], arena)?
-        .is_some()
-    {
+    if super::index_paths::join_query::models_join(storage, txid, statement, &scope, &[], arena)? {
         return Ok(None);
     }
     let Some(shape) = join::join_shape(storage, txid, from, statement.where_clause, &scope, arena)?
@@ -3001,11 +2999,9 @@ impl<'a> RetainedSelect<'a> {
                 && from.joins.iter().any(|join| join.kind.is_semi_or_anti())
             {
                 let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
-                if super::index_paths::join_query::modeled_join(
+                if super::index_paths::join_query::models_join(
                     storage, txid, pulled, &scope, params, arena,
-                )?
-                .is_some()
-                {
+                )? {
                     return Ok(None);
                 }
             }

@@ -20,7 +20,7 @@ use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError};
 use crate::sql::types::Datum;
 use crate::storage::Storage;
 
-use super::index_paths::join_query::ModeledJoin;
+use super::index_paths::join_query::{ModeledJoin, PlannedJoin};
 use super::index_paths::joins::{
     ClauseList, JoinType, KEY_CLASS, KEY_DESCENDING, KEY_NULLS_FIRST, Keys, MAX_JOIN_RELS, Member,
     PathKind, Relids,
@@ -913,7 +913,8 @@ struct Runner<'r, 'a> {
 }
 
 /// Scans `statement`'s FROM clause: by the plan PostgreSQL's join search
-/// chose when it plans the query, otherwise as `scan_source` does.
+/// chose when it plans the query (`planned`, the statement's plan), otherwise
+/// as `scan_source` does.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_statement_source<'a>(
     statement: &'a crate::sql::ast::Select<'a>,
@@ -928,12 +929,11 @@ pub(super) fn scan_statement_source<'a>(
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
     pax_demand: PaxReadDemand,
+    planned: &PlannedJoin<'a>,
     visit: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     if outer.is_none()
-        && let Some(model) = super::index_paths::join_query::modeled_join(
-            storage, txid, statement, scope, params, arena,
-        )?
+        && let Some(model) = planned.get(storage, txid, statement, scope, params, arena)?
     {
         // A `GroupAggregate` over the join's rows sorted by its keys reads
         // them in its sort's order.
@@ -942,10 +942,10 @@ pub(super) fn scan_statement_source<'a>(
             && let Some((_, _, presorted)) = chosen.input_sort
         {
             return run_modeled_sorted(
-                storage, scope, txid, &model, statement, presorted, arena, params, hooks, visit,
+                storage, scope, txid, model, statement, presorted, arena, params, hooks, visit,
             );
         }
-        return run_modeled(storage, scope, txid, &model, arena, params, hooks, visit);
+        return run_modeled(storage, scope, txid, model, arena, params, hooks, visit);
     }
     if recycle_rows {
         super::scan::scan_source_recycling_with_pax_columns(

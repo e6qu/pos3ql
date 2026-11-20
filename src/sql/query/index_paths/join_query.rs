@@ -17,10 +17,9 @@ use crate::storage::{ColumnSet, Storage, TableStatistics};
 
 use super::join_tree::{self, Placed, Qual, Shape, Tree, TreeJoin, TreeNode, VarList};
 use super::joins::{
-    BASE_RELIDS, BasePath, BaseRel, Clause, ClauseForm, ClauseList, EquivalenceClass,
+    BASE_RELIDS, BasePath, BaseRel, Clause, ClauseForm, ClauseId, ClauseList, EquivalenceClass,
     ForeignKeyJoin, JoinPlan, JoinProblem, JoinSettings, JoinStatistics, KEY_CLASS, Keys,
-    MAX_CLAUSES, MAX_JOIN_EXPRESSIONS, MAX_JOIN_RELS, MAX_MEMBERS, Member, NO_KEY_CLASS,
-    NeededColumn, Relids,
+    MAX_CLAUSES, MAX_JOIN_EXPRESSIONS, MAX_JOIN_RELS, Member, NO_KEY_CLASS, NeededColumn, Relids,
 };
 use super::paths::JoinCandidate;
 use super::{
@@ -161,6 +160,85 @@ fn column_expression<'a>(
         .map_err(|_| crate::sql::eval::arena_full())
 }
 
+/// `flatten_join_alias_vars`: `expression` with each merged `USING` column
+/// that is not one column of its type replaced by its join alias variable's
+/// expression, a full join's `COALESCE` or a coercion.
+fn flatten_merged<'a>(
+    scope: &QueryScope<'a>,
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    struct Failed(SqlError);
+    impl From<crate::mem::arena::ArenaFull> for Failed {
+        fn from(_: crate::mem::arena::ArenaFull) -> Self {
+            Self(crate::sql::eval::arena_full())
+        }
+    }
+    crate::sql::ast::rewrite_expression(expression, arena, &mut |node: &'a Expr<'a>| -> Result<
+        Option<&'a Expr<'a>>,
+        Failed,
+    > {
+        let Expr::Column { qualifier, name } = node else {
+            return Ok(None);
+        };
+        match scope.probe_column(*qualifier, name) {
+            Some(ResolvedColumn::Merged(merged)) if scope.merged_plain_var(merged).is_none() => {
+                scope
+                    .star_expression(ResolvedColumn::Merged(merged), arena)
+                    .map(Some)
+                    .map_err(Failed)
+            }
+            _ => Ok(None),
+        }
+    })
+    .map_err(|Failed(error)| error)
+}
+
+/// `flatten_join_alias_vars` of the query: `statement` reading each merged
+/// `USING` column that is not one column of its type as its join alias
+/// variable's expression, in its output, conditions, grouping and ordering.
+fn flatten_merged_statement<'a>(
+    scope: &QueryScope<'a>,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    if (0..scope.n_merged).all(|merged| scope.merged_plain_var(merged).is_some()) {
+        return Ok(statement);
+    }
+    let flatten = |expression| flatten_merged(scope, expression, arena);
+    let full = |_| crate::sql::eval::arena_full();
+    let items = arena.alloc_slice_copy(statement.items).map_err(full)?;
+    for item in items.iter_mut() {
+        if let SelectItem::Expr { expression, .. } = item {
+            *expression = flatten(*expression)?;
+        }
+    }
+    let group_by = arena.alloc_slice_copy(statement.group_by).map_err(full)?;
+    for expression in group_by.iter_mut() {
+        *expression = flatten(*expression)?;
+    }
+    let distinct_on = arena
+        .alloc_slice_copy(statement.distinct_on)
+        .map_err(full)?;
+    for expression in distinct_on.iter_mut() {
+        *expression = flatten(*expression)?;
+    }
+    let order_by = arena.alloc_slice_copy(statement.order_by).map_err(full)?;
+    for order in order_by.iter_mut() {
+        order.expression = flatten(order.expression)?;
+    }
+    let flattened = Select {
+        items,
+        group_by,
+        distinct_on,
+        order_by,
+        where_clause: statement.where_clause.map(flatten).transpose()?,
+        having: statement.having.map(flatten).transpose()?,
+        ..*statement
+    };
+    Ok(&*arena.alloc(flattened).map_err(full)?)
+}
+
 /// `left = right`, each a column named by its relation.
 fn equality<'a>(
     scope: &QueryScope<'a>,
@@ -242,8 +320,9 @@ type PresortKeys<'a> = (Keys, [(&'a Expr<'a>, u8); super::joins::MAX_KEYS], usiz
 pub(crate) struct ModeledJoin<'a> {
     pub(crate) plan: JoinPlan<'a>,
     pub(crate) rels: &'a [ModeledRel<'a>],
-    /// Each class member's FROM position and column.
-    pub(crate) columns: &'a [[(usize, usize); MAX_MEMBERS]],
+    /// The equivalence classes, whose members are FROM positions and
+    /// columns.
+    pub(crate) classes: &'a [EquivalenceClass<'a>],
     /// The query's conditions, by [`Clause::source`].
     pub(crate) quals: &'a [&'a Expr<'a>],
     /// The width of the query's target list, its ordering columns
@@ -325,7 +404,8 @@ pub(crate) struct ModeledGroup<'a> {
 impl<'a> ModeledJoin<'a> {
     /// The FROM position and column of member `member` of class `class`.
     pub(crate) fn member(&self, class: u8, member: u8) -> (usize, usize) {
-        self.columns[usize::from(class)][usize::from(member)]
+        let member = self.classes[usize::from(class)].members()[usize::from(member)];
+        (usize::from(member.rel), usize::from(member.column))
     }
 
     /// The `(left, right)` columns a mergeable join clause equates, as
@@ -497,7 +577,7 @@ const MAX_QUALS: usize = join_tree::MAX_QUALS;
 /// The constants equated with columns, each once by value and type
 /// (`em_is_const` members compare by `equal`).
 struct Constants<'a> {
-    held: [(&'a Expr<'a>, ColType); MAX_QUALS],
+    held: [(&'a Expr<'a>, ColType); MAX_QUALS + 1],
     count: usize,
 }
 
@@ -657,11 +737,18 @@ fn nonnullable(
 fn qual_vars(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<VarList> {
     let mut vars = VarList::default();
     let mut ok = true;
-    let mut add = |qualifier: Option<&str>, name: &str| match scope.probe_column(qualifier, name) {
-        Some(ResolvedColumn::Table(table, column)) if column < 64 => {
-            ok &= vars.add((table as u8, column as u16)).is_some();
+    let mut add = |qualifier: Option<&str>, name: &str| {
+        let var = match scope.probe_column(qualifier, name) {
+            Some(ResolvedColumn::Table(table, column)) => Some((table, column)),
+            Some(ResolvedColumn::Merged(merged)) => scope.merged_plain_var(merged),
+            _ => None,
+        };
+        match var {
+            Some((table, column)) if column < 64 => {
+                ok &= vars.add((table as u8, column as u16)).is_some();
+            }
+            _ => ok = false,
         }
-        _ => ok = false,
     };
     expression.for_each_column_reference(&mut add);
     let mut whole_row = false;
@@ -955,10 +1042,9 @@ fn analyze_qual<'a>(
     expression: &'a Expr<'a>,
     constants: &mut Constants<'a>,
     expressions: &mut Expressions<'a>,
-    full_merged: &dyn Fn(usize) -> Option<ColumnPair>,
 ) -> Result<Option<Qual>, SqlError> {
-    // `COALESCE(left, right) = constant` of a full join's merged column or
-    // a written `COALESCE` of two relations' columns.
+    // `COALESCE(left, right) = constant` of two relations' columns, written
+    // or a full join's merged column.
     if let Expr::Binary {
         operator: BinaryOp::Eq,
         left,
@@ -968,10 +1054,6 @@ fn analyze_qual<'a>(
     {
         let coalesced = |side: &Expr<'_>| -> Option<ColumnPair> {
             match side {
-                Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
-                    Ok(ResolvedColumn::Merged(merged)) => full_merged(merged),
-                    _ => None,
-                },
                 Expr::Call {
                     name,
                     args: [one, two],
@@ -991,6 +1073,17 @@ fn analyze_qual<'a>(
             (None, Some(sides)) => plain_constant(left).map(|value| (sides, value)),
             _ => None,
         };
+        // A full join chain's merged column equated with a constant, which
+        // `reconsider_full_join_clause` pushes into each side through the
+        // lower joins' `COALESCE`.
+        let is_coalesce = |side: &Expr<'_>| matches!(side, Expr::Call { name, .. } if name.eq_ignore_ascii_case("coalesce"));
+        if found.is_none()
+            && scope.has_full_merged()
+            && ((is_coalesce(left) && plain_constant(right).is_some())
+                || (is_coalesce(right) && plain_constant(left).is_some()))
+        {
+            return Ok(None);
+        }
         if let Some(((one, two), value)) = found {
             let meta = |(table, column): (usize, usize)| {
                 let meta = &scope.defs.stored(table).expect("plain table").columns()[column];
@@ -1596,7 +1689,19 @@ pub(crate) fn modeled_join<'a>(
         return Ok(None);
     };
     let Some(from) = nested_members(written, arena)? else {
-        return modeled_join_over(storage, txid, statement, written, scope, params, arena);
+        let modeled = modeled_join_over(storage, txid, statement, written, scope, params, arena)?;
+        if modeled.is_none()
+            && scope.has_full_merged()
+            && (0..scope.n)
+                .all(|table| plain_table(storage, txid, scope, table, source(written, table)))
+        {
+            // Its rows and their order would be pos3ql's join order's.
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "a full join's merged USING column in this query is not supported by the join search"
+            ));
+        }
+        return Ok(modeled);
     };
     // A parenthesized join's members are the join's relations, each its
     // own scope entry; its written entry's columns are theirs in order.
@@ -1645,6 +1750,55 @@ pub(crate) fn modeled_join<'a>(
         joined,
     });
     Ok(Some(model))
+}
+
+/// A statement's join plan, planned at its first use. Every pass one
+/// execution of the statement makes over its join (sizing groups, reading
+/// aggregates, ordering groups or rows) reads the one plan, as PostgreSQL
+/// plans a query once. Its holder fixes the statement, scope, parameters
+/// and arena that plan it.
+pub(crate) struct PlannedJoin<'a>(core::cell::OnceCell<Option<ModeledJoin<'a>>>);
+
+impl<'a> PlannedJoin<'a> {
+    pub(crate) const fn new() -> Self {
+        Self(core::cell::OnceCell::new())
+    }
+
+    /// The statement's plan, `None` when the join search does not plan it.
+    pub(crate) fn get(
+        &self,
+        storage: &'a Storage,
+        txid: u32,
+        statement: &'a Select<'a>,
+        scope: &QueryScope<'a>,
+        params: &[Datum<'a>],
+        arena: &'a Arena,
+    ) -> Result<Option<&ModeledJoin<'a>>, SqlError> {
+        if self.0.get().is_none() {
+            let planned = modeled_join(storage, txid, statement, scope, params, arena)?;
+            let _ = self.0.set(planned);
+        }
+        Ok(self.0.get().and_then(Option::as_ref))
+    }
+}
+
+/// Whether the join search plans `statement`; the arena space the plan
+/// took is reclaimed.
+pub(crate) fn models_join<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    params: &[Datum<'a>],
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    let mark = arena.mark();
+    let modeled = modeled_join(storage, txid, statement, scope, params, arena)
+        .map(|planned| planned.is_some());
+    // SAFETY: the answer and its error hold no arena data, and planning
+    // writes into nothing that outlives it.
+    unsafe { arena.rewind_to(mark) };
+    modeled
 }
 
 /// The FROM item count of `table`: one base relation, or a parenthesized
@@ -1724,6 +1878,7 @@ fn modeled_join_over<'a>(
     params: &[Datum<'a>],
     arena: &'a Arena,
 ) -> Result<Option<ModeledJoin<'a>>, SqlError> {
+    let statement = flatten_merged_statement(scope, statement, arena)?;
     let n = scope.n;
     // A query of one relation is planned here for its window functions.
     let windowed = statement.items.iter().any(|item| {
@@ -1811,17 +1966,6 @@ fn modeled_join_over<'a>(
             .stored(table)
             .map_or(0, |def| def.columns().len().min(64))
     };
-    // A merged `USING` column reads its left column, a right join's its
-    // right one, a full join's both (`COALESCE`).
-    let merged_parts = |merged: usize| -> &[(usize, usize)] {
-        let parts = scope.merged[merged].parts;
-        let right = parts.last().map_or(0, |&(table, _)| table);
-        match from.joins.get(right.wrapping_sub(1)).map(|join| join.kind) {
-            Some(JoinKind::Full) => parts,
-            Some(JoinKind::Right) => &parts[parts.len() - 1..],
-            _ => &parts[..1],
-        }
-    };
     // The select list's expressions' widths and their cost per row; an
     // aggregating query's per group (`create_agg_path`'s target cost).
     let mut expression_width = 0.0;
@@ -1841,7 +1985,8 @@ fn modeled_join_over<'a>(
                             single = [(table, column)];
                             &single[..]
                         }
-                        ResolvedColumn::Merged(merged) => merged_parts(merged),
+                        // The columns its join alias variable reads.
+                        ResolvedColumn::Merged(merged) => scope.merged[merged].vars,
                         _ => {
                             return Ok(None);
                         }
@@ -2153,7 +2298,9 @@ fn modeled_join_over<'a>(
             SelectItem::Wildcard(_) if !scope.merged_output().is_empty() => {
                 scope.merged_output().iter().any(|&entry| match entry {
                     ResolvedColumn::Table(listed, at) => (listed, at) == (table, column),
-                    ResolvedColumn::Merged(merged) => merged_parts(merged) == [(table, column)],
+                    ResolvedColumn::Merged(merged) => {
+                        scope.merged_plain_var(merged) == Some((table, column))
+                    }
                     _ => false,
                 })
             }
@@ -2262,15 +2409,10 @@ fn modeled_join_over<'a>(
     // The conditions: each join's `ON`, then `WHERE`.
     let mut quals = [&Expr::Null; MAX_QUALS + 1];
     let mut constants = Constants {
-        held: [(&Expr::Null, ColType::Int4); MAX_QUALS],
+        held: [(&Expr::Null, ColType::Int4); MAX_QUALS + 1],
         count: 0,
     };
     let mut expressions = Expressions::new(storage, txid, arena);
-    // A full join's merged column: the two columns its `COALESCE` reads.
-    let full_merged = |merged: usize| match merged_parts(merged) {
-        &[one, two] => Some((one, two)),
-        _ => None,
-    };
     let sources = joined.iter().map(|&(node, on)| (Some(node), on)).chain(
         statement
             .where_clause
@@ -2283,21 +2425,16 @@ fn modeled_join_over<'a>(
         let mut conjuncts = [&Expr::Null; super::super::plan::MAX_CONJUNCTS];
         let mut count = 0;
         if !super::super::plan::flatten_and(condition, &mut conjuncts, &mut count) {
-            return Ok(None);
+            return Err(preparation_full());
         }
         for &conjunct in &conjuncts[..count] {
-            let Some(qual) = analyze_qual(
-                scope,
-                conjunct,
-                &mut constants,
-                &mut expressions,
-                &full_merged,
-            )?
+            let conjunct = flatten_merged(scope, conjunct, arena)?;
+            let Some(qual) = analyze_qual(scope, conjunct, &mut constants, &mut expressions)?
             else {
                 return Ok(None);
             };
             let Some(id) = tree.qual(node, qual) else {
-                return Ok(None);
+                return Err(preparation_full());
             };
             quals[usize::from(id)] = conjunct;
         }
@@ -2310,17 +2447,24 @@ fn modeled_join_over<'a>(
     {
         *vars = expressions.get(id).vars;
     }
-    let Ok(mut prepared) = join_tree::prepare(&tree) else {
-        return Ok(None);
+    let mut prepared = match join_tree::prepare(&tree, arena) {
+        Ok(prepared) => prepared,
+        Err(join_tree::FULL) => return Err(preparation_full()),
+        Err(join_tree::ARENA) => return Err(crate::sql::eval::arena_full()),
+        Err(_) => return Ok(None),
     };
     // The constant `true` that replaced outer join clauses
     // (`reconsider_outer_join_clauses`) is the condition after the query's.
     quals[tree.qual_count] = &Expr::Bool(true);
-    for placed in &mut prepared.placed[..prepared.placed_count] {
+    for placed in prepared
+        .placed
+        .as_mut_slice()
+        .map_err(|_| crate::sql::eval::arena_full())?
+    {
         if let Placed::Join(join) = placed
             && join.qual == join_tree::TRUE_QUAL
         {
-            join.qual = tree.qual_count as u8;
+            join.qual = tree.qual_count as join_tree::QualId;
         }
     }
     let quals = &quals[..=tree.qual_count];
@@ -2399,23 +2543,7 @@ fn modeled_join_over<'a>(
     // The join clauses, in the order PostgreSQL distributes them; each
     // relation's `joininfo` holds those required above it.
     let costs = Costs::current();
-    let mut clauses = [Clause {
-        form: ClauseForm::Other,
-        relids: Relids::EMPTY,
-        required: Relids::EMPTY,
-        pushed_down: true,
-        clone: super::joins::CloneKind::None,
-        incompatible: Relids::EMPTY,
-        cost: costs.cpu_operator,
-        selectivity: None,
-        outer_selectivity: None,
-        outer_relids: Relids::EMPTY,
-        operands: None,
-        other: super::joins::OtherShape::Plain,
-        constant: false,
-        source: None,
-    }; MAX_CLAUSES];
-    let mut clause_count = 0;
+    let mut clauses = crate::mem::arena::ArenaList::<Clause>::new(arena);
     // The equalities of expressions of several relations with their
     // class's constant, conditions after the query's.
     let mut implied = [&Expr::Null; MAX_JOIN_EXPRESSIONS];
@@ -2437,7 +2565,7 @@ fn modeled_join_over<'a>(
                 implied_count += 1;
                 let relids = member.relids();
                 join_tree::JoinQual {
-                    qual: (quals.len() + implied_count - 1) as u8,
+                    qual: (quals.len() + implied_count - 1) as join_tree::QualId,
                     relids,
                     required: relids,
                     pushed_down: true,
@@ -2449,9 +2577,6 @@ fn modeled_join_over<'a>(
             }
             _ => continue,
         };
-        if clause_count == MAX_CLAUSES {
-            return Ok(None);
-        }
         let member_cost = |member: Member| {
             member
                 .expression_id()
@@ -2469,27 +2594,28 @@ fn modeled_join_over<'a>(
             ),
             None => (ClauseForm::Other, costs.cpu_operator),
         };
-        clauses[clause_count] = Clause {
-            form,
-            relids: join.relids,
-            required: join.required,
-            pushed_down: join.pushed_down,
-            clone: join.clone,
-            incompatible: join.incompatible,
-            cost,
-            selectivity: None,
-            outer_selectivity: None,
-            outer_relids: join.outer_relids,
-            operands: None,
-            other: super::joins::OtherShape::Plain,
-            constant: quals
-                .get(usize::from(join.qual))
-                .is_some_and(|qual| matches!(qual, Expr::Bool(true))),
-            source: Some(u16::from(join.qual)),
-        };
-        clause_count += 1;
+        clauses
+            .push(Clause {
+                form,
+                relids: join.relids,
+                required: join.required,
+                pushed_down: join.pushed_down,
+                clone: join.clone,
+                incompatible: join.incompatible,
+                cost,
+                selectivity: None,
+                outer_selectivity: None,
+                outer_relids: join.outer_relids,
+                operands: None,
+                other: super::joins::OtherShape::Plain,
+                constant: quals
+                    .get(usize::from(join.qual))
+                    .is_some_and(|qual| matches!(qual, Expr::Bool(true))),
+                source: Some(join.qual),
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
     }
-    let placed_join_count = clause_count;
+    let placed_join_count = clauses.len();
     let quals = &*arena
         .alloc_slice_with(quals.len() + implied_count, |at| {
             match at.checked_sub(quals.len()) {
@@ -2526,8 +2652,7 @@ fn modeled_join_over<'a>(
     // query's output reads it, a key of a class already ordered or of a
     // constant's dropped as redundant.
     let mut extended = [EquivalenceClass {
-        members: [Member::plain(0, 0); MAX_MEMBERS],
-        count: 0,
+        members: &[],
         has_const: false,
     }; join_tree::MAX_CLASSES];
     extended[..class_count].copy_from_slice(classes);
@@ -2599,10 +2724,9 @@ fn modeled_join_over<'a>(
                 Some(class) => class,
                 None => {
                     if class_count == extended.len() {
-                        return Ok(None);
+                        return Err(preparation_full());
                     }
-                    extended[class_count].members[0] = member;
-                    extended[class_count].count = 1;
+                    extended[class_count].members = single_member(member, arena)?;
                     class_count += 1;
                     class_count - 1
                 }
@@ -2654,9 +2778,9 @@ fn modeled_join_over<'a>(
                         Some(&(class, _)) => usize::from(class),
                         None => {
                             if class_count == extended.len() {
-                                return Ok(None);
+                                return Err(preparation_full());
                             }
-                            extended[class_count].count = 0;
+                            extended[class_count].members = &[];
                             extended[class_count].has_const = false;
                             expression_classes[expression_class_count] =
                                 (class_count as u8, expression);
@@ -2693,10 +2817,9 @@ fn modeled_join_over<'a>(
             Some(class) => class,
             None => {
                 if class_count == extended.len() {
-                    return Ok(None);
+                    return Err(preparation_full());
                 }
-                extended[class_count].members[0] = member;
-                extended[class_count].count = 1;
+                extended[class_count].members = single_member(member, arena)?;
                 class_count += 1;
                 class_count - 1
             }
@@ -2725,10 +2848,9 @@ fn modeled_join_over<'a>(
                         ResolvedColumn::Table(table, column) => {
                             Some((table, column)).filter(|&entry| in_class(entry))
                         }
-                        ResolvedColumn::Merged(merged) => match merged_parts(merged) {
-                            &[part] => Some(part).filter(|&part| in_class(part)),
-                            _ => None,
-                        },
+                        ResolvedColumn::Merged(merged) => scope
+                            .merged_plain_var(merged)
+                            .filter(|&part| in_class(part)),
                         _ => None,
                     })
                 }
@@ -2881,10 +3003,9 @@ fn modeled_join_over<'a>(
                     Some(class) => class,
                     None => {
                         if class_count == extended.len() {
-                            return Ok(None);
+                            return Err(preparation_full());
                         }
-                        extended[class_count].members[0] = member;
-                        extended[class_count].count = 1;
+                        extended[class_count].members = single_member(member, arena)?;
                         extended[class_count].has_const = false;
                         class_count += 1;
                         class_count - 1
@@ -3081,10 +3202,9 @@ fn modeled_join_over<'a>(
                         Some(class) => class,
                         None => {
                             if class_count == extended.len() {
-                                return Ok(None);
+                                return Err(preparation_full());
                             }
-                            extended[class_count].members[0] = member;
-                            extended[class_count].count = 1;
+                            extended[class_count].members = single_member(member, arena)?;
                             extended[class_count].has_const = false;
                             class_count += 1;
                             class_count - 1
@@ -3155,10 +3275,9 @@ fn modeled_join_over<'a>(
                     Some(class) => class,
                     None => {
                         if class_count == extended.len() {
-                            return Ok(None);
+                            return Err(preparation_full());
                         }
-                        extended[class_count].members[0] = member;
-                        extended[class_count].count = 1;
+                        extended[class_count].members = single_member(member, arena)?;
                         extended[class_count].has_const = false;
                         class_count += 1;
                         class_count - 1
@@ -3274,7 +3393,10 @@ fn modeled_join_over<'a>(
         .map_err(|_| crate::sql::eval::arena_full())?;
     // The columns each other condition of two relations compares, each
     // nulled by the outer joins the clause reads it above.
-    for clause in &mut clauses[..placed_join_count] {
+    for clause in &mut clauses
+        .as_mut_slice()
+        .map_err(|_| crate::sql::eval::arena_full())?[..placed_join_count]
+    {
         if clause.form != ClauseForm::Other {
             continue;
         }
@@ -3324,7 +3446,7 @@ fn modeled_join_over<'a>(
         [[&Expr::Null; MAX_JOIN_PARAMS]; MAX_JOIN_RELS];
     // The clause each parameter is: an outer join's clause, or `None` for
     // a class's.
-    let mut param_clause = [[None::<u8>; MAX_JOIN_PARAMS]; MAX_JOIN_RELS];
+    let mut param_clause = [[None::<ClauseId>; MAX_JOIN_PARAMS]; MAX_JOIN_RELS];
     let mut total_table_pages = 0.0;
     let member_class = |member: Member| {
         classes
@@ -3379,7 +3501,7 @@ fn modeled_join_over<'a>(
         // member elsewhere, or one a mergeable clause of its `joininfo`
         // sorts by.
         let eclass_joins = classes.iter().any(|class| {
-            usize::from(class.count) + usize::from(class.has_const) > 1
+            class.count() + usize::from(class.has_const) > 1
                 && class.relids() & relids != Relids::EMPTY
                 && class.relids() & !relids != Relids::EMPTY
         });
@@ -3401,17 +3523,19 @@ fn modeled_join_over<'a>(
             let held = &classes[class];
             let useful_by_class = eclass_joins
                 && !held.has_const
-                && held.count > 1
+                && held.count() > 1
                 && held.relids() & !relids != Relids::EMPTY
                 && held
                     .members()
                     .iter()
                     .any(|member| member.relids() & relids == Relids::EMPTY);
-            let useful_by_clause = clauses[..placed_join_count].iter().any(|clause| {
-                clause.in_joininfo_of(relids)
-                    && matches!(clause.form, ClauseForm::Join { left_class, right_class, .. }
+            let useful_by_clause = clauses.borrowed_slice()[..placed_join_count].iter().any(
+                |clause| {
+                    clause.in_joininfo_of(relids)
+                        && matches!(clause.form, ClauseForm::Join { left_class, right_class, .. }
                         if usize::from(left_class) == class || usize::from(right_class) == class)
-            });
+                },
+            );
             if useful_by_class || useful_by_clause {
                 *slot = class as u8;
                 scan.merging |= 1 << class;
@@ -3425,8 +3549,10 @@ fn modeled_join_over<'a>(
         }
         // The columns its btree indexes key.
         let mut keyed = 0u64;
+        let mut btree = false;
         crate::sql::catalog::planner_indexes(storage, txid, scope.slots[table], &mut |index| {
             if index.method == crate::sql::ast::IndexAccessMethod::Btree {
+                btree = true;
                 for position in 0..index.n_cols {
                     if !index.expression_keys[position] && index.columns[position] < 64 {
                         keyed |= 1 << index.columns[position];
@@ -3434,7 +3560,10 @@ fn modeled_join_over<'a>(
                 }
             }
         });
-        for (id, clause) in clauses[..placed_join_count].iter().enumerate() {
+        for (id, clause) in clauses.borrowed_slice()[..placed_join_count]
+            .iter()
+            .enumerate()
+        {
             if !clause.in_joininfo_of(relids)
                 || clause.relids & relids == Relids::EMPTY
                 || clause.outer_relids & relids != Relids::EMPTY
@@ -3485,16 +3614,20 @@ fn modeled_join_over<'a>(
             };
             let at = usize::from(scan.param_count);
             if at == MAX_JOIN_PARAMS {
-                return Ok(None);
+                return Err(join_params_full());
             }
             scan.params[at] = (own_class, other_rel);
             scan.param_others[at] = clause.relids & !BASE_RELIDS;
             scan.clause_params |= 1 << at;
             join_conjuncts[table][at] = expression;
-            param_clause[table][at] = Some(id as u8);
+            param_clause[table][at] = Some(id as ClauseId);
             scan.param_count += 1;
         }
         for (class_id, class) in classes.iter().enumerate() {
+            // Without a btree index no path is parameterized by a class.
+            if !btree {
+                break;
+            }
             let Some(own) = class.members().iter().find(|member| {
                 usize::from(member.rel) == table
                     && member.nulling == Relids::EMPTY
@@ -3508,7 +3641,7 @@ fn modeled_join_over<'a>(
             {
                 continue;
             }
-            if class.has_const || class.count <= 1 {
+            if class.has_const || class.count() <= 1 {
                 continue;
             }
             for other in class.members() {
@@ -3520,7 +3653,7 @@ fn modeled_join_over<'a>(
                 }
                 let at = usize::from(scan.param_count);
                 if at == MAX_JOIN_PARAMS {
-                    return Ok(None);
+                    return Err(join_params_full());
                 }
                 scan.params[at] = (class_id as u8, other.rel);
                 scan.param_others[at] = other.nulling | other.reads;
@@ -3546,22 +3679,14 @@ fn modeled_join_over<'a>(
     // relations' rows).
     let mut rels = [None::<ModeledRel<'a>>; MAX_JOIN_RELS];
     let mut planned_paths = [None::<super::paths::JoinRelPaths<'a>>; MAX_JOIN_RELS];
-    let mut needed = [NeededColumn {
-        rel: 0,
-        column: 0,
-        width: 0.0,
-        needed_by: Relids::EMPTY,
-        output: false,
-    }; 64 * 2];
-    let mut needed_count = 0;
+    let mut needed = crate::mem::arena::ArenaList::<NeededColumn>::new(arena);
     let mut rel_rows = [0.0f64; MAX_JOIN_RELS];
     // The indexes each relation's first sizing found, which the
     // extracted restrictions' estimates read.
     let mut sized_indexes = [&[][..]; MAX_JOIN_RELS];
     // Each join `OR` clause's selectivity divisors, one per restriction
     // extracted from it (`consider_new_or_clause`).
-    let mut or_divisors = [[0.0f64; MAX_JOIN_RELS]; MAX_CLAUSES];
-    let mut or_divisor_count = [0u8; MAX_CLAUSES];
+    let mut or_divisors = crate::mem::arena::ArenaList::<(usize, f64)>::new(arena);
     // Sizing, sizing again with the restrictions extracted from join `OR`
     // clauses, then the paths.
     for pass in 0..3 {
@@ -3570,7 +3695,10 @@ fn modeled_join_over<'a>(
             let mut extracted = false;
             for table in 0..n {
                 let relids: Relids = Relids::of(table);
-                for (id, clause) in clauses[..placed_join_count].iter().enumerate() {
+                for (id, clause) in clauses.borrowed_slice()[..placed_join_count]
+                    .iter()
+                    .enumerate()
+                {
                     if clause.form != ClauseForm::Other
                         || !clause.in_joininfo_of(relids)
                         || clause.relids & relids == Relids::EMPTY
@@ -3633,9 +3761,9 @@ fn modeled_join_over<'a>(
                         Some(held) => and(held, restriction, arena)?,
                     });
                     if or_selectivity > 0.0 {
-                        let count = usize::from(or_divisor_count[id]);
-                        or_divisors[id][count] = or_selectivity;
-                        or_divisor_count[id] += 1;
+                        or_divisors
+                            .push((id, or_selectivity))
+                            .map_err(|_| crate::sql::eval::arena_full())?;
                     }
                     extracted = true;
                 }
@@ -3710,22 +3838,20 @@ fn modeled_join_over<'a>(
                 .map(|&column| usize::from(column))
                 .filter(|&column| above & 1 << column != 0)
             {
-                if needed_count == needed.len() {
-                    return Ok(None);
-                }
-                needed[needed_count] = NeededColumn {
-                    rel: table as u8,
-                    column: column as u16,
-                    width: if prepared.false_relids == Relids::of(table) {
-                        0.0
-                    } else {
-                        f64::from(super::column_width(storage, txid, slot, column))
-                    },
-                    needed_by: prepared.needed_by((table as u8, column as u16))
-                        & !Relids::of(table),
-                    output: output[table] & 1 << column != 0,
-                };
-                needed_count += 1;
+                needed
+                    .push(NeededColumn {
+                        rel: table as u8,
+                        column: column as u16,
+                        width: if prepared.false_relids == Relids::of(table) {
+                            0.0
+                        } else {
+                            f64::from(super::column_width(storage, txid, slot, column))
+                        },
+                        needed_by: prepared.needed_by((table as u8, column as u16))
+                            & !Relids::of(table),
+                        output: output[table] & 1 << column != 0,
+                    })
+                    .map_err(|_| crate::sql::eval::arena_full())?;
             }
             rels[table] = Some(ModeledRel {
                 scan,
@@ -3738,34 +3864,32 @@ fn modeled_join_over<'a>(
     // counts (`get_expr_width`).
     for id in 0..expressions.count {
         let expression = expressions.get(id);
-        if needed_count == needed.len() {
-            return Ok(None);
-        }
-        needed[needed_count] = NeededColumn {
-            rel: expression.rel,
-            column: Member::expression(expression.rel, id as u16).column,
-            width: expression.width,
-            needed_by: Relids::EMPTY,
-            output: false,
-        };
-        needed_count += 1;
+        needed
+            .push(NeededColumn {
+                rel: expression.rel,
+                column: Member::expression(expression.rel, id as u16).column,
+                width: expression.width,
+                needed_by: Relids::EMPTY,
+                output: false,
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
     }
     // The join clauses the base relations' index paths derive, in the
     // order and orientation `create_index_paths` creates them: each index's
     // key columns equated with the other members of their class, then the
     // clauses its parameterized paths move into the scan
     // (`get_baserel_parampathinfo`).
-    let mut derive = |class: u8, left: u8, right: u8| -> Option<u8> {
-        let found = clauses[..clause_count].iter().position(|clause| {
+    let mut derive = |class: u8, left: u8, right: u8| -> Result<ClauseId, SqlError> {
+        let found = clauses.borrowed_slice().iter().position(|clause| {
             clause.source.is_none()
                 && matches!(clause.form, ClauseForm::Equality { class: c, left: l, right: r }
                     if c == class && ((l, r) == (left, right) || (l, r) == (right, left)))
         });
         if let Some(at) = found {
-            return Some(at as u8);
+            return Ok(at as ClauseId);
         }
-        if clause_count == MAX_CLAUSES {
-            return None;
+        if clauses.len() == MAX_CLAUSES {
+            return Err(super::joins::too_many_clauses());
         }
         let members = classes[usize::from(class)].members();
         let relids = members[usize::from(left)].relids() | members[usize::from(right)].relids();
@@ -3774,26 +3898,27 @@ fn modeled_join_over<'a>(
                 .expression_id()
                 .map_or(0.0, |id| expressions.get(id).cost)
         };
-        clauses[clause_count] = Clause {
-            form: ClauseForm::Equality { class, left, right },
-            relids,
-            required: relids,
-            pushed_down: true,
-            clone: super::joins::CloneKind::None,
-            incompatible: Relids::EMPTY,
-            cost: costs.cpu_operator
-                + member_cost(members[usize::from(left)])
-                + member_cost(members[usize::from(right)]),
-            selectivity: None,
-            outer_selectivity: None,
-            outer_relids: Relids::EMPTY,
-            operands: None,
-            other: super::joins::OtherShape::Plain,
-            constant: false,
-            source: None,
-        };
-        clause_count += 1;
-        Some(clause_count as u8 - 1)
+        clauses
+            .push(Clause {
+                form: ClauseForm::Equality { class, left, right },
+                relids,
+                required: relids,
+                pushed_down: true,
+                clone: super::joins::CloneKind::None,
+                incompatible: Relids::EMPTY,
+                cost: costs.cpu_operator
+                    + member_cost(members[usize::from(left)])
+                    + member_cost(members[usize::from(right)]),
+                selectivity: None,
+                outer_selectivity: None,
+                outer_relids: Relids::EMPTY,
+                operands: None,
+                other: super::joins::OtherShape::Plain,
+                constant: false,
+                source: None,
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        Ok((clauses.len() - 1) as ClauseId)
     };
     // `reduce_unique_semijoins` runs before the base relations' paths: for
     // a semi join to one relation with a unique index
@@ -3821,7 +3946,7 @@ fn modeled_join_over<'a>(
         let joined = special.min_left | inner;
         for class in 0..class_count as u8 {
             let held = &classes[usize::from(class)];
-            if held.has_const || held.count <= 1 {
+            if held.has_const || held.count() <= 1 {
                 continue;
             }
             let first = |side: Relids| {
@@ -3830,10 +3955,8 @@ fn modeled_join_over<'a>(
                         && member.relids() & !side == Relids::EMPTY
                 })
             };
-            if let (Some(outer), Some(within)) = (first(special.min_left), first(inner))
-                && derive(class, outer as u8, within as u8).is_none()
-            {
-                return Ok(None);
+            if let (Some(outer), Some(within)) = (first(special.min_left), first(inner)) {
+                derive(class, outer as u8, within as u8)?;
             }
         }
     }
@@ -3881,19 +4004,22 @@ fn modeled_join_over<'a>(
         };
         // The clauses a path parameterized by `param` moves into the scan:
         // the outer joins' movable clauses, then one per class.
-        let moved = |param: Relids, derive: &mut dyn FnMut(u8, u8, u8) -> Option<u8>| {
+        let moved = |param: Relids,
+                     derive: &mut dyn FnMut(u8, u8, u8) -> Result<ClauseId, SqlError>|
+         -> Result<Option<ClauseList>, SqlError> {
             let mut list = ClauseList::EMPTY;
             let params = &rel.scan.params[..usize::from(rel.scan.param_count)];
             for (at, (&(_, other), clause)) in params.iter().zip(param_clause[table]).enumerate() {
                 if let Some(id) = clause
                     && (Relids::of(other) | rel.scan.param_others[at]) & !param == Relids::EMPTY
                 {
-                    list.push_id(id)?;
+                    list.push_id(id)
+                        .ok_or_else(super::joins::too_many_clauses)?;
                 }
             }
             for class in 0..class_count as u8 {
                 let held = &classes[usize::from(class)];
-                if held.has_const || held.count <= 1 {
+                if held.has_const || held.count() <= 1 {
                     continue;
                 }
                 let Some(own) = member_of(class, None) else {
@@ -3909,7 +4035,7 @@ fn modeled_join_over<'a>(
                         .iter()
                         .any(|member| member.relids() & !param == Relids::EMPTY)
                 {
-                    return None;
+                    return Ok(None);
                 }
                 let Some(outer) = held
                     .members()
@@ -3918,9 +4044,10 @@ fn modeled_join_over<'a>(
                 else {
                     continue;
                 };
-                list.push_id(derive(class, outer as u8, own as u8)?)?;
+                list.push_id(derive(class, outer as u8, own as u8)?)
+                    .ok_or_else(super::joins::too_many_clauses)?;
             }
-            Some(list)
+            Ok(Some(list))
         };
         let mut enforced = [ClauseList::EMPTY; 128];
         for (index_at, index) in paths.indexes.iter().enumerate() {
@@ -3940,21 +4067,20 @@ fn modeled_join_over<'a>(
                     continue;
                 }
                 let held = &classes[usize::from(class)];
-                if held.has_const || held.count <= 1 {
+                if held.has_const || held.count() <= 1 {
                     continue;
                 }
                 let own = member_of(class, Some(column)).expect("a class of the relation") as u8;
                 for (other, member) in held.members().iter().enumerate() {
-                    if usize::from(member.rel) != table && derive(class, own, other as u8).is_none()
-                    {
-                        return Ok(None);
+                    if usize::from(member.rel) != table {
+                        derive(class, own, other as u8)?;
                     }
                 }
             }
             for (at, candidate) in paths.candidates.iter().enumerate() {
                 if usize::from(candidate.describe.index) == index_at && !candidate.param.is_empty()
                 {
-                    let Some(list) = moved(candidate.param, &mut derive) else {
+                    let Some(list) = moved(candidate.param, &mut derive)? else {
                         return Ok(None);
                     };
                     enforced[at] = list;
@@ -3963,7 +4089,7 @@ fn modeled_join_over<'a>(
         }
         for (at, candidate) in paths.candidates.iter().enumerate() {
             if !candidate.param.is_empty() && candidate.describe.index == u16::MAX {
-                let Some(list) = moved(candidate.param, &mut derive) else {
+                let Some(list) = moved(candidate.param, &mut derive)? else {
                     return Ok(None);
                 };
                 enforced[at] = list;
@@ -4048,7 +4174,7 @@ fn modeled_join_over<'a>(
                 .iter()
                 .position(|member| member.rel == other_rel && member.reads == reads)
                 .expect("a member of the other relations") as u8;
-            let reversed = clauses[..clause_count].iter().any(|clause| {
+            let reversed = clauses.borrowed_slice().iter().any(|clause| {
                 clause.source.is_none()
                     && clause.form
                         == ClauseForm::Equality {
@@ -4208,7 +4334,12 @@ fn modeled_join_over<'a>(
             * costs.cpu_operator
     };
     let mut single_rel_columns = [0u64; MAX_JOIN_RELS];
-    for (id, clause) in clauses[..placed_join_count].iter_mut().enumerate() {
+    for (id, clause) in clauses
+        .as_mut_slice()
+        .map_err(|_| crate::sql::eval::arena_full())?[..placed_join_count]
+        .iter_mut()
+        .enumerate()
+    {
         if clause.form != ClauseForm::Other {
             continue;
         }
@@ -4259,9 +4390,11 @@ fn modeled_join_over<'a>(
         // The restrictions extracted from it divide its selectivity
         // (`norm_selec`), each quotient clamped to one.
         clause.selectivity = Some(
-            or_divisors[id][..usize::from(or_divisor_count[id])]
+            or_divisors
+                .borrowed_slice()
                 .iter()
-                .fold(selectivity, |held, &divisor| (held / divisor).min(1.0)),
+                .filter(|&&(clause, _)| clause == id)
+                .fold(selectivity, |held, &(_, divisor)| (held / divisor).min(1.0)),
         );
         clause.cost = cost;
         clause.other = match expression {
@@ -4347,7 +4480,10 @@ fn modeled_join_over<'a>(
                             // equating the pair, every copy.
                             *held = NO_KEY_CLASS;
                             let mut found = false;
-                            for (id, clause) in clauses[..placed_join_count].iter().enumerate() {
+                            for (id, clause) in clauses.borrowed_slice()[..placed_join_count]
+                                .iter()
+                                .enumerate()
+                            {
                                 let ClauseForm::Join { left, right, .. } = clause.form else {
                                     continue;
                                 };
@@ -4358,8 +4494,8 @@ fn modeled_join_over<'a>(
                                 if clause.in_joininfo_of(Relids::of(referencing))
                                     && (pair(left, right) || pair(right, left))
                                 {
-                                    if matched_clauses.push_id(id as u8).is_none() {
-                                        return Ok(None);
+                                    if matched_clauses.push_id(id as ClauseId).is_none() {
+                                        return Err(super::joins::too_many_clauses());
                                     }
                                     found = true;
                                 }
@@ -4406,14 +4542,10 @@ fn modeled_join_over<'a>(
                 for &entry in scope.merged_output() {
                     output_width += match entry {
                         ResolvedColumn::Table(table, column) => column_width((table, column)),
-                        ResolvedColumn::Merged(merged) => {
-                            let parts = merged_parts(merged);
-                            if parts.len() == 1 {
-                                column_width(parts[0])
-                            } else {
-                                type_width(scope.merged[merged].ctype)
-                            }
-                        }
+                        ResolvedColumn::Merged(merged) => match scope.merged_plain_var(merged) {
+                            Some(var) => column_width(var),
+                            None => type_width(scope.merged[merged].ctype),
+                        },
                         ResolvedColumn::TableOid(_) => {
                             return Ok(None);
                         }
@@ -4615,8 +4747,8 @@ fn modeled_join_over<'a>(
         specials: &prepared.specials[..prepared.special_count],
         subproblems,
         subproblem_items: &prepared.subproblem_items[..prepared.subproblem_item_count],
-        clauses: &clauses[..clause_count],
-        needed: &needed[..needed_count],
+        clauses: clauses.as_slice(),
+        needed: needed.as_slice(),
         expression_costs: &expression_costs,
         foreign_keys: &foreign_keys[..foreign_count],
         removed,
@@ -4786,15 +4918,6 @@ fn modeled_join_over<'a>(
     let rels = arena
         .alloc_slice_with(n, |table| rels[table].expect("planned"))
         .map_err(|_| crate::sql::eval::arena_full())?;
-    let columns = arena
-        .alloc_slice_with(class_count, |class| {
-            let mut columns = [(0usize, 0usize); MAX_MEMBERS];
-            for (at, member) in classes[class].members().iter().enumerate() {
-                columns[at] = (usize::from(member.rel), usize::from(member.column));
-            }
-            columns
-        })
-        .map_err(|_| crate::sql::eval::arena_full())?;
     let quals = arena
         .alloc_slice_copy(quals)
         .map_err(|_| crate::sql::eval::arena_full())?;
@@ -4804,7 +4927,7 @@ fn modeled_join_over<'a>(
     Ok(Some(ModeledJoin {
         plan,
         rels,
-        columns,
+        classes: &classes[..class_count],
         quals,
         output_width,
         final_width,
@@ -5025,14 +5148,46 @@ pub(crate) fn source<'a>(from: &'a FromClause<'a>, table: usize) -> &'a TableRef
     }
 }
 
-/// The FROM position and column a plain column reference reads.
+/// A class of `member` alone, in `arena`.
+fn single_member(member: Member, arena: &Arena) -> Result<&[Member], SqlError> {
+    Ok(arena
+        .alloc_slice_copy(&[member])
+        .map_err(|_| crate::sql::eval::arena_full())?)
+}
+
+/// A relation's scan equated with more relations than it holds join
+/// parameters for.
+fn join_params_full() -> SqlError {
+    crate::sql_err!(
+        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "join search capacity exceeded: an indexed relation's scan holds at most {} join clauses",
+        MAX_JOIN_PARAMS
+    )
+}
+
+/// The join preparation's capacities exceeded.
+fn preparation_full() -> SqlError {
+    crate::sql_err!(
+        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "join search capacity exceeded: a query holds at most {} conditions, {} equivalence classes of {} members and {} columns joins read",
+        join_tree::MAX_QUALS,
+        join_tree::MAX_CLASSES,
+        super::joins::MAX_MEMBERS,
+        join_tree::MAX_NEEDED
+    )
+}
+
+/// The FROM position and column a plain column reference reads: a merged
+/// `USING` column whose join alias variable is one column of its type
+/// (`flatten_join_alias_vars`) reads that column.
 pub(crate) fn column_of(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<(usize, usize)> {
     let Expr::Column { qualifier, name } = expression else {
         return None;
     };
     match scope.probe_column(*qualifier, name)? {
         ResolvedColumn::Table(table, column) => Some((table, column)),
-        _ => None,
+        ResolvedColumn::Merged(merged) => scope.merged_plain_var(merged),
+        ResolvedColumn::TableOid(_) => None,
     }
 }
 

@@ -60,6 +60,21 @@ fn pool_full(error: LeaseError) -> SqlError {
 }
 
 /// How a hash aggregate's groups are keyed.
+/// Fails once the meta context's bucket array outgrows the chunk limit of
+/// a context PostgreSQL's freelist may hand it: after a hash aggregate built
+/// under `work_mem` below 1MB earlier in the session, aset.c reuses that
+/// aggregate's work context, smaller chunk limit and all, and pos3ql does
+/// not track which context the freelist returns.
+fn check_context_reuse(memory: &HashAggMemory) -> Result<(), SqlError> {
+    if memory.reuse_unmodeled() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "the memory of a hash aggregate after an earlier hash aggregate of this session ran with work_mem below 1MB is not supported: PostgreSQL reuses that aggregate's memory context, which pos3ql does not model; start a new session, or run every hash aggregate of the session with work_mem of at least 1MB"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) trait GroupKeys {
     /// The hash `TupleHashTableHash` gives the row's keys.
     fn hash(&mut self, row: &[u8]) -> Result<u32, SqlError>;
@@ -468,6 +483,8 @@ impl<K: GroupKeys> HashAgg<K> {
                 sizing.columns
             )
         })?;
+        crate::sql::guc::note_hash_aggregate();
+        check_context_reuse(&memory)?;
         Ok(Self {
             keys,
             memory,
@@ -544,6 +561,7 @@ impl<K: GroupKeys> HashAgg<K> {
         // probe run grown too long, which no fill factor announces.
         self.memory.grow_buckets_to(self.table.buckets());
         self.memory.lookup(new);
+        check_context_reuse(&self.memory)?;
         if new.is_some() && self.memory.spilled() {
             self.enter_spill_mode()?;
         }
@@ -768,7 +786,16 @@ impl GroupKeys for ProjectedKeys<'_> {
     }
 
     fn entry_len(&mut self, row: &[u8]) -> Result<usize, SqlError> {
-        crate::sql::query::postgres_memory::projected_tuple_len(None, row, Some(self.columns))
+        // A composite value's fields are sized through the catalog.
+        let sizing = crate::sql::query::postgres_memory::Sizing {
+            catalog: Some((self.storage, self.txid)),
+            scratch: self.arena,
+        };
+        crate::sql::query::postgres_memory::projected_tuple_len(
+            Some(&sizing),
+            row,
+            Some(self.columns),
+        )
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,

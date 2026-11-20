@@ -31,6 +31,7 @@ mod append;
 mod clauses;
 mod expressions;
 mod extended;
+mod group_keys;
 mod grouping_sets;
 pub(crate) mod join_query;
 mod join_tree;
@@ -40,10 +41,11 @@ mod paths;
 mod predicate;
 
 pub(crate) use expressions::{ExpressionVariables, KeyReader};
+pub(crate) use group_keys::{GroupKeys, GroupVariable};
 
 pub(crate) use aggregate::{
     AggInput, AggStrategy, AggregateCosts, aggregate_costs, cost_agg, hash_agg_sizing,
-    having_quals, plain_hash_sizing,
+    having_quals, plain_hash_sizing, target_cost,
 };
 pub(crate) use append::{AppendKind, MemberPath, TreePath, member_path, member_scope};
 pub(crate) use grouping_sets::{
@@ -2183,6 +2185,15 @@ pub(crate) struct GroupingShape {
     pub(crate) order: GroupOrder,
     /// The `HAVING` qualification's cost and selectivity.
     pub(crate) having: Option<aggregate::QualCosts>,
+    /// Each key of `columns` as `estimate_num_groups` reads it, when a key
+    /// is an expression; `None` reads every key as its column.
+    pub(crate) variables: Option<[GroupVariable; MAX_ORDER_KEYS]>,
+    /// The per-group cost of the grouping's target list
+    /// (`create_agg_path`'s tlist evaluation).
+    pub(crate) target_per_group: f64,
+    /// The grouping is a `DISTINCT`, whose sorted strategy is a `Unique`
+    /// that evaluates no target list.
+    pub(crate) distinct: bool,
 }
 
 /// How the query's `ORDER BY` relates to its grouping.
@@ -2662,6 +2673,81 @@ fn projection<'a>(
         wide,
         plain,
     }))
+}
+
+/// The target list a grouping of the one table of `scope` reads from its
+/// scan (`make_group_input_target`): each grouping key `keys` holds, then
+/// every column the other expressions `others` read (the select list,
+/// `HAVING` and `ORDER BY` entries that are no key, aggregate arguments
+/// included). `None` when an entry is outside the model.
+pub(crate) fn grouping_projection<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'a>,
+    keys: &[&'a Expr<'a>],
+    others: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<Option<Projection>, SqlError> {
+    let Some(definition) = scope.defs.stored(0) else {
+        return Ok(None);
+    };
+    let statistics = storage.table_statistics(scope.slots[0], txid);
+    let mut projection = Projection {
+        width: 0,
+        per_tuple: 0.0,
+        expression_width: 0,
+        columns: [0; 64],
+        wide: false,
+        plain: false,
+    };
+    let mut listed = ColumnSet::EMPTY;
+    let mut add_column = |projection: &mut Projection, column: usize| {
+        if listed.contains(column) {
+            return;
+        }
+        listed.insert(column);
+        projection.width += output_width(
+            definition,
+            &statistics,
+            Some(ColumnSet::from_column(column)),
+        );
+        match projection.columns.get_mut(column) {
+            Some(count) => *count = count.saturating_add(1),
+            None => projection.wide = true,
+        }
+    };
+    for &key in keys {
+        let Some((width, cost, column)) =
+            target_entry(storage, txid, scope, definition, &statistics, key, arena)
+        else {
+            return Ok(None);
+        };
+        match column {
+            Some(column) => add_column(&mut projection, column),
+            None => {
+                projection.width += width;
+                projection.per_tuple += cost;
+                projection.expression_width += width;
+            }
+        }
+    }
+    for other in others {
+        let mut foreign = false;
+        let mut read = ColumnSet::EMPTY;
+        other.for_each_column_reference(&mut |qualifier, name| match scope
+            .find_column(qualifier, name)
+        {
+            Ok(ResolvedColumn::Table(0, column)) => read.insert(column),
+            _ => foreign = true,
+        });
+        if foreign {
+            return Ok(None);
+        }
+        for column in read.iter() {
+            add_column(&mut projection, column);
+        }
+    }
+    Ok(Some(projection))
 }
 
 /// `expression` without a cast of a column of the one relation of `scope`

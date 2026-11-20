@@ -286,8 +286,8 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 - [ ] Retire the legacy `EXPLAIN` path: a plan outside the PostgreSQL model
   either matches PostgreSQL or fails with `0A000`. Today `COSTS OFF` and
   `EXPLAIN ANALYZE` print pos3ql's own plan for such queries (hashing the
-  second of two relations, nested loops for three or more, sorting before
-  `DISTINCT ... ORDER BY`, `HashAggregate` for a false condition, no flattened
+  second of two relations, nested loops for three or more, sorting before a
+  join's `DISTINCT ... ORDER BY`, `HashAggregate` for a false condition, no flattened
   distinct union of more than two inputs, `Unique` before `Sort`,
   `top-N heapsort` reported as `external merge` once input spills).
 - [ ] Single-table index paths, each `0A000` in `EXPLAIN` today: non-btree
@@ -396,14 +396,10 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   size them, so a join's hashed `GROUP BY` that spills and `EXPLAIN ANALYZE`
   of hash aggregates with `numeric` sums, text `min`/`max`, collecting
   aggregates or more than seven grouping columns stop failing with `0A000`.
-- [ ] *In progress:* hash order of named composite keys and `record[]` keys,
-  then arrays, records, ranges, `jsonb`, bit strings and `money` (a grouping
-  over them whose `ORDER BY` omits a key fails with `0A000`).
 - [ ] *In progress:* `GROUP BY` state streams instead of materializing.
 - [ ] *In progress:* route every sort through the `tuplesort` model: the
   modeled-join grouping sort and incremental sort batches are charged against
-  `work_mem`; `DISTINCT` of expressions or with `ORDER BY`, and one-table
-  `GROUP BY`s outside the model (expression keys, unsized states) use it.
+  `work_mem`.
 - [ ] *In progress:* multi-chunk external sort: rows beyond the external
   sorter's first 256 KiB chunk sort ties in PostgreSQL's order (needs
   `work_mem`-sized run buffers and a streaming merge over up to 500 tapes); a
@@ -414,14 +410,14 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   statistics figures match for values PostgreSQL compresses or stores out of
   line (rows over about 2 kB).
 - [ ] Hash aggregates inherit `aset.c`'s recycled executor context after a
-  differently shaped statement (a 64 kB `SELECT DISTINCT` of 5,000 groups
-  after an `EXPLAIN` holds 676 groups rather than 461 in its first table).
+  session's hash aggregate under `work_mem` below 1MB (`0A000` from the next
+  statement on while the bucket array is within 8 kB).
 - [ ] `EXPLAIN ANALYZE` of a hash aggregate that spills rows holding columns
   besides its keys, or whose group estimate lies outside the cost model
   (`0A000`).
 - [ ] Enum grouping order: enum OIDs come from pos3ql's identity band, so a
   hashed enum grouping's order cannot match a PostgreSQL cluster's (`925`).
-- [ ] `DISTINCT` with an `ORDER BY` on some of its columns, and the arrival
+- [ ] A join's `DISTINCT` with an `ORDER BY` on some of its columns, and the arrival
   order of tables whose rows vary in width (PostgreSQL's free space map).
 - [ ] Unique index builds PostgreSQL would sort in parallel or beyond 64 MB
   `maintenance_work_mem` (`0A000` on duplicates).

@@ -331,6 +331,12 @@ pub(crate) fn raw_value_length(value: &Datum<'_>) -> usize {
         }
         Datum::Array { element, raw } => array_data_length(*element, raw),
         Datum::TsVector(text) => tsvector_data_length(text.as_str()),
+        // PostgreSQL's binary `jsonb`, range and multirange images, not
+        // their text.
+        Datum::Json { jsonb: true, .. } | Datum::Range { .. } | Datum::Multirange { .. } => {
+            crate::sql::query::postgres_memory::varlena_payload(None, value)
+                .expect("a jsonb, range or multirange image has a size")
+        }
         other => {
             crate::storage::rowenc::encoded_len(core::slice::from_ref(other)).saturating_sub(3)
         }

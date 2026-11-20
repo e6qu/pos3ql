@@ -45,6 +45,7 @@ mod full_join_merged_keys;
 mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;
+mod hash_aggregate_context_reuse;
 mod hash_outer_joins;
 mod index_expression_mutability;
 mod index_parent_ownership;
@@ -87285,7 +87286,7 @@ fn external_runs_use_object_storage_after_cold_cache(phase: ExternalRunPhase) {
             data_rows(&run_with(
                 &mut restarted,
                 &mut restarted_budget,
-                "SELECT DISTINCT id % 17 FROM external_rows",
+                "SELECT DISTINCT id % 17 FROM external_rows ORDER BY 1",
             )),
             [
                 "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14",

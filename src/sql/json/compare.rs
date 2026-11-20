@@ -275,6 +275,120 @@ pub(crate) fn compare_jsonb(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// `JB_FARRAY` and `JB_FOBJECT`, which `jsonb_hash` mixes in at each
+/// container's start.
+const JSONB_ARRAY: u32 = 0x4000_0000;
+const JSONB_OBJECT: u32 = 0x2000_0000;
+
+/// `jsonb_hash` of a canonical `jsonb` document: each token in
+/// `JsonbIteratorNext` order (a container's start mixes in its flag, each
+/// key, value and element its scalar's hash after a left rotation), a
+/// scalar document read as a one-element raw-scalar array and an empty
+/// container hashing to zero. `scratch` holds an escaped string decoded and
+/// a number parsed while each is hashed.
+/// https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/jsonb_op.c
+pub(crate) fn hash_jsonb(
+    text: &str,
+    scratch: &crate::mem::arena::Arena,
+) -> Result<u32, crate::sql::eval::SqlError> {
+    let mut scan = Scan {
+        text: text.as_bytes(),
+        at: 0,
+    };
+    let kind = scan.kind();
+    if matches!(kind, Kind::Array | Kind::Object) && scan.members() == 0 {
+        return Ok(0);
+    }
+    let mut hash = 0u32;
+    if kind < Kind::Array {
+        hash ^= JSONB_ARRAY;
+    }
+    hash_value(&mut scan, &mut hash, scratch)?;
+    Ok(hash)
+}
+
+/// Mixes the next value of `scan` into `hash` as `jsonb_hash` does.
+fn hash_value(
+    scan: &mut Scan<'_>,
+    hash: &mut u32,
+    scratch: &crate::mem::arena::Arena,
+) -> Result<(), crate::sql::eval::SqlError> {
+    let kind = scan.kind();
+    match kind {
+        Kind::Array | Kind::Object => {
+            let object = kind == Kind::Object;
+            *hash ^= if object { JSONB_OBJECT } else { JSONB_ARRAY };
+            let count = scan.members();
+            scan.bump();
+            for _ in 0..count {
+                if object {
+                    let key = scan.scalar();
+                    mix_scalar(Kind::String, key, hash, scratch)?;
+                    scan.peek();
+                    scan.bump();
+                }
+                hash_value(scan, hash, scratch)?;
+                if scan.peek() == b',' {
+                    scan.bump();
+                }
+            }
+            scan.peek();
+            scan.bump();
+        }
+        scalar => {
+            let value = scan.scalar();
+            mix_scalar(scalar, value, hash, scratch)?;
+        }
+    }
+    Ok(())
+}
+
+/// `JsonbHashScalarValue`: rotates `hash` left a bit and mixes in the
+/// scalar's hash (a string's bytes, `hash_numeric`, a boolean's or null's
+/// constant).
+fn mix_scalar(
+    kind: Kind,
+    text: &str,
+    hash: &mut u32,
+    scratch: &crate::mem::arena::Arena,
+) -> Result<(), crate::sql::eval::SqlError> {
+    let scalar = match kind {
+        Kind::Null => 0x01,
+        Kind::Bool => {
+            if text == "true" {
+                0x02
+            } else {
+                0x04
+            }
+        }
+        Kind::String => {
+            if text.contains('\\') {
+                let mut decoded = crate::mem::arena::ArenaList::new(scratch);
+                let mut chars = text.chars();
+                while let Some(code) = next_char(&mut chars) {
+                    let character = char::from_u32(code).unwrap_or('\u{fffd}');
+                    let mut held = [0u8; 4];
+                    for &byte in character.encode_utf8(&mut held).as_bytes() {
+                        decoded
+                            .push(byte)
+                            .map_err(|_| crate::sql::eval::arena_full())?;
+                    }
+                }
+                crate::sql::identity::hash_bytea(decoded.as_slice()) as u32
+            } else {
+                crate::sql::identity::hash_bytea(text.as_bytes()) as u32
+            }
+        }
+        Kind::Number => {
+            let value = crate::sql::numeric::Numeric::parse(text, scratch)?;
+            crate::sql::query::join_exec::numeric_hash(&value)
+        }
+        Kind::Array | Kind::Object => unreachable!("a scalar kind"),
+    };
+    *hash = hash.rotate_left(1) ^ scalar;
+    Ok(())
+}
+
 #[cfg(all(
     test,
     not(all(miri, feature = "miri-ownership")),

@@ -647,6 +647,9 @@ pub struct QueryScope<'d> {
     deferred_joins: &'d mut [Option<&'d crate::sql::ast::Select<'d>>],
     /// Parenthesized joins added now wait rather than run.
     defer_joins: bool,
+    /// The statement reading the FROM items being added, which decides
+    /// whether a derived table's row order can show.
+    consumer: Option<&'d crate::sql::ast::Select<'d>>,
     /// Whether the FROM item being added is the query's only one, so a
     /// foreign table there streams instead of being read whole first.
     sole_source: bool,
@@ -1608,6 +1611,7 @@ impl<'d> QueryScope<'d> {
             lazy_ctes,
             deferred_joins,
             defer_joins: false,
+            consumer: None,
             sole_source: false,
             lateral,
             func_scalar,
@@ -2099,7 +2103,7 @@ impl<'d> QueryScope<'d> {
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<QueryScope<'a>, SqlError> {
         Self::resolve_exec_pushed(
-            storage, from, predicate, txid, arena, params, sequences, outer, None, false,
+            storage, from, predicate, txid, arena, params, sequences, outer, None, false, None,
         )
     }
 
@@ -2107,6 +2111,7 @@ impl<'d> QueryScope<'d> {
     /// `pushed` planned. With `defer_joins`, the queries of its unaliased
     /// parenthesized joins wait: the join search runs their members, and
     /// another plan runs them first ([`QueryScope::run_deferred_joins`]).
+    /// `consumer` is the statement reading the FROM items, when it is known.
     #[expect(
         clippy::too_many_arguments,
         reason = "scope construction carries explicit query restrictions and execution context"
@@ -2122,9 +2127,11 @@ impl<'d> QueryScope<'d> {
         outer: Option<&dyn ColumnLookup<'a>>,
         pushed: Option<&crate::sql::foreign::deparse::ForeignSelectPlan<'a>>,
         defer_joins: bool,
+        consumer: Option<&'a crate::sql::ast::Select<'a>>,
     ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
         scope.defer_joins = defer_joins;
+        scope.consumer = consumer;
         scope.sole_source = from.joins.is_empty();
         scope.add_exec(
             storage,
@@ -2155,6 +2162,7 @@ impl<'d> QueryScope<'d> {
         }
         scope.right_of_outer_join = false;
         scope.defer_joins = false;
+        scope.consumer = None;
         scope.check_join_conditions(from, outer, None)?;
         scope.build_merges(from, arena, Some(arena))?;
         scope.name_repeated_columns(arena)?;
@@ -2601,8 +2609,19 @@ impl<'d> QueryScope<'d> {
             self.register_join_members(storage, tref, txid, arena)?;
             return Ok(());
         }
-        let (rows, external_run) =
-            Self::run_derived(storage, sub, self.n, txid, arena, params, outer, sequences)?;
+        // A reader whose output the derived table's row order cannot change
+        // lets the derived query return its rows in any order.
+        let order = match self.consumer {
+            Some(consumer) if self.sole_source && !tref.lateral => super::group::derived_row_order(
+                consumer,
+                exposed,
+                &definition.columns[..definition.n_columns],
+            ),
+            _ => super::group::RowOrder::Observed,
+        };
+        let (rows, external_run) = Self::run_derived(
+            storage, sub, self.n, order, txid, arena, params, outer, sequences,
+        )?;
         self.names[self.n] = exposed;
         self.derived[self.n] = Some(rows);
         self.external_runs[self.n] = external_run;
@@ -2614,12 +2633,14 @@ impl<'d> QueryScope<'d> {
     }
 
     /// Runs the derived table `sub` at scope entry `position`: its rows, or
-    /// the external run holding them.
+    /// the external run holding them. `order` says whether its reader can
+    /// tell the order its rows come in.
     #[allow(clippy::too_many_arguments)]
     fn run_derived<'a>(
         storage: &'a Storage,
         sub: &'a crate::sql::ast::Select<'a>,
         position: usize,
+        order: super::group::RowOrder,
         txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
@@ -2639,34 +2660,36 @@ impl<'d> QueryScope<'d> {
         let _block = super::instrument::enter(super::instrument::Segment::Derived(
             u16::try_from(position).unwrap_or(u16::MAX),
         ));
+        let select_rows =
+            |emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>| match order {
+                super::group::RowOrder::Observed => {
+                    select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
+                }
+                super::group::RowOrder::Unobserved => {
+                    super::group::with_unobserved_order(sub, || {
+                        select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
+                    })
+                }
+            };
         if storage.spill_attached() {
             // A stable all-equal sort is an insertion-order spool. Resetting
             // one leased producer cannot disturb a nested child's producer.
             let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
             let mut sorter = storage.external_sorter()?;
             sorter.reset();
-            select_into_rows(
-                storage,
-                txid,
-                sub,
-                arena,
-                params,
-                outer,
-                sequences,
-                &mut |values| {
-                    storage
-                        .with_block_store(|blocks| {
-                            sorter.push_projected_by(
-                                storage,
-                                blocks,
-                                values.len(),
-                                |column| values[column],
-                                &mut compare,
-                            )
-                        })
-                        .expect("spill-attached block store")
-                },
-            )?;
+            select_rows(&mut |values| {
+                storage
+                    .with_block_store(|blocks| {
+                        sorter.push_projected_by(
+                            storage,
+                            blocks,
+                            values.len(),
+                            |column| values[column],
+                            &mut compare,
+                        )
+                    })
+                    .expect("spill-attached block store")
+            })?;
             external_run = storage
                 .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
                 .expect("spill-attached block store")?;
@@ -2678,33 +2701,24 @@ impl<'d> QueryScope<'d> {
             let mut store: *mut &[u8] = core::ptr::null_mut();
             let mut len = 0usize;
             let mut cap = 0usize;
-            select_into_rows(
-                storage,
-                txid,
-                sub,
-                arena,
-                params,
-                outer,
-                sequences,
-                &mut |values| {
-                    let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
-                    if len == cap {
-                        let new_cap = if cap == 0 { 8 } else { cap * 2 };
-                        let fresh: &mut [&[u8]] = arena
-                            .alloc_slice_with(new_cap, |_| EMPTY)
-                            .map_err(|_| arena_full())?;
-                        if len > 0 {
-                            let old = unsafe { core::slice::from_raw_parts(store, len) };
-                            fresh[..len].copy_from_slice(old);
-                        }
-                        store = fresh.as_mut_ptr();
-                        cap = new_cap;
+            select_rows(&mut |values| {
+                let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
+                if len == cap {
+                    let new_cap = if cap == 0 { 8 } else { cap * 2 };
+                    let fresh: &mut [&[u8]] = arena
+                        .alloc_slice_with(new_cap, |_| EMPTY)
+                        .map_err(|_| arena_full())?;
+                    if len > 0 {
+                        let old = unsafe { core::slice::from_raw_parts(store, len) };
+                        fresh[..len].copy_from_slice(old);
                     }
-                    unsafe { store.add(len).write(encoded) };
-                    len += 1;
-                    Ok(())
-                },
-            )?;
+                    store = fresh.as_mut_ptr();
+                    cap = new_cap;
+                }
+                unsafe { store.add(len).write(encoded) };
+                len += 1;
+                Ok(())
+            })?;
             rows = if len == 0 {
                 &[]
             } else {
@@ -2733,7 +2747,15 @@ impl<'d> QueryScope<'d> {
         for position in 0..self.n {
             if let Some(sub) = self.deferred_joins[position].take() {
                 let (rows, external_run) = Self::run_derived(
-                    storage, sub, position, txid, arena, params, None, sequences,
+                    storage,
+                    sub,
+                    position,
+                    super::group::RowOrder::Observed,
+                    txid,
+                    arena,
+                    params,
+                    None,
+                    sequences,
                 )?;
                 self.derived[position] = Some(rows);
                 self.external_runs[position] = external_run;

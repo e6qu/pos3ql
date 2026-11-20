@@ -3070,7 +3070,7 @@ fn record_field_index_metadata(
     Ok(selected)
 }
 
-fn expression_static_metadata(
+pub(crate) fn expression_static_metadata(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
 ) -> Option<StaticTypeMeta> {

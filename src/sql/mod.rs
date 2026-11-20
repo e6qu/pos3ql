@@ -22813,6 +22813,7 @@ impl Engine {
         responder: &mut Responder,
         timeout_entry: StatementTimeoutEntry,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        guc.begin_statement();
         // PL/pgSQL loads before a DO block or a PL/pgSQL routine's validator
         // runs, and after any other statement that first ran PL/pgSQL.
         guc::take_plpgsql_use();
@@ -22840,12 +22841,19 @@ impl Engine {
             let txid = txn.txid;
             guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
         }
-        match result {
+        let result = match result {
             Ok(Err(error)) if crate::storage::is_memtable_full(&error) => {
                 Ok(Err(self.wait_for_memtable_room(txn, error)))
             }
             result => result,
+        };
+        if let Ok(Err(error)) = &result
+            && (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+        {
+            guc.discard_statement_attempt();
         }
+        result
     }
 
     /// A write found the memtable full. PostgreSQL has no such limit, so a

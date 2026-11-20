@@ -50,7 +50,7 @@ pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
 pub(crate) mod generator;
-mod join_exec;
+pub(crate) mod join_exec;
 pub(crate) use join_exec::{
     node_number as join_exec_node_number, scan_segment as join_exec_scan_segment,
 };
@@ -11267,6 +11267,27 @@ pub(super) fn resolve_position_target<'a>(
                 }
                 remaining -= width;
             }
+            // `(t).*` of a whole-row reference is the table's columns, as the
+            // grouping expands it.
+            SelectItem::RecordStar(
+                Expr::WholeRow(q)
+                | Expr::Column {
+                    qualifier: None,
+                    name: q,
+                },
+            ) if scope.is_some_and(|scope| {
+                scope.probe_column(None, q).is_none() && scope.has_entry_named(q)
+            }) =>
+            {
+                let scope = scope.expect("checked above");
+                let q: &str = q;
+                let width = scope.qualified_star_columns(q)?;
+                if remaining < width {
+                    let entry = scope.qualified_star_entry(q, remaining)?;
+                    return column_ref(Some(q), scope.output_name(entry));
+                }
+                remaining -= width;
+            }
             SelectItem::RecordStar(base) => {
                 let width = record_star_width(base, scope, outer, storage, txid, arena)?;
                 if remaining < width {
@@ -14684,6 +14705,7 @@ fn enter_scan_context<'a>(
             storage,
             txid,
             grouping,
+            statement.group_by.is_empty(),
             scope,
             from,
             resolved_columns,
@@ -14948,6 +14970,7 @@ pub(crate) fn select_query_resumable<'a>(
         None,
         pushed.as_ref(),
         true,
+        Some(statement),
     ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),

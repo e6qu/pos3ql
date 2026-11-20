@@ -14,7 +14,7 @@ use super::eval::SqlError;
 use super::numeric::Numeric;
 use core::fmt::Write as _;
 
-mod compare;
+pub(crate) mod compare;
 mod lexer;
 pub(crate) use compare::compare_jsonb;
 pub(crate) use lexer::SyntaxError;

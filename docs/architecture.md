@@ -74,7 +74,7 @@ after a wait that would download a block a third time, or one more distinct
 block than `statement_restart_waits` (default 64), reads the rest of the
 statement synchronously. With `block_cache_bytes = 0` and `disk_cache_bytes =
 0`, `SELECT ... UNION ALL ...` over three cold tables therefore waits a few
-times and then finishes, where it used to restart forever.
+times and then finishes.
 
 The rule for statements: a statement can yield until it performs its first
 **effect** — something a restart could not undo or repeat. Effects are calling
@@ -662,11 +662,10 @@ types:
 
 Either way a group folds its rows in input order with the general
 executor's aggregate states, each initialized once per aggregate and copied
-for every group (the general executor now does the same). Transition states never cross a wait inside a
+for every group. Transition states never cross a wait inside a
 row: only reading input waits, and folding calls no routine body. Groups
 come out in the general executor's order (keys ascending, NULLs last), each
-reporting its first input row's key as PostgreSQL's hashed grouping does
-(the general executor now does too). `HAVING` and the output list run per
+reporting its first input row's key as PostgreSQL's hashed grouping does. `HAVING` and the output list run per
 group as its row is returned, so a routine call there hands off on its row.
 An error in an aggregate's input is reported before the first row; one in
 an aggregate's result (an overflowing `sum`), `HAVING` or the output list
@@ -1012,6 +1011,23 @@ gives the steps. A storage wait during publication resumes that publication; it
 never executes the command again. Standalone utilities with an immediate commit
 boundary, such as `CREATE DATABASE`, finish durable publication before their
 Execute response.
+
+### Catalog history at commit
+
+At commit, `catalog_snapshot::capture_transaction` synthesizes each catalog
+relation the transaction's changes can affect twice, as committed and as the
+transaction sees it, in the statement arena, and records the rows that differ.
+When every change edits one table (its definition, indexes, triggers, policies
+or statistics), `reached_tables` limits `pg_class`, `pg_attribute`,
+`pg_attrdef`, `pg_constraint`, `pg_depend`, `pg_index`, `pg_inherits` and
+`pg_trigger` to that table's partition or inheritance family and the tables
+one foreign key away with their families; other changes compare every table.
+`pg_proc` history includes only built-in routines with a per-database entry,
+so `CREATE FUNCTION` is bounded by the stored routines, not the 3,000-row
+built-in catalog. Test builds repeat every selected capture over all tables
+and fail on any difference. Committing 300 foreign-key-chained tables' DDL
+(`configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_recovery`,
+`native-ci` build) takes 32 s, down from 94.5 s before the selection.
 
 ## Reads and storage layout
 

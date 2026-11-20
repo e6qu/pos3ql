@@ -1,10 +1,10 @@
 # Retained benchmark evidence
 
-Each dated run keeps its original workload, revision and binary hashes,
-storage provenance, raw JSON and report. They are exploratory measurements on
-the stated hosts, not current performance claims; new code needs a new run.
-[performance.md](../docs/performance.md#what-the-retained-measurements-actually-show)
-explains how to run the suite and how to read these results.
+Each dated run keeps its workload, revision and binary hashes, storage
+provenance, raw JSON and report. They are exploratory measurements on the
+stated hosts, not current performance claims; new code needs a new run.
+[Performance](../docs/performance.md#what-the-retained-measurements-actually-show)
+explains how to run the suite and read these results.
 
 **User example:** before comparing an old result with a new run, match the
 commit, row count, clients, hardware and storage. A faster number from a

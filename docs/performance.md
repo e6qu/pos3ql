@@ -6,11 +6,10 @@ completed work and resource use in versioned JSON files;
 `tools/benchmark-report.py` builds a report from them.
 
 **No representative deployment has been measured yet.** Existing results use
-an instrumented fixture or MinIO/SeaweedFS on the same host. They show tested
-behavior and exploratory costs, not production speed, a maximum database size
-or a provider ranking. The work to change that is
-[measuring a first deployment baseline](../PLAN.md#measure-a-first-deployment-baseline)
-and [qualifying production deployment](../PLAN.md#qualify-production-deployment).
+an instrumented fixture or MinIO/SeaweedFS on the same host: they show tested
+behavior, not production speed, a maximum database size or a provider ranking.
+See [measure a first deployment baseline](../PLAN.md#measure-a-first-deployment-baseline)
+and [qualify production deployment](../PLAN.md#qualify-production-deployment).
 
 ## What the numbers can tell you
 
@@ -41,9 +40,9 @@ local durable storage:
 
 Both receive the same SQL workload, concurrency, row count and stopping rule;
 duration-bound runs can complete different operation counts. End-to-end latency
-and throughput are directly comparable for the stated setups. Storage requests,
-cache tiers and recovery describe each system's different persistence design and
-are reported separately.
+and throughput are comparable for the stated setups; storage requests, cache
+tiers and recovery reflect different persistence designs and are reported
+separately.
 
 ## Estimating bandwidth and throughput
 
@@ -87,9 +86,11 @@ transfer/CPU cost. That is at least 40 ms per batch, at most 25 batches/s. With
 an optimistic 200 committed transactions/s; one per batch gives 25. The server
 promises neither these rates nor any batch occupancy.
 
-**CPU.** SQL runs on one CPU worker. If processing costs an assumed 2 ms per
-operation, that worker completes at most 500 operations/s before maintenance
-and scheduling. Network and CPU ceilings cannot simply be added.
+**CPU.** SQL runs on one CPU worker
+([several workers are planned](../PLAN.md#run-sql-on-several-cpu-workers)). If
+processing costs an assumed 2 ms per operation, that worker completes at most
+500 operations/s before maintenance and scheduling. Network and CPU ceilings
+cannot simply be added.
 
 ## What the retained measurements actually show
 
@@ -103,11 +104,9 @@ SeaweedFS on the same host.
 | MinIO, mixed with checkpoints | 130.43 | 557.86 ms | 3,152.76 | 10.05 ms |
 | SeaweedFS, mixed with checkpoints | 130.27 | 441.96 ms | 3,488.84 | 7.33 ms |
 
-These expose a substantial gap in that old setup. They do not measure the
-current code, and they do not show that either provider is faster.
-[The benchmark index](../benchmarks/README.md) lists all retained runs;
-[implementation history](history/README.md) keeps the checkpoint optimization
-chronology.
+These show a large gap in that old setup; they do not measure the current code
+or rank the providers. [The benchmark index](../benchmarks/README.md) lists all
+retained runs.
 
 ## Running the suite
 
@@ -163,10 +162,9 @@ tools/run-performance-matrix.sh [checkpoint|full] ./performance-results/object-m
 
 This runs the fixture, MinIO and SeaweedFS in turn, each with both PostgreSQL
 controls, and rejects mismatched commits, binaries or workload shapes in the
-combined report. The fixture retains exact request and byte counters. MinIO and
-SeaweedFS run without injected latency and report request metrics as
-unavailable rather than estimating them. They are independent S3-compatible
-implementations on the benchmark host, not independently operated services.
+combined report. Only the fixture keeps exact request and byte counters; MinIO
+and SeaweedFS run on the benchmark host without injected latency and report
+request metrics as unavailable.
 
 ### External object storage
 
@@ -291,8 +289,7 @@ transaction modes. Each combination runs:
   index and checks row counts and sums;
 - two statistics profiles that spread rows across all tables and analyze every
   column with two-column and 64-column schemas; the wide one also changes a
-  column type, analyzes it and rolls back to a savepoint. Older samples lack
-  these profiles.
+  column type, analyzes it and rolls back to a savepoint.
 
 Metadata, statistics and index-counter backing and their free-range controls
 must stay constant across table counts. The output keeps the exact commands,
@@ -316,10 +313,10 @@ for `getrusage`, while
 [the proc counters use the current address space](https://github.com/torvalds/linux/blob/v7.0/fs/proc/task_mmu.c#L34),
 so a launcher using `vfork` or `CLONE_VM` can impose its own earlier peak.
 `tools/tests/test_measure_embedded_capacity.py` demonstrates this with a 32 MiB
-allocate/free launch. Earlier unlabelled `getrusage` peaks are not engine-only
-memory and are not comparable to version 2; their named budget components remain
-valid. CI runs on Linux, and a new resident-memory claim needs fresh version-2
-samples.
+allocate/free launch. Retained samples from before version 2 have unlabelled
+`getrusage` peaks that are not engine-only memory; their named budget
+components remain valid. A new resident-memory claim needs fresh version-2
+samples from Linux CI.
 
 Compare named shared pools at equal settings. Total memory still rises with
 table identities, catalog and history structures, connection metadata and other
@@ -331,14 +328,13 @@ throughput or an embedded production minimum.
 
 ## CI policy
 
-CI checks correct answers, complete runs, memory use and intended access paths.
-For example, an indexed order lookup must not become a full-table scan that
-still looks fast on a tiny dataset. Hosted-runner timing is recorded but never
-a pass/fail threshold: stable timing thresholds need pinned hardware and an
-independently operated object store. Logical-replica speedup is reported, not
-required to be linear.
-
-CI runs the smoke suite, retains all raw artifacts, and requires:
+CI checks correct answers, complete runs, memory use and intended access paths:
+an indexed order lookup must not become a full-table scan that still looks fast
+on a tiny dataset. Hosted-runner timing is recorded but never a pass/fail
+threshold, because stable thresholds need pinned hardware and an independently
+operated object store; logical-replica speedup is reported, not required to
+be linear. CI runs the smoke suite, retains all raw artifacts, and
+requires:
 
 - zero errors and complete operation counts;
 - present, ordered percentiles and the stable object-operation metric schema;
@@ -355,9 +351,8 @@ CI runs the smoke suite, retains all raw artifacts, and requires:
 The ungrouped durable shape is three PUTs per transaction: journal bytes, their
 descriptor, and a compare-and-swap commit-head update published after both
 uploads complete. The analyzed fixture has a fixed 8 KiB row body so the small
-smoke dataset spans enough immutable blocks for a selective cold index probe to
-be a meaningful costed choice. The ordered-limit fixture uses a descending
-B-tree with `INCLUDE (payload)` and projects both columns, so its zero-fetch
-gate exercises durable covering-index reads. A separate cold-object correctness
-regression rejects reading complete K-nearest-neighbor index generations for
-finite limits.
+smoke dataset spans enough blocks for a selective cold index probe to be a real
+costed choice. The ordered-limit fixture uses a descending B-tree with
+`INCLUDE (payload)` and projects both columns, so its zero-fetch gate exercises
+covering-index reads. A separate cold-object test rejects reading complete
+K-nearest-neighbor index generations for finite limits.

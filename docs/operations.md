@@ -79,8 +79,6 @@ curl --fail http://127.0.0.1:9187/capacity
 
 Only `GET` over HTTP/1.0 or HTTP/1.1 is accepted; other methods and unknown
 paths fail explicitly. Responses are uncacheable and close the connection.
-More connections allow more waiting work; SQL execution still uses one CPU
-worker.
 
 ### Readiness
 
@@ -95,10 +93,10 @@ queries, `/livez`, and `/capacity` keep answering.
 
 Readiness becomes false when commit publication or remote checkpoint work
 fails, and true again only after a successful durable publication or
-completion of the pending remote cleanup. Skipped maintenance, local heap
-cleanup, or a temporary-file spill does not clear it. A cached report can
-therefore succeed while `/readyz` still reports the failed publication. Local
-capacity errors return their named SQL errors and do not change readiness.
+completion of the pending remote cleanup; skipped maintenance, local heap
+cleanup or a temporary-file spill does not clear it, so a cached report can
+succeed while `/readyz` still reports the failure. Local capacity errors return
+their named SQL errors and do not change readiness.
 
 Failed background maintenance retries no sooner than one second later; client
 traffic does not shorten the delay, and an idle server retries too. The commit
@@ -112,9 +110,9 @@ needed. COMMIT waits for its durable journal publication, not for a full
 checkpoint. See [maintenance and scheduling](architecture.md#maintenance-and-scheduling).
 
 Application jobs need an external scheduler (OS cron or your job runner)
-connecting as an ordinary PostgreSQL client. There is no built-in SQL job
-scheduler or background-worker interface, and `pg_cron` is not a qualified
-extension. Example daily job:
+connecting as an ordinary PostgreSQL client; there is no built-in job scheduler
+or background-worker interface, and `pg_cron` is not a qualified extension.
+Example daily job:
 
 ```cron
 0 2 * * * PGSERVICE=orders_jobs /usr/bin/psql -X -v ON_ERROR_STOP=1 -f /etc/orders/remove_expired_orders.sql
@@ -143,11 +141,10 @@ locking, row scans, and memory. Rehearse the real SQL and data size under the
 intended startup capacities.
 
 Upgrading the pos3ql binary is separate: older pos3ql formats are not
-converted automatically. Check the [format matrix](durable-format.md), and
-when needed verify a logical export and restore into a fresh prefix while
-keeping the source. [Offline backup commands](backup-restore.md) take writer
-ownership and fence a running server on that prefix; never schedule them
-against a live server as if they were online SQL backups.
+converted (see the [format matrix](durable-format.md)). When needed, verify a
+logical export and restore into a fresh prefix while keeping the source.
+[Offline backup commands](backup-restore.md) take writer ownership and fence a
+running server on that prefix; never schedule them like online SQL backups.
 
 ## Metrics and alerts
 
@@ -238,8 +235,7 @@ may already have displaced the old writer, so route only to a process whose
 ownership until startup repeats the conditional root invalidation.
 
 To restore a named backup or a point in retained history, follow
-[backup and restore](backup-restore.md). Those offline commands take writer
-ownership, so no server may keep using the same prefix.
+[backup and restore](backup-restore.md).
 
 ## Automatic failure detection and promotion
 

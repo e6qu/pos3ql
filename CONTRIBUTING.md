@@ -202,10 +202,14 @@ temporary validation workflows before the final head.
   only the library test executables that the native test jobs run with the
   full native filter lists; `native-build` compiles every other
   `--all-targets` target on its own runner. One test executable holding every
-  library test peaks at 8 GB of compiler memory, more than a hosted macOS
-  arm64 runner has, so the library tests form two suites built in separate
+  library test peaks at 8.02 GB of compiler memory (the library alone 5.57
+  GB; peak footprint of the `native-ci` profile on Apple M-series, measured
+  with a `RUSTC_WRAPPER` running `/usr/bin/time -l`), more than a hosted macOS
+  arm64 runner's 7 GB, so the library tests form two suites built in separate
   jobs: `cargo test --lib --features sql-fixture-suite` (the SQL fixtures in
-  `sql::tests`) and `--features unit-suite` (every other library test). Each
+  `sql::tests`, 6.90 GB) and `--features unit-suite` (every other library
+  test, 7.11 GB). The test modules use crate-private interfaces, which
+  `unreachable_pub` keeps private, so they cannot move to integration tests. Each
   native test job runs its filters against both executables. A build
   without either feature runs the complete set; the `library-test-suites`
   job checks with `tools/check-lib-test-suites.py` that the two suites

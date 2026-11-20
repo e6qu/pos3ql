@@ -1,10 +1,10 @@
 # Finding rows without reading every storage object
 
-Indexes narrow the data a query inspects. pos3ql stores them in immutable
-objects rather than PostgreSQL index pages. This guide covers the
-specialized GiST, SP-GiST, and GIN indexes; btree and hash behavior is in the
-[compatibility table](postgresql-18-compatibility.md#physical-access-paths),
-and their place beside row generations, PAX column groups and caches is in
+Indexes narrow the data a query inspects; pos3ql stores them in immutable
+objects rather than PostgreSQL index pages. This guide covers GiST, SP-GiST and
+GIN. B-tree and hash behavior is in the
+[compatibility table](postgresql-18-compatibility.md#physical-access-paths), and
+how indexes sit beside row generations, PAX column groups and caches is in
 [architecture](architecture.md#reads-and-storage-layout).
 
 **User example:** find orders containing a tag:
@@ -34,10 +34,8 @@ reduces work; it does not guarantee a request count or query rate.
 | GiST `tsvector` | 256-bit token signatures |
 | GiST range, multirange, network; SP-GiST range, network | Ordered interval envelopes |
 
-These are pos3ql object formats, not PostgreSQL page storage or an
-operator-class callback interface.
-
-Checkpoints sort geometric keys by bounding-box center, GIN postings by token
+These are pos3ql object formats, not PostgreSQL pages or an operator-class
+callback interface. Checkpoints sort geometric keys by bounding-box center, GIN postings by token
 key, and other keys by their deterministic encoding. Target block sizes:
 geometric 16 KiB, signature 1 KiB (keeps signatures selective), interval and
 posting 8 KiB; one oversized entry gets its own block. Parent nodes have at

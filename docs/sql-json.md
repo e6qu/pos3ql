@@ -46,14 +46,17 @@ insert. Invalid paths and unsupported syntax fail with an error.
 
 ## Limits
 
-- JSON nesting: 1,000 levels. `jsonpath` nesting: 128.
+- JSON nesting: 21,790 levels for `json` and 18,675 for `jsonb`, the depths
+  PostgreSQL 18.6 reaches under its default `max_stack_depth` (2048kB). Deeper
+  input fails with `54001` (`stack depth limit exceeded`), as in PostgreSQL.
+  `jsonpath` nesting: 128.
 - Everything else (members, path steps, result items, `JSON_TABLE` rows,
   rendered text) uses fixed statement memory; exhaustion returns a
   program-limit error. See [capacity boundaries](postgresql-18-compatibility.md#capacity-boundaries).
 - JSON is stored in the shared row layout described in
-  [architecture](architecture.md); there is no separate columnar JSON store.
-  PostgreSQL transforms and native storage formats are not available, and
-  syntax that needs them is rejected.
+  [architecture](architecture.md), not a separate columnar store. PostgreSQL
+  transforms and native storage formats are not available; syntax that needs
+  them is rejected.
 
 ## Provenance and verification
 

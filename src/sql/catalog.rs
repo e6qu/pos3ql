@@ -1901,6 +1901,13 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "v",
     },
     IntrinsicRoutine {
+        oid: 6240,
+        name: "pg_settings_get_flags",
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 315,
         name: "pg_jit_available",
         argument_types: "",
@@ -30770,6 +30777,11 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "user"
         };
         let unit = crate::sql::guc::int_setting_metadata(name).map_or("", |(unit, ..)| unit);
+        if let Some(index) = crate::sql::guc::jit_developer_index(name) {
+            let setting = &crate::sql::guc::JIT_DEVELOPER_SETTINGS[index];
+            let boot = if setting.default { "on" } else { "off" };
+            return (boot, "bool", setting.context, unit);
+        }
         (boot, vartype, context, unit)
     }
     let mut count = 0;
@@ -30808,6 +30820,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         let (reset_value, source) = crate::sql::eval::funcs::system::session_setting_metadata(name)
             .unwrap_or((value, "default"));
         let planner = crate::sql::guc::planner_setting_metadata(name);
+        let developer = crate::sql::guc::jit_developer_index(name)
+            .map(|index| &crate::sql::guc::JIT_DEVELOPER_SETTINGS[index]);
         let (boot, vartype, context, unit) = metadata(name);
         let (boot, vartype) = match &planner {
             Some(planner) => (planner.boot.as_str(), planner.vartype),
@@ -30881,6 +30895,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                         | "plpgsql.extra_errors" => "Customized Options",
                         "work_mem" => "Resource Usage / Memory",
                         "jit_provider" => "Client Connection Defaults / Shared Library Preloading",
+                        _ if developer.is_some() => "Developer Options",
                         "session_replication_role" => {
                             "Client Connection Defaults / Statement Behavior"
                         }
@@ -30904,6 +30919,9 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                         }
                         "plpgsql.check_asserts" => "Perform checks given in ASSERT statements.",
                         "jit_provider" => "JIT provider to use.",
+                        _ if developer.is_some() => {
+                            developer.map_or("", |setting| setting.description)
+                        }
                         "plpgsql.extra_warnings" => {
                             "List of programming constructs that should produce a warning."
                         }

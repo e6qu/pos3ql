@@ -1262,6 +1262,7 @@ pub(crate) fn dispatch<'a>(
                 | "pg_try_advisory_xact_lock_shared"
                 | "pg_is_in_recovery"
                 | "pg_jit_available"
+                | "pg_settings_get_flags"
                 | "pg_reload_conf"
                 | "pg_event_trigger_table_rewrite_oid"
                 | "pg_event_trigger_table_rewrite_reason"
@@ -2182,6 +2183,27 @@ pub(crate) fn dispatch<'a>(
             // `current_schemas(bool)` returns the search-path schemas as name[];
             // with `true` it includes pg_catalog at its (implicit or explicit)
             // position.
+            "pg_settings_get_flags" => {
+                arity(1)?;
+                let setting = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(text) => text,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
+                };
+                let Some(flags) = crate::sql::guc::active_setting_flags(setting)? else {
+                    return Ok(Datum::Null);
+                };
+                let mut elems = [Datum::Null; crate::sql::guc::MAX_SETTING_FLAGS];
+                for (elem, flag) in elems.iter_mut().zip(flags) {
+                    *elem = Datum::Text(flag);
+                }
+                Ok(Datum::Array {
+                    element: ArrElem::Text,
+                    raw: array::build(&elems[..flags.len()], arena)?,
+                })
+            }
             "current_schemas" => {
                 arity(1)?;
                 let flag = eval_full(args[0], arena, params, row, hooks)?;

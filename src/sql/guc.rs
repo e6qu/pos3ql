@@ -644,6 +644,24 @@ pub(crate) fn load_active_plpgsql(
     })
 }
 
+/// Whether planner setting `name` carries `GUC_EXPLAIN`, so a changed value
+/// is reported by `EXPLAIN (SETTINGS)`: every one but
+/// `default_statistics_target`, which only `ANALYZE` reads.
+fn planner_explained(name: &str) -> bool {
+    planner::planner_index(name).is_some()
+        && !name.eq_ignore_ascii_case("default_statistics_target")
+}
+
+/// The most flags [`GucState::setting_flags`] reports for one parameter.
+pub(crate) const MAX_SETTING_FLAGS: usize = 3;
+
+/// `pg_settings_get_flags(name)` in the running statement's session.
+pub(crate) fn active_setting_flags(
+    name: &str,
+) -> Result<Option<&'static [&'static str]>, SqlError> {
+    with_active_state(|guc| Ok(guc.setting_flags(name)))
+}
+
 /// Whether setting `name` in the running statement's session needs the
 /// `SET` privilege: a superuser-only parameter, which PL/pgSQL's
 /// `plpgsql.variable_conflict` is only once PL/pgSQL has loaded.
@@ -1092,6 +1110,8 @@ struct GucValues {
     session_replication_role: SessionReplicationRole,
     plpgsql_print_strict_params: bool,
     planner: planner::PlannerValues,
+    /// The JIT developer settings, in [`JIT_DEVELOPER_SETTINGS`] order.
+    jit_developer: [bool; JIT_DEVELOPER_COUNT],
     plpgsql_check_asserts: bool,
     plpgsql_extra_warnings: PlpgsqlExtraChecks,
     plpgsql_extra_errors: PlpgsqlExtraChecks,
@@ -1267,7 +1287,8 @@ impl GucValues {
             plpgsql_extra_errors,
             session_replication_role,
             custom,
-            planner
+            planner,
+            jit_developer
         )
     }
 
@@ -1303,6 +1324,7 @@ impl GucValues {
             session_replication_role: SessionReplicationRole::Origin,
             plpgsql_print_strict_params: false,
             planner: planner::PlannerValues::DEFAULTS,
+            jit_developer: JIT_DEVELOPER_DEFAULTS,
             plpgsql_check_asserts: true,
             plpgsql_extra_warnings: PlpgsqlExtraChecks::none(),
             plpgsql_extra_errors: PlpgsqlExtraChecks::none(),
@@ -1355,13 +1377,94 @@ const GUC_SESSION_REPLICATION_ROLE: GucMask = 1 << 31;
 const GUC_PLPGSQL_CHECK_ASSERTS: GucMask = 1 << 32;
 const GUC_PLPGSQL_EXTRA_WARNINGS: GucMask = 1 << 33;
 const GUC_PLPGSQL_EXTRA_ERRORS: GucMask = 1 << 34;
+/// The first JIT developer setting's bit; the rest follow in table order.
+const GUC_JIT_DEVELOPER_FIRST: usize = 35;
 /// The first planner setting's bit; the rest follow in table order.
-const GUC_PLANNER_FIRST: usize = 35;
+const GUC_PLANNER_FIRST: usize = GUC_JIT_DEVELOPER_FIRST + JIT_DEVELOPER_COUNT;
 /// The built-in settings: the named bits, then the planner settings.
 const GUC_BUILTIN_SETTING_COUNT: usize = GUC_PLANNER_FIRST + planner::PLANNER_SETTING_COUNT;
 #[cfg(test)]
 const GUC_BUILTIN_ALL: GucMask =
     GucMask::MAX >> (GucMask::BITS as usize - GUC_BUILTIN_SETTING_COUNT);
+
+/// One of PostgreSQL's JIT developer options. pos3ql compiles nothing, as a
+/// PostgreSQL built without LLVM, so they are only shown and kept.
+pub(crate) struct JitDeveloperSetting {
+    pub(crate) name: &'static str,
+    pub(crate) default: bool,
+    /// `pg_settings.context`: a `superuser-backend` one is set only when a
+    /// connection starts.
+    pub(crate) context: &'static str,
+    pub(crate) description: &'static str,
+}
+
+const JIT_DEVELOPER_COUNT: usize = 5;
+
+/// PostgreSQL 18.6's `guc_tables.c` entries, by name.
+pub(crate) const JIT_DEVELOPER_SETTINGS: [JitDeveloperSetting; JIT_DEVELOPER_COUNT] = [
+    JitDeveloperSetting {
+        name: "jit_debugging_support",
+        default: false,
+        context: "superuser-backend",
+        description: "Register JIT-compiled functions with debugger.",
+    },
+    JitDeveloperSetting {
+        name: "jit_dump_bitcode",
+        default: false,
+        context: "superuser",
+        description: "Write out LLVM bitcode to facilitate JIT debugging.",
+    },
+    JitDeveloperSetting {
+        name: "jit_expressions",
+        default: true,
+        context: "user",
+        description: "Allow JIT compilation of expressions.",
+    },
+    JitDeveloperSetting {
+        name: "jit_profiling_support",
+        default: false,
+        context: "superuser-backend",
+        description: "Register JIT-compiled functions with perf profiler.",
+    },
+    JitDeveloperSetting {
+        name: "jit_tuple_deforming",
+        default: true,
+        context: "user",
+        description: "Allow JIT compilation of tuple deforming.",
+    },
+];
+
+const JIT_DEVELOPER_DEFAULTS: [bool; JIT_DEVELOPER_COUNT] = {
+    let mut defaults = [false; JIT_DEVELOPER_COUNT];
+    let mut index = 0;
+    while index < JIT_DEVELOPER_COUNT {
+        defaults[index] = JIT_DEVELOPER_SETTINGS[index].default;
+        index += 1;
+    }
+    defaults
+};
+
+pub(crate) fn jit_developer_index(name: &str) -> Option<usize> {
+    JIT_DEVELOPER_SETTINGS
+        .iter()
+        .position(|setting| setting.name.eq_ignore_ascii_case(name))
+}
+
+/// Whether `name` is set only by a connection's startup packet, as
+/// PostgreSQL's `superuser-backend` parameters are.
+pub(crate) fn is_connection_start_parameter(name: &str) -> bool {
+    jit_developer_index(name)
+        .is_some_and(|index| JIT_DEVELOPER_SETTINGS[index].context == "superuser-backend")
+}
+
+fn connection_start_parameter(name: &str) -> SqlError {
+    let name = jit_developer_index(name).map_or(name, |index| JIT_DEVELOPER_SETTINGS[index].name);
+    sql_err!(
+        sqlstate::CANT_CHANGE_RUNTIME_PARAM,
+        "parameter \"{}\" cannot be set after connection start",
+        name
+    )
+}
 
 /// Custom parameters (`SET myapp.tenant = '7'`) a session can define. Like
 /// PostgreSQL's placeholders they live for the session once defined, also
@@ -1718,6 +1821,8 @@ fn guc_bit(name: &str) -> GucMask {
         GUC_PLPGSQL_PRINT_STRICT_PARAMS
     } else if let Some(index) = planner::planner_index(name) {
         1 << (GUC_PLANNER_FIRST + index)
+    } else if let Some(index) = jit_developer_index(name) {
+        1 << (GUC_JIT_DEVELOPER_FIRST + index)
     } else if name.eq_ignore_ascii_case("plpgsql.check_asserts") {
         GUC_PLPGSQL_CHECK_ASSERTS
     } else if name.eq_ignore_ascii_case("plpgsql.extra_warnings") {
@@ -1746,6 +1851,7 @@ pub(crate) fn is_valid_custom_parameter(name: &str) -> bool {
 
 pub(crate) fn requires_set_privilege(name: &str) -> bool {
     name.eq_ignore_ascii_case("event_triggers")
+        || name.eq_ignore_ascii_case("jit_dump_bitcode")
         || name.eq_ignore_ascii_case("track_functions")
         || name.eq_ignore_ascii_case("plpgsql.variable_conflict")
         || name.eq_ignore_ascii_case("session_replication_role")
@@ -1884,6 +1990,11 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: GucMask) {
     for index in 0..planner::PLANNER_SETTING_COUNT {
         if mask & (1 << (GUC_PLANNER_FIRST + index)) != 0 {
             target.planner.0[index] = source.planner.0[index];
+        }
+    }
+    for index in 0..JIT_DEVELOPER_COUNT {
+        if mask & (1 << (GUC_JIT_DEVELOPER_FIRST + index)) != 0 {
+            target.jit_developer[index] = source.jit_developer[index];
         }
     }
     copy!(GUC_PLPGSQL_CHECK_ASSERTS, plpgsql_check_asserts);
@@ -2306,6 +2417,42 @@ impl GucState {
             && !self.custom.is_custom(name)
     }
 
+    /// PostgreSQL's `pg_settings_get_flags`: the `EXPLAIN`, `NO_SHOW_ALL`,
+    /// `NO_RESET`, `NO_RESET_ALL`, `NOT_IN_SAMPLE` and `RUNTIME_COMPUTED`
+    /// flags of `guc_tables.c`, or none for a parameter the session does not
+    /// define (a custom one defined here is a placeholder).
+    pub(crate) fn setting_flags(&self, name: &str) -> Option<&'static [&'static str]> {
+        const NOT_IN_SAMPLE: &[&str] = &["NOT_IN_SAMPLE"];
+        if self.custom.is_custom(name) {
+            return self
+                .custom
+                .find(name)
+                .map(|_| &["NO_SHOW_ALL", "NOT_IN_SAMPLE"] as &[&str]);
+        }
+        let name = crate::sql::SETTING_NAMES
+            .iter()
+            .chain(&["max_identifier_length", "max_index_keys"])
+            .find(|known| known.eq_ignore_ascii_case(name))?;
+        Some(match *name {
+            "search_path" | "work_mem" => &["EXPLAIN"],
+            _ if planner_explained(name) => &["EXPLAIN"],
+            _ if jit_developer_index(name).is_some() => NOT_IN_SAMPLE,
+            "application_name"
+            | "integer_datetimes"
+            | "max_identifier_length"
+            | "max_index_keys"
+            | "server_encoding"
+            | "server_version"
+            | "server_version_num" => NOT_IN_SAMPLE,
+            "data_directory_mode" => &["NOT_IN_SAMPLE", "RUNTIME_COMPUTED"],
+            "is_superuser" => &["NO_RESET_ALL", "NO_SHOW_ALL", "NOT_IN_SAMPLE"],
+            "transaction_deferrable" | "transaction_isolation" | "transaction_read_only" => {
+                &["NO_RESET", "NO_RESET_ALL", "NOT_IN_SAMPLE"]
+            }
+            _ => &[],
+        })
+    }
+
     /// Whether setting `name` needs the `SET` privilege in this session.
     pub(crate) fn requires_set_privilege(&self, name: &str) -> bool {
         requires_set_privilege(name) && !self.custom.is_custom(name)
@@ -2476,7 +2623,9 @@ impl GucState {
             );
         }
         for (index, setting) in planner::PLANNER_SETTINGS.iter().enumerate() {
-            if current.planner.0[index] != built_in.planner.0[index] {
+            if current.planner.0[index] != built_in.planner.0[index]
+                && planner_explained(setting.name)
+            {
                 push(
                     setting.name,
                     StackStr::from_str(planner::show(index, current.planner.0[index]).as_str()),
@@ -3160,6 +3309,20 @@ impl GucState {
         crate::sql::timezone::set_session(self.timezone());
     }
 
+    /// Sets a parameter from a connection's startup packet, the only time a
+    /// `superuser-backend` parameter may be set; the value becomes the
+    /// connection's reset value.
+    pub(crate) fn set_startup_config(&self, name: &str, value: &str) -> Result<(), SqlError> {
+        if !is_connection_start_parameter(name) {
+            return self.set_config(name, Some(value), false).map(|_| ());
+        }
+        let mut state = self.store.borrow_mut();
+        let mut values = state.current;
+        apply_setting(&mut values, &state.defaults, name, value)?;
+        let bit = self.bit(name);
+        finish_setting_change(&mut state, values, bit, false, false)
+    }
+
     pub fn set_config(
         &self,
         name: &str,
@@ -3224,6 +3387,14 @@ impl GucState {
         if !self.custom.unknown(name) {
             return match (value, read_only_parameter_context(name)) {
                 (None, Some(ReadOnlyParameterContext::Startup)) => Ok(()),
+                // The configuration file sets a connection-start parameter
+                // for the connections that start after it.
+                (None, _) if is_connection_start_parameter(name) => Ok(()),
+                (Some(value), _) if is_connection_start_parameter(name) => {
+                    let state = self.store.borrow();
+                    let mut values = state.current;
+                    apply_setting(&mut values, &state.defaults, name, value)
+                }
                 _ => self.check_setting_value(name, value),
             };
         }
@@ -3545,6 +3716,9 @@ fn change_setting(
         };
         return Ok(());
     }
+    if is_connection_start_parameter(name) {
+        return Err(connection_start_parameter(name));
+    }
     match value {
         Some(value) => apply_setting(values, defaults, name, value),
         None => reset_setting(values, defaults, name),
@@ -3608,6 +3782,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.plpgsql_print_strict_params = defaults.plpgsql_print_strict_params;
     } else if let Some(index) = planner::planner_index(name) {
         values.planner.0[index] = defaults.planner.0[index];
+    } else if let Some(index) = jit_developer_index(name) {
+        values.jit_developer[index] = defaults.jit_developer[index];
     } else if name.eq_ignore_ascii_case("plpgsql.check_asserts") {
         values.plpgsql_check_asserts = defaults.plpgsql_check_asserts;
     } else if name.eq_ignore_ascii_case("plpgsql.extra_warnings") {
@@ -3756,6 +3932,10 @@ fn apply_setting(
     }
     if let Some(index) = planner::planner_index(name) {
         values.planner.0[index] = planner::parse(index, v)?;
+        return Ok(());
+    }
+    if let Some(index) = jit_developer_index(name) {
+        values.jit_developer[index] = parse_boolean_setting(JIT_DEVELOPER_SETTINGS[index].name, v)?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("synchronize_seqscans") {
@@ -4053,6 +4233,12 @@ fn owned_setting(values: &GucValues, custom: &CustomNames, name: &str) -> Option
         Some(StackStr::from_str(
             planner::show(index, values.planner.0[index]).as_str(),
         ))
+    } else if let Some(index) = jit_developer_index(name) {
+        Some(StackStr::from_str(if values.jit_developer[index] {
+            "on"
+        } else {
+            "off"
+        }))
     } else if name.eq_ignore_ascii_case("default_transaction_isolation") {
         Some(StackStr::from_str(
             values.default_transaction_isolation.as_str(),

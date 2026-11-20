@@ -82061,6 +82061,53 @@ fn jit_is_unavailable_as_without_llvm() {
             ),
         "{text}"
     );
+    let output = run_with(&mut engine, &mut budget, "SET jit_debugging_support = on");
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("C55P02")
+            && text.contains(
+                "parameter \"jit_debugging_support\" cannot be set after connection start"
+            ),
+        "{text}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT context, boot_val, pg_settings_get_flags(name) FROM pg_settings \
+             WHERE name LIKE 'jit\\_%' AND category = 'Developer Options' ORDER BY name"
+        )),
+        [
+            "superuser-backend|off|{NOT_IN_SAMPLE}",
+            "superuser|off|{NOT_IN_SAMPLE}",
+            "user|on|{NOT_IN_SAMPLE}",
+            "superuser-backend|off|{NOT_IN_SAMPLE}",
+            "user|on|{NOT_IN_SAMPLE}"
+        ]
+    );
+}
+
+#[test]
+fn connection_start_parameters_are_set_only_at_startup() {
+    let guc = GucState::new();
+    guc.set_startup_config("jit_profiling_support", "on")
+        .unwrap();
+    assert_eq!(
+        guc.get_owned("jit_profiling_support").unwrap().as_str(),
+        "on"
+    );
+    guc.reset_all().unwrap();
+    assert_eq!(
+        guc.get_owned("jit_profiling_support").unwrap().as_str(),
+        "on"
+    );
+    let error = guc
+        .set_config("jit_profiling_support", None, false)
+        .unwrap_err();
+    assert_eq!(
+        error.sqlstate,
+        crate::sql::eval::sqlstate::CANT_CHANGE_RUNTIME_PARAM
+    );
 }
 
 #[test]

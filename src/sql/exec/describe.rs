@@ -6854,6 +6854,7 @@ fn infer_type_unpositioned(
             | "macaddr8_or" => of(ColType::Macaddr8),
             "array_dims" => of(ColType::Text),
             "current_schemas" => of(ColType::Array(crate::sql::types::ArrElem::Name)),
+            "pg_settings_get_flags" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
             "array_to_json" => of(ColType::Json),
             "json_populate_record"
             | "jsonb_populate_record"

@@ -1078,10 +1078,12 @@ write or a row lock is never parallel, so its plan prints); at 0 every plan
 is exact (`differential_exact/931`). pos3ql compiles nothing, as a
 PostgreSQL built without LLVM: `jit_provider` is the server-start setting
 naming `llvmjit`, `pg_jit_available()` is false and no `EXPLAIN` prints a
-`JIT` section (`differential_exact/973`); the developer settings
-`jit_debugging_support`, `jit_dump_bitcode`, `jit_expressions`,
-`jit_profiling_support` and `jit_tuple_deforming` are not yet settings
-(`SHOW` fails with `42704`). `BUFFERS` is on by default under
+`JIT` section. Its developer options are kept and shown with PostgreSQL's
+contexts: `jit_debugging_support` and `jit_profiling_support` are set
+only when a connection starts (a startup `-c` option or `ALTER SYSTEM`),
+and `jit_dump_bitcode` only by a superuser. `pg_settings_get_flags`
+reports each setting's `guc_tables.c` flags (`differential_exact/973`).
+`BUFFERS` is on by default under
 `ANALYZE`, as in PostgreSQL 18, and accepted without it. Each node prints
 pos3ql's own page accesses in PostgreSQL's format and placement (its
 inputs' and a read `WITH` query's included, zero counters omitted in text,

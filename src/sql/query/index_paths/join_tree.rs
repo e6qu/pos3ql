@@ -267,6 +267,9 @@ pub(crate) enum Placed {
     /// `left = right` of two columns of one relation a class equates
     /// (`generate_base_implied_equalities_no_const`).
     Equated { left: Member, right: Member },
+    /// `member IS NOT NULL`: a removed self-join's equality of one column
+    /// with itself (`replace_relid_callback`), of class `class`.
+    NotNull { member: Member, class: u8 },
     /// A join clause.
     Join(JoinQual),
 }
@@ -348,7 +351,9 @@ impl<'a> Prepared<'a> {
                 Placed::Restriction { rel, .. } => {
                     Relids::of(*rel) & info.min_right == Relids::EMPTY
                 }
-                Placed::Implied { member, .. } => member.relids() & gone == Relids::EMPTY,
+                Placed::Implied { member, .. } | Placed::NotNull { member, .. } => {
+                    member.relids() & gone == Relids::EMPTY
+                }
                 Placed::Equated { left, .. } => left.relids() & gone == Relids::EMPTY,
                 Placed::Join(join)
                     if join.required & gone == Relids::EMPTY
@@ -431,6 +436,217 @@ impl<'a> Prepared<'a> {
         }
         self.subproblem_item_count = kept;
         Ok(())
+    }
+
+    /// `remove_self_join_rel`: relation `removed`, a scan of the table
+    /// relation `kept` scans that a unique key joins to it, becomes `kept`.
+    /// Each class member of `removed` becomes `kept`'s, a duplicate leaving
+    /// its class (`update_eclasses`); the clauses that join only the two
+    /// and `removed`'s restrictions leave the placed clauses, and its other
+    /// join clauses read `kept`. Returns the clauses `kept` may take as
+    /// restrictions, in the order PostgreSQL offers them (`removed`'s join
+    /// clauses, its restrictions, then each class's equality of the two
+    /// relations' first members, which becomes `IS NOT NULL` of one
+    /// column), and the join clauses, for the caller to keep those that
+    /// are not redundant (`add_non_redundant_clauses`).
+    pub(crate) fn remove_self_join(
+        &mut self,
+        removed: u8,
+        kept: u8,
+        arena: &'a Arena,
+    ) -> Result<(ArenaList<'a, Placed>, ArenaList<'a, Placed>), Outside> {
+        let gone = Relids::of(removed);
+        let into = Relids::of(kept);
+        let rename_relids = |relids: Relids| {
+            if relids & gone == Relids::EMPTY {
+                relids
+            } else {
+                (relids & !gone) | into
+            }
+        };
+        let rename_member = |member: Member| -> Member {
+            if member.base_relids() & gone == Relids::EMPTY {
+                return member;
+            }
+            let base = rename_relids(member.base_relids());
+            let rel = base.trailing_zeros() as u8;
+            Member {
+                rel,
+                column: member.column,
+                nulling: member.nulling,
+                reads: base & !Relids::of(rel),
+            }
+        };
+        let mut restrictions = ArenaList::new(arena);
+        let mut joins = ArenaList::new(arena);
+        // `generate_join_implied_equalities` of the two: each class
+        // without a constant, its first member of each relation.
+        let mut equalities = ArenaList::new(arena);
+        for (at, class) in self.classes().iter().enumerate() {
+            if class.has_const {
+                continue;
+            }
+            let first = |relids: Relids| {
+                class
+                    .members()
+                    .iter()
+                    .find(|member| member.relids() == relids)
+                    .copied()
+            };
+            if let (Some(outer), Some(inner)) = (first(gone), first(into)) {
+                let outer = rename_member(outer);
+                equalities
+                    .push(if outer == inner {
+                        Placed::NotNull {
+                            member: inner,
+                            class: at as u8,
+                        }
+                    } else {
+                        Placed::Equated {
+                            left: outer,
+                            right: inner,
+                        }
+                    })
+                    .map_err(|_| ARENA)?;
+            }
+        }
+        let mut held = ArenaList::new(arena);
+        let mut own = ArenaList::new(arena);
+        for &entry in self.placed.borrowed_slice() {
+            match entry {
+                Placed::Join(join) if join.required & gone != Relids::EMPTY => {
+                    let join = JoinQual {
+                        relids: rename_relids(join.relids),
+                        required: rename_relids(join.required),
+                        incompatible: rename_relids(join.incompatible),
+                        outer_relids: rename_relids(join.outer_relids),
+                        merge: join.merge.map(|(left, right, one, two)| {
+                            (rename_member(left), rename_member(right), one, two)
+                        }),
+                        ..join
+                    };
+                    if join.required != into {
+                        joins.push(Placed::Join(join)).map_err(|_| ARENA)?;
+                        continue;
+                    }
+                    let restriction = match join.merge {
+                        Some((left, right, class, _)) if left == right => Placed::NotNull {
+                            member: left,
+                            class,
+                        },
+                        _ => Placed::Restriction {
+                            rel: kept,
+                            qual: join.qual,
+                        },
+                    };
+                    restrictions.push(restriction).map_err(|_| ARENA)?;
+                }
+                Placed::Restriction { rel, qual } if rel == removed => {
+                    own.push(Placed::Restriction { rel: kept, qual })
+                        .map_err(|_| ARENA)?;
+                }
+                Placed::Implied { member, class } if member.base_relids() == gone => {
+                    own.push(Placed::Implied {
+                        member: rename_member(member),
+                        class,
+                    })
+                    .map_err(|_| ARENA)?;
+                }
+                Placed::NotNull { member, class } if member.base_relids() == gone => {
+                    own.push(Placed::NotNull {
+                        member: rename_member(member),
+                        class,
+                    })
+                    .map_err(|_| ARENA)?;
+                }
+                Placed::Equated { left, right } if left.rel == removed => {
+                    own.push(Placed::Equated {
+                        left: rename_member(left),
+                        right: rename_member(right),
+                    })
+                    .map_err(|_| ARENA)?;
+                }
+                Placed::Implied { member, .. } | Placed::NotNull { member, .. }
+                    if member.base_relids() & gone != Relids::EMPTY =>
+                {
+                    return Err("a removed self-join's expression of several relations");
+                }
+                entry => held.push(entry).map_err(|_| ARENA)?,
+            }
+        }
+        for &entry in own
+            .borrowed_slice()
+            .iter()
+            .chain(equalities.borrowed_slice())
+        {
+            restrictions.push(entry).map_err(|_| ARENA)?;
+        }
+        self.placed = held;
+        for at in 0..self.class_count {
+            let members = self.classes[at].members();
+            if members
+                .iter()
+                .all(|member| member.base_relids() & gone == Relids::EMPTY)
+            {
+                continue;
+            }
+            let mut renamed = ArenaList::new(arena);
+            for &member in members {
+                let member = rename_member(member);
+                if !renamed.borrowed_slice().contains(&member) {
+                    renamed.push(member).map_err(|_| ARENA)?;
+                }
+            }
+            self.classes[at].members = renamed.as_slice();
+        }
+        // `rebuild_*_attr_needed`: a column only its own relation reads is
+        // not needed above it.
+        for (var, relids, _) in self.needed.as_mut_slice().map_err(|_| ARENA)? {
+            if var.0 == removed {
+                var.0 = kept;
+            }
+            *relids = rename_relids(*relids);
+            if *relids & !Relids::of(var.0) == Relids::EMPTY {
+                *relids = Relids::EMPTY;
+            }
+        }
+        for special in &mut self.specials[..self.special_count] {
+            for set in [
+                &mut special.min_left,
+                &mut special.min_right,
+                &mut special.syn_left,
+                &mut special.syn_right,
+                &mut special.commute_above_l,
+                &mut special.commute_above_r,
+                &mut special.commute_below_l,
+                &mut special.commute_below_r,
+            ] {
+                *set = rename_relids(*set);
+            }
+            for member in &mut special.semi_rhs[..usize::from(special.semi_count)] {
+                *member = rename_member(*member);
+            }
+        }
+        self.false_relids = rename_relids(self.false_relids);
+        // `remove_rel_from_joinlist`.
+        let mut kept_items = 0;
+        for problem in &mut self.subproblems[..self.subproblem_count] {
+            let first = kept_items;
+            for index in usize::from(problem.first)..usize::from(problem.first + problem.count) {
+                let item = self.subproblem_items[index];
+                if item == gone {
+                    continue;
+                }
+                self.subproblem_items[kept_items] = rename_relids(item);
+                kept_items += 1;
+            }
+            *problem = Subproblem {
+                first: first as u16,
+                count: (kept_items - first) as u16,
+            };
+        }
+        self.subproblem_item_count = kept_items;
+        Ok((restrictions, joins))
     }
 
     /// The relations and outer joins that need column `var` above its
@@ -672,7 +888,9 @@ pub(crate) fn prepare<'a>(tree: &Tree, arena: &'a Arena) -> Result<Prepared<'a>,
     let mut placed = core::mem::replace(&mut prep.placed, ArenaList::new(arena));
     for entry in placed.as_mut_slice().map_err(|_| ARENA)? {
         match entry {
-            Placed::Implied { class, .. } => *class = canonical(&prep, *class),
+            Placed::Implied { class, .. } | Placed::NotNull { class, .. } => {
+                *class = canonical(&prep, *class);
+            }
             Placed::Join(join) => {
                 if let Some((_, _, left, right)) = &mut join.merge {
                     *left = canonical(&prep, *left);

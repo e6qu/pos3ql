@@ -231,8 +231,7 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 
 - [x] Full join merged keys: a `COALESCE` of a full join's compared columns
   equated with a constant (PR #779, `975`).
-- [ ] *In progress:* self-join removal (`remove_useless_self_joins`; `EXPLAIN`
-  of such joins fails with `0A000` today, `949`).
+- [x] Self-join removal (`remove_useless_self_joins`, `976`).
 - [ ] *In progress:* plan joins of never-analyzed tables by PostgreSQL's
   search (they keep pos3ql's join order today). Needs the retained pull-based
   executor below so the result-stream and cursor tests keep streaming.

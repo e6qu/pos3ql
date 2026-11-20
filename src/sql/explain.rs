@@ -6788,6 +6788,17 @@ fn plan_pulled_select<'a>(
             "EXPLAIN of a self-join PostgreSQL's remove_useless_self_joins may remove is not supported"
         ));
     }
+    // The plan of a removed self-join reads the kept scan's columns where
+    // the query named the removed one's.
+    let statement = match (&modeled, scope.as_ref()) {
+        (Some(model), Some(scope)) => query::index_paths::join_query::rename_self_joined(
+            scope,
+            &model.kept_for,
+            statement,
+            arena,
+        )?,
+        _ => statement,
+    };
     // A parenthesized join the join search does not plan would print
     // pos3ql's own join order.
     if modeled.is_none()

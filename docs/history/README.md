@@ -1,21 +1,17 @@
 # Historical implementation records
 
-These fixed revisions preserve earlier plans, investigations, and
-observations. They may describe limits since removed or work since completed;
-use the current [roadmap](../../PLAN.md),
-[compatibility contract](../postgresql-18-compatibility.md), and
-[benchmark evidence index](../../benchmarks/README.md) for present decisions.
-For example, an old report of costly checkpoint rewrites measured the binary
-and workload recorded there, not today's code. Offline, use
+These fixed revisions preserve earlier plans, investigations and observations.
+They may describe limits since removed or work since completed; for present
+decisions use the [roadmap](../../PLAN.md), the
+[compatibility contract](../postgresql-18-compatibility.md) and the
+[benchmark evidence index](../../benchmarks/README.md). Offline, use
 `git show REVISION:PATH`.
 
 ## Before the architecture review
 
 Revision `27af086bff6a9e02f5c05bac1774b6bea50cc03c`:
 [earlier detailed behavior narrative](https://github.com/e6qu/pos3ql/blob/27af086bff6a9e02f5c05bac1774b6bea50cc03c/docs/implemented-baseline.md).
-Current behavior is in the [behavior guide](../implemented-baseline.md) and
-[architecture](../architecture.md); old implementation steps are not open
-roadmap items.
+Its implementation steps are not open roadmap items.
 
 ## Original implementation record
 
@@ -50,7 +46,3 @@ Related pull requests:
 - [PR #623](https://github.com/e6qu/pos3ql/pull/623): retained-reader
   qualification and fixes that keep metadata-only ALTER from rewriting rows
   while still enforcing uniqueness; its CI covers PRs #620–#622.
-
-Raw benchmark artifacts, generator provenance, and upstream licenses stay in
-their original locations. Do not regenerate them or treat exploratory timings
-as production qualification.

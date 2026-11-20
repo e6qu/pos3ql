@@ -6,6 +6,7 @@ unfinished work lives only in the [roadmap](../PLAN.md).
 | Your question | Guide |
 |---|---|
 | Can my application use this PostgreSQL feature? | [Compatibility and limits](postgresql-18-compatibility.md), [SQL/JSON](sql-json.md), [SQL/XML](sql-xml.md) |
+| Will a query get PostgreSQL's plan, row order and `EXPLAIN` output? | [Query planning](query-planning.md) |
 | What can my application rely on today? | [What works today](implemented-baseline.md) |
 | How do requests, commits, storage layout and caches work? | [Architecture](architecture.md) |
 | What are the memory and size limits? | [Physical limits](architecture.md#memory-and-physical-size) |
@@ -16,7 +17,7 @@ unfinished work lives only in the [roadmap](../PLAN.md).
 | Will an upgrade read my existing data? | [Durable formats](durable-format.md) |
 | How do indexes find rows in saved files? | [Index navigation](index-navigation.md) |
 | How fast is it, and how do I measure? | [Performance](performance.md), [retained benchmarks](../benchmarks/README.md) |
-| How will capacity sharing and feedback control work? | [Resource design](adaptive-resources.md) (unfinished) |
+| How will capacity sharing and feedback control work? | [Resource design](adaptive-resources.md) (proposal, not current behavior) |
 | What does a term mean? | [Glossary](terminology.md) |
 | How do I contribute? | [Contributing](../CONTRIBUTING.md), [engineering rules](../AGENTS.md) |
 | Which defects are blocked? | [Blocked defects](../BUGS.md) |

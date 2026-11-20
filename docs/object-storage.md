@@ -5,14 +5,12 @@ storage. RAM and disk are caches: a replacement server can recover everything
 from the configured bucket and prefix. With `object_store = off` (local mode),
 the local journal file is the durable copy; losing that disk loses the data.
 
-pos3ql talks directly to the S3 HTTP API with one built-in client. There is no
-vendor SDK, translation proxy, or behavior chosen by the provider's brand.
-Bucket creation, accounts and credential issuing happen outside pos3ql.
-An endpoint is supported only after it passes the
-[qualification suite](#qualification); an "S3-compatible" label is not enough.
-
+pos3ql talks directly to the S3 HTTP API with one built-in client: no vendor
+SDK, translation proxy, or behavior chosen by the provider's brand. Bucket
+creation, accounts and credential issuing happen outside pos3ql. An endpoint is
+supported only after it passes the [qualification suite](#qualification).
 [Architecture](architecture.md#writes-and-the-success-response) describes the
-commit path, checkpoints and caches in detail.
+commit path, checkpoints and caches.
 
 ## What a successful commit means
 
@@ -156,28 +154,25 @@ capacity fails with the setting's name and never weakens retention. The
 development fixture uses 4 slots each for reads, journal uploads, file uploads
 and the commit queue; size them explicitly for a deployment.
 
-While a request waits on the network, the SQL worker serves other connections.
-For example, reading a cached invoice continues while another connection's
-commit uploads, and while cleanup lists or deletes old files. Two behaviors are
-worth knowing:
+While a request waits on the network, the SQL worker serves other connections:
+reading a cached invoice continues while another connection's commit uploads or
+cleanup lists and deletes old files. Exceptions and details:
 
-- A large `SELECT` from one table, a retained join or a grouping (no
-  sorting, subqueries or set operations in object-store mode) resumes row by
-  row: a cold block after delivered rows yields like any other
-  download. Other large results, once their first bytes have reached the
-  client, finish their remaining reads synchronously, because a sent prefix
-  cannot be withdrawn. Rows the client has not yet read never hold the worker;
-  resuming more result shapes is
-  [planned work](../PLAN.md#pause-and-resume-every-query-path).
+- A large `SELECT` from one table, a retained join or a grouping (no sorting,
+  subqueries or set operations in object-store mode) resumes row by row: a cold
+  block after delivered rows yields like any other download. Other large
+  results, once their first bytes have reached the client, finish their
+  remaining reads synchronously, because a sent prefix cannot be withdrawn.
+  Rows the client has not yet read never hold the worker. Resuming more result
+  shapes is [planned](../PLAN.md#pause-and-resume-every-query-path).
 - Deleting old files never delays a statement that waits for memory. When
   the row heap, `row_overlay_slots` or `row_history_slots` fill, a writer
   waits for the next checkpoint to save resident rows and release their
-  space, and file cleanup pauses so that checkpoint starts at once. For
-  example, a `CREATE TABLE` issued while cleanup deletes thousands of old
-  files waits only for one checkpoint, not for the deletions; cleanup
-  resumes afterwards. The wait obeys `statement_timeout` and query
-  cancellation. A statement that still does not fit after the checkpoint
-  gets the named `54000` capacity error.
+  space, and file cleanup pauses so that checkpoint starts at once: a
+  `CREATE TABLE` issued while cleanup deletes thousands of old files waits
+  only for one checkpoint. The wait obeys `statement_timeout` and query
+  cancellation; a statement that still does not fit gets the named `54000`
+  capacity error.
 - Setting both caches to zero does not evict rows already in memory: an
   `INSERT` followed by `SELECT` can return the row without a download. To test
   cold reads, make the writes durable, then restart in durable mode with an
@@ -201,12 +196,10 @@ pos3ql does not discover credentials through a vendor SDK, instance metadata
 service or provider control plane.
 
 **User example:** when temporary credentials expire, install their replacement
-while both still work, then reload. Reload validates the candidate with a
-conditional writer-fence renewal before installing it. A rejected candidate
-leaves the installed credential in place and makes readiness fail, so routing
-can stop until the problem is fixed. In-flight repeatable requests restart from
-the same position with the new credential. See
-[operations](operations.md#object-store-credential-rotation) for the procedure.
+while both still work, then reload. A rejected candidate leaves the installed
+credential in place and makes readiness fail; in-flight repeatable requests
+restart from the same position with the new credential. See
+[credential rotation](operations.md#object-store-credential-rotation).
 
 Backups and exports use the same client and capacities; see
 [backup and restore](backup-restore.md).
@@ -244,8 +237,8 @@ Set `POS3QL_OBJECT_STORE_SESSION_TOKEN` for temporary credentials,
 `POS3QL_OBJECT_STORE_TLS_CA_FILE` for a private certificate authority.
 
 The CI services share a host with the tests, so they prove portability across
-implementations, not behavior of a separately operated service. That evidence
-is part of [qualifying production deployment](../PLAN.md#qualify-production-deployment).
+implementations, not behavior of a separately operated service; that is part of
+[qualifying production deployment](../PLAN.md#qualify-production-deployment).
 
 CI architecture guards reject vendor SDK dependencies, provider-named branches
 or settings, and fallbacks that change protocol semantics. No S3 request, XML,

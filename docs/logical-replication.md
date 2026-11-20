@@ -87,13 +87,12 @@ appear in `pg_subscription_rel` as `i` when the statement commits and become
 `create_slot = true` is refused inside a transaction block (`25001`).
 
 `DROP SUBSCRIPTION` drops the publisher's replication slot before it returns,
-as PostgreSQL does: it stops the apply worker, sends `DROP_REPLICATION_SLOT
-name WAIT`, reports `NOTICE: dropped replication slot "name" on publisher`, and
-then removes the subscription; the apply worker stays stopped until the
-dropping transaction ends. Because the slot cannot come back, a
-subscription with a slot cannot be dropped inside a transaction block (`25001`).
-If the publisher is unreachable or refuses the drop, the command fails with
-`08006` and the subscription stays.
+as PostgreSQL does: it stops the apply worker (which stays stopped until the
+dropping transaction ends), sends `DROP_REPLICATION_SLOT name WAIT`, reports
+`NOTICE: dropped replication slot "name" on publisher`, then removes the
+subscription. A subscription with a slot cannot be dropped inside a transaction
+block (`25001`). If the publisher is unreachable or refuses the drop, the
+command fails with `08006` and the subscription stays.
 
 **User example:** when the publisher is gone for good, detach the slot first,
 then drop only the local subscription:
@@ -108,12 +107,10 @@ As a publisher, pos3ql honors `DROP_REPLICATION_SLOT name WAIT` by waiting for
 an active slot's walsender to release it; without `WAIT`, an active slot
 returns `55006`.
 
-Workers use their own session settings and an empty `search_path`, as in
-PostgreSQL. Schema-qualify tables inside replica-enabled trigger functions, for
-example `INSERT INTO public.order_audit ...`.
-
-Workers run with `session_replication_role = replica`, as PostgreSQL's do.
-Only triggers enabled with `ALTER TABLE ... ENABLE REPLICA TRIGGER` or `ENABLE
+As in PostgreSQL, workers use their own session settings, an empty
+`search_path` (schema-qualify tables in replica-enabled trigger functions, for
+example `INSERT INTO public.order_audit ...`) and
+`session_replication_role = replica`. Only triggers enabled with `ALTER TABLE ... ENABLE REPLICA TRIGGER` or `ENABLE
 ALWAYS TRIGGER` fire; ordinary triggers do not. Foreign keys are enforced by
 ordinary (ORIGIN) internal triggers, so the subscriber neither checks nor runs
 their actions.

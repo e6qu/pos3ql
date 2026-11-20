@@ -253,6 +253,38 @@ OID as `hashenum` does, but those OIDs come from pos3ql's own identity band
 (`925` sorts its groups). `Batches`, `Memory Usage` and `Disk Usage` follow
 `hash_agg_update_metrics` for one to seven grouping columns.
 
+A one-table `GROUP BY` or `DISTINCT` of expressions plans as PostgreSQL's
+does (`929`); a `DISTINCT` takes its `ORDER BY` items first
+(`transformDistinctClause`) and `EXPLAIN` shows the `HashAggregate` over the
+computed keys under the `Sort` (`961`). The select list is read after
+`ExpandRowReference` and `eval_const_expressions`: `(t).*` of a whole-row
+reference is the table's columns, and a field of a row constructor is its
+argument, so ordinals count expanded columns (`960`). Arrays, records,
+ranges, multiranges and `jsonb` hash as `hash_array`, `hash_record`,
+`hash_range`, `hash_multirange` and `jsonb_hash`; a named composite key, or
+an array of one, hashes when every field type hashes (`962`); `money`, bit
+strings and anonymous records have no hash operator class and sort. A
+`Sort` over a hashed grouping whose `ORDER BY` names only some keys runs
+the `tuplesort` model over the groups in hash table order, so tied groups
+keep PostgreSQL's quicksort order. A grouping the model leaves out, or a
+hashed one whose transition states have no modelled size, fails with
+`0A000` unless its order cannot show: its `ORDER BY` names every key or
+output column, every key is fixed by a constant, it forms at most one group,
+it is an `IN`, `ANY` or `ALL` subquery without `LIMIT`, or it is a derived
+table whose sole reader orders by every shown column of a type whose equal
+values print alike, or reduces it to `count`, `min` or `max` (`960`). With
+a spill store attached, such a `DISTINCT` fails once a second distinct row
+arrives, as in memory.
+
+`aset.c` reuses freed default-sized contexts without recomputing their
+chunk limit, so after a hash aggregate under `work_mem` below 1MB
+(`CreateWorkExprContext`: 1,024 bytes at `64kB`, 2,048 at `256kB`, 4,096 at
+`512kB`) a later aggregate's meta context may get the lower limit at any
+`work_mem` (on PostgreSQL 18.6 a later `string_agg` grouping reported other
+figures at 1MB, 4MB and 16MB). pos3ql records that per session and fails a
+later hash aggregate whose bucket array falls between the lower limit and
+8 kB with `0A000` (`926`, `928`).
+
 A hash join's `Hash` node reports the table PostgreSQL builds: at least 1,024
 buckets, doubled while rows outnumber them, and `Memory Usage` from each row's
 minimal tuple plus 8 bytes per bucket (a 1,500-row build reports `Buckets:

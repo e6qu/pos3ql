@@ -4,7 +4,11 @@
 -- batch, last partition first, so its rows follow the batches. A batch that
 -- does not fit spills again by the next hash bits.
 -- autovacuum_enabled = off keeps autovacuum from refreshing the statistics
--- the plan is chosen from; the rows commit in small statements.
+-- the plan is chosen from; the rows commit in small statements. Each
+-- aggregate runs in a session of its own: PostgreSQL reuses an earlier
+-- small-work_mem aggregate's memory context, which pos3ql does not model
+-- (src/sql/tests/hash_aggregate_context_reuse.rs).
+\set origin :DBNAME
 CREATE TABLE h926 (id int, a int, b text, c bigint) WITH (autovacuum_enabled = off);
 INSERT INTO h926 SELECT i, i % 20, 'k' || (i % 5), i % 20 FROM generate_series(1, 200) i;
 ANALYZE h926;
@@ -32,37 +36,90 @@ FROM generate_series(6201, 7200) i;
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 SELECT DISTINCT a FROM h926;
-SELECT DISTINCT b FROM h926;
-SELECT DISTINCT a, b FROM h926;
-SELECT DISTINCT c FROM h926;
-SELECT DISTINCT a FROM h926 OFFSET 4000;
-SELECT DISTINCT c FROM h926 OFFSET 100 LIMIT 25;
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-SELECT DISTINCT c FROM h926;
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-SELECT DISTINCT a, b FROM h926;
-SELECT a, count(*) FROM h926 GROUP BY a;
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-SELECT a, count(*) FROM h926 GROUP BY a;
-SELECT a, sum(c) FROM h926 GROUP BY a LIMIT 40;
-SET work_mem = '128kB';
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-SELECT DISTINCT c FROM h926;
-SET work_mem = '256kB';
-SELECT DISTINCT c FROM h926;
-SELECT DISTINCT a, b FROM h926 OFFSET 2000;
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-SELECT DISTINCT c FROM h926;
-SET work_mem = '1MB';
-SELECT DISTINCT c FROM h926;
-SELECT DISTINCT a, b FROM h926;
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-SELECT DISTINCT c FROM h926;
+\c :origin
 SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT DISTINCT b FROM h926;
+\c :origin
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT DISTINCT a, b FROM h926;
+\c :origin
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT DISTINCT c FROM h926;
+\c :origin
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT DISTINCT a FROM h926 OFFSET 4000;
+\c :origin
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT DISTINCT c FROM h926 OFFSET 100 LIMIT 25;
+\c :origin
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT DISTINCT c FROM h926;
+\c :origin
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT DISTINCT a, b FROM h926;
+\c :origin
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT a, count(*) FROM h926 GROUP BY a;
+\c :origin
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT a, count(*) FROM h926 GROUP BY a;
+\c :origin
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT a, sum(c) FROM h926 GROUP BY a LIMIT 40;
+\c :origin
+SET work_mem = '128kB';
+SET hash_mem_multiplier = 1;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT DISTINCT c FROM h926;
+\c :origin
+SET work_mem = '256kB';
+SET hash_mem_multiplier = 1;
+SELECT DISTINCT c FROM h926;
+\c :origin
+SET work_mem = '256kB';
+SET hash_mem_multiplier = 1;
+SELECT DISTINCT a, b FROM h926 OFFSET 2000;
+\c :origin
+SET work_mem = '256kB';
+SET hash_mem_multiplier = 1;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT DISTINCT c FROM h926;
+\c :origin
+SET work_mem = '1MB';
+SET hash_mem_multiplier = 1;
+SELECT DISTINCT c FROM h926;
+\c :origin
+SET work_mem = '1MB';
+SET hash_mem_multiplier = 1;
+SELECT DISTINCT a, b FROM h926;
+\c :origin
+SET work_mem = '1MB';
+SET hash_mem_multiplier = 1;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT DISTINCT c FROM h926;
+\c :origin
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
 SELECT DISTINCT a FROM h926 WHERE id % 3 = 0;
+\c :origin
 SET work_mem = '4MB';
+SET hash_mem_multiplier = 1;
 SELECT DISTINCT a FROM h926 OFFSET 4990;
+\c :origin
+SET work_mem = '4MB';
+SET hash_mem_multiplier = 1;
 EXPLAIN (COSTS OFF) SELECT DISTINCT a FROM h926;
-RESET work_mem;
-RESET hash_mem_multiplier;
 DROP TABLE h926;

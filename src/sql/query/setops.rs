@@ -610,6 +610,11 @@ fn external_set_tree<'a>(
         };
     let _loop = node.start();
     let input_loop = input.start();
+    // PostgreSQL may hash a distinct `UNION` (a `HashAggregate` over an
+    // `Append`): its work context may join the session's freelist.
+    if *operator == SetOp::Union && !*all {
+        crate::sql::guc::note_hash_aggregate();
+    }
     let merge_inputs = !(*operator == SetOp::Union && *all);
     let left_run = external_set_tree(left, context, target, sorted || merge_inputs, numbers)?;
     let right_run = external_set_tree(right, context, target, sorted || merge_inputs, numbers)?;
@@ -2412,6 +2417,11 @@ fn combine_sets<'a>(
     r: &'a mut [&'a [u8]],
     arena: &'a Arena,
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
+    // PostgreSQL may hash a distinct `UNION` (a `HashAggregate` over an
+    // `Append`): its work context may join the session's freelist.
+    if operator == SetOp::Union && !all {
+        crate::sql::guc::note_hash_aggregate();
+    }
     // UNION ALL preserves order (left rows then right, as scanned); only the
     // distinct set operations sort to merge/dedup.
     if !(operator == SetOp::Union && all) {

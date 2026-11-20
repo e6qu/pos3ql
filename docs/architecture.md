@@ -1221,7 +1221,7 @@ explicitly.
 | `definition_image_slots` | Retained execution-schema identities | A paused trigger pins its completion's existing image rather than reserving another |
 | `result_spool_bytes` / `result_spool_leases` | Result rows queued behind clients that read slower than statements produce them | A connection holds at most one lease, growing geometrically and returned once its queue drains. Exhaustion fails only the lagging statement with `54000` after the rows already queued |
 | `plan_build_bytes` / `plan_build_leases` | Build sides of retained plan nodes: a retained hash join's buckets, entries and encoded build rows | Starter: 16 MiB and 64 leases; a hash join holds three leases and a sort two, from opening (a cursor's from `DECLARE`) until the stream or cursor ends. A build that does not fit runs its statement as it ran without streaming: the result spools, a cursor saves its rows |
-| `memtable_bytes` | Resident row heap | At most 4,294,967,295 bytes per buffer, two buffers reserved; a cache limit, not total table size |
+| `memtable_bytes` | Resident row heap | At most 4,294,967,295 bytes per buffer, two buffers reserved; a cache limit, not total table size. Uncommitted rows are pinned resident until their transaction ends, so one transaction's own uncommitted rows must fit it: a statement that outgrows it fails with `54000` (committed rows spill to object storage) |
 
 **Example:** a function with 128 declared locals and one named input stages
 that one parameter, then releases the staging range. It does not reserve a

@@ -1116,6 +1116,12 @@ pub(crate) struct HashAggMemory {
     /// A new group put the table past its limits, so PostgreSQL's aggregate
     /// spills the groups after it to partitions.
     spilled: bool,
+    /// The smallest chunk limit the meta context may carry from the
+    /// session's freelist ([`crate::sql::guc::reused_context_chunk_limit`]),
+    /// and whether a bucket array outgrew it while staying within the
+    /// default limit, so the context it lands in is not known.
+    reused_limit: usize,
+    reuse_unmodeled: bool,
 }
 
 /// The blocks an aset.c context with the default first block size
@@ -1202,6 +1208,8 @@ impl HashAggMemory {
             meta: AllocSetBlocks::new(DEFAULT_MAX_BLOCK),
             transition: AllocSetBlocks::new(work_mem_block()),
             spilled: false,
+            reused_limit: crate::sql::guc::reused_context_chunk_limit() as usize,
+            reuse_unmodeled: false,
         };
         memory.meta.take(META_HEADERS);
         memory.allocate_buckets(simplehash_size(sizing.buckets));
@@ -1211,6 +1219,10 @@ impl HashAggMemory {
 
     fn allocate_buckets(&mut self, size: usize) {
         let bytes = size * TUPLE_HASH_ENTRY;
+        // A meta context aset.c recycled from an earlier statement's work
+        // context keeps that context's lower chunk limit: such an array is a
+        // block of its own there, a chunk of a default context's block.
+        self.reuse_unmodeled |= bytes > self.reused_limit && bytes <= ALLOC_CHUNK_LIMIT;
         if bytes <= ALLOC_CHUNK_LIMIT {
             self.meta.take(allocset_chunk_space(bytes));
         }
@@ -1297,6 +1309,13 @@ impl HashAggMemory {
     /// (`hashkey_mem` of `hash_agg_update_metrics`).
     pub(crate) fn transition_allocated(&self) -> usize {
         self.transition.allocated
+    }
+
+    /// Whether a bucket array outgrew the chunk limit of a context the
+    /// session's freelist may hand the meta context, which pos3ql does not
+    /// track.
+    pub(crate) fn reuse_unmodeled(&self) -> bool {
+        self.reuse_unmodeled
     }
 
     /// Whether the aggregate spilled (`hash_agg_enter_spill_mode`).

@@ -1301,6 +1301,22 @@ workspace of `work_arena_bytes`, fixed at startup. Exhausting any of these
 fails with `54000` naming it, whatever `work_mem` says; raise the reservation
 and restart.
 
+After a session runs or explains a hash aggregate (a hashed `GROUP BY` or
+`DISTINCT`) with `work_mem` below 1MB, PostgreSQL may reuse that
+aggregate's memory for a later one, changing its row order in ways pos3ql
+cannot follow. From the next statement on, such a later hash aggregate
+fails with `0A000` ("the memory of a hash aggregate after an earlier hash
+aggregate of this session ran with work_mem below 1MB is not supported")
+while its table is small. For example:
+
+```sql
+SET work_mem = '64kB';
+EXPLAIN SELECT DISTINCT a FROM big;   -- plans a 64kB hash aggregate
+SELECT DISTINCT a FROM big;           -- 0A000 once its table outgrows 1 kB
+```
+
+Start a new session, or keep `work_mem` at 1MB or more, to avoid it.
+
 ### Planner settings
 
 All 52 "Query Tuning" settings are accepted with PostgreSQL 18's values,

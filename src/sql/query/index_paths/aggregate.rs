@@ -241,6 +241,32 @@ pub(crate) fn aggregate_costs<'a>(
     Ok(Some(result))
 }
 
+/// The per-row cost of evaluating `expressions` above an aggregation
+/// (`set_pathtarget_cost_width`): each expression's cost, its aggregate
+/// calls costing nothing, as `cost_qual_eval_walker` treats an `Aggref`.
+pub(crate) fn target_cost<'a>(
+    expressions: &[&'a Expr<'a>],
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    arena: &'a Arena,
+) -> Result<f64, SqlError> {
+    let costs = Costs::current();
+    let cost = |expression: &Expr<'_>| {
+        plan::qual_cost(expression, columns, storage, txid, arena) / 2.0 * costs.cpu_operator
+    };
+    let mut total = 0.0;
+    for &expression in expressions {
+        let mut calls = ArenaList::new(arena);
+        collect_aggs(expression, &mut calls, storage, txid, columns)?;
+        total += cost(expression);
+        for &(_, call) in calls.as_slice() {
+            total -= cost(call);
+        }
+    }
+    Ok(total.max(0.0))
+}
+
 /// The bytes a polymorphic state of type `oid` adds: nothing passed by
 /// value, else its `get_typavgwidth` (32 for a variable-length type) rounded
 /// to `MAXALIGN` plus two pointers.

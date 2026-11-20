@@ -1930,6 +1930,10 @@ fn eval_subquery_nodes<'a>(
                 | Expr::QuantifiedSubquery {
                     operand, select, ..
                 } => {
+                    // PostgreSQL may unique-ify the subquery's rows for a
+                    // semijoin with a `HashAggregate`, whose work context
+                    // may join the session's freelist.
+                    crate::sql::guc::note_hash_aggregate();
                     let original_select = *select;
                     let (select, arity) = row_projected(operand, original_select, arena)?;
                     // A list the statement bound keeps its analysis.
@@ -1980,36 +1984,43 @@ fn eval_subquery_nodes<'a>(
                         }
                     };
                     if storage.spill_attached() {
-                        lists[n_lists] = external_list_subquery(
-                            node,
-                            select,
-                            storage,
-                            txid,
-                            arena,
-                            params,
-                            depth,
-                            arity,
-                            row_witness,
-                            column_types,
-                            collations,
-                            outer,
-                            sequences,
-                        )?;
+                        // `IN`, `ANY` and `ALL` read the rows as a set.
+                        lists[n_lists] = super::group::with_unobserved_order(select, || {
+                            external_list_subquery(
+                                node,
+                                select,
+                                storage,
+                                txid,
+                                arena,
+                                params,
+                                depth,
+                                arity,
+                                row_witness,
+                                column_types,
+                                collations,
+                                outer,
+                                sequences,
+                            )
+                        })?;
                         n_lists += 1;
                         return Ok(());
                     }
-                    let (values, saw_null, witness) = run_subquery(
-                        select,
-                        storage,
-                        txid,
-                        arena,
-                        params,
-                        depth,
-                        outer,
-                        arity,
-                        sequences,
-                        binding.filter(|_| arity == 1),
-                    )?;
+                    // `IN`, `ANY` and `ALL` read the rows as a set.
+                    let (values, saw_null, witness) =
+                        super::group::with_unobserved_order(select, || {
+                            run_subquery(
+                                select,
+                                storage,
+                                txid,
+                                arena,
+                                params,
+                                depth,
+                                outer,
+                                arity,
+                                sequences,
+                                binding.filter(|_| arity == 1),
+                            )
+                        })?;
                     lists[n_lists] = SubqueryList {
                         node: (*node as *const Expr).cast(),
                         values,

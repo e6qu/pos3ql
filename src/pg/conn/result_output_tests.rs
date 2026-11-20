@@ -931,7 +931,7 @@ fn grouped_results_stream_rows_as_the_client_reads() {
     );
     for (sql, expected) in [
         (
-            "SELECT id, count(*), max(payload), sum(id), avg(id) FROM big GROUP BY id",
+            "SELECT id, count(*), max(payload), sum(id), avg(id) FROM big GROUP BY id ORDER BY id",
             5000,
         ),
         (
@@ -1015,7 +1015,7 @@ fn builds_that_outgrow_plan_build_bytes_spool_instead() {
     assert!(messages(&setup).iter().all(|message| message.0 != b'E'));
     let sorted = "SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g ORDER BY g DESC";
     let joined = "SELECT b.id, b.payload, c.id FROM big b JOIN big c ON c.id = b.id";
-    let grouped = "SELECT id, max(payload), count(*) FROM big GROUP BY id";
+    let grouped = "SELECT id, max(payload), count(*) FROM big GROUP BY id ORDER BY id";
     // A routine call in the output runs the promotion attempt itself through
     // a retained reader, which also falls back before describing its result.
     // The general executor restarts at each first call, so keep it short.

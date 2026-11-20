@@ -2166,6 +2166,51 @@ pub(super) fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows
     groups.ceil().min(input).max(1.0)
 }
 
+/// `estimate_num_groups` of a grouping's keys, each read as `variables`
+/// gives it, over the relation's `rows`: a key of type `boolean` makes two
+/// groups, a variable with statistics counts as itself, and any other
+/// expression counts the columns it reads (`pull_var_clause`).
+pub(super) fn estimate_grouping(
+    planner: &Planner<'_, '_>,
+    variables: &[super::GroupVariable],
+    rows: f64,
+) -> f64 {
+    let input = clamp_row_est(rows);
+    let mut booleans = 1.0;
+    let mut read = [0usize; 64];
+    let mut count = 0;
+    let mut add = |column: usize| {
+        if !read[..count].contains(&column) && count < read.len() {
+            read[count] = column;
+            count += 1;
+        }
+    };
+    for variable in variables {
+        match *variable {
+            super::GroupVariable::Boolean(_) => booleans *= 2.0,
+            super::GroupVariable::Variable { variable, columns } => {
+                if planner.column_type(variable) == ColType::Bool {
+                    booleans *= 2.0;
+                    continue;
+                }
+                let statistics = planner.variable(variable);
+                if statistics.analyzed || statistics.unique {
+                    add(variable);
+                } else {
+                    columns.iter().for_each(&mut add);
+                }
+            }
+            super::GroupVariable::Columns(columns) => columns.iter().for_each(&mut add),
+        }
+    }
+    let groups = if count == 0 {
+        booleans
+    } else {
+        booleans * relation_groups_of(planner, &read[..count], 0, rows).0
+    };
+    groups.ceil().min(input).max(1.0)
+}
+
 /// `estimate_num_groups`' factor for the relation's `columns`, which the
 /// relation's `rows` restrict: its distinct combinations times two per
 /// boolean, and whether a column's distinct count was a default
@@ -2173,6 +2218,18 @@ pub(super) fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows
 pub(super) fn relation_groups(
     planner: &Planner<'_, '_>,
     columns: &[usize],
+    rows: f64,
+) -> (f64, bool) {
+    relation_groups_of(planner, columns, columns.len(), rows)
+}
+
+/// [`relation_groups`] of `columns`, the first `keys` of them grouping
+/// keys (a boolean one makes two groups) and the rest variables an
+/// expression reads, each counted by its distinct values.
+fn relation_groups_of(
+    planner: &Planner<'_, '_>,
+    columns: &[usize],
+    keys: usize,
     rows: f64,
 ) -> (f64, bool) {
     let mut used_default = false;
@@ -2186,7 +2243,7 @@ pub(super) fn relation_groups(
         if columns[..at].contains(&column) {
             continue;
         }
-        if planner.column_type(column) == ColType::Bool {
+        if at < keys && planner.column_type(column) == ColType::Bool {
             groups *= 2.0;
             continue;
         }
@@ -3175,10 +3232,15 @@ fn grouped<'a>(
     // A column an equality with a constant fixes is no grouping key: its
     // pathkey is redundant, and `processed_groupClause` leaves it out.
     let mut group_columns = [0usize; super::MAX_ORDER_KEYS];
+    let mut group_variables =
+        [super::GroupVariable::Boolean(ColumnSet::EMPTY); super::MAX_ORDER_KEYS];
     let mut group_count = 0;
-    for &column in &grouping.columns[..grouping.len] {
+    for (at, &column) in grouping.columns[..grouping.len].iter().enumerate() {
         if !paths.fixed.contains(column) {
             group_columns[group_count] = column;
+            if let Some(variables) = grouping.variables {
+                group_variables[group_count] = variables[at];
+            }
             group_count += 1;
         }
     }
@@ -3191,7 +3253,10 @@ fn grouped<'a>(
         .alloc_slice_with(kept.len(), |at| Some(kept[at]))
         .map_err(|_| crate::sql::eval::arena_full())?;
     let cheapest = cheapest_total(kept_options).expect("the relation keeps a path");
-    let groups = estimate_groups(planner, columns, rows);
+    let groups = match grouping.variables {
+        Some(_) => estimate_grouping(planner, &group_variables[..group_count], rows),
+        None => estimate_groups(planner, columns, rows),
+    };
     // The sorted strategy over each path sorted by the grouping keys: as it
     // is, incrementally after its leading keys, or the cheapest path in
     // full (`add_paths_to_grouping_rel`). A sort over no key is no sort.
@@ -3305,7 +3370,7 @@ fn grouped<'a>(
                 width,
             };
             // Without aggregates the sorted grouping is a `Group`.
-            let (startup, total, _) = super::aggregate::with_having(
+            let (startup, total, sorted_groups) = super::aggregate::with_having(
                 if grouping.aggregates.aggregated() {
                     cost_agg(
                         AggStrategy::Sorted,
@@ -3319,6 +3384,13 @@ fn grouped<'a>(
                 },
                 grouping.having,
             );
+            // A `Group` or `GroupAggregate` evaluates its target list per
+            // group; a `DISTINCT`'s `Unique` evaluates none.
+            let total = if grouping.distinct {
+                total
+            } else {
+                total + grouping.target_per_group * sorted_groups
+            };
             if sorted_count + 1 == MAX_CANDIDATES {
                 return Ok(Err("more than 66 grouped paths"));
             }
@@ -3353,6 +3425,7 @@ fn grouped<'a>(
         ),
         grouping.having,
     );
+    let total = total + grouping.target_per_group * kept_groups;
     let hashed = Candidate {
         startup,
         total,

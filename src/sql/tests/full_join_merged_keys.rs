@@ -104,6 +104,63 @@ fn full_join_merged_columns_group_and_push_constants() {
                 "        Filter: (id = 9)",
             ]
         );
+        // Only `COALESCE` of the clause's written left then right operand
+        // reaches the sides; any other stays the full join's filter.
+        for (condition, filter) in [
+            (
+                "t0.id = t1.id WHERE COALESCE(t1.id, t0.id) = 30",
+                "  Filter: (COALESCE(t1.id, t0.id) = 30)",
+            ),
+            (
+                "t0.id = t1.id WHERE COALESCE(t0.id, t1.id, 0) = 30",
+                "  Filter: (COALESCE(t0.id, t1.id, 0) = 30)",
+            ),
+            (
+                "t0.id = t1.id WHERE COALESCE(t0.v, t1.v) = 3",
+                "  Filter: (COALESCE(t0.v, t1.v) = 3)",
+            ),
+        ] {
+            assert_eq!(
+                plan(
+                    engine,
+                    budget,
+                    &format!("SELECT * FROM fu t0 FULL JOIN fu t1 ON {condition}")
+                ),
+                [
+                    "Hash Full Join",
+                    "  Hash Cond: (t0.id = t1.id)",
+                    filter,
+                    "  ->  Seq Scan on fu t0",
+                    "  ->  Hash",
+                    "        ->  Seq Scan on fu t1",
+                ]
+            );
+        }
+        assert_eq!(
+            data_rows(&run_with(
+                engine,
+                budget,
+                "EXPLAIN SELECT * FROM fu t0 FULL JOIN fu t1 ON t0.id = t1.id \
+                 WHERE COALESCE(t1.id, t0.id) = 30"
+            ))[0],
+            "Hash Full Join  (cost=5.50..11.75 rows=1 width=16)"
+        );
+        assert_eq!(
+            plan(
+                engine,
+                budget,
+                "SELECT * FROM fu t0 FULL JOIN fu t1 ON t1.id = t0.id \
+                 WHERE COALESCE(t1.id, t0.id) = 30"
+            ),
+            [
+                "Merge Full Join",
+                "  ->  Seq Scan on fu t0",
+                "        Filter: (id = 30)",
+                "  ->  Materialize",
+                "        ->  Seq Scan on fu t1",
+                "              Filter: (id = 30)",
+            ]
+        );
         // A sorted grouping reads the key from its input, parenthesized.
         assert_eq!(
             data_rows(&run_with(

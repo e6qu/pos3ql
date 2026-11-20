@@ -1280,7 +1280,10 @@ constant it joins that constant's equivalence class:
 `reconsider_full_join_clause` equates each side of the full join with the
 constant in that side's join domain, through each lower full join's own
 `COALESCE`, and drops the `COALESCE` member, while an outer join's clause
-of it moves the constant to the inner side (`differential_exact/975`). A
+of it moves the constant to the inner side (`differential_exact/975`). It
+matches only a two-argument `COALESCE` of the clause's written left then
+right operand; any other `COALESCE` equated with a constant (operands
+swapped, other columns, a third argument) stays the full join's filter. A
 query of analyzed tables reading a full join's merged column that the
 search does not plan still fails with `0A000` rather than run pos3ql's
 join order. The

@@ -2005,16 +2005,31 @@ impl Prep<'_, '_> {
             return Ok(false);
         };
         let (qual, constant, _) = self.classes[class].constant.expect("a constant");
-        // The full join whose sides the clause's sides read.
-        let Some(node) = (0..self.tree.node_count).find(|&node| {
-            self.kinds[node] == Some(TreeJoin::Full)
-                && left.base_relids() & !self.left_rels[node] == Relids::EMPTY
-                && right.base_relids() & !self.right_rels[node] == Relids::EMPTY
+        // The full join whose sides the clause's operands read; the clause
+        // may name the join's right side first.
+        let within = |member: Member, rels: Relids| member.base_relids() & !rels == Relids::EMPTY;
+        let Some((node, written_order)) = (0..self.tree.node_count).find_map(|node| {
+            if self.kinds[node] != Some(TreeJoin::Full) {
+                return None;
+            }
+            let (left_rels, right_rels) = (self.left_rels[node], self.right_rels[node]);
+            if within(left, left_rels) && within(right, right_rels) {
+                Some((node, true))
+            } else if within(left, right_rels) && within(right, left_rels) {
+                Some((node, false))
+            } else {
+                None
+            }
         }) else {
             return Err("a full join clause outside its full join");
         };
         let (left_node, right_node) = self.sides[node];
-        for (side, child) in [(left, left_node), (right, right_node)] {
+        let (left_child, right_child) = if written_order {
+            (left_node, right_node)
+        } else {
+            (right_node, left_node)
+        };
+        for (side, child) in [(left, left_child), (right, right_child)] {
             if side.expression_id().is_none() && side.nulling != Relids::EMPTY {
                 return Err("a full join clause of a nulled column equated with a constant");
             }

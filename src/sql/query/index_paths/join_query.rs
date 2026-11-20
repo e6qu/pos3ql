@@ -1038,13 +1038,16 @@ impl<'a> Expressions<'a> {
     }
 }
 
-/// The operands of `side` when it is `COALESCE(one, two)` of members of
-/// disjoint relations of one hashable type and collation, as a full join's
-/// merged `USING` column is: each a column, an expression, or such a
-/// `COALESCE` again, whose operands [`Expressions::parts`] records.
+/// The operands of `side` when it is `COALESCE(one, two)` whose operands
+/// are, in order, the left and right operands of a full join's clause
+/// (`full_clauses`), as a full join's merged `USING` column is: each a
+/// column, an expression, or such a `COALESCE` again, whose operands
+/// [`Expressions::parts`] records. `reconsider_full_join_clause` matches no
+/// other `COALESCE`: one with other arguments stays an ordinary filter.
 fn coalesce_operands<'a>(
     scope: &QueryScope<'a>,
     expressions: &mut Expressions<'a>,
+    full_clauses: &[join_tree::Var],
     side: &'a Expr<'a>,
 ) -> Result<Option<(Member, Member, ColType)>, SqlError> {
     let Expr::Call {
@@ -1072,13 +1075,16 @@ fn coalesce_operands<'a>(
         || left_type != right_type
         || left_collation != right_collation
         || !joinable(left_type)
+        || !full_clauses
+            .chunks_exact(2)
+            .any(|pair| pair == [(left.rel, left.column), (right.rel, right.column)])
     {
         return Ok(None);
     }
     for (member, operand) in [(left, *one), (right, *two)] {
         if let Some(id) = member.expression_id() {
             let Some((inner_left, inner_right, _)) =
-                coalesce_operands(scope, expressions, operand)?
+                coalesce_operands(scope, expressions, full_clauses, operand)?
             else {
                 return Ok(None);
             };
@@ -1098,6 +1104,7 @@ fn analyze_qual<'a>(
     expression: &'a Expr<'a>,
     constants: &mut Constants<'a>,
     expressions: &mut Expressions<'a>,
+    full_clauses: &[join_tree::Var],
 ) -> Result<Option<Qual>, SqlError> {
     // `COALESCE(left, right) = constant` of two relations' columns or such
     // `COALESCE`s, written or a full join's merged column.
@@ -1115,7 +1122,7 @@ fn analyze_qual<'a>(
             _ => None,
         };
         if let Some((side, value)) = found {
-            match coalesce_operands(scope, expressions, side)? {
+            match coalesce_operands(scope, expressions, full_clauses, side)? {
                 Some((one, two, ctype)) => {
                     // The `COALESCE` itself, a member of the constant's class
                     // that `reconsider_full_join_clause` finds by its parts.
@@ -1143,10 +1150,6 @@ fn analyze_qual<'a>(
                         },
                     }));
                 }
-                // A full join chain's merged column equated with a constant
-                // is one `reconsider_full_join_clause` pushes into each side
-                // through the lower joins' `COALESCE`.
-                None if scope.has_full_merged() => return Ok(None),
                 None => {}
             }
         }
@@ -2613,6 +2616,10 @@ fn modeled_join_over<'a>(
         count: 0,
     };
     let mut expressions = Expressions::new(storage, txid, arena);
+    // The written left and right operands of each full join's equality
+    // clause, in pairs, which a `COALESCE` above it must name in order.
+    let mut full_clauses = [(0u8, 0u16); 2 * (MAX_QUALS + 1)];
+    let mut full_clause_count = 0;
     let sources = joined.iter().map(|&(node, on)| (Some(node), on)).chain(
         statement
             .where_clause
@@ -2629,10 +2636,28 @@ fn modeled_join_over<'a>(
         }
         for &conjunct in &conjuncts[..count] {
             let conjunct = flatten_merged(scope, conjunct, arena)?;
-            let Some(qual) = analyze_qual(scope, conjunct, &mut constants, &mut expressions)?
+            let Some(qual) = analyze_qual(
+                scope,
+                conjunct,
+                &mut constants,
+                &mut expressions,
+                &full_clauses[..full_clause_count],
+            )?
             else {
                 return Ok(None);
             };
+            if let (
+                TreeNode::Join {
+                    kind: TreeJoin::Full,
+                    ..
+                },
+                Shape::Columns(one, two),
+            ) = (tree.nodes[usize::from(node)], qual.shape)
+            {
+                full_clauses[full_clause_count] = one;
+                full_clauses[full_clause_count + 1] = two;
+                full_clause_count += 2;
+            }
             let Some(id) = tree.qual(node, qual) else {
                 return Err(preparation_full());
             };

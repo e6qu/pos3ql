@@ -6,7 +6,9 @@
 -- each side of the full join with the constant, through every lower full
 -- join's own COALESCE, and the join keeps no condition; an outer join's
 -- clause of it moves the constant to the inner side. USING and NATURAL
--- joins beside a parenthesized join join on its members' columns.
+-- joins beside a parenthesized join join on its members' columns. Only a
+-- two-argument COALESCE of the clause's written left then right operand
+-- matches; any other COALESCE stays a filter of the full join.
 CREATE TABLE fu (id int, v int);
 INSERT INTO fu SELECT g, g % 7 FROM generate_series(1, 200) g;
 ANALYZE fu;
@@ -52,6 +54,13 @@ EXPLAIN (COSTS OFF) SELECT * FROM fu t0 FULL JOIN fu t1 USING (id) LEFT JOIN fu 
 SELECT * FROM fu t0 FULL JOIN fu t1 USING (id) LEFT JOIN fu t2 USING (id) WHERE id = 9;
 EXPLAIN (COSTS OFF) SELECT * FROM fu t0 FULL JOIN fu t1 USING (id) WHERE id = 300;
 SELECT * FROM fu t0 FULL JOIN fu t1 USING (id) WHERE id = 300;
+EXPLAIN SELECT * FROM fu t0 FULL JOIN fu t1 ON t0.id = t1.id WHERE COALESCE(t1.id, t0.id) = 30;
+EXPLAIN SELECT * FROM fu t0 FULL JOIN fu t1 ON t0.id = t1.id WHERE COALESCE(t0.id, t1.id, 0) = 30;
+EXPLAIN SELECT * FROM fu t0 FULL JOIN fu t1 ON t0.id = t1.id WHERE COALESCE(t0.id, t1.id) = 30;
+EXPLAIN SELECT * FROM fu t0 FULL JOIN fu t1 ON t1.id = t0.id WHERE COALESCE(t1.id, t0.id) = 30;
+EXPLAIN SELECT * FROM fu t0 FULL JOIN fu t1 ON t0.id = t1.id WHERE COALESCE(t0.v, t1.v) = 3;
+SELECT * FROM fu t0 FULL JOIN fu t1 ON t0.id = t1.id WHERE COALESCE(t1.id, t0.id) = 30;
+SELECT * FROM fu t0 FULL JOIN fu t1 ON t0.id = t1.id WHERE COALESCE(t0.id, t1.id, 0) = 30;
 
 EXPLAIN (COSTS OFF) SELECT * FROM pa JOIN (pb JOIN pc USING (id)) USING (id);
 SELECT * FROM pa JOIN (pb JOIN pc USING (id)) USING (id) LIMIT 5;

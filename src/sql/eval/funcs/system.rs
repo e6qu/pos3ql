@@ -1261,6 +1261,7 @@ pub(crate) fn dispatch<'a>(
                 | "pg_try_advisory_xact_lock"
                 | "pg_try_advisory_xact_lock_shared"
                 | "pg_is_in_recovery"
+                | "pg_jit_available"
                 | "pg_reload_conf"
                 | "pg_event_trigger_table_rewrite_oid"
                 | "pg_event_trigger_table_rewrite_reason"
@@ -1930,6 +1931,12 @@ pub(crate) fn dispatch<'a>(
             }
             // pos3ql is a single-primary server and has no recovery/standby mode.
             "pg_is_in_recovery" => {
+                arity(0)?;
+                Ok(Datum::Bool(false))
+            }
+            // pos3ql loads no JIT provider, as a PostgreSQL built without
+            // LLVM (`jit_provider` names one that is not installed).
+            "pg_jit_available" => {
                 arity(0)?;
                 Ok(Datum::Bool(false))
             }

@@ -29561,6 +29561,7 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
         "standard_conforming_strings" => Some("on"),
         "integer_datetimes" => Some("on"),
         "data_directory_mode" => Some("0700"),
+        "jit_provider" => Some("llvmjit"),
         _ => None,
     }
 }
@@ -29781,6 +29782,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "jit_above_cost",
     "jit_inline_above_cost",
     "jit_optimize_above_cost",
+    "jit_provider",
     "join_collapse_limit",
     "lc_monetary",
     "lock_timeout",

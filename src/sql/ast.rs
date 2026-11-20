@@ -6486,6 +6486,7 @@ pub(crate) fn is_volatile_function(name: &str) -> bool {
         "txid_status",
         "pg_xact_status",
         "pg_is_in_recovery",
+        "pg_jit_available",
         "pg_reload_conf",
         "pg_blocking_pids",
         "pg_cancel_backend",

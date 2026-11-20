@@ -82029,6 +82029,41 @@ fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
 }
 
 #[test]
+fn jit_is_unavailable_as_without_llvm() {
+    let (mut engine, mut budget) = test_engine();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_jit_available(), current_setting('jit_provider'), \
+             current_setting('jit')"
+        )),
+        ["f|llvmjit|on"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT context, vartype, category, short_desc, boot_val FROM pg_settings \
+             WHERE name = 'jit_provider'"
+        )),
+        [
+            "postmaster|string|Client Connection Defaults / Shared Library Preloading|\
+             JIT provider to use.|llvmjit"
+        ]
+    );
+    let output = run_with(&mut engine, &mut budget, "SET jit_provider = 'llvmjit'");
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("C55P02")
+            && text.contains(
+                "parameter \"jit_provider\" cannot be changed without restarting the server"
+            ),
+        "{text}"
+    );
+}
+
+#[test]
 fn pg_dump_bootstrap_surface() {
     let (mut engine, mut budget) = test_engine();
     assert_eq!(

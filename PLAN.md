@@ -1075,7 +1075,13 @@ query. `max_parallel_workers_per_gather` is PostgreSQL's setting (default 2,
 setting above 0 an `EXPLAIN` of a query scanning a relation at least that
 large fails with `0A000`, since PostgreSQL may choose a `Gather` there (a
 write or a row lock is never parallel, so its plan prints); at 0 every plan
-is exact (`differential_exact/931`). `BUFFERS` is on by default under
+is exact (`differential_exact/931`). pos3ql compiles nothing, as a
+PostgreSQL built without LLVM: `jit_provider` is the server-start setting
+naming `llvmjit`, `pg_jit_available()` is false and no `EXPLAIN` prints a
+`JIT` section (`differential_exact/973`); the developer settings
+`jit_debugging_support`, `jit_dump_bitcode`, `jit_expressions`,
+`jit_profiling_support` and `jit_tuple_deforming` are not yet settings
+(`SHOW` fails with `42704`). `BUFFERS` is on by default under
 `ANALYZE`, as in PostgreSQL 18, and accepted without it. Each node prints
 pos3ql's own page accesses in PostgreSQL's format and placement (its
 inputs' and a read `WITH` query's included, zero counters omitted in text,

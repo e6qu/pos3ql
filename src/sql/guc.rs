@@ -3623,11 +3623,7 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
     {
         // Their only accepted value is already the fixed default.
     } else if is_read_only(name) {
-        return Err(sql_err!(
-            sqlstate::CANT_CHANGE_RUNTIME_PARAM,
-            "parameter \"{}\" cannot be changed",
-            name
-        ));
+        return Err(read_only_parameter(name));
     } else {
         return Err(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -3925,11 +3921,7 @@ fn apply_setting(
     }
     // Read-only parameters cannot be assigned.
     if is_read_only(name) {
-        return Err(sql_err!(
-            crate::sql::eval::sqlstate::CANT_CHANGE_RUNTIME_PARAM,
-            "parameter \"{}\" cannot be changed",
-            name
-        ));
+        return Err(read_only_parameter(name));
     }
     Err(sql_err!(
         sqlstate::UNDEFINED_OBJECT,
@@ -4960,6 +4952,7 @@ enum ReadOnlyParameterContext {
 
 fn read_only_parameter_context(name: &str) -> Option<ReadOnlyParameterContext> {
     if [
+        "jit_provider",
         "max_connections",
         "max_locks_per_transaction",
         "max_prepared_transactions",
@@ -4988,6 +4981,27 @@ fn read_only_parameter_context(name: &str) -> Option<ReadOnlyParameterContext> {
 
 fn is_read_only(name: &str) -> bool {
     read_only_parameter_context(name).is_some()
+}
+
+/// The assignment of read-only parameter `name`, refused as PostgreSQL's
+/// `set_config_option` refuses it: a server-start parameter needs a restart.
+fn read_only_parameter(name: &str) -> SqlError {
+    let name = crate::sql::SETTING_NAMES
+        .iter()
+        .find(|held| held.eq_ignore_ascii_case(name))
+        .map_or(name, |held| held);
+    match read_only_parameter_context(name) {
+        Some(ReadOnlyParameterContext::Startup) => sql_err!(
+            sqlstate::CANT_CHANGE_RUNTIME_PARAM,
+            "parameter \"{}\" cannot be changed without restarting the server",
+            name
+        ),
+        _ => sql_err!(
+            sqlstate::CANT_CHANGE_RUNTIME_PARAM,
+            "parameter \"{}\" cannot be changed",
+            name
+        ),
+    }
 }
 
 /// An enumerated setting's rejection, with PostgreSQL's list of its values.

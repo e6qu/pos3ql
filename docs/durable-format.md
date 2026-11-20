@@ -1,32 +1,25 @@
 # Durable format compatibility
 
-This guide lists the object formats the current binary reads and writes, and
-the rules it uses to reject anything else. [Architecture](architecture.md)
-explains the storage layout and physical limits; this page is the byte-level
-inventory.
+This page is the byte-level inventory of the object formats the current binary
+reads and writes; [architecture](architecture.md) explains the storage layout.
+Saved objects can outlive the binary that wrote them, so every root, journal
+record, block and row SST (sorted string table, an immutable sorted run of rows)
+carries a format identity that is checked before its bytes are interpreted. An
+unknown identity stops startup with a named error; no decoder is guessed.
 
-Object storage is the durable tier, and immutable objects can outlive the
-binary that wrote them. Every root, journal record, block and row SST
-(sorted string table, an immutable sorted run of rows) therefore carries a
-format identity that is checked before its bytes are interpreted. An unknown
-identity stops startup with a named error; it never selects a guessed decoder.
-
-Compatibility with earlier pos3ql versions is not provided. There is no
-automatic upgrade, downgrade or offline migration.
-
-**User example:** after an incompatible format change, a database saved by an
-older binary fails startup. Use a fresh object-store prefix, or an explicitly
-verified logical export and restore between the two binaries. Never point a new
-database at an old prefix and assume its objects are disposable. Application
-schema changes follow a different procedure; see
-[operations](operations.md#scheduled-work-and-schema-migrations).
+Earlier pos3ql versions are not supported: there is no upgrade, downgrade or
+offline migration. **User example:** after an incompatible format change, a
+database saved by an older binary fails startup. Use a fresh object-store prefix,
+or a verified logical export and restore between the two binaries; never treat an
+old prefix's objects as disposable. Application schema changes follow
+[a different procedure](operations.md#scheduled-work-and-schema-migrations).
 
 ## Current compatibility matrix
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v49` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
-| Journal record | Version `33` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
+| Journal record | Version `34` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process's writer token. |
@@ -63,9 +56,8 @@ changing the code, this table and the tests together.
   recovery never guesses or regenerates a missing identity.
 - Recovery fails with `22000` when a valid partitioned index lacks exactly one
   attached index on a partition that can hold one, or an index is attached to
-  a parent index outside its table's partition parent. Earlier releases could
-  save partitions without their copy of a partitioned unique index, leaving
-  duplicates unchecked there; such a state is refused, not repaired.
+  a parent index outside its table's partition parent. Such a state is refused,
+  not repaired.
 
 ### Change checklist
 
@@ -87,7 +79,7 @@ Do not keep a decoder or add a conversion solely for an older pos3ql version.
 ### Journal records
 
 Framing is 24 bytes: CRC32C, payload length and LSN in bytes 0–15; byte 16 is
-the operation kind; byte 17 is the version (`33`); bytes 18–23 are zero.
+the operation kind; byte 17 is the version (`34`); bytes 18–23 are zero.
 Field-width changes use new kind bytes. Kinds with special rules:
 
 | Kind | Meaning | Rule |
@@ -122,65 +114,67 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 28: version byte, ten-byte catalog
-  position, name, then the definition. Other versions are rejected. Each
-  column's NOT NULL inheritance byte carries inheritability in bit 0,
-  PostgreSQL's `attislocal` in bit 1 and, in bit 2, that the column's NOT NULL
-  constraint was added `NOT VALID` and not yet validated (PostgreSQL's
-  `convalidated` false); bit 2 on a nullable column and other bits are
-  rejected. The manifest's `col6` line carries the same byte. Each CHECK constraint's inheritance byte
-  carries `NO INHERIT` in bit 0 and, in bit 1, that the table only inherits
-  it (PostgreSQL's `conislocal` false); other bits are rejected. The
-  manifest's `chk2` line carries the same byte. Each column carries a generation-kind
-  byte after its NOT NULL inheritance byte
-  (0, or the `attgenerated` code `s` or `v`), which must agree with the
-  generated flag. After its validation code, each foreign key stores four
-  one-byte `tgenabled` codes (`O`, `R`, `A`, `D`) for its delete-action,
-  update-action, insert-check and update-check RI triggers, then a one-byte
-  count and the two-byte column positions its `ON DELETE SET NULL (...)` or
-  `SET DEFAULT (...)` list changes (PostgreSQL's `confdelsetcols`; zero means
-  every key column), then the four-byte creation stamp of the referenced
-  table's unique index the key depends on (PostgreSQL's `conindid`; zero is
-  rejected), then three four-byte stamps (zero for none): the partition
-  parent's key it is attached to (PostgreSQL's `conparentid`), its action
-  triggers' and its check triggers' stamps, from which their OIDs derive. A
-  NOT ENFORCED key has no triggers; an enforced key has check triggers, and
-  action triggers exactly when it is not attached; anything else is rejected. The manifest's `fkey` line carries the
-  same four codes, count, positions and four stamps after the validation code. After the inline key names
-  come the foreign keys' partition clones (PostgreSQL's `pg_constraint` row
-  per partition of a referenced partitioned table): a two-byte count of at
-  most 256, then for each the four-byte creation stamp of the key it belongs
-  to, the referenced partition's ten-byte catalog position and the clone's
-  name. Each clone's own creation stamp follows the table's other constraint
-  stamps, last. A duplicate (key, partition) pair or an empty name is
-  rejected. The manifest writes each clone as an `fkclone <key stamp>
-  <partition slot> <partition stamp> <hex name>` line after the `fkey`
-  lines. Each exclusion constraint
-  element is a tag byte, `0` with a two-byte column position or `1` with a
-  two-byte length and that many bytes of canonical UTF-8 expression text,
-  then the four-byte operator OID (a runnable built-in or a user-defined
-  operator) and fifteen bytes of key options: the written operator class
-  (five bytes: tag `0` none, `1` btree, `3` hash, `4` BRIN, `5` GiST, `6` GIN
-  or `7` SP-GiST with a built-in class code and three zero bytes, or `2` with
-  a four-byte user class OID), the resolved class (same form, never `0`), the
-  four-byte key collation code and a flag byte (bit 0 `DESC`, bit 1
-  `NULLS FIRST`, bit 2 collation written; other bits rejected). An unknown
-  tag, invalid UTF-8, a span past the record or more than 256 bytes of
-  expression text in one constraint is rejected. The definition ends with its
-  [expression dependencies](#expression-dependencies).
+- **Table definition payload** is version 29: version byte, ten-byte catalog
+  position, name, then the definition. Other versions are rejected.
+  - Each column's NOT NULL inheritance byte: bit 0 inheritable, bit 1
+    PostgreSQL's `attislocal`, bit 2 added `NOT VALID` and not yet validated
+    (`convalidated` false). Bit 2 on a nullable column and other bits are
+    rejected. The manifest's `col6` line carries the same byte. A
+    generation-kind byte follows (0, or the `attgenerated` code `s` or `v`) and
+    must agree with the generated flag.
+  - Each CHECK constraint's inheritance byte: bit 0 `NO INHERIT`, bit 1 only
+    inherited (`conislocal` false); other bits are rejected. The manifest's
+    `chk2` line carries the same byte.
+  - After the fill-factor byte, the `autovacuum_enabled` storage option: a flags
+    byte (0 unset; otherwise bit 0 set, bit 1 the value, bit 2 written before
+    `fillfactor`) and the one-byte-length written spelling. A value that
+    disagrees with its spelling is rejected.
+  - After its validation code, each foreign key stores four one-byte
+    `tgenabled` codes (`O`, `R`, `A`, `D`) for its delete-action,
+    update-action, insert-check and update-check RI triggers; a one-byte count
+    and the two-byte column positions of its `ON DELETE SET NULL (...)` or
+    `SET DEFAULT (...)` list (`confdelsetcols`; zero means every key column);
+    the four-byte creation stamp of the referenced unique index (`conindid`;
+    zero is rejected); then three four-byte stamps (zero for none): the
+    partition parent's key it is attached to (`conparentid`), its action
+    triggers and its check triggers, from which their OIDs derive. A NOT
+    ENFORCED key has no triggers; an enforced key has check triggers, and
+    action triggers exactly when it is not attached; anything else is
+    rejected. The manifest's `fkey` line carries the same fields after the
+    validation code.
+  - After the inline key names come the foreign keys' partition clones
+    (PostgreSQL's `pg_constraint` row per partition of a referenced partitioned
+    table): a two-byte count of at most 256, then for each the four-byte stamp
+    of its key, the referenced partition's ten-byte position and the clone's
+    name. Each clone's own stamp follows the table's other constraint stamps,
+    last. A duplicate (key, partition) pair or an empty name is rejected. The
+    manifest writes `fkclone <key stamp> <partition slot> <partition stamp>
+    <hex name>` lines after the `fkey` lines.
+  - Each exclusion constraint element is a tag byte, `0` with a two-byte column
+    position or `1` with a two-byte length and canonical UTF-8 expression text,
+    then the four-byte operator OID (a runnable built-in or user-defined
+    operator) and fifteen bytes of key options: the written operator class
+    (five bytes: tag `0` none, `1` btree, `3` hash, `4` BRIN, `5` GiST, `6` GIN
+    or `7` SP-GiST with a built-in class code and three zero bytes, or `2` with
+    a four-byte user class OID), the resolved class (same form, never `0`), the
+    four-byte key collation code and a flag byte (bit 0 `DESC`, bit 1
+    `NULLS FIRST`, bit 2 collation written; other bits rejected). An unknown
+    tag, invalid UTF-8, a span past the record or more than 256 bytes of
+    expression text in one constraint is rejected.
+  - The definition ends with its
+    [expression dependencies](#expression-dependencies).
 - **Domain payload** uses marker 250; earlier layouts are rejected. Its collation
   code (`pg_type.typcollation`) follows the base type modifier. A mandatory
   checked-default input section follows the constraint identities (an empty
   section is explicit).
 - **Table statistics** use V7 marker 249 and a declared record count of at
   most 3,456: the table's columns, up to 256 index expression keys and the
-  columns' inherited statistics. Each
-  record starts with an eight-byte index creation stamp (0 for a table
+  columns' inherited statistics. Each record starts with an eight-byte index creation stamp (0 for a table
   column, all ones for a column's statistics over the table and its
   descendants, `pg_statistic.stainherit`, else the index whose key it
   describes, as `pg_statistic` keys an index expression's statistics to
-  the index) and a two-byte attribute
-  number (a column number 1–1,600, or a key position 1–32); records are
+  the index) and a two-byte attribute number (a column number 1–1,600, or a
+  key position 1–32); records are
   strictly increasing by stamp, then attribute. Each record stores its null and
   distinct fractions as IEEE-754 `float4` bits and ends with a four-byte
   length and its value distribution: format byte 1, a correlation flag and
@@ -189,10 +183,8 @@ Other payload rules:
   encodings (empty when ANALYZE computed none). The checkpoint manifest's
   `stats` line adds the image's distribution bytes; each `cstat` and `cdist`
   line names the index stamp before the attribute, and a `cdist` line after
-  each `cstat` holds the distribution in hexadecimal. V3–V6 images are
-  rejected, as are `pos3ql-manifest-v46` through `pos3ql-manifest-v48`,
-  whose `cstat` and `cdist` lines lack the index stamp or whose columns are
-  `col5` lines.
+  each `cstat` holds the distribution in hexadecimal. Earlier markers are
+  rejected.
 - **Commit boundaries** append PostgreSQL-epoch commit microseconds to the
   transaction identity fields. The empty, identity-only and
   identity-plus-assignment forms are still read; LSN recovery can use them, but
@@ -226,19 +218,19 @@ inserts a missing writer.
 |---|---|
 | `table2` | Slot, creation stamp, hexadecimal checked-input image, name. Internal large-object page table keeps its reserved slot and stamp zero. |
 | `sq7`, `rtn2` | Sequence / routine slot and creation stamp. A routine's language code is 0 (SQL), 1 (PL/pgSQL), 2 (internal aggregate) or 16 plus a native routine code for a `LANGUAGE C` routine bound to built-in postgres_fdw code (0 handler, 1 validator, 2 and 3 `get_connections` 1.1 and 1.2, 4 `disconnect`, 5 `disconnect_all`). Such a handler's `fdw_handler` result persists as type code 250. |
-| `fdw2` | Foreign-data wrapper slot, creation stamp, owner, handler and validator `pg_proc` OIDs (0 for none), name and options. The earlier `fdw` record, with 0/1 flags, is rejected. |
+| `fdw2` | Foreign-data wrapper slot, creation stamp, owner, handler and validator `pg_proc` OIDs (0 for none), name and options. |
 | `xpk`, `xsc` | Available extension packages and their version scripts, numbered after the packages built into the binary (`$system`'s postgres_fdw), which are never persisted. |
 | `mv6` | Materialized-view catalog position and backing-table position. |
 | `vw16` | View position and stamp, return-rule position and stamp, encoded query, schema, search path, name, then the security, barrier, check-option and query-origin codes (query origin: 0 `CREATE VIEW`, 1 `CREATE OR REPLACE RULE "_RETURN"`; it decides whether `pg_get_viewdef` qualifies columns), the `reloptions` list as hexadecimal (order code, then each option's written value: length and eight padded bytes), then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
 | `hidx <table-slot> <0-or-1>` | Required once per table, including tables without indexes. The large-object page table requires `0`. |
-| `col6` | Type, flags, then the generation kind, the field `col5` added (0, or `pg_attribute.attgenerated`'s `s` or `v` code), then the remaining column fields; hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
+| `col6` | Type, flags, then the generation kind (0, or `pg_attribute.attgenerated`'s `s` or `v` code), then the remaining column fields; hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
 | `xdep <hex>` | One [expression dependency](#expression-dependencies) of the preceding table, in its journal encoding; at most 64 per table. Index owners are rejected. |
 | `attributes2` | Entry count and each attribute entry as sixteen hex digits. |
 | `implicit_index POSITION CREATED_AT` | Constraint-created index identities, including the current TOAST index. |
 | `inline_key_name ATTRIBUTE HEX_NAME` | One per active inline primary or unique key. |
 | `constraint_identity POSITION CREATED_AT` | Table constraint identities in the [canonical order](#constraints-and-keys). |
 | `ukey` | Starts with the unique-key mode tag. |
-| `excl4` | Timing, method and element count, then per element `c COLUMN` or `e HEX_EXPRESSION` followed by the operator OID and the journal's fifteen key-option bytes in hex, then the hexadecimal name and predicate (`-` for none). Other element tags, over-long expression text and the earlier `excl3` record are rejected. |
+| `excl4` | Timing, method and element count, then per element `c COLUMN` or `e HEX_EXPRESSION` followed by the operator OID and the journal's fifteen key-option bytes in hex, then the hexadecimal name and predicate (`-` for none). Other element tags and over-long expression text are rejected. |
 | `dom8`, `enm3`, `cmp2` | Domain, enum and composite types; written before the required `types_end`. Later type records or a missing/duplicate `types_end` are rejected. |
 | `nsp` | Creation stamp, database-owner flag (`0`/`1`), hexadecimal name. Stamp zero is an initial public schema. |
 | `pub` | Creation stamp after the owner, before the flags. |
@@ -253,7 +245,7 @@ inserts a missing writer.
 | `pol` | Position and creation stamp first. |
 | `am`, `cst`, `opr`, `opf`, `opc` | Position before creation stamp. |
 | `dsst` | Row SST reference naming its own format (`v2`, `v3`, `v4`). |
-| Dependency records | `i2` grammar with a trailing hexadecimal checked-input image (`-` when empty). Earlier grammars are rejected. |
+| Dependency records | `i2` grammar with a trailing hexadecimal checked-input image (`-` when empty). |
 
 `catalog_sequence` is at least every restored creation stamp, including objects
 deleted before checkpoint. `role_sequence` keeps the highest role reservation,
@@ -322,8 +314,8 @@ Public SQL identifiers (OIDs) are a fixed base plus the creation stamp, so names
 and slots never determine them. Every family owns one band in a single registry
 (`src/storage/oid_bands.rs`); a compile-time check rejects a band that overlaps
 another, starts below PostgreSQL's first user OID (16,384) or passes the
-largest signed 32-bit OID, so an OID alone identifies its family. Every stamp is in 1–9,999,999; fresh creation
-past that returns `54000` and installs nothing. Recovery rejects zero,
+largest signed 32-bit OID, so an OID alone identifies its family. Every stamp
+is in 1–9,999,999; fresh creation past that returns `54000` and installs nothing. Recovery rejects zero,
 out-of-range, duplicate or unreserved stamps (`22000` where a SQLSTATE applies)
 before writer promotion, using fixed 8 KiB bitmaps scanned over bounded windows
 rather than collections that grow with catalog churn.
@@ -422,22 +414,22 @@ detached partition CHECKs, and domain CHECK and NOT NULL constraints each have a
 creation identity. Renames preserve it; replacing a backing index changes
 `conindid` but not the constraint identifier, comments or dependencies.
 
-Table payload v21 and domain marker 250 append one four-byte little-endian
+The table payload and domain marker 250 append one four-byte little-endian
 identity per constraint and column default. Table order: CHECKs, foreign keys,
 live attributes by stable attribute number (NOT NULL, then the default or
 generation expression, each when present), detached partition CHECK, named
 primary and unique keys, exclusions, inline keys by attribute number. A column
-default's identity selects its `pg_attrdef` OID. Domain order:
-CHECKs, then NOT NULL. `dom8` appends domain identities and the typcollation code after the modifier. Positions describe the
-layout only. Recovery also rejects identities created before their owner, above
+default's identity selects its `pg_attrdef` OID. Domain order: CHECKs, then
+NOT NULL. `dom8` appends domain identities and the typcollation code after the
+modifier. Positions describe the layout only. Recovery also rejects identities created before their owner, above
 the saved counter, or shared by distinct tables or domains in one database.
 
 | Rule | Format |
 |---|---|
 | Per-kind capacity | 64 table constraints per kind, 64 domain checks; journal counts are bytes; the 65th returns `54000` |
-| Unique-key mode | Tag `0` NULLs distinct, `1` primary key, `2` `NULLS NOT DISTINCT`; other tags rejected. v21 stores tag, key-column count and timing as three bytes before positions |
+| Unique-key mode | Tag `0` NULLs distinct, `1` primary key, `2` `NULLS NOT DISTINCT`; other tags rejected. Stored as tag, key-column count and timing as three bytes before positions |
 | Constraint-created indexes | Own stamp; stored beside stable attribute numbers within the 512-byte column metadata bound |
-| Inline key names | Chosen once at admission (63-byte limit, no split UTF-8, collision suffix); v21 stores two-byte attribute number plus bounded name per key |
+| Inline key names | Chosen once at admission (63-byte limit, no split UTF-8, collision suffix); stored as two-byte attribute number plus bounded name per key |
 | NOT NULL names | Stored for columns and domains; renaming `orders` keeps `orders_id_not_null` |
 | Deferred uniqueness | Stored; every current index-option section is required |
 
@@ -445,8 +437,7 @@ the saved counter, or shared by distinct tables or domains in one database.
 
 The objects a CHECK constraint, exclusion constraint element or predicate,
 column default or generation expression, or index key or predicate was bound
-to when written. Table payloads append a
-one-byte count and the entries after the constraint identities; index journal
+to when written. Table payloads append a one-byte count and the entries after the constraint identities; index journal
 records append marker `0xa7`, a one-byte count and the entries after the
 definition. Each entry:
 
@@ -477,7 +468,9 @@ Invalid indexes cannot serve reads; ready indexes participate in writes and
 uniqueness. An index create or definition change journals the partitioned
 index it is attached to as that index's four-byte creation stamp (zero for
 none), never its catalog slot, which replay does not reproduce; recovery
-resolves the stamp and rejects one that names no index. TOAST index sources are encoded in 11 journal bytes: one tag plus a
+resolves the stamp and rejects one that names no index.
+
+TOAST index sources are encoded in 11 journal bytes: one tag plus a
 ten-byte owner identity (the ordinary-table tag requires ten zero bytes). They
 distinguish real columns from virtual `chunk_id`/`chunk_seq` keys. Unknown tags,
 stale owners and contradictory keys are rejected.
@@ -607,7 +600,7 @@ inferred from row values.
 
 ### Fixed-memory accounting
 
-All added fields are charged by the common journal sizing function or the
-configured manifest buffer; none adds runtime heap growth. Manifest records grow
+Every field is charged by the common journal sizing function or the configured
+manifest buffer; none adds runtime heap growth. Manifest records grow
 by at most 22 bytes per table, 27 per sequence, 7 per routine and 54 per
 materialized view. Table header scratch is 278 bytes.

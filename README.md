@@ -18,7 +18,8 @@ read while another connection waits for storage. Performance and failover on
 separate machines have not yet been measured.
 
 See [what works today](docs/implemented-baseline.md) and the
-[roadmap](PLAN.md) for what remains.
+[roadmap](PLAN.md), whose [finish line](PLAN.md#the-finish-line) defines when
+the project is done.
 
 ## Where we want to get
 

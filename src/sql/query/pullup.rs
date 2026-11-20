@@ -293,6 +293,10 @@ fn spell_out_parenthesized_joins<'a>(
             let table = item(from, index);
             table.join_members.is_some()
                 && (table.alias.is_some()
+                    || from
+                        .joins
+                        .iter()
+                        .any(|join| join.using.is_some() || join.natural)
                     || table
                         .subquery
                         .and_then(|body| body.from.as_ref())
@@ -346,7 +350,7 @@ fn spell_out_parenthesized_join<'a>(
         || from
             .joins
             .iter()
-            .any(|join| join.using.is_some() || join.natural)
+            .any(|join| join.using.is_some_and(|using| using.alias.is_some()))
         || inner_items().any(|member| member.join_members.is_some() || member.lateral)
         || inner_from
             .joins
@@ -582,6 +586,11 @@ fn spell_out_parenthesized_join<'a>(
      -> Step<()> {
         let expression = match entry {
             ResolvedColumn::Table(at, index) if at == position => rewrite.copy(columns[index])?,
+            // A merged column of the outer joins reads the join's columns
+            // through its expression.
+            entry @ ResolvedColumn::Merged(_) => {
+                rewrite.expression(scope.star_expression(entry, arena)?, None)?
+            }
             entry => scope.star_expression(entry, arena)?,
         };
         items
@@ -631,6 +640,20 @@ fn spell_out_parenthesized_join<'a>(
         let mut join = *join;
         if index + 1 == position {
             join.table = unaliased;
+        }
+        // A `USING` or `NATURAL` join joins on its equalities, which read
+        // the members' columns once the join's are spelled out.
+        if join.using.is_some() || join.natural {
+            join.on = scope.join_on.get(index).copied().flatten();
+            join.using = None;
+            join.natural = false;
+            match (join.kind, join.on) {
+                (JoinKind::Inner, None) => join.kind = JoinKind::Cross,
+                (JoinKind::Left | JoinKind::Right | JoinKind::Full, None) => {
+                    join.on = Some(&Expr::Bool(true));
+                }
+                _ => {}
+            }
         }
         if let Some(condition) = join.on {
             join.on = Some(rewrite.expression(condition, None)?);
@@ -1996,6 +2019,12 @@ impl<'a> Rewrite<'_, 'a> {
                 {
                     Ok(Some(self.copy(columns[column])?))
                 }
+                // A merged column of the outer joins, whose `USING` or
+                // `NATURAL` join becomes an `ON` join: its join alias
+                // variable's expression, read through the join's columns.
+                Ok(entry @ ResolvedColumn::Merged(_)) => Ok(Some(
+                    self.expression(scope.star_expression(entry, self.arena)?, None)?,
+                )),
                 Ok(_) => Ok(None),
                 // The join's whole row (`SELECT j`) names its alias.
                 Err(_)

@@ -120,6 +120,24 @@ Data-modifying statements:
 
 Identity, inheritance, and partitions:
 
+- A `HASH` partition key of an integer, text, `varchar`, `bpchar`, `bool`,
+  `"char"`, `oid`, float, `numeric`, date, time, timestamp, `bytea` or `uuid`
+  column routes rows with PostgreSQL's seeded hash, and
+  `satisfies_hash_partition` answers as PostgreSQL's does
+  (`differential_exact/550`); other key types fail with `0A000`.
+  `pg_get_partition_constraintdef` and psql's `Partition constraint:` line
+  print `generate_partition_qual`'s constraint, and new bounds report
+  PostgreSQL's overlap, default-conflict, empty-range and modulus errors
+  (`505`).
+- A foreign key referencing a partitioned table has one `pg_constraint` clone,
+  with its two action triggers, per referenced partition at any depth
+  (`pc_a_fkey_1`), kept as partitions are created, attached, detached and
+  dropped; at most 256 clones per table (`54000`).
+- Outer joins null-extend the rows a partitioned table or inheritance tree
+  matches nowhere (`611`); a select list or `UPDATE` over an inheritance tree is
+  computed in a `Result` above the `Append`, and `ONLY` writes the parent
+  alone (`610`).
+
 - `CREATE TABLE ... (LIKE ... INCLUDING IDENTITY)` creates independently owned
   sequences with the source's settings and starting value; a `serial` default
   copied with `INCLUDING DEFAULTS` or `INCLUDING ALL` shares the original
@@ -147,8 +165,7 @@ Identity, inheritance, and partitions:
   `UNIQUE` or `PRIMARY KEY` constraint of the new partition is not attached to
   a parent's plain unique index, so pos3ql builds a separate copy where
   PostgreSQL reuses the constraint's index. Startup refuses (`22000`) a saved
-  catalog in which a valid partitioned index lacks its copy on a partition, a
-  state earlier pos3ql releases could commit.
+  catalog in which a valid partitioned index lacks its copy on a partition.
 
 Syntax and errors:
 
@@ -189,6 +206,31 @@ Syntax and errors:
   constraint of a domain violation. `RAISE ... USING COLUMN`, `CONSTRAINT`,
   `DATATYPE`, `TABLE` and `SCHEMA` set those fields (up to 1,024 bytes each)
   and `GET STACKED DIAGNOSTICS` reads them.
+- Key and row details follow PostgreSQL's privilege rules
+  (`ExecBuildSlotValueDescription`): the keys of unique, exclusion, foreign
+  key and partition-routing violations (`Partition key of the failing row
+  contains (id) = (21).`) show only to a user with `SELECT` on the table or
+  every key column, and never under row security; otherwise a unique violation
+  has no detail and the others say `Key conflicts with existing key.`, `Key is
+  not present in table "p".` or `Key is still referenced from table "c".`. A
+  `Failing row contains (...)` detail then names only the columns the user may
+  read or the statement wrote (`(a, c) = (1, 3)`). A subscription's applied row
+  is described by the applying role's privileges.
+- `PREPARE` and the extended protocol's Parse convert literals as
+  PostgreSQL's parse analysis does: a literal cast to a built-in type
+  (`''::tsquery`, `int4 '7'`) or converted by analysis runs its input function
+  once there, raising its notice or error, and the statement keeps the
+  converted value in its `prepared_bytes` slot (`54000` beyond). A cast's
+  length coercion and constant folding (`1/0`) run when the statement is
+  planned, at each `EXECUTE`. An input notice or error carries the literal's
+  cursor position when it is cast, assigned, compared or passed to a full-text
+  routine.
+- JSON nests as deeply as PostgreSQL 18.6's `json` and `jsonb` inputs do under
+  the default `max_stack_depth` (21,790 and 18,675 levels on the reference
+  build); deeper documents, or a recursion that would exhaust the query
+  thread's fixed stack, fail with `54001` `stack depth limit exceeded`
+  (`differential_exact/747`). PostgreSQL's limit varies with each operation's
+  frames, which pos3ql does not model.
 - `COPY FROM` reports errors in PostgreSQL's order. PostgreSQL buffers rows
   and adds their index entries only when the buffer flushes: after 1,000 rows,
   after 64 KB of input lines, and at the end of the data. So if row 2
@@ -537,6 +579,63 @@ Row types:
   domains of the relation's row type, as PostgreSQL does.
 
 Functions and expressions:
+
+- Column defaults, CHECK constraints, parameter defaults, `RETURN` bodies,
+  index predicates, trigger `WHEN` and rule conditions print in PostgreSQL's
+  analyzed form for literals, columns, parameters, operators, `IN`, `LIKE`,
+  null and boolean tests, `IS [NOT] DISTINCT FROM`, `CASE`, casts, SQL value
+  functions, positional calls, `ROW(...)` and whole-row references; other
+  expressions print as stored. `pg_get_viewdef` and `pg_get_ruledef` deparse
+  the stored query, never its text; a shape the deparser does not cover fails
+  with `0A000` (`deparsing the query of view "v" is not supported`). In a
+  `BEGIN ATOMIC` body only a `SELECT` of expressions without `FROM` is
+  deparsed; other statements print as written. A `FROM` function returning
+  `record` with a column definition list is accepted only for the
+  `json[b]_to_record[set]` family.
+- A SQL function whose body is one expression is inlined as PostgreSQL's
+  `inline_function` does; [query planning](query-planning.md) gives the rules.
+- An index key or predicate may call a PL/pgSQL function
+  (`differential_exact/755`): a utility statement (`CREATE INDEX`, `REINDEX`,
+  `CLUSTER`, `VACUUM`, `ANALYZE`, `ALTER TABLE`, `CREATE TABLE AS`,
+  materialized view population) runs such calls and restarts replaying their
+  results; a function's notice is raised once per row and index (`833`);
+  `REINDEX TABLE` builds indexes one at a time in OID order. An index whose
+  expression no longer resolves after `ALTER COLUMN ... TYPE` fails with
+  `function rw(bigint) does not exist` and its hint (`863`).
+- Collations: conflicting explicit `COLLATE` clauses fail at analysis
+  (`assign_collations`, `832`); an unknown collation (`42704`, or `3F000` for a
+  missing schema) and a `COLLATE` on a type without collation (`42804`) fail at
+  the clause with its cursor (`860`, `861`). A domain has a collation
+  (`pg_type.typcollation`): its own `COLLATE`, else its parent's or base
+  type's; columns and attributes of the domain take it unless they write their
+  own, and a custom collation it uses is a dependency (`864`). `DROP TYPE`
+  drops a domain as `DROP DOMAIN` does (`865`).
+- `ALTER COLUMN ... TYPE` to a domain, enum or composite rewrites through the
+  type: a domain's checks apply to each row, an enum or composite needs `USING`
+  unless the column already has the type (`42804` with PostgreSQL's hint), and
+  a default that cannot convert is refused (`866`).
+- Constraints: table-level `NOT NULL` constraints merge with column ones as in
+  PostgreSQL 18; a `NOT VALID` not-null constraint checks new rows until
+  validated (`745`); a CHECK merges with a same-named inherited one when their
+  analyzed predicates are equal, with PostgreSQL's conflicts otherwise (`742`);
+  a column merged with an inherited one at another position is reported as
+  moved (`781`). A unique btree build sorts keys with PostgreSQL's quicksort
+  in physical order and names the first equal pair PostgreSQL compares; a
+  build whose keys outgrow the statement arena fails with `54000`.
+- A table's or materialized view's `fillfactor` and `autovacuum_enabled` keep
+  the order they were set in (`927`); pos3ql runs no autovacuum, so either
+  value holds. Other heap storage parameters fail with `22023`.
+- A `DROP TABLE ... CASCADE` drops every referencing foreign key in one
+  statement (`898`); a transaction that changes one relation in more than
+  `max_catalog_versions_per_object` statements fails with that named capacity
+  error.
+- PL/pgSQL row and record variables (`NEW` and `OLD` included) are visible at
+  every query level: `(r).*`, `r.*` and `ROW(r.*)` expand them; a record
+  holding an anonymous record or none fails with `42809`, and `r.*` naming
+  both a FROM item and a variable follows `plpgsql.variable_conflict` (`780`);
+  a cursor may be declared in a nested block (`743`, `744`). A PL/pgSQL `FOR`
+  loop names its query in an error's context only when planning raised it
+  (`944`).
 
 - `pg_get_expr`, `pg_get_constraintdef`, `pg_get_function_arguments` and
   `pg_get_functiondef` print column defaults, CHECK constraints, parameter
@@ -1037,59 +1136,14 @@ describe output with PostgreSQL 18.6.
 | GIN | Array, full-text, JSONB, and jsonpath bitmap predicates |
 | SP-GiST | Built-in network, range, geometry, text ordering/prefix, and geometric distance ordering |
 
-A query reading one ordinary table, and the scan of an `UPDATE`'s or
-`DELETE`'s target, choose their scan as PostgreSQL 18 does. pos3ql costs the
-sequential scan, each B-tree index's index and index-only scans and the
-bitmap heap scan with PostgreSQL's formulas and the statistics `ANALYZE`
-gathers. The model covers:
-
-- B-tree indexes of one or several key columns, including descending keys,
-  `NULLS FIRST`, `INCLUDE` columns and pattern classes (`text_pattern_ops`);
-- expression indexes: a condition or `ORDER BY` on the indexed expression,
-  such as `WHERE lower(email) = 'a@b.org'` with an index on `lower(email)`,
-  reads the statistics `ANALYZE` gathered for the expression (shown in
-  `pg_stats` under the index's name) and uses the index, whose scan returns
-  rows in the expression's order;
-- partial indexes whose predicate the query's conditions imply, such as an
-  index `WHERE status = 'open'` for `WHERE status = 'open' AND k = 5`, or one
-  `WHERE k < 10` for `WHERE k = 5`;
-- conditions that compare a column with constants: `=`, `<>`, `<`, `<=`,
-  `>`, `>=`, the pattern operators (`~<~`), `IN` and `NOT IN` lists,
-  `op ANY (array)`, NULL tests, a boolean column tested by itself
-  (`WHERE active`, `WHERE NOT active`), and `OR` combinations of these;
-- `LIKE` on a `text` or `varchar` column: a fixed prefix (`name LIKE
-  'abc%'`) becomes the index conditions `name >= 'abc' AND name < 'abd'`
-  under the `C` collation (`~>=~` and `~<~` for a pattern class), the
-  `LIKE` itself staying a filter, with PostgreSQL's pattern selectivity; a
-  `varchar` column cast to `text` counts as the column;
-- `BitmapAnd` and `BitmapOr` combinations of several indexes;
-- `ORDER BY` of several columns in any direction, served by an index scan,
-  an incremental sort over an index's leading columns or a sort;
-- `LIMIT` and `OFFSET`.
-
-`EXPLAIN` then shows the same plan, and the rows come back in that scan's
-order. For example, after `ANALYZE orders`, `SELECT * FROM orders WHERE
-customer = 17 OR id = 5` reads a bitmap heap scan over a `BitmapOr` of two
-bitmap index scans and returns the rows by heap position, as PostgreSQL
-does.
-
-When a table has no index path for the query, its sequential scan is the
-plan whatever the conditions are, so `EXPLAIN` shows it for any condition.
-Where the model would have to choose among index paths for a shape it does
-not cover, `EXPLAIN` fails with `0A000` and names the shape, for example
-`EXPLAIN of a scan of one table with a GiST index is not supported`. Not
-covered yet: hash, GiST, SP-GiST, GIN and BRIN indexes the query could use,
-an expression index over a user-defined routine or type, `ILIKE`, regular
-expressions and `LIKE` with an escape or a non-ASCII prefix on indexed
-columns, other casts of indexed columns, extended statistics, and
-partitioned tables or inheritance trees whose members have index paths.
-Estimates (not plans) stay approximate for a sequential scan whose
-conditions read an expression no index holds, and index sizes are computed
-as `CREATE INDEX` lays out the current rows, not as later out-of-order
-inserts split its pages. `EXPLAIN
-ANALYZE` also fails with `0A000` for an index scan that searches an array
-or skips a key column over an index of several leaf pages, whose number of
-index descents depends on PostgreSQL's page layout.
+A query reading one table, a join of analyzed tables, and the scan of an
+`UPDATE`'s or `DELETE`'s target choose their scans and joins by PostgreSQL 18's
+costs and return rows in that plan's order; `EXPLAIN` prints the same plan.
+[Query planning](query-planning.md) lists the covered shapes, the figures
+`EXPLAIN ANALYZE` and `BUFFERS` report, and the planner settings. Where
+PostgreSQL could choose a path pos3ql does not model, `EXPLAIN` fails with
+`0A000` naming the shape, for example `EXPLAIN of a scan of one table with a
+GiST index is not supported`.
 
 Index names describe SQL behavior, not PostgreSQL's page layout; native index
 callbacks are not available. MVCC visibility and SQL rechecks decide every
@@ -1098,10 +1152,18 @@ covering, and nearest-neighbor eligibility.
 
 An exclusion constraint (`EXCLUDE USING gist (during WITH &&)`) may use the
 B-tree (the default), hash, GiST or SP-GiST method with any commutative
-operator of the column type's default operator class for that method, as
-PostgreSQL checks it: `EXCLUDE (code WITH =)` on `text`, `EXCLUDE USING gist
-(area WITH &&)` on `box`. Each element must be a column; an expression element
-such as `int4range(lo, hi)` returns `0A000`. `CLUSTER` and `REPLICA IDENTITY
+operator of an operator class of that method that accepts the element's type,
+as PostgreSQL checks it: `EXCLUDE (code WITH =)` on `text`, `EXCLUDE USING gist
+(area WITH &&)` on `box`. An element may be a column, a function call or a
+parenthesized expression (`EXCLUDE USING gist (int4range(a, b) WITH &&)`,
+`differential_exact/356`), with a `COLLATE`, a built-in or user-defined btree
+operator class, and under btree `DESC` and `NULLS FIRST/LAST`; the elements'
+expressions together hold at most 256 bytes of stored text (`54000` beyond).
+Operator class options on an element fail with `0A000`. A build sorts rows by
+the equality elements and sweeps one range-overlap element in O(n log n)
+comparisons, naming the first conflicting row in heap order (`746`, `792`,
+`797`); for a GiST constraint without such elements PostgreSQL names the
+partner its index scan finds first. `CLUSTER` and `REPLICA IDENTITY
 USING INDEX` accept a primary key or unique constraint's index as well as an
 ordinary index.
 
@@ -1172,7 +1234,7 @@ why none of these numbers is a throughput rate.
 | `RAISE ... USING DETAIL` or `HINT` text | 12,288 bytes each | `54000` |
 | Built-in function NOTICE/WARNING messages raised before the next output message; one message's text | 64; 256 bytes | `54000` |
 | Transaction identities and command counters | 32-bit, checked | `54000` before reuse |
-| JSON nesting / jsonpath depth | 1,000 / 128 | see [SQL/JSON](sql-json.md) |
+| `json` / `jsonb` nesting; jsonpath depth | 21,790 / 18,675; 128 | `54001`; see [SQL/JSON](sql-json.md) |
 | XML nesting, XPath work, constructor output | see [SQL/XML](sql-xml.md) | program-limit error |
 
 ### Startup reservations
@@ -1229,133 +1291,21 @@ default (`4MB`), errors, `SHOW`, `pg_settings` row and routine `SET` clause.
 For example, `CREATE PROCEDURE nightly() ... SET work_mem = '256MB'` works,
 and `SHOW work_mem` inside it reports `256MB`.
 
-The value does not size memory in pos3ql. Each query runs in a workspace of
-`work_arena_bytes`, fixed at startup, and pos3ql never spills to temporary
-files: a sort, grouping or hash table that outgrows the workspace fails with
-`54000` whatever `work_mem` says. Raise `work_arena_bytes` in the configuration
-file and restart to let larger sorts run.
-
-`EXPLAIN ANALYZE` reports a hash join's `Hash` node as PostgreSQL sizes its
-table: at least 1024 buckets, the next power of two above the node's row
-estimate, doubled while the rows outnumber them, and `Memory Usage` counting
-each row as PostgreSQL stores it plus 8 bytes per bucket. For example, a
-1,500-row build reports `Buckets: 2048  Batches: 1`. A join PostgreSQL's
-join search plans splits a build larger than `work_mem` times
-`hash_mem_multiplier` into batches as PostgreSQL does; another query's
-join runs such a build whole and reports one batch.
-A `Materialize` node reports the memory PostgreSQL's tuplestore holds:
-`Storage: Memory  Maximum Storage: 18kB` for 40 small rows, mostly its
-initial array of 2048 row pointers.
-
-An `UPDATE ... FROM` or `DELETE ... USING` of one analyzed table joins the
-way PostgreSQL's costs choose: for example, `UPDATE accounts SET rate =
-r.rate FROM rates r WHERE accounts.tier = r.tier` hashes the smaller
-relation, and `EXPLAIN ANALYZE` counts each node of that join. The rows
-change in the join's order, so `RETURNING` and row triggers see them as in
-PostgreSQL. PostgreSQL estimates a table from its current size on disk, so
-a table that rolled-back or deleted rows grew since its last `ANALYZE` (or
-`VACUUM`) can make it pick the other order.
-
-`EXPLAIN (ANALYZE)` shows each node's page accesses on a `Buffers:` line, as
-PostgreSQL 18 does by default (`BUFFERS OFF` hides them). pos3ql has no 8 kB
-buffer pool, so it counts its own pages: the 8 kB heap pages its table's
-rows would fill and the pages of its modeled btree layout, the same pages
-`pg_class.relpages` and the planner's page counts use. For example, a
-sequential scan of a table whose rows fill 22 pages prints `Buffers:
-shared hit=22`; stopped early by a `LIMIT`, it counts the pages up to the
-one it stopped on and the next, which PostgreSQL's read stream has already
-pinned. An index scan counts one page per level from the root to a leaf,
-each further leaf its matching entries fill, and each heap page it moves
-to; an index-only scan its visibility map page and the heap pages not
-marked all-visible; a bitmap heap scan each heap page it reads, its bitmap
-index scans their index pages. A page is a `hit` unless reaching its first
-row needed a storage block that the RAM block cache did not hold, which
-makes it a `read`. A temporary table's pages are `local`; a sort that
-spills to disk writes and reads back its spilled bytes in 8 kB `temp`
-pages, as does a `WITH` query's store that outgrows `work_mem`. Each node
-includes its inputs' pages, and a `WITH` query's pages count under the
-first `CTE Scan` that reads it. Planning reads no pages, since pos3ql keeps
-its catalogs and statistics in memory, so no `Planning:` buffer line
-appears (structured formats show the `Planning` counters as zero), and
-sending rows under `SERIALIZE` reads none either. `EXPLAIN (BUFFERS)`
-without `ANALYZE` prints no node counts, as in PostgreSQL. The numbers
-therefore differ from PostgreSQL's, whose counts depend on its buffer
-cache, but they appear on the same nodes.
-
-A write's `Insert`, `Update`, `Delete` or `Merge` node counts the pages its
-rows change, with its scan's. For example, inserting one row into a table
-with a two-level primary key index prints `Buffers: shared hit=3`: the
-table's last page and the index's two levels. A row that does not fit the
-last page adds a page, counted as `dirtied` and `written`, as is a new index
-page. An update reads its old row twice and keeps the new version on the
-same page while it has room; an update that changes an indexed column, or
-moves the row, inserts into every index. A delete reads its row's page once.
-`nextval` counts its sequence's page in the node that calls it, as
-PostgreSQL does. pos3ql treats existing pages as already dirty, as they stay
-in PostgreSQL's buffer cache between checkpoints, so only new pages are
-`dirtied`.
-
-A write into a table with an index other than a plain btree on columns (an
-expression, partial or non-btree index), scans on a path that does not count
-pages, and hash joins that run in batches fail `EXPLAIN ANALYZE` with
-`0A000` while `BUFFERS` is on; `EXPLAIN (ANALYZE, BUFFERS OFF)` runs them.
+In pos3ql the value decides when a sort, hash join, hash aggregate, window or
+`WITH` query store spills, where PostgreSQL's would, so row order and
+`EXPLAIN ANALYZE` figures match ([query planning](query-planning.md#sorting-hashing-and-memory-figures)).
+It never sizes memory: spilled sorts and stores go to external runs on the
+block grid when an object store is attached, a hash aggregate's spilled rows
+to 8 kB blocks of `plan_build_bytes`, and everything else stays in the query
+workspace of `work_arena_bytes`, fixed at startup. Exhausting any of these
+fails with `54000` naming it, whatever `work_mem` says; raise the reservation
+and restart.
 
 ### Planner settings
 
-PostgreSQL's planner settings (every `pg_settings` row in a "Query Tuning"
-category, such as `enable_seqscan`, `random_page_cost` or `geqo`) steer how a
-query is planned; they never change its result. pos3ql accepts all 52 with
-PostgreSQL 18's values, units, ranges, errors, `SHOW` text, `pg_settings` row,
-`SET LOCAL`, routine `SET` clause and `EXPLAIN (SETTINGS)` line.
-
-Where pos3ql's planner has the same choice, the setting decides it:
-
-- `enable_seqscan`, `enable_indexscan`, `enable_indexonlyscan` and
-  `enable_bitmapscan` choose between a sequential scan, an index scan and a
-  bitmap heap scan. For example, `SET enable_indexscan = off` makes
-  `SELECT * FROM t WHERE id = 5` read `t` through a bitmap heap scan, as
-  PostgreSQL does, when the query is one whose scan pos3ql chooses by
-  PostgreSQL's costs (see [physical access paths](#physical-access-paths)).
-  For the plan costs of such a scan, `seq_page_cost`, `random_page_cost`,
-  `cpu_tuple_cost`, `cpu_index_tuple_cost`, `cpu_operator_cost` and
-  `effective_cache_size` apply as in PostgreSQL.
-- `enable_hashjoin`, `enable_mergejoin` and `enable_nestloop` choose
-  between a hash join, a merge join and a nested loop, `enable_material`
-  drops the `Materialize` step `EXPLAIN` shows over a nested loop's inner
-  sequential scan, and `enable_memoize` drops the `Memoize` cache over a
-  nested loop's inner index scan. For example, `SELECT * FROM a JOIN b ON
-  a.id = b.a_id` over two analyzed tables, with `a.id` a primary key and an
-  index on `b.a_id`, is planned with PostgreSQL's costs: `EXPLAIN` prints
-  the same plan and costs (a hash join, or a nested loop over an index scan
-  of `b` for each row of `a`), and the rows come back in the same order.
-- `geqo`, `geqo_threshold`, `geqo_effort`, `geqo_pool_size`,
-  `geqo_generations`, `geqo_selection_bias` and `geqo_seed` steer the genetic
-  query optimizer (GEQO), which PostgreSQL uses instead of trying every join
-  order once a join problem has `geqo_threshold` (12) relations or more. GEQO
-  tries random join orders and breeds better ones from the cheapest; pos3ql
-  runs the same algorithm with the same random numbers, so at a given
-  `geqo_seed` a query gets PostgreSQL's plan and costs. For example, twelve
-  tables joined in a chain print the same `EXPLAIN` in both, and `SET
-  geqo_seed = 0.5` changes both plans the same way. Its pool holds at most
-  500 join orders (the largest default, `50 * geqo_effort`); a larger
-  `geqo_pool_size` fails with `54000` when a join is planned. A query of more
-  than 128 relations is not searched: it runs pos3ql's own join order.
-- `join_collapse_limit` and `from_collapse_limit` split a query's joins into
-  separate join problems as PostgreSQL does. With `SET join_collapse_limit =
-  1`, `a JOIN b ON ... JOIN c ON ...` joins `a` and `b` first, as written.
-- When every way to run a step is disabled, the step still runs and `EXPLAIN`
-  marks it `Disabled: true`, as PostgreSQL 18 does. `SET enable_seqscan = off`
-  followed by `EXPLAIN SELECT * FROM t` on a table without indexes prints
-  `Seq Scan on t` with `Disabled: true`. A disabled sort or hashed aggregate is
-  marked the same way.
-
-The other settings name plan types pos3ql's planner does not have, so they
-change no plan, just as disabling an unused method changes nothing in
-PostgreSQL: there is no parallel query, JIT, TID scan or partitionwise
-planning. pos3ql behaves as a PostgreSQL built without LLVM: `jit` is on
-and `jit_provider` (a server-start setting, so `SET jit_provider` fails
-with `55P02`) names `llvmjit`, but `pg_jit_available()` returns false and
-no `EXPLAIN` prints a `JIT` section (`differential_exact/973`).
+All 52 "Query Tuning" settings are accepted with PostgreSQL 18's values,
+units, ranges, errors and `pg_settings` rows; [query planning](query-planning.md#planner-settings)
+describes which plans they steer.
 
 ### Cursor capacity
 
@@ -1424,18 +1374,12 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   no other system column (`42P10`), and assigning a system column fails with
   `0A000` (`cannot assign to system column "ctid"`).
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
-  Cost estimates differ from PostgreSQL. `EXPLAIN` shows the plan pos3ql
-  runs: scan filters (`Filter: (a = 1)`), a hash join's `Hash Cond` and `Hash`
-  node, a merge join's `Merge Cond` and sorts, and a nested loop's `Join
-  Filter` and `Materialize` inner scan, in PostgreSQL's layout. Joins of
-  plain tables, joined by inner, left, right or full joins on column
-  equalities, follow PostgreSQL's join search and costs, index scans and
-  `Memoize` included: `SELECT a.id, b.y FROM a LEFT JOIN b ON a.id = b.a_id`
-  prints the same `Hash Right Join` (or merge or nested-loop join) as
-  PostgreSQL and returns its rows, those of `a` without a match padded with
-  NULLs, in the same order. Other joins keep pos3ql's own order and
-  methods, and `EXPLAIN` with costs refuses them with `0A000`. A statement a rewrite rule
-  changes shows each statement the rule produces, separated by an empty line.
+  [Query planning](query-planning.md) describes which plans match
+  PostgreSQL's; `SELECT a.id, b.y FROM a LEFT JOIN b ON a.id = b.a_id` over
+  analyzed tables prints the same `Hash Right Join` (or merge or nested-loop
+  join) as PostgreSQL and returns its rows in the same order. A statement a
+  rewrite rule changes shows each statement the rule produces, separated by
+  an empty line.
 - Logical copies are separate durable databases updated asynchronously; there
   are no shared-storage replicas or multiple writers.
 - Monitoring fields for absent subsystems report empty or zero values. A
@@ -1506,9 +1450,19 @@ NULLS LAST` and checks `random() < 0.5` locally; `EXPLAIN VERBOSE` shows it as
 a `Foreign Scan` with that `Remote SQL`. An `UPDATE` or `DELETE` whose
 conditions and new values all ship, on a table without triggers, runs as one
 remote statement (`Foreign Update`/`Foreign Delete`); otherwise its rows are
-read `FOR UPDATE` and each is changed with `... WHERE ctid = $1`. Joins and
-aggregates are not sent to the server, and an `UPDATE` or `DELETE` with
-`RETURNING` is always changed row by row. A `LANGUAGE C` function
+read `FOR UPDATE` and each is changed with `... WHERE ctid = $1`. A direct
+`UPDATE` or `DELETE` ships the columns its `RETURNING` list reads; one whose
+`RETURNING` reads `old` or `new`, or whose table has a row trigger for its event
+or a stored generated column, runs row by row (`differential_exact/506`). A
+grouped query whose keys and `WHERE` ship is sent as one grouped remote query
+(`507`); joins are not sent, so a foreign table joined with other relations is
+read whole and joined here, and `EXPLAIN` of such a query fails with `0A000`.
+Connection options beyond host, hostaddr, port, dbname, user, password,
+connect_timeout, application_name and sslmode fail with `HV00D`; the host must
+be a numeric address ([B-351](../BUGS.md)). A failed connection reports
+`08001` `could not connect to server "name"` with libpq's message as its
+detail (`620`). `CREATE EXTENSION postgres_fdw SCHEMA pg_catalog` fails
+because `pg_catalog` is a read-only virtual schema. A `LANGUAGE C` function
 of any other library fails with `0A000`; an unknown symbol of
 `$libdir/postgres_fdw` fails with `42883`. Other packages in PostgreSQL's
 `$system` directory are not available.

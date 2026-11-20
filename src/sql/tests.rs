@@ -41,6 +41,7 @@ mod foreign_key_attach;
 mod foreign_key_clones;
 mod foreign_key_lookups;
 mod foreign_parent_admission;
+mod full_join_merged_keys;
 mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;

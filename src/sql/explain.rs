@@ -190,6 +190,10 @@ enum KeyLabel {
     None,
     Sort,
     Group,
+    /// The `Group Key` of a grouping over sorted input, which computes
+    /// each key: a key other than a column reads the input's output, which
+    /// PostgreSQL parenthesizes as it does a sort key.
+    GroupInput,
     /// A grouping sets node's key lines, each record a tag (`B` a rollup's
     /// start, `S` its sort, `H` a hashed set, `G` a grouped set) and its
     /// items, separated by [`GROUPING_SET_SEPARATOR`].
@@ -210,7 +214,7 @@ impl PlanKeys {
         let label = match self.label {
             KeyLabel::None | KeyLabel::Sets => return None,
             KeyLabel::Sort => "Sort Key",
-            KeyLabel::Group => "Group Key",
+            KeyLabel::Group | KeyLabel::GroupInput => "Group Key",
         };
         let keys = if verbose { &self.verbose } else { &self.plain };
         Some((label, keys.as_str().split(KEY_SEPARATOR)))
@@ -6902,18 +6906,28 @@ fn plan_pulled_select<'a>(
         let mut group_nodes = [PlanNode::EMPTY; 2];
         let mut group_count = 0;
         if let (Some(group), Some(chosen)) = (model.group, model.plan.upper.group) {
+            // A key naming a full join's merged column shows its join alias
+            // variable's expression.
+            let mut shown = [&Expr::Null; query::index_paths::joins::MAX_KEYS];
+            for (slot, &(position, _)) in shown.iter_mut().zip(group.keys) {
+                *slot = query::index_paths::join_query::flatten_merged(
+                    scope,
+                    if group.distinct {
+                        match statement.items[position] {
+                            SelectItem::Expr { expression, .. } => expression,
+                            _ => &Expr::Null,
+                        }
+                    } else {
+                        statement.group_by[position]
+                    },
+                    arena,
+                )?;
+            }
             let items = arena
                 .alloc_slice_with(group.keys.len(), |at| {
-                    let (position, flags) = group.keys[at];
+                    let (_, flags) = group.keys[at];
                     (
-                        if group.distinct {
-                            match statement.items[position] {
-                                SelectItem::Expr { expression, .. } => expression,
-                                _ => &Expr::Null,
-                            }
-                        } else {
-                            statement.group_by[position]
-                        },
+                        shown[at],
                         Some((
                             flags & query::index_paths::joins::KEY_DESCENDING != 0,
                             flags & query::index_paths::joins::KEY_NULLS_FIRST != 0,
@@ -6948,7 +6962,11 @@ fn plan_pulled_select<'a>(
                 txid,
                 Some(scope),
                 statement,
-                KeyLabel::Group,
+                if group.hashed {
+                    KeyLabel::Group
+                } else {
+                    KeyLabel::GroupInput
+                },
                 unsorted,
                 arena,
             )?;
@@ -7110,10 +7128,12 @@ fn plan_pulled_select<'a>(
                     count += 1;
                 }
             }
+            // A full join's merged column is its join alias variable's
+            // `COALESCE` in each target list.
             targets::BlockTargets::new(
                 storage,
                 txid,
-                statement,
+                query::index_paths::join_query::flatten_merged_statement(scope, statement, arena)?,
                 Some(scope),
                 true,
                 &stages[..count],
@@ -10949,7 +10969,7 @@ fn plan_keys_unscanned(
                 KeyLabel::Sort => {
                     crate::sql::catalog::deparse::planned_collated_key(&context, expression, arena)
                 }
-                KeyLabel::Group => {
+                KeyLabel::Group | KeyLabel::GroupInput => {
                     crate::sql::catalog::deparse::deparse_shown(&context, expression, arena)
                 }
                 KeyLabel::None | KeyLabel::Sets => Ok(None),

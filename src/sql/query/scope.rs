@@ -3573,6 +3573,18 @@ impl<'d> QueryScope<'d> {
                         name
                     ));
                 };
+                // A parenthesized join on the right may hold the name twice.
+                if (0..right_def.n_columns)
+                    .filter(|&column| self.defs.column_name(right_t, column) == name)
+                    .count()
+                    > 1
+                {
+                    return Err(sql_err!(
+                        crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
+                        "common column name \"{}\" appears more than once in right table",
+                        name
+                    ));
+                }
                 let Some(right_c) = right_def.column_index(name) else {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_COLUMN,

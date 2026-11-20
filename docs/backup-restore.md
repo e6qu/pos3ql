@@ -71,11 +71,7 @@ Point-in-time recovery replays retained history after the backup:
 | Option | Stops at | Rejected when |
 |---|---|---|
 | `--recovery-target-lsn` | The exact `pg_lsn` transaction boundary. | The LSN is inside a transaction, before the backup, or beyond the retained history. |
-| `--recovery-target-time` | The last transaction committed at or before the given `timestamptz`. Include `Z` or a numeric offset. | The backup has only a `pos3ql-backup-v1` completion record; time targets need `pos3ql-backup-v2`. v1 backups restore by name or exact LSN. |
-
-For example, restoring to `14:30:00+00` selects the last retained transaction
-committed no later than that time; it never stops partway through a
-transaction.
+| `--recovery-target-time` | The last transaction committed at or before the given `timestamptz`, never partway through one. Include `Z` or a numeric offset. | The backup has only a `pos3ql-backup-v1` completion record; time targets need `pos3ql-backup-v2`. v1 backups restore by name or exact LSN. |
 
 Before publishing `restore-pending`, recovery validates the retained descriptor
 chain, batch checksums, journal framing and commit timestamps. If the target

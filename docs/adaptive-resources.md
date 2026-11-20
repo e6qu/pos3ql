@@ -1,45 +1,28 @@
 # Share fixed capacity according to demand
 
-This is the design note for two unfinished milestones:
-[share fixed capacity by demand](../PLAN.md#share-fixed-capacity-by-demand) and
-[adapt batching and layout with feedback control](../PLAN.md#adapt-batching-and-layout-with-feedback-control).
-PLAN.md owns the sequence; [architecture](architecture.md#memory-and-physical-size)
-owns current behavior and limits. Every control named under "Proposed design" is
-a proposal, not an available setting.
+**This is a design, not current behavior.** No setting or controller described
+under "Proposed design" exists. Demand-based sharing belongs to the milestone
+[share fixed capacity by demand](../PLAN.md#share-fixed-capacity-by-demand);
+feedback control of batching and layout is scheduled
+[after the finish line](../PLAN.md#after-the-finish-line). PLAN.md owns the
+sequence.
 
 **User example:** configuring room for many tables must not give each empty
 table private space for its maximum row count. If most requests touch `orders`,
-that table should use the shared capacity. When a report starts reading `sales`,
+that table should use the shared capacity; when a report starts reading `sales`,
 capacity that is safe to reuse should follow it. Total reserved memory stays
 the same.
 
-## What exists today
+## Starting point
 
-All of these are fixed at startup; none is a workload controller.
-
-| Shared resource | Settings |
-|---|---|
-| Ordinary-table resident row metadata, instance-wide; empty tables own none | `row_overlay_slots` (`large_object_pages` is separate) |
-| Row bytes: two buffers for active data and relocation; committed MVCC history (none in locking mode) | `memtable_bytes`, `row_history_slots` |
-| Foreground retained row IDs and DML buffers | `row_work_bytes`, `row_work_leases` |
-| Reader table definitions | `definition_image_slots` |
-| Procedural execution state | `execution_control_bytes`, `execution_control_leases` |
-| Table columns, constraints, pending edit mappings, index bindings | `table_metadata_bytes` (starter 64 MiB), `table_metadata_leases` (8,192) |
-| Analyzed column statistics; index counters | `statistics_bytes`, `statistics_leases`; `index_statistics_slots` |
-| RAM and disk block caches, CLOCK eviction across objects | fixed slots; the disk file's logical length does not guarantee physical disk space |
-
-Checkpoint and relocation buffers keep independent guaranteed-progress capacity
-and never borrow foreground space. Byte pools round each extent to 64 bytes and
-charge old and new extents while a buffer moves, so fragmentation can exhaust a
-pool whose total free bytes look sufficient; the error names requested, free and
-largest contiguous bytes and free descriptors.
-
-On the I/O side, the checkpoint writer emits compressed row groups for small
-deltas and column-oriented (PAX) row groups for full slices; column reads start
-missing selected columns before yielding; read-ahead uses the configured request
-slots minus one for the current read; physical output batches fill free upload
-slots; and group commit shares publication within one event-loop turn without
-a timer to collect more arrivals.
+Today every shared pool is fixed at startup and no controller resizes it; see
+[shared memory pools](architecture.md#shared-memory-pools) for the settings,
+what each holds and how exhaustion is reported. Checkpoint and relocation
+buffers keep their own guaranteed-progress capacity and never borrow foreground
+space. On the I/O side, read-ahead uses the configured request slots minus one
+for the current read, physical output batches fill free upload slots, and group
+commit shares publication within one event-loop turn without a timer to collect
+more arrivals.
 
 ## Proposed design
 
@@ -103,8 +86,7 @@ Proposed explicit inputs, all bounded by startup reservations:
 Expose the current active limits and why each changed. A latency target guides
 policy; it does not guarantee completion during an object-store outage.
 
-Candidate controllers, compared by measurement rather than chosen by
-sophistication:
+Candidate controllers, to be compared by measurement:
 
 - **Simple bounded feedback:** step the limit up while latency stays within
   target, back off on overshoot (in the style of the references below).

@@ -80,16 +80,10 @@ pub(crate) enum Shape {
     /// its btree and hash operator families: mergeable and hashable.
     Columns(Var, Var),
     /// `column = constant` of a constant of the column's type; equal
-    /// constants share `constant`.
+    /// constants share `constant`. The column may be an expression, such
+    /// as a full join's merged `USING` column, `COALESCE(left, right)`,
+    /// which `reconsider_full_join_clause` finds in the constant's class.
     Constant { var: Var, constant: u16 },
-    /// `COALESCE(left, right) = constant` (a full join's merged `USING`
-    /// column), which `reconsider_full_join_clause` matches with a full
-    /// join's clause `left = right`.
-    Coalesce {
-        left: Var,
-        right: Var,
-        constant: u16,
-    },
     /// Any other qual.
     Other,
 }
@@ -162,6 +156,10 @@ pub(crate) struct Tree {
     /// The columns each expression member reads
     /// ([`super::joins::Member::expression_id`]).
     pub(crate) expression_vars: [VarList; super::joins::MAX_JOIN_EXPRESSIONS],
+    /// The operands of each expression member that is a full join's merged
+    /// column, `COALESCE(left, right)`, which a constant equated with an
+    /// upper full join's merged column reaches.
+    pub(crate) expression_parts: [Option<(Var, Var)>; super::joins::MAX_JOIN_EXPRESSIONS],
 }
 
 impl Tree {
@@ -187,6 +185,7 @@ impl Tree {
             from_collapse_limit: 8,
             join_collapse_limit: 8,
             expression_vars: [VarList::default(); super::joins::MAX_JOIN_EXPRESSIONS],
+            expression_parts: [None; super::joins::MAX_JOIN_EXPRESSIONS],
         }
     }
 
@@ -516,7 +515,6 @@ struct Prep<'t, 'a> {
     /// domain: the qual, its sides and its constant, with each one's
     /// placement, which an ordinary filter of the joined rows takes when no
     /// full join clause matches it.
-    coalesce: ArenaList<'a, ((QualId, Var, Var, u16), JoinQual)>,
     /// Each node's join domain (`JoinDomain`): the query's is 0.
     domain: [u8; MAX_NODES],
     domain_count: u8,
@@ -604,7 +602,6 @@ pub(crate) fn prepare<'a>(tree: &Tree, arena: &'a Arena) -> Result<Prepared<'a>,
         left_join: ArenaList::new(arena),
         right_join: ArenaList::new(arena),
         full_join: ArenaList::new(arena),
-        coalesce: ArenaList::new(arena),
         domain: [0; MAX_NODES],
         domain_count: 1,
         domain_root: [None; MAX_NODES],
@@ -1595,21 +1592,6 @@ impl Prep<'_, '_> {
                     return Err("a constant equality of a nulled column");
                 }
             }
-            // `process_equivalence` of the `COALESCE` with the constant,
-            // held for `reconsider_full_join_clause`.
-            Shape::Coalesce {
-                left,
-                right,
-                constant,
-            } => {
-                if !maybe_equivalence || self.domain[usize::from(node)] != 0 {
-                    return Err("a COALESCE equated with a constant below the query's join domain");
-                }
-                self.coalesce
-                    .push(((qual_id, left, right, constant), join))
-                    .map_err(|_| ARENA)?;
-                return Ok(());
-            }
             Shape::Other => {}
         }
         self.distribute_restrictinfo(join)
@@ -1967,16 +1949,6 @@ impl Prep<'_, '_> {
                 break;
             }
         }
-        // A `COALESCE` no full join clause matched (its operands in the
-        // other order, say) filters the joined rows by an expression of
-        // several relations.
-        for at in 0..self.coalesce.len() {
-            let (held, join) = self.coalesce.borrowed_slice()[at];
-            if held.0 != NO_QUAL {
-                self.coalesce.as_mut_slice().map_err(|_| ARENA)?[at].0.0 = NO_QUAL;
-                self.distribute_restrictinfo(join)?;
-            }
-        }
         let constant = |prep: &Self, member: Member| {
             prep.class_of(member)
                 .is_some_and(|class| prep.classes[usize::from(class)].has_const)
@@ -2005,41 +1977,82 @@ impl Prep<'_, '_> {
         Ok(())
     }
 
-    /// `reconsider_full_join_clause` of `join`: a `COALESCE` of its two
-    /// sides equated with a constant equates each side with the constant
-    /// inside its own join domain, and the `COALESCE` member leaves its
-    /// class, so no filter tests it.
+    /// `reconsider_full_join_clause` of `join`: a class with a constant
+    /// holding `COALESCE(left, right)` of the clause's sides equates each
+    /// side with the constant inside the join domain of the join's side,
+    /// and the `COALESCE` member leaves its class, so no filter tests it. A
+    /// side that is a lower full join's merged column joins a class with
+    /// the constant in turn, which that join's clause then finds.
     fn reconsider_full_join_clause(&mut self, join: JoinQual) -> Result<bool, Outside> {
         let (left, right, ..) = join.merge.expect("mergeable");
-        let Some(at) =
-            self.coalesce
-                .borrowed_slice()
-                .iter()
-                .position(|&((qual, one, two, _), _)| {
-                    qual != NO_QUAL
-                        && one == (left.rel, left.column)
-                        && two == (right.rel, right.column)
-                })
-        else {
+        let parts = Some(((left.rel, left.column), (right.rel, right.column)));
+        let mut found = None;
+        for class in 0..self.class_count {
+            let held = self.classes[class];
+            if held.merged_into.is_some() || !held.has_const {
+                continue;
+            }
+            if self.members_of(class as u8).iter().any(|member| {
+                member
+                    .expression_id()
+                    .is_some_and(|id| self.tree.expression_parts[id] == parts)
+            }) {
+                found = Some(class);
+                break;
+            }
+        }
+        let Some(class) = found else {
             return Ok(false);
         };
-        let ((qual, _, _, constant), _) = self.coalesce.borrowed_slice()[at];
-        for side in [left, right] {
-            if side.nulling != Relids::EMPTY {
+        let (qual, constant, _) = self.classes[class].constant.expect("a constant");
+        // The full join whose sides the clause's operands read; the clause
+        // may name the join's right side first.
+        let within = |member: Member, rels: Relids| member.base_relids() & !rels == Relids::EMPTY;
+        let Some((node, written_order)) = (0..self.tree.node_count).find_map(|node| {
+            if self.kinds[node] != Some(TreeJoin::Full) {
+                return None;
+            }
+            let (left_rels, right_rels) = (self.left_rels[node], self.right_rels[node]);
+            if within(left, left_rels) && within(right, right_rels) {
+                Some((node, true))
+            } else if within(left, right_rels) && within(right, left_rels) {
+                Some((node, false))
+            } else {
+                None
+            }
+        }) else {
+            return Err("a full join clause outside its full join");
+        };
+        let (left_node, right_node) = self.sides[node];
+        let (left_child, right_child) = if written_order {
+            (left_node, right_node)
+        } else {
+            (right_node, left_node)
+        };
+        for (side, child) in [(left, left_child), (right, right_child)] {
+            if side.expression_id().is_none() && side.nulling != Relids::EMPTY {
                 return Err("a full join clause of a nulled column equated with a constant");
             }
-            let Some(node) = self.tree.nodes[..self.tree.node_count]
-                .iter()
-                .position(|node| matches!(node, TreeNode::Rel(rel) if *rel == side.rel))
-            else {
-                return Err("a full join's side outside the join tree");
-            };
-            let domain = self.domain[node];
+            let domain = self.domain[usize::from(child)];
             self.process_equivalence(qual, side, None, Some(constant), domain)?;
             let derived = self.class_of(side).expect("just equated");
             self.classes[usize::from(derived)].derived = true;
         }
-        self.coalesce.as_mut_slice().map_err(|_| ARENA)?[at].0.0 = NO_QUAL;
+        // `list_delete_nth_cell` of the `COALESCE` member; the class may
+        // have moved its members since.
+        let class = self.canonical(class as u8);
+        let members = self.classes[usize::from(class)].members;
+        let pool = self.member_pool.as_mut_slice().map_err(|_| ARENA)?;
+        let run = &mut pool[members.first as usize..(members.first + members.len) as usize];
+        let Some(at) = run.iter().position(|member| {
+            member
+                .expression_id()
+                .is_some_and(|id| self.tree.expression_parts[id] == parts)
+        }) else {
+            return Err("a full join's merged column left its class");
+        };
+        run.copy_within(at + 1.., at);
+        self.classes[usize::from(class)].members.len -= 1;
         Ok(true)
     }
 
@@ -2068,8 +2081,10 @@ impl Prep<'_, '_> {
         if inner.nulling != Relids::EMPTY {
             return Err("an outer join clause of a nulled column equated with a constant");
         }
-        if inner.reads != Relids::EMPTY || outer.reads != Relids::EMPTY {
-            return Ok(false);
+        if inner.reads != Relids::EMPTY {
+            return Err(
+                "an outer join clause's inner expression of several relations equated with a constant",
+            );
         }
         let Some(node) = self.tree.nodes[..self.tree.node_count]
             .iter()

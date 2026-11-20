@@ -5942,17 +5942,14 @@ mod tests {
             needed_by,
             output: true,
         };
+        let (outer_paths, lateral_paths) = ([seq(1000.0, 15.0)], [lateral]);
+        let lateral_vars = [Member::plain(0, 0)];
+        let rels = [
+            base(1000.0, 8.0, &outer_paths, Relids::EMPTY, &[]),
+            base(1.0, 8.0, &lateral_paths, Relids::of(0u8), &lateral_vars),
+        ];
         let mut problem = JoinProblem {
-            rels: &[
-                base(1000.0, 8.0, &[seq(1000.0, 15.0)], Relids::EMPTY, &[]),
-                base(
-                    1.0,
-                    8.0,
-                    &[lateral],
-                    Relids::of(0u8),
-                    &[Member::plain(0, 0)],
-                ),
-            ],
+            rels: &rels,
             classes: &[],
             specials: &[],
             subproblems: &[Subproblem { first: 0, count: 2 }],

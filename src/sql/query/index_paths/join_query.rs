@@ -391,6 +391,10 @@ pub(crate) struct ModeledGroup<'a> {
     /// What sizes a grouping `HashAggregate`'s memory, when the model
     /// covers it.
     pub(crate) hash_agg: Option<crate::sql::query::postgres_memory::HashAggSizing>,
+    /// [`Self::hash_agg`] without the transition states the model does not
+    /// size: a lower bound on the table's memory, which orders the groups
+    /// when even it does not spill.
+    pub(crate) order_sizing: Option<crate::sql::query::postgres_memory::HashAggSizing>,
     /// A `DISTINCT`'s `Unique` or `HashAggregate`, whose keys are select
     /// list positions.
     pub(crate) distinct: bool,
@@ -4895,7 +4899,22 @@ fn modeled_join_over<'a>(
                             usize::from(group_columns_count),
                         )
                     });
+            let order_sizing =
+                problem_group_aggregates
+                    .filter(|_| chosen.hashed)
+                    .and_then(|aggregates| {
+                        super::aggregate::hash_agg_sizing(
+                            &super::aggregate::AggregateCosts {
+                                unsized_states: false,
+                                ..aggregates
+                            },
+                            chosen.groups,
+                            output_width,
+                            usize::from(group_columns_count),
+                        )
+                    });
             Some(ModeledGroup {
+                order_sizing,
                 hashed: chosen.hashed,
                 aggregated: problem_group_aggregates
                     .is_some_and(|aggregates| aggregates.aggregated()),

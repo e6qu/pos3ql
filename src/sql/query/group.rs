@@ -1377,17 +1377,25 @@ fn modeled_group_order<'a>(
         let positions = arena
             .alloc_slice_with(group.keys.len(), |at| group.keys[at].0)
             .map_err(|_| arena_full())?;
-        let sizing = group.hash_agg.ok_or_else(|| {
+        let not_modeled = || {
             sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
-                "a hashed grouping over a join whose hash table memory is not modeled is not supported"
+                "a hashed grouping over a join that spills transition states of unmodeled size is not supported"
             )
-        })?;
-        if hashed_order(
+        };
+        let sizing = group
+            .hash_agg
+            .or(group.order_sizing)
+            .ok_or_else(not_modeled)?;
+        let figures = hashed_order(
             storage, txid, arena, group_of, keys, positions, sizing, order,
-        )?
-        .is_none()
-        {
+        )?;
+        // Without every state sized the model's memory is a lower bound:
+        // its order holds only while even that bound does not spill.
+        if group.hash_agg.is_none() && figures.is_some_and(|figures| figures.batches > 1) {
+            return Err(not_modeled());
+        }
+        if figures.is_none() {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "the hash order of this grouping key type is not supported"

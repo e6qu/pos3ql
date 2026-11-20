@@ -1656,7 +1656,10 @@ by-reference state (`numeric` sums, text `min`/`max`, collecting
 aggregates) or more than seven grouping columns fails with `0A000`, as does
 one that spills rows holding columns besides its keys (their tape bytes
 are not modelled) and a hash aggregate whose group estimate lies outside
-the cost model (an expression key, a join pos3ql does not plan).
+the cost model (an expression key, a join pos3ql does not plan). A join's
+hashed `GROUP BY` whose transition states are not all sized orders its
+groups by the table without them, a lower bound on its memory: it holds
+while that table does not spill, and one that spills fails with `0A000`.
 Aggregates over a join and a `DISTINCT` over one table size their tables
 from the planner's group estimate (`differential_exact/908`). A `Materialize`
 above a merge join's inner sort replays its mark, restore and

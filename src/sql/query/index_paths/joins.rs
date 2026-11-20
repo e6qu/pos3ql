@@ -15,7 +15,7 @@
 //! <https://github.com/postgres/postgres/blob/REL_18_6/src/backend/optimizer/path/joinpath.c>
 //! <https://github.com/postgres/postgres/blob/REL_18_6/src/backend/optimizer/path/costsize.c>
 
-use crate::mem::arena::{Arena, ArenaList};
+use crate::mem::arena::{Arena, ArenaChunks, ArenaList};
 use crate::sql::eval::SqlError;
 
 use super::{Costs, clamp_row_est};
@@ -27,14 +27,21 @@ pub(crate) use geqo::GeqoSettings;
 /// `join_collapse_limit` and `from_collapse_limit` and each is searched
 /// exhaustively or, from `geqo_threshold` on, genetically.
 pub(crate) const MAX_JOIN_RELS: usize = 128;
-/// Members per equivalence class and clauses the search holds.
-pub(crate) const MAX_MEMBERS: usize = 16;
-pub(crate) const MAX_CLAUSES: usize = 64;
+/// Members of one equivalence class, numbered by `u8`; the members
+/// themselves live in the statement arena.
+pub(crate) const MAX_MEMBERS: usize = u8::MAX as usize;
+/// Clauses one search holds, numbered by [`ClauseId`]; the clauses live in
+/// the statement arena.
+pub(crate) const MAX_CLAUSES: usize = u16::MAX as usize;
+/// A clause's number in the search's clause list.
+pub(crate) type ClauseId = u16;
 /// Join clauses of one join or relation, and sort keys of one path.
 pub(crate) const MAX_JOIN_CLAUSES: usize = 32;
 pub(crate) const MAX_KEYS: usize = 8;
 /// Paths kept per relation by `add_path`.
 const MAX_REL_PATHS: usize = 32;
+/// Paths and relations per chunk of the search's lists.
+const SEARCH_CHUNK: usize = 128;
 
 /// A set of base relations, by bit, and of the outer joins above them
 /// (PostgreSQL's join relids), each at [`OJ_SHIFT`] past its number.
@@ -287,15 +294,19 @@ pub(crate) const MAX_JOIN_EXPRESSIONS: usize = 16;
 /// operator family. A class holding a constant joins nothing: its members
 /// are each restricted to the constant instead.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct EquivalenceClass {
-    pub(crate) members: [Member; MAX_MEMBERS],
-    pub(crate) count: u8,
+pub(crate) struct EquivalenceClass<'a> {
+    pub(crate) members: &'a [Member],
     pub(crate) has_const: bool,
 }
 
-impl EquivalenceClass {
-    pub(crate) fn members(&self) -> &[Member] {
-        &self.members[..usize::from(self.count)]
+impl<'a> EquivalenceClass<'a> {
+    pub(crate) fn members(&self) -> &'a [Member] {
+        self.members
+    }
+
+    /// Its member count.
+    pub(crate) fn count(&self) -> usize {
+        self.members.len()
     }
 
     /// The member a sort of rows of `relids` sorts by
@@ -588,7 +599,7 @@ pub(crate) struct JoinSettings {
 /// An ordered list of clause numbers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ClauseList {
-    ids: [u8; MAX_JOIN_CLAUSES],
+    ids: [ClauseId; MAX_JOIN_CLAUSES],
     len: u8,
 }
 
@@ -598,22 +609,22 @@ impl ClauseList {
         len: 0,
     };
 
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[ClauseId] {
         &self.ids[..usize::from(self.len)]
     }
 
-    fn push(&mut self, id: u8) -> Option<()> {
+    fn push(&mut self, id: ClauseId) -> Option<()> {
         *self.ids.get_mut(usize::from(self.len))? = id;
         self.len += 1;
         Some(())
     }
 
-    fn contains(&self, id: u8) -> bool {
+    fn contains(&self, id: ClauseId) -> bool {
         self.as_slice().contains(&id)
     }
 
     /// Appends clause `id`, or `None` when the list is full.
-    pub(crate) fn push_id(&mut self, id: u8) -> Option<()> {
+    pub(crate) fn push_id(&mut self, id: ClauseId) -> Option<()> {
         self.push(id)
     }
 }
@@ -829,7 +840,7 @@ pub(crate) struct JoinPlan<'a> {
     /// The members of each Unique and Memoize path.
     pub(crate) member_keys: &'a [[Member; MAX_KEYS]],
     pub(crate) clauses: &'a [Clause],
-    pub(crate) classes: &'a [EquivalenceClass],
+    pub(crate) classes: &'a [EquivalenceClass<'a>],
     /// The join's chosen path, below [`Self::upper`].
     pub(crate) top: u32,
     pub(crate) upper: UpperPlan,
@@ -1120,7 +1131,7 @@ pub(crate) struct UpperPlan {
 /// The join problem.
 pub(crate) struct JoinProblem<'p> {
     pub(crate) rels: &'p [BaseRel<'p>],
-    pub(crate) classes: &'p [EquivalenceClass],
+    pub(crate) classes: &'p [EquivalenceClass<'p>],
     /// The outer, semi and anti joins (`join_info_list`).
     pub(crate) specials: &'p [SpecialJoin],
     /// The join problems, lower ones first; the last joins them all.
@@ -1159,12 +1170,14 @@ struct Search<'p, 'a, 's> {
     statistics: &'s dyn JoinStatistics,
     arena: &'a Arena,
     clauses: ArenaList<'a, Clause>,
-    paths: ArenaList<'a, Path>,
+    paths: ArenaChunks<'a, Path>,
+    /// Each `Material` path built, by the path it reads.
+    materials: ArenaList<'a, (u32, u32)>,
     /// The members of Unique and Memoize paths, kept apart so a path stays
     /// small.
     member_keys: ArenaList<'a, [Member; MAX_KEYS]>,
     /// The relations built (`join_rel_list`), base ones first.
-    rels: ArenaList<'a, Rel>,
+    rels: ArenaChunks<'a, Rel>,
     /// The newest relation of each hash chain of [`Self::rels`].
     rel_buckets: &'a mut [u32],
     /// The joinrels of each level of the current problem in the order they
@@ -1180,7 +1193,7 @@ struct Search<'p, 'a, 's> {
     /// Each clause side's `estimate_hash_bucket_stats`, as its first
     /// estimate cached it on the clause (`left_bucketsize`,
     /// `right_bucketsize` and their most common value frequencies).
-    buckets: [[Option<(f64, f64)>; 2]; MAX_CLAUSES],
+    buckets: ArenaList<'a, [Option<(f64, f64)>; 2]>,
     /// `all_baserels`.
     all_baserels: Relids,
     /// `consider_startup` of every relation: the query has a `LIMIT`
@@ -1212,7 +1225,7 @@ pub(crate) fn search<'a>(
         return Ok(Err("a join of more relations than the join search holds"));
     }
     if problem.clauses.len() > MAX_CLAUSES {
-        return Err(too_many());
+        return Err(too_many_clauses());
     }
     let mut search = Search {
         problem,
@@ -1220,15 +1233,16 @@ pub(crate) fn search<'a>(
         statistics,
         arena,
         clauses: ArenaList::new(arena),
-        paths: ArenaList::new(arena),
+        paths: ArenaChunks::new(arena, SEARCH_CHUNK),
+        materials: ArenaList::new(arena),
         member_keys: ArenaList::new(arena),
-        rels: ArenaList::new(arena),
+        rels: ArenaChunks::new(arena, SEARCH_CHUNK),
         rel_buckets: arena_slice(arena, REL_BUCKETS, |_| NO_REL)?,
         levels: core::array::from_fn(|_| ArenaList::new(arena)),
         outside: None,
         memoize_rescans: ArenaList::new(arena),
         param_rows: ArenaList::new(arena),
-        buckets: [[None; 2]; MAX_CLAUSES],
+        buckets: ArenaList::new(arena),
         all_baserels: Relids::below(n as u32) & !problem.removed,
         consider_startup: problem
             .upper
@@ -1237,6 +1251,7 @@ pub(crate) fn search<'a>(
     };
     for clause in problem.clauses {
         search.clauses.push(*clause).map_err(|_| arena_full())?;
+        search.buckets.push([None; 2]).map_err(|_| arena_full())?;
     }
     for (index, rel) in problem.rels.iter().enumerate() {
         let relids = Relids::of(index);
@@ -1245,7 +1260,7 @@ pub(crate) fn search<'a>(
         let mut joininfo = ClauseList::EMPTY;
         for (id, clause) in problem.clauses.iter().enumerate() {
             if clause.in_joininfo() && clause.required.overlaps(relids) {
-                joininfo.push(id as u8).ok_or_else(too_many)?;
+                joininfo.push(id as ClauseId).ok_or_else(too_many_clauses)?;
             }
         }
         search.insert_rel(Rel {
@@ -1362,22 +1377,43 @@ pub(crate) fn search<'a>(
     let Some(top) = search.find_rel(search.all_baserels) else {
         return Ok(Err("a join the search does not reach"));
     };
-    let top = search.rels.borrowed_slice()[top];
+    let top = search.rels.get(top);
     let (top, upper) = search.upper_paths(&top)?;
-    let rels = search.rels.borrowed_slice();
+    let mut chosen = ChosenPaths {
+        paths: ArenaList::new(arena),
+        member_keys: ArenaList::new(arena),
+        numbered: ArenaList::new(arena),
+    };
+    let top = chosen.take(&search.paths, search.member_keys.borrowed_slice(), top)?;
+    let rels = &search.rels;
     Ok(Ok(JoinPlan {
-        paths: search.paths.as_slice(),
-        member_keys: search.member_keys.as_slice(),
+        paths: chosen.paths.as_slice(),
+        member_keys: chosen.member_keys.as_slice(),
         clauses: search.clauses.as_slice(),
-        classes: arena
-            .alloc_slice_copy(problem.classes)
-            .map_err(|_| arena_full())?,
+        classes: {
+            let classes = arena
+                .alloc_slice_with(problem.classes.len(), |_| EquivalenceClass {
+                    members: &[],
+                    has_const: false,
+                })
+                .map_err(|_| arena_full())?;
+            for (class, held) in classes.iter_mut().zip(problem.classes) {
+                *class = EquivalenceClass {
+                    members: arena
+                        .alloc_slice_copy(held.members())
+                        .map_err(|_| arena_full())?,
+                    has_const: held.has_const,
+                };
+            }
+            classes
+        },
         top,
         upper,
         settings: problem.settings,
         firsts: arena
             .alloc_slice_with(rels.len(), |at| {
-                (rels[at].relids & BASE_RELIDS, rels[at].first)
+                let rel = rels.entry(at);
+                (rel.relids & BASE_RELIDS, rel.first)
             })
             .map_err(|_| arena_full())?,
         needed: arena
@@ -1389,6 +1425,65 @@ pub(crate) fn search<'a>(
 
 fn arena_full() -> SqlError {
     crate::sql::eval::arena_full()
+}
+
+/// The chosen plan's paths alone, numbered from its leaves: the other paths
+/// the search built are its working space, as `create_plan` copies only the
+/// chosen paths into plan nodes, so what runs or explains the plan holds
+/// state for its own nodes only.
+struct ChosenPaths<'a> {
+    paths: ArenaList<'a, Path>,
+    member_keys: ArenaList<'a, [Member; MAX_KEYS]>,
+    /// Each search path taken, with its number in [`Self::paths`]: a path
+    /// two nodes read (a shared input) is taken once.
+    numbered: ArenaList<'a, (u32, u32)>,
+}
+
+impl ChosenPaths<'_> {
+    /// Takes path `id` of `paths` and the paths below it; returns its new
+    /// number.
+    fn take(
+        &mut self,
+        paths: &ArenaChunks<'_, Path>,
+        member_keys: &[[Member; MAX_KEYS]],
+        id: u32,
+    ) -> Result<u32, SqlError> {
+        if let Some(&(_, number)) = self
+            .numbered
+            .borrowed_slice()
+            .iter()
+            .find(|(old, _)| *old == id)
+        {
+            return Ok(number);
+        }
+        let mut path = paths.get(id as usize);
+        let keys_of = |this: &mut Self, keys: &mut u32| -> Result<(), SqlError> {
+            let number = this.member_keys.len() as u32;
+            this.member_keys
+                .push(member_keys[*keys as usize])
+                .map_err(|_| arena_full())?;
+            *keys = number;
+            Ok(())
+        };
+        match &mut path.kind {
+            PathKind::Dummy | PathKind::Scan { .. } => {}
+            PathKind::Material { input } => *input = self.take(paths, member_keys, *input)?,
+            PathKind::Unique { input, keys, .. } | PathKind::Memoize { input, keys, .. } => {
+                *input = self.take(paths, member_keys, *input)?;
+                keys_of(self, keys)?;
+            }
+            PathKind::NestLoop { outer, inner, .. }
+            | PathKind::HashJoin { outer, inner, .. }
+            | PathKind::MergeJoin { outer, inner, .. } => {
+                *outer = self.take(paths, member_keys, *outer)?;
+                *inner = self.take(paths, member_keys, *inner)?;
+            }
+        }
+        let number = self.paths.len() as u32;
+        self.paths.push(path).map_err(|_| arena_full())?;
+        self.numbered.push((id, number)).map_err(|_| arena_full())?;
+        Ok(number)
+    }
 }
 
 fn arena_slice<T: Copy>(
@@ -1404,6 +1499,7 @@ fn arena_slice<T: Copy>(
 struct SavedJoins {
     rels: usize,
     paths: usize,
+    materials: usize,
     member_keys: usize,
     memoize_rescans: usize,
     param_rows: usize,
@@ -1471,16 +1567,16 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     }
 
     fn path(&self, id: u32) -> Path {
-        self.paths.borrowed_slice()[id as usize]
+        self.paths.get(id as usize)
     }
 
-    fn clause(&self, id: u8) -> Clause {
+    fn clause(&self, id: ClauseId) -> Clause {
         self.clauses.borrowed_slice()[usize::from(id)]
     }
 
     /// Whether a clause list holds clause `id` or a copy of it: the copies
     /// of a commuting outer join's clause share its `rinfo_serial`.
-    fn holds_serial(&self, list: &ClauseList, id: u8) -> bool {
+    fn holds_serial(&self, list: &ClauseList, id: ClauseId) -> bool {
         let source = self.clause(id).source;
         list.as_slice()
             .iter()
@@ -1490,10 +1586,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// `find_join_rel`: the relation of `relids`' base relations.
     fn find_rel(&self, relids: Relids) -> Option<usize> {
         let base = relids & BASE_RELIDS;
-        let rels = self.rels.borrowed_slice();
         let mut at = self.rel_buckets[rel_bucket(base)];
         while at != NO_REL {
-            let rel = &rels[at as usize];
+            let rel = self.rels.entry(at as usize);
             if rel.relids & BASE_RELIDS == base {
                 return Some(at as usize);
             }
@@ -1504,7 +1599,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
 
     fn rel(&self, relids: Relids) -> Rel {
         let at = self.find_rel(relids).expect("the relation was built");
-        self.rels.borrowed_slice()[at]
+        self.rels.get(at)
     }
 
     /// Adds a relation not yet built (`add_join_rel`).
@@ -1518,7 +1613,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// Replaces a built relation's state.
     fn store_rel(&mut self, rel: Rel) -> Result<(), SqlError> {
         let at = self.find_rel(rel.relids).expect("the relation was built");
-        self.rels.as_mut_slice().map_err(|_| arena_full())?[at] = rel;
+        *self.rels.entry_mut(at) = rel;
         Ok(())
     }
 
@@ -1528,6 +1623,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         SavedJoins {
             rels: self.rels.len(),
             paths: self.paths.len(),
+            materials: self.materials.len(),
             member_keys: self.member_keys.len(),
             memoize_rescans: self.memoize_rescans.len(),
             param_rows: self.param_rows.len(),
@@ -1538,15 +1634,15 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// tour's memory context. A kept relation's unique-ified path, which
     /// PostgreSQL builds in the planner's own context, is kept.
     fn restore_joins(&mut self, saved: SavedJoins) -> Result<(), SqlError> {
-        let rels = self.rels.borrowed_slice();
-        for rel in rels[saved.rels..].iter().rev() {
+        for at in (saved.rels..self.rels.len()).rev() {
+            let rel = self.rels.get(at);
             let bucket = rel_bucket(rel.relids);
             self.rel_buckets[bucket] = rel.next;
         }
         self.rels.truncate(saved.rels);
         let mut kept = [(0usize, None::<(Path, [Member; MAX_KEYS])>); 2 * MAX_JOIN_RELS];
         let mut kept_count = 0;
-        for (at, rel) in self.rels.borrowed_slice().iter().enumerate() {
+        for (at, rel) in self.rels.iter().enumerate() {
             if let Some(Some(id)) = rel.unique
                 && id as usize >= saved.paths
             {
@@ -1557,11 +1653,12 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     }
                     _ => unreachable!("a unique-ified path"),
                 };
-                *kept.get_mut(kept_count).ok_or_else(too_many)? = (at, Some((path, keys)));
+                *kept.get_mut(kept_count).ok_or_else(too_many_paths)? = (at, Some((path, keys)));
                 kept_count += 1;
             }
         }
         self.paths.truncate(saved.paths);
+        self.materials.truncate(saved.materials);
         self.member_keys.truncate(saved.member_keys);
         self.memoize_rescans.truncate(saved.memoize_rescans);
         self.param_rows.truncate(saved.param_rows);
@@ -1571,7 +1668,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 *keys = self.push_member_keys(members)?;
             }
             let id = self.push_path(path)?;
-            self.rels.as_mut_slice().map_err(|_| arena_full())?[at].unique = Some(Some(id));
+            self.rels.entry_mut(at).unique = Some(Some(id));
         }
         Ok(())
     }
@@ -1582,7 +1679,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
 
     /// The sides of a mergeable clause: its left and right members and
     /// their classes (`left_ec`, `right_ec`).
-    fn sides(&self, id: u8) -> Option<(Member, Member, u8, u8)> {
+    fn sides(&self, id: ClauseId) -> Option<(Member, Member, u8, u8)> {
         match self.clause(id).form {
             ClauseForm::Equality { class, left, right } => {
                 let members = self.problem.classes[usize::from(class)].members();
@@ -1605,7 +1702,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
 
     /// `clause_sides_match_join`: whether the clause's left side is the
     /// outer relation's, `None` when its sides are not the two inputs'.
-    fn outer_is_left(&self, id: u8, outer: Relids, inner: Relids) -> Option<bool> {
+    fn outer_is_left(&self, id: ClauseId, outer: Relids, inner: Relids) -> Option<bool> {
         let (left, right, ..) = self.sides(id)?;
         if left.relids() & !outer == Relids::EMPTY && right.relids() & !inner == Relids::EMPTY {
             Some(true)
@@ -1619,7 +1716,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     }
 
     /// The class of a merge clause's outer side, and of its inner side.
-    fn merge_classes(&self, id: u8, outer: Relids, inner: Relids) -> (u8, u8) {
+    fn merge_classes(&self, id: ClauseId, outer: Relids, inner: Relids) -> (u8, u8) {
         let (_, _, left, right) = self.sides(id).expect("a merge clause");
         if self.outer_is_left(id, outer, inner) == Some(true) {
             (left, right)
@@ -1650,7 +1747,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     let joined = special.min_left | inner;
                     let mut restrict = ClauseList::EMPTY;
                     for (class_id, class) in self.problem.classes.iter().enumerate() {
-                        if class.has_const || class.count <= 1 {
+                        if class.has_const || class.count() <= 1 {
                             continue;
                         }
                         let members = class.members();
@@ -1664,11 +1761,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                         {
                             let id =
                                 self.class_clause(class_id as u8, outer as u8, within as u8)?;
-                            restrict.push(id).ok_or_else(too_many)?;
+                            restrict.push(id).ok_or_else(too_many_clauses)?;
                         }
                     }
                     for &id in self.rel(inner).joininfo.as_slice() {
-                        restrict.push(id).ok_or_else(too_many)?;
+                        restrict.push(id).ok_or_else(too_many_clauses)?;
                     }
                     self.inner_unique(joined, special.min_left, inner, JoinType::Semi, &restrict)
                 };
@@ -1684,7 +1781,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// `has_relevant_eclass_joinclause`.
     fn has_eclass_joins(&self, relids: Relids) -> bool {
         self.problem.classes.iter().any(|class| {
-            class.count > 1
+            class.count() > 1
                 && class.relids() & relids & BASE_RELIDS != Relids::EMPTY
                 && class.relids() & !relids != Relids::EMPTY
         })
@@ -1717,7 +1814,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         self.has_eclass_joins(left)
             && self.has_eclass_joins(right)
             && self.problem.classes.iter().any(|class| {
-                class.count > 1
+                class.count() > 1
                     && class.relids() & left & BASE_RELIDS != Relids::EMPTY
                     && class.relids() & right & BASE_RELIDS != Relids::EMPTY
             })
@@ -2105,10 +2202,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let joined = self.add_outer_joins(rel1 | rel2, special);
         let (rel1, rel2) = if reversed { (rel2, rel1) } else { (rel1, rel2) };
         let restrict = self.restrictlist(rel1, rel2, joined)?;
-        match self
-            .find_rel(joined)
-            .map(|at| self.rels.borrowed_slice()[at])
-        {
+        match self.find_rel(joined).map(|at| self.rels.get(at)) {
             None => {
                 let (outer, inner) = (self.rel(rel1), self.rel(rel2));
                 let rows = self.join_size(
@@ -2275,12 +2369,12 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     continue;
                 }
                 if !list.contains(id) {
-                    list.push(id).ok_or_else(too_many)?;
+                    list.push(id).ok_or_else(too_many_clauses)?;
                 }
             }
         }
         for (class_id, class) in self.problem.classes.iter().enumerate() {
-            if class.has_const || class.count <= 1 {
+            if class.has_const || class.count() <= 1 {
                 continue;
             }
             let members = class.members();
@@ -2311,7 +2405,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 })
                 .expect("found");
             let id = self.class_clause(class_id as u8, outer_member as u8, inner_member as u8)?;
-            list.push(id).ok_or_else(too_many)?;
+            list.push(id).ok_or_else(too_many_clauses)?;
         }
         Ok(list)
     }
@@ -2328,7 +2422,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         for joininfo in [self.rel(outer).joininfo, self.rel(inner).joininfo] {
             for &id in joininfo.as_slice() {
                 if self.clause(id).required & !joined != Relids::EMPTY && !list.contains(id) {
-                    list.push(id).ok_or_else(too_many)?;
+                    list.push(id).ok_or_else(too_many_clauses)?;
                 }
             }
         }
@@ -2338,7 +2432,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// `create_join_clause`: the class's derived clause equating the two
     /// members in either orientation, else a new one oriented outer member
     /// first.
-    fn class_clause(&mut self, class: u8, outer: u8, inner: u8) -> Result<u8, SqlError> {
+    fn class_clause(&mut self, class: u8, outer: u8, inner: u8) -> Result<ClauseId, SqlError> {
         // The query's own equalities are not searched: PostgreSQL derives
         // a clause for each split, oriented as the split that first needed
         // it, and reuses it in either orientation.
@@ -2348,7 +2442,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     if c == class && ((left, right) == (outer, inner) || (left, right) == (inner, outer)))
         });
         if let Some(id) = found {
-            return u8::try_from(id).map_err(|_| too_many());
+            return ClauseId::try_from(id).map_err(|_| too_many_clauses());
         }
         let members = self.problem.classes[usize::from(class)].members();
         let relids = members[usize::from(outer)].relids() | members[usize::from(inner)].relids();
@@ -2357,7 +2451,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             + self.member_cost(members[usize::from(inner)]);
         let id = self.clauses.len();
         if id >= MAX_CLAUSES {
-            return Err(too_many());
+            return Err(too_many_clauses());
         }
         self.clauses
             .push(Clause {
@@ -2381,13 +2475,14 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 source: None,
             })
             .map_err(|_| arena_full())?;
-        Ok(id as u8)
+        self.buckets.push([None; 2]).map_err(|_| arena_full())?;
+        Ok(id as ClauseId)
     }
 
     /// `clause_selectivity` of a join clause, cached on the clause as
     /// PostgreSQL caches it on its `RestrictInfo`: one estimate for inner
     /// joins and one, whichever join computed it first, for the others.
-    fn selectivity(&mut self, id: u8, mode: Selectivity) -> Result<f64, SqlError> {
+    fn selectivity(&mut self, id: ClauseId, mode: Selectivity) -> Result<f64, SqlError> {
         let clause = self.clause(id);
         let cached = match mode {
             Selectivity::Inner => clause.selectivity,
@@ -2420,9 +2515,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     } else {
                         (left, right)
                     };
-                let Some(inner_rel) = self
-                    .find_rel(special.min_right)
-                    .map(|at| self.rels.borrowed_slice()[at])
+                let Some(inner_rel) = self.find_rel(special.min_right).map(|at| self.rels.get(at))
                 else {
                     self.outside = Some("a semi join whose inner relation is not yet built");
                     return Ok(1.0);
@@ -2493,15 +2586,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         Ok(selectivity)
     }
 
-    fn set_clause(&mut self, id: u8, clause: Clause) -> Result<(), SqlError> {
-        // The list never published a slice, so its entries are writable.
-        let mut rebuilt = ArenaList::new(self.arena);
-        for (at, held) in self.clauses.borrowed_slice().iter().enumerate() {
-            rebuilt
-                .push(if at == usize::from(id) { clause } else { *held })
-                .map_err(|_| arena_full())?;
-        }
-        self.clauses = rebuilt;
+    fn set_clause(&mut self, id: ClauseId, clause: Clause) -> Result<(), SqlError> {
+        self.clauses.as_mut_slice().map_err(|_| arena_full())?[usize::from(id)] = clause;
         Ok(())
     }
 
@@ -2600,12 +2686,12 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     fn add_path(&mut self, relids: Relids, new: Path) -> Result<(), SqlError> {
         let mut rel = self.rel(relids);
         let id = self.paths.len() as u32;
-        let paths = self.paths.borrowed_slice();
+        let paths = &self.paths;
         let (count, accepted) = add_to_pathlist(
             &mut rel.paths,
             usize::from(rel.count),
             (id, new),
-            &|id| paths[id as usize],
+            &|id| paths.get(id as usize),
             self.consider_startup,
         )?;
         if accepted {
@@ -2742,7 +2828,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 limit = Some((startup, total, rows));
             }
             if stored == MAX_UPPER {
-                return Err(too_many());
+                return Err(too_many_paths());
             }
             store[stored] = path;
             below[stored] = below[at as usize];
@@ -3132,7 +3218,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     )
                 };
                 if stored == MAX_GROUPED {
-                    return Err(too_many());
+                    return Err(too_many_paths());
                 }
                 let path = Path {
                     startup,
@@ -3183,7 +3269,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 },
             );
             if stored == MAX_GROUPED {
-                return Err(too_many());
+                return Err(too_many_paths());
             }
             let path = Path {
                 startup,
@@ -3259,7 +3345,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             grouped_count = 0;
             for (at, &(tag, path, steps)) in windowed[..count].iter().enumerate() {
                 if stored == MAX_GROUPED {
-                    return Err(too_many());
+                    return Err(too_many_paths());
                 }
                 store[stored] = path;
                 plans[stored] = plans[tag as usize];
@@ -3311,7 +3397,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 ));
             }
             if stored == MAX_GROUPED {
-                return Err(too_many());
+                return Err(too_many_paths());
             }
             store[stored] = path;
             plans[stored] = plans[at as usize];
@@ -3353,7 +3439,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 limit = Some((startup, total, rows));
             }
             if stored == MAX_GROUPED {
-                return Err(too_many());
+                return Err(too_many_paths());
             }
             store[stored] = path;
             plans[stored] = plans[at as usize];
@@ -3398,7 +3484,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// `eclass_useful_for_merging`.
     fn useful_for_merging(&self, class: u8, relids: Relids) -> bool {
         let class = &self.problem.classes[usize::from(class)];
-        if class.has_const || class.count <= 1 || class.relids() & !relids == Relids::EMPTY {
+        if class.has_const || class.count() <= 1 || class.relids() & !relids == Relids::EMPTY {
             return false;
         }
         class
@@ -3703,7 +3789,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
 
     /// The direction flags of the outer pathkey of merge clause `id`'s
     /// outer class.
-    fn merge_direction(&self, id: u8, inputs: &JoinInputs, outer_keys: &Keys) -> u8 {
+    fn merge_direction(&self, id: ClauseId, inputs: &JoinInputs, outer_keys: &Keys) -> u8 {
         let (class, _) = self.merge_classes(id, inputs.outer, inputs.inner);
         outer_keys
             .as_slice()
@@ -4195,7 +4281,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 && !movable(relids, outer_relids, inputs.outer, outer_and_req)
                 && !movable(relids, outer_relids, inputs.inner, inner_and_req)
             {
-                moved.push(id).ok_or_else(too_many)?;
+                moved.push(id).ok_or_else(too_many_clauses)?;
             }
         }
         let mut dropped = [0u8; MAX_JOIN_CLAUSES];
@@ -4207,7 +4293,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         };
         for class_id in 0..self.problem.classes.len() {
             let class = self.problem.classes[class_id];
-            if class.has_const || class.count <= 1 {
+            if class.has_const || class.count() <= 1 {
                 continue;
             }
             let members = class.members();
@@ -4227,7 +4313,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 continue;
             }
             let id = self.class_clause(class_id as u8, outside as u8, within as u8)?;
-            moved.push(id).ok_or_else(too_many)?;
+            moved.push(id).ok_or_else(too_many_clauses)?;
         }
         for &class_id in &dropped[..dropped_count] {
             let members = self.problem.classes[usize::from(class_id)].members();
@@ -4241,7 +4327,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 continue;
             }
             let id = self.class_clause(class_id, outside as u8, outer as u8)?;
-            moved.push(id).ok_or_else(too_many)?;
+            moved.push(id).ok_or_else(too_many_clauses)?;
         }
         Ok(moved)
     }
@@ -4265,19 +4351,35 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         matches!(self.path(id).kind, PathKind::Material { .. })
     }
 
-    /// `create_material_path` with `cost_material`.
+    /// `create_material_path` with `cost_material`: one path per input, as
+    /// its costs and rows are the input's alone (PostgreSQL builds one per
+    /// join pair and never frees it). A relation's path appears once in a
+    /// plan, so no plan reads the shared path twice.
     fn material_path(&mut self, input: u32) -> Result<u32, SqlError> {
+        if let Some(&(_, material)) = self
+            .materials
+            .borrowed_slice()
+            .iter()
+            .rev()
+            .find(|(over, _)| *over == input)
+        {
+            return Ok(material);
+        }
         let path = self.path(input);
         let settings = self.problem.settings;
         let (startup, total) =
             material_cost(path.startup, path.total, path.rows, path.width, settings);
-        self.push_path(Path {
+        let material = self.push_path(Path {
             kind: PathKind::Material { input },
             startup,
             total,
             disabled: path.disabled + u32::from(!settings.material),
             ..path
-        })
+        })?;
+        self.materials
+            .push((input, material))
+            .map_err(|_| arena_full())?;
+        Ok(material)
     }
 
     /// `generate_mergejoin_paths`.
@@ -4460,7 +4562,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         };
         for &id in inputs.restrict.as_slice() {
             if !self.holds_serial(&enforced, id) {
-                clauses.push(id).ok_or_else(too_many)?;
+                clauses.push(id).ok_or_else(too_many_clauses)?;
             }
         }
         let param_rows =
@@ -4609,7 +4711,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             required,
         )?;
         for &id in inputs.restrict.as_slice() {
-            clauses.push(id).ok_or_else(too_many)?;
+            clauses.push(id).ok_or_else(too_many_clauses)?;
         }
         Ok(Some((required, clauses)))
     }
@@ -4912,17 +5014,18 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// clause caches its first estimate.
     fn bucket(
         &mut self,
-        id: u8,
+        id: ClauseId,
         inner: Member,
         left: bool,
         buckets: f64,
     ) -> Result<(f64, f64), SqlError> {
         let side = usize::from(!left);
-        if let Some(held) = self.buckets[usize::from(id)][side] {
+        if let Some(held) = self.buckets.borrowed_slice()[usize::from(id)][side] {
             return Ok(held);
         }
         let estimate = self.statistics.bucket(inner, buckets)?;
-        self.buckets[usize::from(id)][side] = Some(estimate);
+        self.buckets.as_mut_slice().map_err(|_| arena_full())?[usize::from(id)][side] =
+            Some(estimate);
         Ok(estimate)
     }
 
@@ -5049,10 +5152,20 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     }
 }
 
-fn too_many() -> SqlError {
+pub(crate) fn too_many_clauses() -> SqlError {
     crate::sql_err!(
-        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-        "a join with more clauses or paths than the join search holds is not supported"
+        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "join search capacity exceeded: a join or relation holds at most {} join clauses and a query {}",
+        MAX_JOIN_CLAUSES,
+        MAX_CLAUSES
+    )
+}
+
+fn too_many_paths() -> SqlError {
+    crate::sql_err!(
+        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "join search capacity exceeded: a relation holds at most {} paths",
+        MAX_REL_PATHS
     )
 }
 
@@ -5335,7 +5448,7 @@ fn add_to_pathlist(
     }
     if accept {
         if kept_count == MAX_REL_PATHS {
-            return Err(too_many());
+            return Err(too_many_paths());
         }
         kept.copy_within(insert_at..kept_count, insert_at + 1);
         kept[insert_at] = id;
@@ -5544,12 +5657,10 @@ mod tests {
         // Hash Join (cost=28.50..85.00 rows=2000 width=20).
         let mut budget = crate::mem::budget::Budget::new(1 << 21);
         let arena = Arena::new(&mut budget, "join search", 1 << 20).unwrap();
-        let mut class = EquivalenceClass {
-            members: [Member::plain(0, 0); MAX_MEMBERS],
-            count: 2,
+        let class = EquivalenceClass {
+            members: &[Member::plain(0, 0), Member::plain(1, 0)],
             has_const: false,
         };
-        class.members[1] = Member::plain(1, 0);
         let problem = JoinProblem {
             rels: &[
                 BaseRel {

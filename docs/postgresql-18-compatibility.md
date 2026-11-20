@@ -1352,7 +1352,10 @@ Where pos3ql's planner has the same choice, the setting decides it:
 The other settings name plan types pos3ql's planner does not have, so they
 change no plan, just as disabling an unused method changes nothing in
 PostgreSQL: there is no parallel query, JIT, TID scan or partitionwise
-planning.
+planning. pos3ql behaves as a PostgreSQL built without LLVM: `jit` is on
+and `jit_provider` (a server-start setting, so `SET jit_provider` fails
+with `55P02`) names `llvmjit`, but `pg_jit_available()` returns false and
+no `EXPLAIN` prints a `JIT` section (`differential_exact/973`).
 
 ### Cursor capacity
 

@@ -16,6 +16,7 @@ mod builtin_aggregate_resolution;
 mod builtin_argument_binding;
 mod builtin_routine_changes;
 mod builtin_routine_comments;
+mod cache_space_waits;
 mod canonical_sequences;
 mod cast_and_operator_class_descriptions;
 mod catalog_capture_selection;
@@ -82029,6 +82030,88 @@ fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
 }
 
 #[test]
+fn jit_is_unavailable_as_without_llvm() {
+    let (mut engine, mut budget) = test_engine();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_jit_available(), current_setting('jit_provider'), \
+             current_setting('jit')"
+        )),
+        ["f|llvmjit|on"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT context, vartype, category, short_desc, boot_val FROM pg_settings \
+             WHERE name = 'jit_provider'"
+        )),
+        [
+            "postmaster|string|Client Connection Defaults / Shared Library Preloading|\
+             JIT provider to use.|llvmjit"
+        ]
+    );
+    let output = run_with(&mut engine, &mut budget, "SET jit_provider = 'llvmjit'");
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("C55P02")
+            && text.contains(
+                "parameter \"jit_provider\" cannot be changed without restarting the server"
+            ),
+        "{text}"
+    );
+    let output = run_with(&mut engine, &mut budget, "SET jit_debugging_support = on");
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("C55P02")
+            && text.contains(
+                "parameter \"jit_debugging_support\" cannot be set after connection start"
+            ),
+        "{text}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT context, boot_val, pg_settings_get_flags(name) FROM pg_settings \
+             WHERE name LIKE 'jit\\_%' AND category = 'Developer Options' ORDER BY name"
+        )),
+        [
+            "superuser-backend|off|{NOT_IN_SAMPLE}",
+            "superuser|off|{NOT_IN_SAMPLE}",
+            "user|on|{NOT_IN_SAMPLE}",
+            "superuser-backend|off|{NOT_IN_SAMPLE}",
+            "user|on|{NOT_IN_SAMPLE}"
+        ]
+    );
+}
+
+#[test]
+fn connection_start_parameters_are_set_only_at_startup() {
+    let guc = GucState::new();
+    guc.set_startup_config("jit_profiling_support", "on")
+        .unwrap();
+    assert_eq!(
+        guc.get_owned("jit_profiling_support").unwrap().as_str(),
+        "on"
+    );
+    guc.reset_all().unwrap();
+    assert_eq!(
+        guc.get_owned("jit_profiling_support").unwrap().as_str(),
+        "on"
+    );
+    let error = guc
+        .set_config("jit_profiling_support", None, false)
+        .unwrap_err();
+    assert_eq!(
+        error.sqlstate,
+        crate::sql::eval::sqlstate::CANT_CHANGE_RUNTIME_PARAM
+    );
+}
+
+#[test]
 fn pg_dump_bootstrap_surface() {
     let (mut engine, mut budget) = test_engine();
     assert_eq!(
@@ -83228,7 +83311,10 @@ fn checkpoint_value_source_resumes_inside_a_spilled_pax_block() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap();
         let beat = engine.storage.block_io_stats().saturating_sub(before);
         if value_beat {
@@ -83348,7 +83434,10 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary
+            )
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -83372,7 +83461,10 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
                 .ckpt
                 .as_mut()
                 .unwrap()
-                .checkpoint_step(&mut engine.storage)
+                .checkpoint_step(
+                    &mut engine.storage,
+                    crate::checkpoint::CapturePriority::Ordinary
+                )
                 .unwrap(),
             crate::checkpoint::CheckpointStep::Working
         ));
@@ -83389,7 +83481,10 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary
+            )
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -83416,7 +83511,10 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary
+            )
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -83429,7 +83527,10 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary
+            )
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -83452,7 +83553,10 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary
+            )
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -83465,7 +83569,10 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary
+            )
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -83482,7 +83589,10 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
                 .ckpt
                 .as_mut()
                 .unwrap()
-                .checkpoint_step(&mut engine.storage)
+                .checkpoint_step(
+                    &mut engine.storage,
+                    crate::checkpoint::CapturePriority::Ordinary
+                )
                 .unwrap(),
             crate::checkpoint::CheckpointStep::Working
         ));
@@ -83496,7 +83606,10 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary
+            )
             .is_err(),
         "the retained writer must surface an object-store failure"
     );
@@ -83522,7 +83635,10 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap();
         let beat = engine.storage.block_io_stats().saturating_sub(before);
         if writer_beat {
@@ -83585,7 +83701,10 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
                 .ckpt
                 .as_mut()
                 .unwrap()
-                .checkpoint_step(&mut engine.storage)
+                .checkpoint_step(
+                    &mut engine.storage,
+                    crate::checkpoint::CapturePriority::Ordinary
+                )
                 .unwrap(),
             crate::checkpoint::CheckpointStep::Working
         ));
@@ -83749,7 +83868,10 @@ fn checkpoint_value_index_merges_changed_rows_with_cold_navigation_base() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap();
         let active_after = engine.ckpt.as_ref().unwrap().value_index_job_active();
         let beat = engine.storage.block_io_stats().saturating_sub(before);
@@ -84239,7 +84361,10 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary
+            )
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -84260,7 +84385,10 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
                 .ckpt
                 .as_mut()
                 .unwrap()
-                .checkpoint_step(&mut engine.storage)
+                .checkpoint_step(
+                    &mut engine.storage,
+                    crate::checkpoint::CapturePriority::Ordinary,
+                )
                 .unwrap();
             assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
             engine
@@ -84283,7 +84411,10 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary
+            )
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -84733,7 +84864,10 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap()
         {
             crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
@@ -84933,7 +85067,10 @@ fn checkpoint_reports_publication_before_paced_maintenance() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap();
         match step {
             crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
@@ -85017,7 +85154,10 @@ fn checkpoint_publishes_final_slices_after_upload_completion() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap();
         beats += 1;
         if engine.ckpt.as_ref().unwrap().sliced_generation(first) == first_generation {
@@ -85125,7 +85265,10 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap();
         assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
         if engine.ckpt.as_ref().unwrap().sliced_generation(table) == first_generation {
@@ -85152,7 +85295,10 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap();
         assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
         if engine.ckpt.as_ref().unwrap().sliced_generation(table) == reslice_generation {
@@ -85275,7 +85421,10 @@ fn failed_full_roster_merge_keeps_the_prior_slice_for_retry() {
                 .ckpt
                 .as_mut()
                 .unwrap()
-                .checkpoint_step(&mut engine.storage)
+                .checkpoint_step(
+                    &mut engine.storage,
+                    crate::checkpoint::CapturePriority::Ordinary
+                )
                 .unwrap(),
             crate::checkpoint::CheckpointStep::Working
         ));
@@ -85488,7 +85637,10 @@ fn dirty_full_roster_merges_across_bounded_checkpoint_beats() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap();
         let beat = engine.storage.block_io_stats().saturating_sub(before);
         assert!(
@@ -85640,7 +85792,10 @@ fn row_merge_reuses_unchanged_wide_pax_groups_across_beats() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap();
         let beat = engine.storage.block_io_stats().saturating_sub(before_beat);
         max_beat_gets = max_beat_gets.max(beat.object_gets);
@@ -86375,7 +86530,10 @@ fn published_checkpoint_maintenance_retries_without_fencing_reads() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap()
         {
             crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
@@ -97467,7 +97625,10 @@ fn sliced_heap_cleanup_preserves_journal_suffix_and_empty_cache_recovery() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap()
         {
             crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
@@ -97989,7 +98150,10 @@ fn publish_cleanup_fixture(engine: &mut Engine) -> u64 {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .unwrap()
         {
             crate::checkpoint::CheckpointStep::Published { lsn } => return lsn,
@@ -100017,7 +100181,10 @@ fn parallel_physical_table_slices_preserve_interleaved_changes_in_both_modes() {
                     .ckpt
                     .as_mut()
                     .unwrap()
-                    .checkpoint_step(&mut engine.storage)
+                    .checkpoint_step(
+                        &mut engine.storage,
+                        crate::checkpoint::CapturePriority::Ordinary
+                    )
                     .unwrap(),
                 crate::checkpoint::CheckpointStep::Working
             ));
@@ -100098,7 +100265,10 @@ fn parallel_physical_table_slices_discard_replaced_encodings_and_keep_truncation
                 .ckpt
                 .as_mut()
                 .unwrap()
-                .checkpoint_step(&mut engine.storage)
+                .checkpoint_step(
+                    &mut engine.storage,
+                    crate::checkpoint::CapturePriority::Ordinary
+                )
                 .unwrap(),
             crate::checkpoint::CheckpointStep::Working
         ));
@@ -100173,12 +100343,10 @@ fn parallel_physical_table_write_capacity_names_the_limit_before_publication() {
         "CREATE TABLE output_capacity(id integer); INSERT INTO output_capacity VALUES(1),(2)",
     );
     assert!(error_sqlstates(&setup).is_empty());
-    let error = match engine
-        .ckpt
-        .as_mut()
-        .unwrap()
-        .checkpoint_step(&mut engine.storage)
-    {
+    let error = match engine.ckpt.as_mut().unwrap().checkpoint_step(
+        &mut engine.storage,
+        crate::checkpoint::CapturePriority::Ordinary,
+    ) {
         Err(error) => error,
         Ok(_) => panic!("overfull checkpoint version schedule was accepted"),
     };
@@ -100299,7 +100467,13 @@ fn parallel_physical_table_handles_stay_private_until_uploads_complete() {
             assert!(!checkpointer.retained_output_ready());
             assert_eq!(checkpointer.published_spill_generation_count(table), 0);
         }
-        match checkpointer.checkpoint_step(&mut engine.storage).unwrap() {
+        match checkpointer
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
+            .unwrap()
+        {
             crate::checkpoint::CheckpointStep::Working => {
                 assert_eq!(
                     checkpointer.published_spill_generation_count(table),
@@ -100375,11 +100549,10 @@ fn parallel_physical_table_capture_releases_deletion_owners_on_failure_and_drop(
             .storage
             .find_table("public", "deletion_owner")
             .unwrap();
-        let capture = engine
-            .ckpt
-            .as_mut()
-            .unwrap()
-            .checkpoint_step(&mut engine.storage);
+        let capture = engine.ckpt.as_mut().unwrap().checkpoint_step(
+            &mut engine.storage,
+            crate::checkpoint::CapturePriority::Ordinary,
+        );
         if captured {
             assert!(matches!(
                 capture.unwrap(),
@@ -100475,7 +100648,13 @@ fn parallel_physical_index_files_wait_for_uploads_and_recover_without_caches() {
                 pending_index = true;
             }
             let before = engine.storage.block_io_stats();
-            match checkpointer.checkpoint_step(&mut engine.storage).unwrap() {
+            match checkpointer
+                .checkpoint_step(
+                    &mut engine.storage,
+                    crate::checkpoint::CapturePriority::Ordinary,
+                )
+                .unwrap()
+            {
                 crate::checkpoint::CheckpointStep::Working => {
                     if !checkpointer.manifest_installing() {
                         for binding in 0..engine.storage.value_binding_count(table) {
@@ -100591,7 +100770,10 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
                 .ckpt
                 .as_mut()
                 .unwrap()
-                .checkpoint_step(&mut engine.storage)
+                .checkpoint_step(
+                    &mut engine.storage,
+                    crate::checkpoint::CapturePriority::Ordinary
+                )
                 .unwrap(),
             crate::checkpoint::CheckpointStep::Working
         ));
@@ -100607,7 +100789,10 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
                         .ckpt
                         .as_mut()
                         .unwrap()
-                        .checkpoint_step(&mut engine.storage)
+                        .checkpoint_step(
+                            &mut engine.storage,
+                            crate::checkpoint::CapturePriority::Ordinary
+                        )
                         .unwrap(),
                     crate::checkpoint::CheckpointStep::Working
                 ));
@@ -100619,7 +100804,10 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage)
+            .checkpoint_step(
+                &mut engine.storage,
+                crate::checkpoint::CapturePriority::Ordinary,
+            )
             .err()
             .expect("source read must report storage failure");
         assert_eq!(error.sqlstate, "58030");
@@ -101212,7 +101400,12 @@ fn parallel_physical_index_changes_cancel_unready_uploads_in_both_modes() {
                 break;
             }
             assert!(matches!(
-                checkpointer.checkpoint_step(&mut engine.storage).unwrap(),
+                checkpointer
+                    .checkpoint_step(
+                        &mut engine.storage,
+                        crate::checkpoint::CapturePriority::Ordinary
+                    )
+                    .unwrap(),
                 crate::checkpoint::CheckpointStep::Working
             ));
         }
@@ -101307,7 +101500,12 @@ fn parallel_physical_manifest_completion_preserves_later_rows_and_indexes() {
                 break;
             }
             assert!(matches!(
-                checkpoint.checkpoint_step(&mut engine.storage).unwrap(),
+                checkpoint
+                    .checkpoint_step(
+                        &mut engine.storage,
+                        crate::checkpoint::CapturePriority::Ordinary
+                    )
+                    .unwrap(),
                 crate::checkpoint::CheckpointStep::Working
             ));
         }
@@ -101422,7 +101620,12 @@ fn parallel_physical_manifest_completion_skips_rewritten_and_replaced_tables() {
                 break;
             }
             assert!(matches!(
-                checkpoint.checkpoint_step(&mut engine.storage).unwrap(),
+                checkpoint
+                    .checkpoint_step(
+                        &mut engine.storage,
+                        crate::checkpoint::CapturePriority::Ordinary
+                    )
+                    .unwrap(),
                 crate::checkpoint::CheckpointStep::Working
             ));
         }
@@ -101646,7 +101849,12 @@ fn parallel_physical_manifest_install_failure_resumes_without_republishing_or_re
             break;
         }
         assert!(matches!(
-            checkpoint.checkpoint_step(&mut engine.storage).unwrap(),
+            checkpoint
+                .checkpoint_step(
+                    &mut engine.storage,
+                    crate::checkpoint::CapturePriority::Ordinary
+                )
+                .unwrap(),
             crate::checkpoint::CheckpointStep::Working
         ));
     }
@@ -101659,12 +101867,10 @@ fn parallel_physical_manifest_install_failure_resumes_without_republishing_or_re
         .unwrap();
     let mut failure = None;
     for _ in 0..128 {
-        match engine
-            .ckpt
-            .as_mut()
-            .unwrap()
-            .checkpoint_step(&mut engine.storage)
-        {
+        match engine.ckpt.as_mut().unwrap().checkpoint_step(
+            &mut engine.storage,
+            crate::checkpoint::CapturePriority::Ordinary,
+        ) {
             Ok(crate::checkpoint::CheckpointStep::Working) => {}
             Err(error) => {
                 failure = Some(error);
@@ -102633,7 +102839,12 @@ fn bounded_local_cleanup_checkpoint_markers_preserve_later_deletes_and_cold_reco
             break;
         }
         assert!(matches!(
-            checkpoint.checkpoint_step(&mut engine.storage).unwrap(),
+            checkpoint
+                .checkpoint_step(
+                    &mut engine.storage,
+                    crate::checkpoint::CapturePriority::Ordinary
+                )
+                .unwrap(),
             crate::checkpoint::CheckpointStep::Working,
         ));
     }

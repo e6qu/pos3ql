@@ -184,14 +184,17 @@ fn set_startup_parameter(
     value: &str,
     may_set: &dyn Fn(&str) -> bool,
 ) -> Result<(), SqlError> {
-    if crate::sql::guc::requires_set_privilege(name) && !may_set(name) {
+    if (crate::sql::guc::requires_set_privilege(name)
+        || crate::sql::guc::is_connection_start_parameter(name))
+        && !may_set(name)
+    {
         return Err(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "permission denied to set parameter \"{}\"",
             name
         ));
     }
-    guc.set_config(name, Some(value), false).map(|_| ())
+    guc.set_startup_config(name, value)
 }
 
 struct Prepared {
@@ -1948,12 +1951,10 @@ impl Conn {
                 // Retain the login transaction without re-running its triggers.
                 // Credential installation and journal publication need reactor turns.
                 self.phase = Phase::AwaitLoginCommit;
-                let wait = if self.txn.staged_commit().is_some()
-                    || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                {
+                let wait = if self.txn.staged_commit().is_some() {
                     crate::sql::StatementWait::ObjectIo
                 } else {
-                    crate::sql::StatementWait::Lock
+                    crate::sql::StatementWait::of_internal(error.sqlstate)
                 };
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
                 return Step::Parked;
@@ -2419,12 +2420,10 @@ impl Conn {
                             && (self.txn.staged_commit().is_some()
                                 || self.txn.commit_admission().is_some())
                         {
-                            let wait = if self.txn.staged_commit().is_some()
-                                || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                            {
+                            let wait = if self.txn.staged_commit().is_some() {
                                 crate::sql::StatementWait::ObjectIo
                             } else {
-                                crate::sql::StatementWait::Lock
+                                crate::sql::StatementWait::of_internal(error.sqlstate)
                             };
                             self.park(wait, engine.statement_wait_generation(wait, self.id));
                             engine.park_backend_statement(self.id, self.parked_wait);
@@ -2527,12 +2526,10 @@ impl Conn {
                         && (self.txn.staged_commit().is_some()
                             || self.txn.commit_admission().is_some()) =>
                 {
-                    let wait = if self.txn.staged_commit().is_some()
-                        || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                    {
+                    let wait = if self.txn.staged_commit().is_some() {
                         crate::sql::StatementWait::ObjectIo
                     } else {
-                        crate::sql::StatementWait::Lock
+                        crate::sql::StatementWait::of_internal(error.sqlstate)
                     };
                     self.park(wait, engine.statement_wait_generation(wait, self.id));
                     engine.park_backend_statement(self.id, self.parked_wait);
@@ -3387,12 +3384,10 @@ impl Conn {
                 || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
             && (self.txn.staged_commit().is_some() || self.txn.commit_admission().is_some())
         {
-            let wait = if self.txn.staged_commit().is_some()
-                || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-            {
+            let wait = if self.txn.staged_commit().is_some() {
                 crate::sql::StatementWait::ObjectIo
             } else {
-                crate::sql::StatementWait::Lock
+                crate::sql::StatementWait::of_internal(error.sqlstate)
             };
             self.copy = Some(copy);
             self.park(wait, engine.statement_wait_generation(wait, self.id));
@@ -3645,11 +3640,7 @@ impl Conn {
                 if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                     || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT =>
             {
-                let wait = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                    crate::sql::StatementWait::ObjectIo
-                } else {
-                    crate::sql::StatementWait::Lock
-                };
+                let wait = crate::sql::StatementWait::of_internal(error.sqlstate);
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
                 return Step::Parked;
             }
@@ -4121,11 +4112,7 @@ impl Conn {
                 if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                     || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT =>
             {
-                let wait = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                    crate::sql::StatementWait::ObjectIo
-                } else {
-                    crate::sql::StatementWait::Lock
-                };
+                let wait = crate::sql::StatementWait::of_internal(error.sqlstate);
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
                 engine.park_backend_statement(self.id, self.parked_wait);
                 return Step::Parked;

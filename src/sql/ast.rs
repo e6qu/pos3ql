@@ -4075,19 +4075,39 @@ pub enum TableMembership<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelationStorageOptions {
     pub fillfactor: Option<u8>,
+    /// `autovacuum_enabled` and its value as written.
+    pub autovacuum_enabled: Option<(bool, crate::storage::ReloptionSpelling)>,
+    /// Both options were written, `autovacuum_enabled` first.
+    pub autovacuum_first: bool,
 }
 
 impl RelationStorageOptions {
-    pub const DEFAULT: Self = Self { fillfactor: None };
+    pub const DEFAULT: Self = Self {
+        fillfactor: None,
+        autovacuum_enabled: None,
+        autovacuum_first: false,
+    };
 
     pub const fn is_empty(self) -> bool {
-        self.fillfactor.is_none()
+        self.fillfactor.is_none() && self.autovacuum_enabled.is_none()
+    }
+
+    /// The first option written, which a relation without heap options
+    /// reports as unrecognized.
+    pub const fn first_name(self) -> Option<&'static str> {
+        match (self.fillfactor.is_some(), self.autovacuum_enabled.is_some()) {
+            (true, true) if !self.autovacuum_first => Some("fillfactor"),
+            (_, true) => Some("autovacuum_enabled"),
+            (true, false) => Some("fillfactor"),
+            (false, false) => None,
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelationStorageOptionNames {
     pub fillfactor: bool,
+    pub autovacuum_enabled: bool,
     /// View options; resetting one a relation lacks changes nothing.
     pub security_invoker: bool,
     pub security_barrier: bool,
@@ -4097,6 +4117,7 @@ pub struct RelationStorageOptionNames {
 impl RelationStorageOptionNames {
     pub const EMPTY: Self = Self {
         fillfactor: false,
+        autovacuum_enabled: false,
         security_invoker: false,
         security_barrier: false,
         check_option: false,
@@ -6486,6 +6507,7 @@ pub(crate) fn is_volatile_function(name: &str) -> bool {
         "txid_status",
         "pg_xact_status",
         "pg_is_in_recovery",
+        "pg_jit_available",
         "pg_reload_conf",
         "pg_blocking_pids",
         "pg_cancel_backend",

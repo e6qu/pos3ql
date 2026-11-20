@@ -182,8 +182,9 @@ pub(crate) struct NodeCounters {
     /// The rows went to a temporary file (`usedDisk`), so the node reports
     /// its storage as disk.
     pub(crate) stored_disk: bool,
-    /// A hashed aggregate's peak memory (`hash_mem_peak`).
-    pub(crate) hash_agg_peak: Option<usize>,
+    /// A hashed aggregate's batches, peak memory and disk use
+    /// (`hash_batches_used`, `hash_mem_peak`, `hash_disk_used`).
+    pub(crate) hash_agg: Option<super::hashagg::HashAggFigures>,
     /// For the first node of a `WITH` query's block, the most bytes its
     /// tuplestore held, which each `CTE Scan` reading it reports.
     pub(crate) cte_stored: Option<StoredSpace>,
@@ -1324,7 +1325,7 @@ impl Slot {
                 sort: None,
                 stored: None,
                 stored_disk: false,
-                hash_agg_peak: None,
+                hash_agg: None,
                 cte_stored: None,
                 incremental: None,
                 merged: MergeTuples {
@@ -2059,15 +2060,19 @@ impl Node {
         self.with(|slot, _| slot.counters.memoize = Some(stats));
     }
 
-    /// Records a hashed aggregate's peak memory; across rescans PostgreSQL
-    /// reports the most.
-    pub(crate) fn hash_agg_peak(self, bytes: usize) {
+    /// Records what a hashed aggregate reports. Across rescans PostgreSQL
+    /// reports the most memory and disk, and counts every rescan's spilled
+    /// batches on top of its first batch.
+    pub(crate) fn hash_agg_figures(self, figures: super::hashagg::HashAggFigures) {
         self.with(|slot, _| {
-            slot.counters.hash_agg_peak = Some(
-                slot.counters
-                    .hash_agg_peak
-                    .map_or(bytes, |held| held.max(bytes)),
-            );
+            slot.counters.hash_agg = Some(match slot.counters.hash_agg {
+                None => figures,
+                Some(held) => super::hashagg::HashAggFigures {
+                    batches: held.batches + figures.batches - 1,
+                    peak: held.peak.max(figures.peak),
+                    disk_kb: held.disk_kb.max(figures.disk_kb),
+                },
+            });
         });
     }
 

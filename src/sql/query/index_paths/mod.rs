@@ -26,7 +26,7 @@ use crate::storage::{
 
 use super::scope::{QueryScope, ResolvedColumn};
 
-mod aggregate;
+pub(super) mod aggregate;
 mod append;
 mod clauses;
 mod expressions;
@@ -43,7 +43,7 @@ pub(crate) use expressions::{ExpressionVariables, KeyReader};
 
 pub(crate) use aggregate::{
     AggInput, AggStrategy, AggregateCosts, aggregate_costs, cost_agg, hash_agg_sizing,
-    having_quals, plain_hash_buckets,
+    having_quals, plain_hash_sizing,
 };
 pub(crate) use append::{AppendKind, MemberPath, TreePath, member_path, member_scope};
 pub(crate) use grouping_sets::{
@@ -2276,7 +2276,7 @@ pub(crate) struct JoinScan {
     /// else [`NO_CLASS`].
     pub(crate) classes: [u8; 64],
     /// The classes useful for merging, by bit.
-    pub(crate) merging: u32,
+    pub(crate) merging: u64,
     /// The query's pathkeys (`query_pathkeys`).
     pub(crate) order: joins::Keys,
     /// Each relation's rows by FROM position (`get_loop_count`).

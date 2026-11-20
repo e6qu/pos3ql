@@ -1470,6 +1470,7 @@ impl Server {
             ) {
                 let cache_generation = self.engine.cache_capacity_generation();
                 let beat = self.engine.checkpoint_beat();
+                self.engine.observe_cache_capacity();
                 checkpoint_schedule.observe(beat, Instant::now(), &mut self.durability_ready);
                 self.durability_ready &= !self.engine.publication_failed();
                 if self.engine.cache_capacity_generation() != cache_generation {
@@ -3341,6 +3342,8 @@ impl Server {
     }
 
     fn wake_waiters(&mut self, retry_io_waiters: bool) {
+        // A finished statement can release the cache space a waiter needs.
+        self.engine.observe_cache_capacity();
         // A retry can itself abort a deadlock victim and release locks. Loop
         // until one complete pass observes a stable generation so every newly
         // unblocked connection is considered in the same reactor turn.

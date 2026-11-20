@@ -169,6 +169,15 @@ worth knowing:
   cannot be withdrawn. Rows the client has not yet read never hold the worker;
   resuming more result shapes is
   [planned work](../PLAN.md#pause-and-resume-every-query-path).
+- Deleting old files never delays a statement that waits for memory. When
+  the row heap, `row_overlay_slots` or `row_history_slots` fill, a writer
+  waits for the next checkpoint to save resident rows and release their
+  space, and file cleanup pauses so that checkpoint starts at once. For
+  example, a `CREATE TABLE` issued while cleanup deletes thousands of old
+  files waits only for one checkpoint, not for the deletions; cleanup
+  resumes afterwards. The wait obeys `statement_timeout` and query
+  cancellation. A statement that still does not fit after the checkpoint
+  gets the named `54000` capacity error.
 - Setting both caches to zero does not evict rows already in memory: an
   `INSERT` followed by `SELECT` can return the row without a download. To test
   cold reads, make the writes durable, then restart in durable mode with an

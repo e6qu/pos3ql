@@ -1901,6 +1901,20 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "v",
     },
     IntrinsicRoutine {
+        oid: 6240,
+        name: "pg_settings_get_flags",
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 315,
+        name: "pg_jit_available",
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
         oid: 3815,
         name: "pg_collation_is_visible",
         argument_types: "26",
@@ -21600,18 +21614,26 @@ fn pg_class<'a>(
             },
         );
         let relation_owner = storage.role_oid(storage.object_owner(relation_object, txid));
-        let reloptions = match table_def.storage_options.fillfactor {
-            Some(fillfactor) => Datum::Array {
+        let mut entries = [Datum::Null; 2];
+        let mut count = 0usize;
+        let mut failed = None;
+        table_def.storage_options.for_each_reloption(|entry| {
+            match text(stack_format!(48, "{entry}").as_str(), arena) {
+                Ok(value) => entries[count] = value,
+                Err(error) => failed = Some(error),
+            }
+            count += 1;
+        });
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        let reloptions = if count == 0 {
+            Datum::Null
+        } else {
+            Datum::Array {
                 element: super::types::ArrElem::Text,
-                raw: super::array::build(
-                    &[text(
-                        stack_format!(32, "fillfactor={fillfactor}").as_str(),
-                        arena,
-                    )?],
-                    arena,
-                )?,
-            },
-            None => Datum::Null,
+                raw: super::array::build(&entries[..count], arena)?,
+            }
         };
         out[n] = row(
             &[
@@ -30669,6 +30691,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "IntervalStyle" => "postgres",
             "lc_monetary" => "C.UTF-8",
             "is_superuser" => "on",
+            "jit_provider" => "llvmjit",
             "max_connections" => "100",
             "max_locks_per_transaction" => "64",
             "max_prepared_transactions" => "0",
@@ -30744,7 +30767,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "internal"
         } else if matches!(
             name,
-            "max_connections" | "max_locks_per_transaction" | "max_prepared_transactions"
+            "jit_provider"
+                | "max_connections"
+                | "max_locks_per_transaction"
+                | "max_prepared_transactions"
         ) {
             "postmaster"
         } else if matches!(
@@ -30759,6 +30785,11 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "user"
         };
         let unit = crate::sql::guc::int_setting_metadata(name).map_or("", |(unit, ..)| unit);
+        if let Some(index) = crate::sql::guc::jit_developer_index(name) {
+            let setting = &crate::sql::guc::JIT_DEVELOPER_SETTINGS[index];
+            let boot = if setting.default { "on" } else { "off" };
+            return (boot, "bool", setting.context, unit);
+        }
         (boot, vartype, context, unit)
     }
     let mut count = 0;
@@ -30797,6 +30828,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         let (reset_value, source) = crate::sql::eval::funcs::system::session_setting_metadata(name)
             .unwrap_or((value, "default"));
         let planner = crate::sql::guc::planner_setting_metadata(name);
+        let developer = crate::sql::guc::jit_developer_index(name)
+            .map(|index| &crate::sql::guc::JIT_DEVELOPER_SETTINGS[index]);
         let (boot, vartype, context, unit) = metadata(name);
         let (boot, vartype) = match &planner {
             Some(planner) => (planner.boot.as_str(), planner.vartype),
@@ -30869,6 +30902,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                         | "plpgsql.extra_warnings"
                         | "plpgsql.extra_errors" => "Customized Options",
                         "work_mem" => "Resource Usage / Memory",
+                        "jit_provider" => "Client Connection Defaults / Shared Library Preloading",
+                        _ if developer.is_some() => "Developer Options",
                         "session_replication_role" => {
                             "Client Connection Defaults / Statement Behavior"
                         }
@@ -30891,6 +30926,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                             "Print information about parameters in the DETAIL part of the error messages generated on INTO ... STRICT failures."
                         }
                         "plpgsql.check_asserts" => "Perform checks given in ASSERT statements.",
+                        "jit_provider" => "JIT provider to use.",
+                        _ if developer.is_some() => {
+                            developer.map_or("", |setting| setting.description)
+                        }
                         "plpgsql.extra_warnings" => {
                             "List of programming constructs that should produce a warning."
                         }

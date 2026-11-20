@@ -87,10 +87,10 @@ enum DeliveryStop {
 }
 
 fn wait_kind(error: &SqlError) -> Option<StatementWait> {
-    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-        Some(StatementWait::ObjectIo)
-    } else if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
-        Some(StatementWait::Lock)
+    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+        || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+    {
+        Some(StatementWait::of_internal(error.sqlstate))
     } else {
         None
     }

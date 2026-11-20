@@ -17,24 +17,27 @@ use super::joins::{
     BASE_RELIDS, CloneKind, EquivalenceClass, MAX_JOIN_RELS, MAX_MEMBERS, Member, OJ_SHIFT, Relids,
     SpecialJoin, SpecialKind, Subproblem,
 };
+use crate::mem::arena::{Arena, ArenaList};
 
-/// Quals of one query the preparation holds.
-pub(crate) const MAX_QUALS: usize = 48;
+/// Quals of one query the preparation holds: two per relation, as a
+/// chain of `USING` joins on two columns has.
+pub(crate) const MAX_QUALS: usize = 2 * MAX_JOIN_RELS;
 /// Nodes of one join tree, numbered by `u8`.
 pub(crate) const MAX_NODES: usize = 256;
 /// Columns a qual's strictness names.
 pub(crate) const MAX_QUAL_VARS: usize = 8;
-/// Equivalence classes of one query.
-pub(crate) const MAX_CLASSES: usize = 24;
-/// Placed quals of one query.
-pub(crate) const MAX_PLACED: usize = 96;
+/// Equivalence classes of one query: a pathkey names its class in six
+/// bits ([`super::joins::KEY_CLASS`]).
+pub(crate) const MAX_CLASSES: usize = super::joins::KEY_CLASS as usize + 1;
 /// Outer, semi and anti joins of one query.
 pub(crate) const MAX_SPECIALS: usize = MAX_JOIN_RELS;
+/// A qual's number among its query's quals.
+pub(crate) type QualId = u16;
 /// No qual: a column a class needs.
-pub(crate) const NO_QUAL: u8 = u8::MAX;
+pub(crate) const NO_QUAL: QualId = QualId::MAX;
 /// The constant `true` that stands in for an outer join clause
 /// `reconsider_outer_join_clauses` replaced.
-pub(crate) const TRUE_QUAL: u8 = u8::MAX - 1;
+pub(crate) const TRUE_QUAL: QualId = QualId::MAX - 1;
 
 /// A column of a base relation: `(relation, column)`.
 pub(crate) type Var = (u8, u16);
@@ -209,12 +212,12 @@ impl Tree {
     }
 
     /// Attaches `qual` to `node`.
-    pub(crate) fn qual(&mut self, node: u8, qual: Qual) -> Option<u8> {
+    pub(crate) fn qual(&mut self, node: u8, qual: Qual) -> Option<QualId> {
         let at = self.qual_count;
         *self.quals.get_mut(at)? = qual;
         self.qual_node[at] = node;
         self.qual_count += 1;
-        Some(at as u8)
+        Some(at as QualId)
     }
 
     fn items(&self, first: u8, count: u8) -> &[u8] {
@@ -222,10 +225,10 @@ impl Tree {
     }
 
     /// The quals attached to `node`, in order.
-    fn quals_of(&self, node: u8) -> impl Iterator<Item = u8> + '_ {
+    fn quals_of(&self, node: u8) -> impl Iterator<Item = QualId> + '_ {
         (0..self.qual_count)
             .filter(move |&at| self.qual_node[at] == node)
-            .map(|at| at as u8)
+            .map(|at| at as QualId)
     }
 
     /// The base relations under `node`.
@@ -258,7 +261,7 @@ impl Tree {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Placed {
     /// A restriction of one relation's scan (`baserestrictinfo`).
-    Restriction { rel: u8, qual: u8 },
+    Restriction { rel: u8, qual: QualId },
     /// `member = constant` of a class with a constant
     /// (`generate_base_implied_equalities_const`).
     Implied { member: Member, class: u8 },
@@ -272,7 +275,7 @@ pub(crate) enum Placed {
 /// A qual evaluated at a join.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JoinQual {
-    pub(crate) qual: u8,
+    pub(crate) qual: QualId,
     /// `clause_relids` and `required_relids`.
     pub(crate) relids: Relids,
     pub(crate) required: Relids,
@@ -286,24 +289,22 @@ pub(crate) struct JoinQual {
 }
 
 /// The prepared problem.
-pub(crate) struct Prepared {
+pub(crate) struct Prepared<'a> {
     pub(crate) specials: [SpecialJoin; MAX_SPECIALS],
     pub(crate) special_count: usize,
     pub(crate) subproblems: [Subproblem; MAX_JOIN_RELS],
     pub(crate) subproblem_count: usize,
     pub(crate) subproblem_items: [Relids; 2 * MAX_JOIN_RELS],
     pub(crate) subproblem_item_count: usize,
-    pub(crate) classes: [EquivalenceClass; MAX_CLASSES],
+    pub(crate) classes: [EquivalenceClass<'a>; MAX_CLASSES],
     pub(crate) class_count: usize,
     /// Each class's constant, by the qual that equated it.
-    pub(crate) class_constant: [Option<u8>; MAX_CLASSES],
-    pub(crate) placed: [Placed; MAX_PLACED],
-    pub(crate) placed_count: usize,
+    pub(crate) class_constant: [Option<QualId>; MAX_CLASSES],
+    pub(crate) placed: ArenaList<'a, Placed>,
     /// Each column some join reads (`attr_needed`), with the qual that
     /// reads it there ([`NO_QUAL`] for a class's); a removed join's column
     /// is needed only by its own relation.
-    pub(crate) needed: [(Var, Relids, u8); 64],
-    pub(crate) needed_count: usize,
+    pub(crate) needed: ArenaList<'a, (Var, Relids, QualId)>,
     /// A class equates two different constants in the query's join
     /// domain: the query returns no rows.
     pub(crate) contradictory: bool,
@@ -314,12 +315,12 @@ pub(crate) struct Prepared {
     pub(crate) false_relids: Relids,
 }
 
-impl Prepared {
+impl<'a> Prepared<'a> {
     pub(crate) fn placed(&self) -> &[Placed] {
-        &self.placed[..self.placed_count]
+        self.placed.borrowed_slice()
     }
 
-    pub(crate) fn classes(&self) -> &[EquivalenceClass] {
+    pub(crate) fn classes(&self) -> &[EquivalenceClass<'a>] {
         &self.classes[..self.class_count]
     }
 
@@ -333,14 +334,17 @@ impl Prepared {
         let join_plus_commute =
             info.min_left | info.min_right | info.oj | info.commute_above_r | info.commute_below_l;
         if self.classes().iter().any(|class| {
-            !class.has_const && class.count > 1 && class.relids() & info.min_right != Relids::EMPTY
+            !class.has_const
+                && class.count() > 1
+                && class.relids() & info.min_right != Relids::EMPTY
         }) {
             return Err("a removable join's relation in an equivalence class");
         }
         let mut kept = 0;
         let mut dropped_quals = [false; MAX_QUALS + 1];
-        for index in 0..self.placed_count {
-            let mut entry = self.placed[index];
+        let placed = self.placed.as_mut_slice().map_err(|_| ARENA)?;
+        for index in 0..placed.len() {
+            let mut entry = placed[index];
             let keep = match &mut entry {
                 Placed::Restriction { rel, .. } => {
                     Relids::of(*rel) & info.min_right == Relids::EMPTY
@@ -370,14 +374,15 @@ impl Prepared {
                 }
             };
             if keep {
-                self.placed[kept] = entry;
+                placed[kept] = entry;
                 kept += 1;
             }
         }
-        self.placed_count = kept;
+        self.placed.truncate(kept);
         let mut kept = 0;
-        for index in 0..self.needed_count {
-            let (var, relids, qual) = self.needed[index];
+        let needed = self.needed.as_mut_slice().map_err(|_| ARENA)?;
+        for index in 0..needed.len() {
+            let (var, relids, qual) = needed[index];
             if Relids::of(var.0) & info.min_right != Relids::EMPTY {
                 continue;
             }
@@ -388,10 +393,10 @@ impl Prepared {
             } else {
                 relids & !gone
             };
-            self.needed[kept] = (var, relids, qual);
+            needed[kept] = (var, relids, qual);
             kept += 1;
         }
-        self.needed_count = kept;
+        self.needed.truncate(kept);
         for index in at..self.special_count - 1 {
             self.specials[index] = self.specials[index + 1];
         }
@@ -432,7 +437,8 @@ impl Prepared {
     /// The relations and outer joins that need column `var` above its
     /// scan.
     pub(crate) fn needed_by(&self, var: Var) -> Relids {
-        self.needed[..self.needed_count]
+        self.needed
+            .borrowed_slice()
             .iter()
             .filter(|(held, ..)| *held == var)
             .fold(Relids::EMPTY, |relids, (_, needed, _)| relids | *needed)
@@ -441,12 +447,22 @@ impl Prepared {
 
 /// A class during preparation: merged ones forward to the class that
 /// absorbed them (`ec_merged`).
+/// A class's members during preparation: `len` of `capacity` slots of the
+/// preparation's member pool from `first`.
+#[derive(Clone, Copy)]
+struct BuildMembers {
+    first: u32,
+    len: u32,
+    capacity: u32,
+}
+
 #[derive(Clone, Copy)]
 struct BuildClass {
-    class: EquivalenceClass,
+    members: BuildMembers,
+    has_const: bool,
     /// Its constant: the qual that equated it, the constant's identity
     /// and its join domain (`em_jdomain`).
-    constant: Option<(u8, u16, u8)>,
+    constant: Option<(QualId, u16, u8)>,
     merged_into: Option<u8>,
     sources: u8,
     /// Whether `reconsider_outer_join_clauses` derived one of its
@@ -461,8 +477,10 @@ struct Pending {
 }
 
 /// The state of one preparation.
-struct Prep<'t> {
+struct Prep<'t, 'a> {
     tree: &'t Tree,
+    /// The classes' members, each class's in its own run.
+    member_pool: ArenaList<'a, Member>,
     kinds: [Option<TreeJoin>; MAX_NODES],
     /// Left and right children after `reduce_outer_joins` swapped a
     /// right join's.
@@ -481,30 +499,24 @@ struct Prep<'t> {
     /// The post-order list of nodes (`item_list`).
     items: [u8; MAX_NODES],
     item_count: usize,
-    /// Postponed quals of each left join (`oj_joinclauses`).
-    postponed: [[u8; MAX_QUALS]; MAX_NODES],
-    postponed_count: [u8; MAX_NODES],
+    /// Postponed quals of the left joins (`oj_joinclauses`), each with
+    /// its join's node, in order.
+    postponed: [(u8, QualId); MAX_QUALS],
+    postponed_count: usize,
     classes: [BuildClass; MAX_CLASSES],
     class_count: usize,
-    placed: [Placed; MAX_PLACED],
-    placed_count: usize,
-    sources: [(u8, u8); MAX_QUALS],
+    placed: ArenaList<'a, Placed>,
+    sources: [(QualId, u8); MAX_QUALS],
     source_count: usize,
-    needed: [(Var, Relids, u8); 64],
-    needed_count: usize,
-    left_join: [Pending; MAX_QUALS],
-    left_count: usize,
-    right_join: [Pending; MAX_QUALS],
-    right_count: usize,
-    full_join: [Pending; MAX_QUALS],
-    full_count: usize,
+    needed: ArenaList<'a, (Var, Relids, QualId)>,
+    left_join: ArenaList<'a, Pending>,
+    right_join: ArenaList<'a, Pending>,
+    full_join: ArenaList<'a, Pending>,
     /// The `COALESCE(left, right) = constant` quals of the query's join
-    /// domain: the qual, its sides and its constant.
-    coalesce: [(u8, Var, Var, u16); MAX_QUALS],
-    /// Each held `COALESCE`'s placement, which an ordinary filter of the
-    /// joined rows takes when no full join clause matches it.
-    coalesce_join: [Option<JoinQual>; MAX_QUALS],
-    coalesce_count: usize,
+    /// domain: the qual, its sides and its constant, with each one's
+    /// placement, which an ordinary filter of the joined rows takes when no
+    /// full join clause matches it.
+    coalesce: ArenaList<'a, ((QualId, Var, Var, u16), JoinQual)>,
     /// Each node's join domain (`JoinDomain`): the query's is 0.
     domain: [u8; MAX_NODES],
     domain_count: u8,
@@ -529,12 +541,18 @@ struct Subproblems {
     item_count: usize,
 }
 
-const FULL: Outside = "a query beyond the join preparation's capacity";
+/// A capacity of the preparation exceeded; the caller reports it as a
+/// named error rather than planning the query another way.
+pub(crate) const FULL: Outside = "a query beyond the join preparation's capacity";
+/// The statement arena exhausted.
+pub(crate) const ARENA: Outside = "the statement arena exhausted";
 
-/// Prepares `tree` as `query_planner` does up to the join search.
-pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
+/// Prepares `tree` as `query_planner` does up to the join search, its
+/// lists in `arena`.
+pub(crate) fn prepare<'a>(tree: &Tree, arena: &'a Arena) -> Result<Prepared<'a>, Outside> {
     let mut prep = Prep {
         tree,
+        member_pool: ArenaList::new(arena),
         kinds: [None; MAX_NODES],
         sides: [(0, 0); MAX_NODES],
         oj: [Relids::EMPTY; MAX_NODES],
@@ -564,35 +582,29 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         special_count: 0,
         items: [0; MAX_NODES],
         item_count: 0,
-        postponed: [[0; MAX_QUALS]; MAX_NODES],
-        postponed_count: [0; MAX_NODES],
+        postponed: [(0, 0); MAX_QUALS],
+        postponed_count: 0,
         classes: [BuildClass {
-            class: EquivalenceClass {
-                members: [Member::plain(0, 0); MAX_MEMBERS],
-                count: 0,
-                has_const: false,
+            members: BuildMembers {
+                first: 0,
+                len: 0,
+                capacity: 0,
             },
+            has_const: false,
             constant: None,
             merged_into: None,
             sources: 0,
             derived: false,
         }; MAX_CLASSES],
         class_count: 0,
-        placed: [Placed::Restriction { rel: 0, qual: 0 }; MAX_PLACED],
-        placed_count: 0,
+        placed: ArenaList::new(arena),
         sources: [(0, 0); MAX_QUALS],
         source_count: 0,
-        needed: [((0, 0), Relids::EMPTY, NO_QUAL); 64],
-        needed_count: 0,
-        left_join: [Pending { join: empty_join() }; MAX_QUALS],
-        left_count: 0,
-        right_join: [Pending { join: empty_join() }; MAX_QUALS],
-        right_count: 0,
-        full_join: [Pending { join: empty_join() }; MAX_QUALS],
-        full_count: 0,
-        coalesce: [(0, (0, 0), (0, 0), 0); MAX_QUALS],
-        coalesce_join: [None; MAX_QUALS],
-        coalesce_count: 0,
+        needed: ArenaList::new(arena),
+        left_join: ArenaList::new(arena),
+        right_join: ArenaList::new(arena),
+        full_join: ArenaList::new(arena),
+        coalesce: ArenaList::new(arena),
         domain: [0; MAX_NODES],
         domain_count: 1,
         domain_root: [None; MAX_NODES],
@@ -621,7 +633,10 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
     }
     for at in 0..prep.item_count {
         let item = prep.items[at];
-        if prep.postponed_count[usize::from(item)] != 0 {
+        if prep.postponed[..prep.postponed_count]
+            .iter()
+            .any(|&(node, _)| node == item)
+        {
             prep.distribute_oj_quals(item)?;
         }
     }
@@ -638,23 +653,27 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
     // The classes in their final order.
     let mut map = [u8::MAX; MAX_CLASSES];
     let mut classes = [EquivalenceClass {
-        members: [Member::plain(0, 0); MAX_MEMBERS],
-        count: 0,
+        members: &[],
         has_const: false,
     }; MAX_CLASSES];
     let mut class_constant = [None; MAX_CLASSES];
     let mut class_count = 0;
+    let pool = prep.member_pool.as_slice();
     for (slot, held) in map.iter_mut().zip(&prep.classes[..prep.class_count]) {
         if held.merged_into.is_none() {
             *slot = class_count as u8;
-            classes[class_count] = held.class;
+            let BuildMembers { first, len, .. } = held.members;
+            classes[class_count] = EquivalenceClass {
+                members: &pool[first as usize..(first + len) as usize],
+                has_const: held.has_const,
+            };
             class_constant[class_count] = held.constant.map(|(qual, ..)| qual);
             class_count += 1;
         }
     }
-    let canonical = |prep: &Prep<'_>, class: u8| map[usize::from(prep.canonical(class))];
-    let mut placed = prep.placed;
-    for entry in &mut placed[..prep.placed_count] {
+    let canonical = |prep: &Prep<'_, '_>, class: u8| map[usize::from(prep.canonical(class))];
+    let mut placed = core::mem::replace(&mut prep.placed, ArenaList::new(arena));
+    for entry in placed.as_mut_slice().map_err(|_| ARENA)? {
         match entry {
             Placed::Implied { class, .. } => *class = canonical(&prep, *class),
             Placed::Join(join) => {
@@ -677,29 +696,23 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         class_count,
         class_constant,
         placed,
-        placed_count: prep.placed_count,
         needed: prep.needed,
-        needed_count: prep.needed_count,
         contradictory: prep.contradictory,
         false_relids: prep.false_relids,
     })
 }
 
-const fn empty_join() -> JoinQual {
-    JoinQual {
-        qual: 0,
-        relids: Relids::EMPTY,
-        required: Relids::EMPTY,
-        pushed_down: false,
-        clone: CloneKind::None,
-        incompatible: Relids::EMPTY,
-        outer_relids: Relids::EMPTY,
-        merge: None,
-    }
+/// Removes entry `at` of `list`, keeping the others' order.
+fn remove_pending(list: &mut ArenaList<'_, Pending>, at: usize) -> Result<(), Outside> {
+    let entries = list.as_mut_slice().map_err(|_| ARENA)?;
+    entries.copy_within(at + 1.., at);
+    let len = entries.len() - 1;
+    list.truncate(len);
+    Ok(())
 }
 
-impl Prep<'_> {
-    fn qual(&self, id: u8) -> &Qual {
+impl Prep<'_, '_> {
+    fn qual(&self, id: QualId) -> &Qual {
         &self.tree.quals[usize::from(id)]
     }
 
@@ -1352,8 +1365,15 @@ impl Prep<'_> {
         let qualscope = info.syn_left | info.syn_right | info.oj;
         let ojscope = info.min_left | info.min_right;
         let nonnullable = info.syn_left;
-        let quals = self.postponed[at];
-        let quals = &quals[..usize::from(self.postponed_count[at])];
+        let mut postponed = [0; MAX_QUALS];
+        let mut count = 0;
+        for &(held, qual) in &self.postponed[..self.postponed_count] {
+            if held == node {
+                postponed[count] = qual;
+                count += 1;
+            }
+        }
+        let quals = &postponed[..count];
         let base_nulling = self.nulling_at(node);
         if info.commute_above_r != Relids::EMPTY || info.commute_below_l != Relids::EMPTY {
             let (above, below) = (info.commute_above_r, info.commute_below_l);
@@ -1450,7 +1470,7 @@ impl Prep<'_> {
     #[allow(clippy::too_many_arguments)]
     fn distribute_qual(
         &mut self,
-        qual_id: u8,
+        qual_id: QualId,
         node: u8,
         special: Option<u8>,
         qualscope: Relids,
@@ -1481,10 +1501,8 @@ impl Prep<'_> {
         let (pushed_down, maybe_equivalence, maybe_outer_join);
         if relids & nonnullable != Relids::EMPTY {
             if postpone {
-                let at = usize::from(node);
-                let count = usize::from(self.postponed_count[at]);
-                *self.postponed[at].get_mut(count).ok_or(FULL)? = qual_id;
-                self.postponed_count[at] += 1;
+                *self.postponed.get_mut(self.postponed_count).ok_or(FULL)? = (node, qual_id);
+                self.postponed_count += 1;
                 return Ok(());
             }
             pushed_down = false;
@@ -1546,22 +1564,19 @@ impl Prep<'_> {
                     if left_relids & !nonnullable == Relids::EMPTY
                         && right_relids & nonnullable == Relids::EMPTY
                     {
-                        *self.left_join.get_mut(self.left_count).ok_or(FULL)? = pending;
-                        self.left_count += 1;
+                        self.left_join.push(pending).map_err(|_| ARENA)?;
                         return Ok(());
                     }
                     if right_relids & !nonnullable == Relids::EMPTY
                         && left_relids & nonnullable == Relids::EMPTY
                     {
-                        *self.right_join.get_mut(self.right_count).ok_or(FULL)? = pending;
-                        self.right_count += 1;
+                        self.right_join.push(pending).map_err(|_| ARENA)?;
                         return Ok(());
                     }
                     if special
                         .is_some_and(|id| self.specials[usize::from(id)].kind == SpecialKind::Full)
                     {
-                        *self.full_join.get_mut(self.full_count).ok_or(FULL)? = pending;
-                        self.full_count += 1;
+                        self.full_join.push(pending).map_err(|_| ARENA)?;
                         return Ok(());
                     }
                 } else {
@@ -1590,10 +1605,9 @@ impl Prep<'_> {
                 if !maybe_equivalence || self.domain[usize::from(node)] != 0 {
                     return Err("a COALESCE equated with a constant below the query's join domain");
                 }
-                *self.coalesce.get_mut(self.coalesce_count).ok_or(FULL)? =
-                    (qual_id, left, right, constant);
-                self.coalesce_join[self.coalesce_count] = Some(join);
-                self.coalesce_count += 1;
+                self.coalesce
+                    .push(((qual_id, left, right, constant), join))
+                    .map_err(|_| ARENA)?;
                 return Ok(());
             }
             Shape::Other => {}
@@ -1616,15 +1630,11 @@ impl Prep<'_> {
     }
 
     fn place(&mut self, placed: Placed) -> Result<(), Outside> {
-        *self.placed.get_mut(self.placed_count).ok_or(FULL)? = placed;
-        self.placed_count += 1;
-        Ok(())
+        self.placed.push(placed).map_err(|_| ARENA)
     }
 
-    fn note_needed(&mut self, var: Var, relids: Relids, qual: u8) -> Result<(), Outside> {
-        *self.needed.get_mut(self.needed_count).ok_or(FULL)? = (var, relids, qual);
-        self.needed_count += 1;
-        Ok(())
+    fn note_needed(&mut self, var: Var, relids: Relids, qual: QualId) -> Result<(), Outside> {
+        self.needed.push((var, relids, qual)).map_err(|_| ARENA)
     }
 
     /// `check_redundant_nullability_qual`: `column IS NULL` of a column an
@@ -1647,12 +1657,25 @@ impl Prep<'_> {
         class
     }
 
+    /// The members of class `class`.
+    fn members_of(&self, class: u8) -> &[Member] {
+        let BuildMembers { first, len, .. } = self.classes[usize::from(class)].members;
+        &self.member_pool.borrowed_slice()[first as usize..(first + len) as usize]
+    }
+
+    /// `ec_relids` of class `class`.
+    fn class_relids(&self, class: u8) -> Relids {
+        self.members_of(class)
+            .iter()
+            .fold(Relids::EMPTY, |relids, member| relids | member.relids())
+    }
+
     /// The live class holding `member`.
     fn class_of(&self, member: Member) -> Option<u8> {
         (0..self.class_count)
             .find(|&at| {
                 self.classes[at].merged_into.is_none()
-                    && self.classes[at].class.members().contains(&member)
+                    && self.members_of(at as u8).contains(&member)
             })
             .map(|at| at as u8)
     }
@@ -1678,11 +1701,12 @@ impl Prep<'_> {
             return Err(FULL);
         }
         self.classes[at] = BuildClass {
-            class: EquivalenceClass {
-                members: [Member::plain(0, 0); MAX_MEMBERS],
-                count: 0,
-                has_const: false,
+            members: BuildMembers {
+                first: 0,
+                len: 0,
+                capacity: 0,
             },
+            has_const: false,
             constant: None,
             merged_into: None,
             sources: 0,
@@ -1692,13 +1716,31 @@ impl Prep<'_> {
         Ok(at as u8)
     }
 
+    /// Appends `member` to class `class`, moving the class's run to the
+    /// pool's end with twice the room when it is full.
     fn add_member(&mut self, class: u8, member: Member) -> Result<(), Outside> {
-        let held = &mut self.classes[usize::from(class)].class;
-        if usize::from(held.count) == MAX_MEMBERS {
+        let mut held = self.classes[usize::from(class)].members;
+        if held.len as usize == MAX_MEMBERS {
             return Err(FULL);
         }
-        held.members[usize::from(held.count)] = member;
-        held.count += 1;
+        if held.len == held.capacity {
+            let first = u32::try_from(self.member_pool.len()).map_err(|_| ARENA)?;
+            let capacity = (held.capacity * 2).max(4);
+            for at in 0..capacity {
+                let moved = if at < held.len {
+                    self.member_pool.borrowed_slice()[(held.first + at) as usize]
+                } else {
+                    member
+                };
+                self.member_pool.push(moved).map_err(|_| ARENA)?;
+            }
+            held.first = first;
+            held.capacity = capacity;
+        }
+        self.member_pool.as_mut_slice().map_err(|_| ARENA)?[(held.first + held.len) as usize] =
+            member;
+        held.len += 1;
+        self.classes[usize::from(class)].members = held;
         Ok(())
     }
 
@@ -1706,7 +1748,7 @@ impl Prep<'_> {
     /// in join domain `domain`.
     fn process_equivalence(
         &mut self,
-        qual: u8,
+        qual: QualId,
         left: Member,
         right: Option<Member>,
         constant: Option<u16>,
@@ -1725,19 +1767,21 @@ impl Prep<'_> {
             (Some(one), Some(two)) if one == two => one,
             (Some(one), Some(two)) => {
                 let moved = self.classes[usize::from(two)];
-                for &member in moved.class.members() {
+                for at in 0..moved.members.len {
+                    let member =
+                        self.member_pool.borrowed_slice()[(moved.members.first + at) as usize];
                     self.add_member(one, member)?;
                 }
                 let kept = self.classes[usize::from(one)];
-                if kept.class.has_const
-                    && moved.class.has_const
+                if kept.has_const
+                    && moved.has_const
                     && kept.constant.map(|(_, constant, _)| constant)
                         != moved.constant.map(|(_, constant, _)| constant)
                 {
                     self.contradiction(domain)?;
                 }
                 let held = &mut self.classes[usize::from(one)];
-                held.class.has_const |= moved.class.has_const;
+                held.has_const |= moved.has_const;
                 if held.constant.is_none() {
                     held.constant = moved.constant;
                 }
@@ -1751,7 +1795,7 @@ impl Prep<'_> {
                     Some(right) => self.add_member(one, right)?,
                     None => {
                         let held = &self.classes[usize::from(one)];
-                        if held.class.has_const {
+                        if held.has_const {
                             // `generate_base_implied_equalities_const`
                             // equates the two constants: a constant
                             // false.
@@ -1760,7 +1804,7 @@ impl Prep<'_> {
                             }
                         } else {
                             let held = &mut self.classes[usize::from(one)];
-                            held.class.has_const = true;
+                            held.has_const = true;
                             held.constant = Some((qual, constant.expect("a constant"), domain));
                         }
                     }
@@ -1778,7 +1822,7 @@ impl Prep<'_> {
                     Some(right) => self.add_member(class, right)?,
                     None => {
                         let held = &mut self.classes[usize::from(class)];
-                        held.class.has_const = true;
+                        held.has_const = true;
                         held.constant = Some((qual, constant.expect("a constant"), domain));
                     }
                 }
@@ -1875,31 +1919,26 @@ impl Prep<'_> {
             for right in [false, true] {
                 let mut at = 0;
                 loop {
-                    let count = if right {
-                        self.right_count
+                    let list = if right {
+                        &self.right_join
                     } else {
-                        self.left_count
+                        &self.left_join
                     };
-                    if at == count {
+                    let Some(&pending) = list.borrowed_slice().get(at) else {
                         break;
-                    }
-                    let join = if right {
-                        self.right_join[at].join
-                    } else {
-                        self.left_join[at].join
                     };
+                    let join = pending.join;
                     if !self.reconsider_outer_join_clause(join, !right)? {
                         at += 1;
                         continue;
                     }
                     found = true;
-                    let (list, count) = if right {
-                        (&mut self.right_join, &mut self.right_count)
+                    let list = if right {
+                        &mut self.right_join
                     } else {
-                        (&mut self.left_join, &mut self.left_count)
+                        &mut self.left_join
                     };
-                    list.copy_within(at + 1..*count, at);
-                    *count -= 1;
+                    remove_pending(list, at)?;
                     self.distribute_restrictinfo(JoinQual {
                         qual: TRUE_QUAL,
                         relids: Relids::EMPTY,
@@ -1909,15 +1948,14 @@ impl Prep<'_> {
                 }
             }
             let mut at = 0;
-            while at < self.full_count {
-                let join = self.full_join[at].join;
+            while let Some(&pending) = self.full_join.borrowed_slice().get(at) {
+                let join = pending.join;
                 if !self.reconsider_full_join_clause(join)? {
                     at += 1;
                     continue;
                 }
                 found = true;
-                self.full_join.copy_within(at + 1..self.full_count, at);
-                self.full_count -= 1;
+                remove_pending(&mut self.full_join, at)?;
                 self.distribute_restrictinfo(JoinQual {
                     qual: TRUE_QUAL,
                     relids: Relids::EMPTY,
@@ -1932,34 +1970,37 @@ impl Prep<'_> {
         // A `COALESCE` no full join clause matched (its operands in the
         // other order, say) filters the joined rows by an expression of
         // several relations.
-        for at in 0..self.coalesce_count {
-            if self.coalesce[at].0 != NO_QUAL {
-                self.coalesce[at].0 = NO_QUAL;
-                let join = self.coalesce_join[at].expect("held with its placement");
+        for at in 0..self.coalesce.len() {
+            let (held, join) = self.coalesce.borrowed_slice()[at];
+            if held.0 != NO_QUAL {
+                self.coalesce.as_mut_slice().map_err(|_| ARENA)?[at].0.0 = NO_QUAL;
                 self.distribute_restrictinfo(join)?;
             }
         }
         let constant = |prep: &Self, member: Member| {
             prep.class_of(member)
-                .is_some_and(|class| prep.classes[usize::from(class)].class.has_const)
+                .is_some_and(|class| prep.classes[usize::from(class)].has_const)
         };
-        for pending in &self.full_join[..self.full_count] {
+        for pending in self.full_join.borrowed_slice() {
             let (left, right, ..) = pending.join.merge.expect("mergeable");
             if constant(self, left) || constant(self, right) {
                 return Err("a full join clause of a column equated with a constant");
             }
         }
-        let pending = (self.left_join, self.left_count);
-        for entry in &pending.0[..pending.1] {
-            self.distribute_restrictinfo(entry.join)?;
-        }
-        let pending = (self.right_join, self.right_count);
-        for entry in &pending.0[..pending.1] {
-            self.distribute_restrictinfo(entry.join)?;
-        }
-        let pending = (self.full_join, self.full_count);
-        for entry in &pending.0[..pending.1] {
-            self.distribute_restrictinfo(entry.join)?;
+        for which in 0..3 {
+            let mut at = 0;
+            loop {
+                let list = match which {
+                    0 => &self.left_join,
+                    1 => &self.right_join,
+                    _ => &self.full_join,
+                };
+                let Some(&pending) = list.borrowed_slice().get(at) else {
+                    break;
+                };
+                self.distribute_restrictinfo(pending.join)?;
+                at += 1;
+            }
         }
         Ok(())
     }
@@ -1971,9 +2012,10 @@ impl Prep<'_> {
     fn reconsider_full_join_clause(&mut self, join: JoinQual) -> Result<bool, Outside> {
         let (left, right, ..) = join.merge.expect("mergeable");
         let Some(at) =
-            self.coalesce[..self.coalesce_count]
+            self.coalesce
+                .borrowed_slice()
                 .iter()
-                .position(|&(qual, one, two, _)| {
+                .position(|&((qual, one, two, _), _)| {
                     qual != NO_QUAL
                         && one == (left.rel, left.column)
                         && two == (right.rel, right.column)
@@ -1981,7 +2023,7 @@ impl Prep<'_> {
         else {
             return Ok(false);
         };
-        let (qual, _, _, constant) = self.coalesce[at];
+        let ((qual, _, _, constant), _) = self.coalesce.borrowed_slice()[at];
         for side in [left, right] {
             if side.nulling != Relids::EMPTY {
                 return Err("a full join clause of a nulled column equated with a constant");
@@ -1997,7 +2039,7 @@ impl Prep<'_> {
             let derived = self.class_of(side).expect("just equated");
             self.classes[usize::from(derived)].derived = true;
         }
-        self.coalesce[at].0 = NO_QUAL;
+        self.coalesce.as_mut_slice().map_err(|_| ARENA)?[at].0.0 = NO_QUAL;
         Ok(true)
     }
 
@@ -2020,7 +2062,7 @@ impl Prep<'_> {
             return Ok(false);
         };
         let held = self.classes[usize::from(class)];
-        let Some((qual, constant, _)) = held.constant.filter(|_| held.class.has_const) else {
+        let Some((qual, constant, _)) = held.constant.filter(|_| held.has_const) else {
             return Ok(false);
         };
         if inner.nulling != Relids::EMPTY {
@@ -2071,8 +2113,12 @@ impl Prep<'_> {
             if held.merged_into.is_some() {
                 continue;
             }
-            let members = held.class.members();
-            if held.class.has_const {
+            // A copy: placing the equalities edits the preparation.
+            let mut copied = [Member::plain(0, 0); MAX_MEMBERS];
+            let held_members = self.members_of(at as u8);
+            copied[..held_members.len()].copy_from_slice(held_members);
+            let members = &copied[..held_members.len()];
+            if held.has_const {
                 if members.iter().any(|member| member.nulling != Relids::EMPTY) {
                     return Err("a constant's class of a nulled column");
                 }
@@ -2120,7 +2166,7 @@ impl Prep<'_> {
                 }
                 previous[rel] = Some(member);
             }
-            let relids = held.class.relids();
+            let relids = self.class_relids(at as u8);
             for &member in members {
                 // An expression's columns (`pull_var_clause` of `em_expr`).
                 if let Some(id) = member.expression_id() {
@@ -2139,6 +2185,12 @@ impl Prep<'_> {
 #[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
+
+    /// A statement arena for one preparation.
+    fn arena() -> Arena {
+        let mut budget = crate::mem::budget::Budget::new(1 << 21);
+        Arena::new(&mut budget, "join preparation", 1 << 20).expect("arena")
+    }
 
     /// `left.column = right.column`, strict for both.
     fn equality(left: Var, right: Var) -> Qual {
@@ -2203,9 +2255,59 @@ mod tests {
         tree
     }
 
+    /// A chain of `MAX_JOIN_RELS` relations inner joined by `columns`
+    /// equalities of each relation with the first one, as `USING` joins
+    /// on those columns read.
+    fn using_chain(columns: u16) -> Tree {
+        let mut tree = Tree::new(MAX_JOIN_RELS);
+        let mut current = tree.node(TreeNode::Rel(0)).expect("room");
+        for rel in 1..MAX_JOIN_RELS as u8 {
+            let right = tree.node(TreeNode::Rel(rel)).expect("room");
+            current = tree
+                .node(TreeNode::Join {
+                    kind: TreeJoin::Inner,
+                    left: current,
+                    right,
+                    rtindex: None,
+                })
+                .expect("room");
+            for column in 0..columns {
+                tree.qual(current, equality((0, column), (rel, column)))
+                    .expect("room");
+            }
+        }
+        tree.root = tree.list_of(&[current]).expect("room");
+        tree
+    }
+
+    #[test]
+    fn using_chains_of_the_most_relations_fit() {
+        let arena = arena();
+        let prepared = prepare(&using_chain(2), &arena).expect("modeled");
+        let classes = prepared.classes();
+        assert_eq!(classes.len(), 2);
+        for (column, class) in classes.iter().enumerate() {
+            assert_eq!(class.count(), MAX_JOIN_RELS);
+            assert!(class.members().iter().enumerate().all(|(rel, member)| (
+                usize::from(member.rel),
+                usize::from(member.column)
+            ) == (rel, column)));
+        }
+        // Two more conditions fill the conditions' capacity; the caller
+        // reports the one past it by name.
+        let mut tree = using_chain(2);
+        let root = tree.root;
+        for _ in 0..MAX_QUALS - 2 * (MAX_JOIN_RELS - 1) {
+            assert!(tree.qual(root, equality((0, 2), (1, 2))).is_some());
+        }
+        assert!(tree.qual(root, equality((0, 2), (1, 2))).is_none());
+    }
+
     #[test]
     fn left_joins_commute_by_identity_three() {
-        let prepared = prepare(&chain(TreeJoin::Left, TreeJoin::Left, &[])).expect("modeled");
+        let arena = arena();
+        let prepared =
+            prepare(&chain(TreeJoin::Left, TreeJoin::Left, &[]), &arena).expect("modeled");
         let specials = &prepared.specials[..prepared.special_count];
         assert_eq!(specials.len(), 2);
         let (one, two) = (specials[0], specials[1]);
@@ -2232,21 +2334,25 @@ mod tests {
 
     #[test]
     fn a_strict_where_condition_makes_a_left_join_inner() {
+        let arena = arena();
         // `WHERE rel1.column1 = rel2.column0` rejects the NULLs both left
         // joins would return.
-        let prepared = prepare(&chain(
-            TreeJoin::Left,
-            TreeJoin::Left,
-            &[equality((1, 1), (2, 0))],
-        ))
+        let prepared = prepare(
+            &chain(TreeJoin::Left, TreeJoin::Left, &[equality((1, 1), (2, 0))]),
+            &arena,
+        )
         .expect("modeled");
         assert_eq!(prepared.special_count, 0);
     }
 
     #[test]
     fn is_null_of_a_compared_column_makes_an_anti_join() {
-        let prepared =
-            prepare(&chain(TreeJoin::Inner, TreeJoin::Left, &[is_null((2, 0))])).expect("modeled");
+        let arena = arena();
+        let prepared = prepare(
+            &chain(TreeJoin::Inner, TreeJoin::Left, &[is_null((2, 0))]),
+            &arena,
+        )
+        .expect("modeled");
         assert_eq!(prepared.special_count, 1);
         assert_eq!(prepared.specials[0].kind, SpecialKind::Anti);
         // The test itself is then true and dropped.
@@ -2260,7 +2366,9 @@ mod tests {
 
     #[test]
     fn a_right_join_swaps_its_sides() {
-        let prepared = prepare(&chain(TreeJoin::Right, TreeJoin::Inner, &[])).expect("modeled");
+        let arena = arena();
+        let prepared =
+            prepare(&chain(TreeJoin::Right, TreeJoin::Inner, &[]), &arena).expect("modeled");
         let special = prepared.specials[0];
         assert_eq!(special.kind, SpecialKind::Left);
         assert_eq!(

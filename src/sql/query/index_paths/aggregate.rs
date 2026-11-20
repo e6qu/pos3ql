@@ -289,8 +289,14 @@ fn hash_memory_limit() -> f64 {
 /// `BLCKSZ`, the size of the buffers of a hash aggregate's spill files.
 const BLOCK: f64 = 8192.0;
 
-/// `hash_choose_num_partitions` with no hash bits used yet.
-fn hash_choose_num_partitions(input_groups: f64, entry_size: f64) -> u32 {
+/// `hash_choose_num_partitions`: the partitions (a power of two) and the
+/// hash bits that choose among them, once `used_bits` of the hash chose
+/// the batch being spilled.
+pub(crate) fn hash_choose_num_partitions(
+    input_groups: f64,
+    entry_size: f64,
+    used_bits: u32,
+) -> (u32, u32) {
     let memory = hash_memory_limit();
     let partition_limit = (memory * 0.25 - BLOCK) / BLOCK;
     let wanted = 1.5 * input_groups * entry_size;
@@ -299,19 +305,27 @@ fn hash_choose_num_partitions(input_groups: f64, entry_size: f64) -> u32 {
         partitions = partition_limit;
     }
     partitions = partitions.clamp(4.0, 1024.0);
-    // `my_log2`, then a power of two.
+    // `my_log2`, then a power of two, within the hash bits left.
     let count = partitions as u32;
-    1 << count.next_power_of_two().trailing_zeros()
+    let bits = count
+        .next_power_of_two()
+        .trailing_zeros()
+        .min(32u32.saturating_sub(used_bits));
+    (1 << bits, bits)
 }
 
 /// `hash_agg_set_limits`: the memory and group limits of the table and the
 /// partitions it spills to (0 when it is not expected to spill).
-fn hash_agg_set_limits(entry_size: f64, input_groups: f64) -> (f64, f64, u32) {
+pub(crate) fn hash_agg_set_limits(
+    entry_size: f64,
+    input_groups: f64,
+    used_bits: u32,
+) -> (f64, f64, u32) {
     let memory = hash_memory_limit();
     if input_groups * entry_size <= memory {
         return (memory, (memory / entry_size).trunc(), 0);
     }
-    let partitions = hash_choose_num_partitions(input_groups, entry_size);
+    let (partitions, _) = hash_choose_num_partitions(input_groups, entry_size, used_bits);
     let partition_memory = BLOCK + BLOCK * f64::from(partitions);
     let limit = if memory > 4.0 * partition_memory {
         memory - partition_memory
@@ -346,7 +360,7 @@ pub(crate) struct AggInput {
 pub(crate) fn planned_partitions(aggregates: &AggregateCosts, groups: f64, width: f64) -> u32 {
     let entry_size =
         hash_agg_entry_size(aggregates.transitions, width, aggregates.transition_space);
-    hash_agg_set_limits(entry_size, groups).2
+    hash_agg_set_limits(entry_size, groups, 0).2
 }
 
 /// What sizes the memory of a hash aggregate of `groups` estimated groups
@@ -366,7 +380,7 @@ pub(crate) fn hash_agg_sizing(
     }
     let entry_size =
         hash_agg_entry_size(aggregates.transitions, width, aggregates.transition_space);
-    let (memory, groups_limit, _) = hash_agg_set_limits(entry_size, groups);
+    let (memory, groups_limit, _) = hash_agg_set_limits(entry_size, groups, 0);
     Some(crate::sql::query::postgres_memory::HashAggSizing {
         memory_limit: memory,
         groups_limit: groups_limit as u64,
@@ -376,6 +390,8 @@ pub(crate) fn hash_agg_sizing(
             memory,
             aggregates.transitions,
         ),
+        entry_size,
+        groups,
         columns,
         transitions: aggregates.transitions,
         per_group: aggregates.per_group,
@@ -383,27 +399,15 @@ pub(crate) fn hash_agg_sizing(
     })
 }
 
-/// The buckets `build_hash_table` asks of a hash aggregate of `groups`
-/// estimated groups over rows `width` bytes wide (`hash_choose_num_buckets`).
-pub(crate) fn hash_agg_buckets(aggregates: &AggregateCosts, groups: f64, width: f64) -> usize {
-    let entry_size =
-        hash_agg_entry_size(aggregates.transitions, width, aggregates.transition_space);
-    let (memory, _, _) = hash_agg_set_limits(entry_size, groups);
-    crate::sql::query::postgres_memory::HashAggSizing::buckets(
-        entry_size,
-        groups,
-        memory,
-        aggregates.transitions,
-    )
-}
-
-/// The buckets `build_hash_table` asks of a hash aggregate without
-/// transition states over `groups` estimated groups of rows `width` bytes
-/// wide (`hash_choose_num_buckets`).
-pub(crate) fn plain_hash_buckets(width: f64, groups: f64) -> usize {
-    let entry_size = hash_agg_entry_size(0, width, 0.0);
-    let (memory, _, _) = hash_agg_set_limits(entry_size, groups);
-    crate::sql::query::postgres_memory::HashAggSizing::buckets(entry_size, groups, memory, 0)
+/// What sizes the memory of a hash aggregate without transition states
+/// over `groups` estimated groups of rows `width` bytes wide, hashing
+/// `columns` columns; `None` past the columns the model covers.
+pub(crate) fn plain_hash_sizing(
+    width: f64,
+    groups: f64,
+    columns: usize,
+) -> Option<crate::sql::query::postgres_memory::HashAggSizing> {
+    hash_agg_sizing(&AggregateCosts::default(), groups, width, columns)
 }
 
 /// The cost and selectivity of a grouping's `HAVING` qualification
@@ -554,7 +558,7 @@ pub(crate) fn cost_agg(
             input.width,
             aggregates.transition_space,
         );
-        let (memory_limit, groups_limit, partitions) = hash_agg_set_limits(entry_size, groups);
+        let (memory_limit, groups_limit, partitions) = hash_agg_set_limits(entry_size, groups, 0);
         let batches = ((groups * entry_size) / memory_limit)
             .max(groups / groups_limit)
             .ceil()

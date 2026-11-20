@@ -8,6 +8,7 @@
 //! order a result. Volatile or expensive output can be evaluated after sorting,
 //! in the order and row window requested by LIMIT and OFFSET.
 
+use super::index_paths::join_query::PlannedJoin;
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, FromClause, Select, SelectItem};
@@ -1724,13 +1725,31 @@ fn modeled_distinct<'a>(
             }
             *hash = super::simplehash::murmur32(combined);
         }
-        let firsts = super::simplehash::iteration_order(
-            held.len(),
-            group.buckets,
-            arena,
-            &mut |row| Ok(hashes[row]),
-            &mut |left, right| same(left as u32, right as u32),
+        let sizing = group.hash_agg.ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a hashed DISTINCT over a join whose hash table memory is not modeled is not supported"
+            )
+        })?;
+        let lens = arena
+            .alloc_slice_with(held.len(), |_| 0usize)
+            .map_err(|_| arena_full())?;
+        for (length, row) in lens.iter_mut().zip(held.iter()) {
+            *length = super::postgres_memory::projected_tuple_len(None, row, None)
+                .ok_or_else(instrument::unsized_value)?;
+        }
+        let order = arena
+            .alloc_slice_with(held.len(), |_| 0u32)
+            .map_err(|_| arena_full())?;
+        let (count, _) = super::hashagg::hashed_row_order(
+            storage.plan_build(),
+            sizing,
+            hashes,
+            lens,
+            |left, right| same(left as u32, right as u32),
+            order,
         )?;
+        let firsts = &order[..count];
         for &row in firsts {
             rows[kept] = held[row as usize];
             kept += 1;
@@ -2160,6 +2179,7 @@ pub(crate) fn materialized_rows<'a>(
     rank_window: Option<usize>,
     lock_window: Option<u64>,
     stages: &instrument::Stages,
+    planned: &PlannedJoin<'a>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, outer, arena)?;
     let visible_collations = projected_collations(storage, txid, arena, statement, scope, outer)?;
@@ -2227,9 +2247,7 @@ pub(crate) fn materialized_rows<'a>(
         && (n_order > 0 || (statement.distinct && n_on == 0))
         && ordered_candidates.is_none()
     {
-        super::index_paths::join_query::modeled_join(
-            storage, txid, statement, scope, params, arena,
-        )?
+        planned.get(storage, txid, statement, scope, params, arena)?
     } else {
         None
     };
@@ -3180,6 +3198,43 @@ pub(crate) fn external_materialized_into<'a>(
     };
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
+    let mut hashed = if statement.distinct
+        && plan.n_on == 0
+        && plan.n_keys == 0
+        && stages.unique.hash_agg_sizing().is_none()
+        && statement.locking.is_empty()
+    {
+        match super::group::hashed_distinct_plan(storage, scope, txid, statement, arena)? {
+            Some((positions, len, sizing)) => {
+                let positions = &*arena
+                    .alloc_slice_copy(&positions[..len])
+                    .map_err(|_| arena_full())?;
+                let collations =
+                    projected_collations(storage, txid, arena, statement, scope, outer)?;
+                let collations = &*arena
+                    .alloc_slice_copy(&collations[..plan.width])
+                    .map_err(|_| arena_full())?;
+                let columns = &*arena
+                    .alloc_slice_with(plan.width, |column| column)
+                    .map_err(|_| arena_full())?;
+                Some(super::hashagg::HashAgg::new(
+                    super::hashagg::ProjectedKeys {
+                        storage,
+                        txid,
+                        arena,
+                        positions,
+                        collations,
+                        columns,
+                    },
+                    sizing,
+                    storage.plan_build(),
+                )?)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     if plan.n_keys > 0 || plan.n_on > 0 {
         let mut columns = [0usize; MAX_PROJ];
         let count = super::postgres_sort_columns(
@@ -3292,6 +3347,25 @@ pub(crate) fn external_materialized_into<'a>(
                         })
                         .expect("spill-attached block store");
                 }
+                if let Some(hashed) = hashed.as_mut() {
+                    let mut values = [Datum::Null; MAX_PROJ];
+                    for (index, value) in values.iter_mut().enumerate().take(plan.width) {
+                        *value = materialized_value_at(
+                            scope,
+                            row,
+                            projected,
+                            keys,
+                            plan.width,
+                            plan.n_keys,
+                            plan.identities_at,
+                            plan.raw_columns.as_ref(),
+                            index,
+                        );
+                    }
+                    let encoded =
+                        crate::sql::exec::encode_projected_pub(&values[..plan.width], arena)?;
+                    return hashed.offer(encoded);
+                }
                 if let Some(distinct_rows) = distinct_rows.as_mut() {
                     // Kept past the rewind below, in the arena's tail.
                     let mut values = [Datum::Null; MAX_PROJ];
@@ -3376,6 +3450,32 @@ pub(crate) fn external_materialized_into<'a>(
             pax_columns,
             &mut push,
         )?;
+    }
+    if let Some(mut hashed) = hashed {
+        hashed.finish_input()?;
+        let window = offset.saturating_add(limit);
+        let mut logical_index = 0u64;
+        let mut emitted = 0u64;
+        hashed.emit(&mut |encoded| {
+            if logical_index >= window {
+                return Ok(false);
+            }
+            below_limit.row();
+            let keep = if logical_index >= offset {
+                stages.limit.row();
+                let mut output = [Datum::Null; MAX_PROJ];
+                for (column, value) in output.iter_mut().enumerate().take(plan.width) {
+                    *value = crate::sql::exec::decode_projected_col_record(encoded, column, arena)?;
+                }
+                emitted += 1;
+                emit(&output[..plan.width], source_rowids)?
+            } else {
+                true
+            };
+            logical_index += 1;
+            Ok(keep && logical_index < window)
+        })?;
+        return Ok(emitted);
     }
     if let Some(rows) = distinct_rows.as_ref() {
         super::group::record_distinct_hash_memory(
@@ -3627,8 +3727,10 @@ pub(crate) fn external_materialized_into<'a>(
 
 /// Whether the rows of `statement` are sorted through the external sorter
 /// (an object store is attached): not those of a join PostgreSQL sorts
-/// within its modeled plan, nor of a hashed `DISTINCT`, whose rows return
-/// in its hash table's order and so are all held in the statement arena.
+/// within its modeled plan, nor of a hashed `DISTINCT` measured by
+/// `EXPLAIN ANALYZE`. An unmeasured hashed `DISTINCT` streams its rows
+/// through a hash table that spills as PostgreSQL's does.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(super) fn externally_materialized<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -3637,13 +3739,22 @@ pub(super) fn externally_materialized<'a>(
     params: &[Datum<'a>],
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
+    planned: &PlannedJoin<'a>,
 ) -> Result<bool, SqlError> {
     if !storage.spill_attached()
-        || sorts_modeled_join(storage, txid, statement, scope, params, arena, outer)?
+        || sorts_modeled_join(
+            storage, txid, statement, scope, params, arena, outer, planned,
+        )?
     {
         return Ok(false);
     }
+    // `EXPLAIN ANALYZE` of a hashed `DISTINCT` measures its table from rows
+    // all held in the statement arena.
     Ok(!(statement.distinct
+        && instrument::Stages::current()
+            .unique
+            .hash_agg_sizing()
+            .is_some()
         && super::group::hashed_distinct_plan(storage, scope, txid, statement, arena)?.is_some()))
 }
 
@@ -3754,6 +3865,7 @@ pub(crate) fn materialized_stages(limited: bool) -> instrument::Stages {
 /// tuplesort does
 /// (`pg_tuplesort`, `pg_incremental_sort`): a spilling sort's order of
 /// equal rows would differ.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(crate) fn sorts_modeled_join<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -3762,14 +3874,14 @@ pub(crate) fn sorts_modeled_join<'a>(
     params: &[Datum<'a>],
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
+    planned: &PlannedJoin<'a>,
 ) -> Result<bool, SqlError> {
     Ok(outer.is_none()
         && (!statement.order_by.is_empty() || statement.distinct)
         && scope.n > 1
-        && super::index_paths::join_query::modeled_join(
-            storage, txid, statement, scope, params, arena,
-        )?
-        .is_some())
+        && planned
+            .get(storage, txid, statement, scope, params, arena)?
+            .is_some())
 }
 
 /// DISTINCT / ORDER BY execution to the wire: materialize the rows, then page
@@ -3790,7 +3902,10 @@ pub(crate) fn materialized_select<'a>(
     offset: u64,
     responder: &mut Responder,
 ) -> Outcome {
-    if match externally_materialized(storage, txid, statement, scope, params, arena, None) {
+    let planned = PlannedJoin::new();
+    if match externally_materialized(
+        storage, txid, statement, scope, params, arena, None, &planned,
+    ) {
         Ok(external) => external,
         Err(error) => return sql_fail(error),
     } {
@@ -3820,6 +3935,7 @@ pub(crate) fn materialized_select<'a>(
         .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
         locked_scan_window(statement, limit, offset),
         &stages,
+        &planned,
     ) {
         Ok(x) => x,
         Err(e) => return sql_fail(e),

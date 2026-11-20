@@ -1027,7 +1027,7 @@ impl Writer<'_, '_, '_, '_> {
     ) -> Result<Option<StackStr<512>>, SqlError> {
         // The constant `true` an outer join clause gave way to
         // (`reconsider_outer_join_clauses`) prints as nothing.
-        let mut kept = [0u8; query::index_paths::joins::MAX_CLAUSES];
+        let mut kept = [0; query::index_paths::joins::MAX_JOIN_CLAUSES];
         let mut count = 0;
         for &id in clauses.as_slice() {
             let clause = &self.model.plan.clauses[usize::from(id)];

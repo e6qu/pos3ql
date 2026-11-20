@@ -394,10 +394,20 @@ With object storage on, a write that finds the memtable full no longer fails
 while committed rows can spill: the statement rolls back, waits for a
 checkpoint the reactor drives, and runs again. Only a statement (with its
 transaction) whose own uncommitted rows exceed `memtable_bytes` fails, with
-`54000`.
+`54000`. A write that finds `row_overlay_slots` or `row_history_slots`
+exhausted while committed changes await a checkpoint waits for that
+checkpoint's cleanup and resumes at its row. Writers waiting for cache space
+or a requested checkpoint pause saved-file cleanup at its next request
+boundary, so the capture that frees space runs first; a waiter whose
+maintenance ends without freeing space runs again at once and fits or gets
+the named error.
 
 **Remaining:**
 
+- A write that cannot yield (`COPY FROM`, a statement after its first
+  unreplayable effect) still fails with `54000` when `row_overlay_slots` or
+  `row_history_slots` are exhausted, even while a checkpoint could free them;
+  it needs the same checkpoint wait without a restart.
 - Reserve forward progress for commit, rollback, required reads and maintenance;
   reclaim in bounded steps; report pinned capacity and named exhaustion.
   Replacements are reserved before effects. For example, if analyzing `orders`
@@ -1075,7 +1085,15 @@ query. `max_parallel_workers_per_gather` is PostgreSQL's setting (default 2,
 setting above 0 an `EXPLAIN` of a query scanning a relation at least that
 large fails with `0A000`, since PostgreSQL may choose a `Gather` there (a
 write or a row lock is never parallel, so its plan prints); at 0 every plan
-is exact (`differential_exact/931`). `BUFFERS` is on by default under
+is exact (`differential_exact/931`). pos3ql compiles nothing, as a
+PostgreSQL built without LLVM: `jit_provider` is the server-start setting
+naming `llvmjit`, `pg_jit_available()` is false and no `EXPLAIN` prints a
+`JIT` section. Its developer options are kept and shown with PostgreSQL's
+contexts: `jit_debugging_support` and `jit_profiling_support` are set
+only when a connection starts (a startup `-c` option or `ALTER SYSTEM`),
+and `jit_dump_bitcode` only by a superuser. `pg_settings_get_flags`
+reports each setting's `guc_tables.c` flags (`differential_exact/973`).
+`BUFFERS` is on by default under
 `ANALYZE`, as in PostgreSQL 18, and accepted without it. Each node prints
 pos3ql's own page accesses in PostgreSQL's format and placement (its
 inputs' and a read `WITH` query's included, zero counters omitted in text,
@@ -1249,15 +1267,44 @@ index fails with `0A000`, and its join's costs refuse to print), a
 `LATERAL` subquery (PostgreSQL may cache it in a `Memoize`; `EXPLAIN` of
 one the search does not plan fails with `0A000` while `enable_memoize` is
 on), a correlated subplan in an `OR` or compared with a column (`0A000`),
-`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), a query
-whose join conditions pass the search's fixed clause capacities (32
-clauses of one join, 48 conditions, 64 clauses): a chain of 34 `USING`
-joins on one column (33 conditions) already does, so its `EXPLAIN (COSTS
-OFF)` prints pos3ql's join order where PostgreSQL filters each join by the
-class's equality, and `join_capacity_diff.py` compares only the analyzed
-128-relation GEQO plan's text; and more than
+`BUFFERS` of a scan or InitPlan running a subplan (`0A000`), and more than
 128 relations in one query, past which the search holds no plan and such
-queries run pos3ql's join order. An `ORDER BY` over a join keeps every joined row in
+queries run pos3ql's join order. A `USING` or `NATURAL` join's merged
+column is PostgreSQL's join alias variable (`buildMergedJoinVar`: the left
+column, a right join's right one, a full join's `COALESCE`, each coerced
+to the merged type), so a chain's joins compare the first relation's
+column and every column joins one class, and a full join chain's later
+joins hash or merge by the lower joins' `COALESCE`, as
+`flatten_join_alias_vars` leaves it (`differential_exact/972`). A query of
+analyzed tables reading a full join's merged column that the search does
+not plan fails with `0A000` rather than run pos3ql's join order: one
+grouped by that column (PostgreSQL groups by its `COALESCE`), and a
+chain's merged column equated with a constant, which
+`reconsider_full_join_clause` pushes into each lower join's sides. The
+search's capacities follow the 128-relation maximum: 256 conditions, 64
+equivalence classes of up to 255 members, 32 clauses of one join and
+65535 clauses, its lists and the columns joins read kept in the statement
+arena (`sql_arena_bytes`); past any of them a query fails with `54000`
+naming the capacity rather than running pos3ql's join order. The search
+keeps its paths (288 bytes each, as PostgreSQL's path nodes and their
+clause lists take) and relations in fixed chunks of that arena, which grow
+without copying; the plan it returns holds only the chosen paths, so its
+execution state is per plan node, as `create_plan` copies only those; one
+execution of a statement plans its join once, the passes that size,
+aggregate and order its groups or rows reading that plan; and a check of
+whether the search plans a statement plans in a region of the arena it
+then reclaims. A nested loop's inner `Material` path is built once per
+input path, as its costs are the input's alone, where each join pair
+built its own (92% of an all-equated chain's paths). The `EXPLAIN` of a
+64-relation `USING` chain's search takes about 4 MB of the arena and a
+128-relation chain's GEQO search about 8 MB. Remaining
+there: a relation with a btree index holds 16 join parameters (one per
+other member of its classes and per movable outer join clause), bounded by
+the single-relation planner's 32 conditions and 64-bit restriction sets,
+so an indexed relation equated with more than 16 others fails with
+`54000`; and
+`join_capacity_diff.py` compares the analyzed 34- and 128-relation `USING`
+chains' GEQO plans with PostgreSQL's. An `ORDER BY` over a join keeps every joined row in
 the statement arena before sorting, so a join of millions of rows (seven
 8-row tables cross joined, `ORDER BY 1 LIMIT 1`) fails with `54000` where
 PostgreSQL runs a bounded top-N sort; the join's rows must feed the
@@ -1577,22 +1624,52 @@ the sort keys that are not among them and the `ctid`s a row lock reads; a
 `GroupAggregate`'s input sort is sized only when its aggregates read no
 column (pos3ql's grouping keys lack the aggregates' inputs), and a value of
 a type without a PostgreSQL size here (`jsonb`, arrays, records) or a sort
-past `work_mem` keeps pos3ql's own figure. A hash aggregate prints `Batches:
-1  Memory Usage` as `hash_agg_update_metrics` measures it once its input
-ends: the meta context (first block, the bucket array `simplehash` sizes
+past `work_mem` keeps pos3ql's own figure. A hash aggregate prints
+`Batches`, `Memory Usage` and, once it spilled, `Disk Usage` as
+`hash_agg_update_metrics` measures them after its input and each batch: the meta context (first block, the bucket array `simplehash` sizes
 from the planned groups and grows at its 0.9 fill factor, the table's
 expressions measured on PostgreSQL 18.6 for one to seven grouping columns,
 and the expression context under it), the bump context of the entries and
 the context of by-reference transition states (array initial values and the
-`Int128AggState` of integer averages and sums are modelled). `EXPLAIN
-ANALYZE` of a hash aggregate with another by-reference state (`numeric`
-sums, text `min`/`max`, collecting aggregates) or more than seven grouping
-columns fails with `0A000`, as does a table that spills
-(`hash_agg_check_limits`'s memory or group limit, from `hash_agg_set_limits`;
-its `Batches`, `Disk Usage` and partitions need the tapes' block allocation,
-`hash_bytes_uint32` hashes and the hyperloglog cardinalities of
-`nodeAgg.c`'s spill batches) and a hash aggregate whose group estimate lies
-outside the cost model (an expression key, a join pos3ql does not plan).
+`Int128AggState` of integer averages and sums are modelled), plus one
+8 kB buffer per open partition tape and the batch's read buffer. A
+`HashAggregate` runs as `nodeAgg.c` does (`differential_exact/926`): once
+`hash_agg_check_limits` finds the table past the memory or group limit of
+`hash_agg_set_limits`, rows of new groups go to a power of two of partitions
+(`hash_choose_num_partitions`) by the next hash bits, each partition's
+groups estimated by a 5-bit hyperloglog of `hash_bytes_uint32` of the hash;
+the partitions become a stack of batches read back last first into the
+emptied table, which keeps its buckets, and a batch that does not fit
+spills again. Partitions are tapes of a port of `logtape.c`'s allocation
+(blocks preallocated to each tape 8 to 128 at a time, freed as a batch
+reads them and reused lowest first), run twice: over PostgreSQL's
+`t_len`s, giving `Disk Usage`, and over pos3ql's own rows, which it holds in
+8 kB blocks leased from `plan_build_bytes`, so a batch reads only its own
+blocks and a spill that outgrows the pool fails with `54000`. The same
+aggregate streams a one-table hashed `DISTINCT` (with or without an
+object store), orders a hashed one-table or join `GROUP BY`, a join's
+hashed `DISTINCT` and a hashed unique-ified relation, and measures
+`EXPLAIN ANALYZE`. Still open: PostgreSQL's meta context may be a context
+`aset.c` recycles from its per-backend freelist without resetting its block
+sizes. After a statement whose plan created its contexts in another order
+(an `EXPLAIN` without `ANALYZE` of a hash aggregate, a filter's expression
+context), a hash aggregate under a small `work_mem` (below 1MB, whose work
+context's 8 kB to 32 kB largest block lowers the chunk limit) can inherit
+that context: its bucket arrays become dedicated blocks freed on growth, it
+counts less memory and holds more groups before it spills. pos3ql models a
+meta context with default block sizes, so such a statement returns its
+groups in another order and reports other figures than PostgreSQL's (a 64kB
+`SELECT DISTINCT` of 5000 groups after an `EXPLAIN` holds 676 rather than
+461 in its first table); matching it needs the session's freelist of
+executor contexts modelled. `EXPLAIN ANALYZE` of a hash aggregate with another
+by-reference state (`numeric` sums, text `min`/`max`, collecting
+aggregates) or more than seven grouping columns fails with `0A000`, as does
+one that spills rows holding columns besides its keys (their tape bytes
+are not modelled) and a hash aggregate whose group estimate lies outside
+the cost model (an expression key, a join pos3ql does not plan). A join's
+hashed `GROUP BY` whose transition states are not all sized orders its
+groups by the table without them, a lower bound on its memory: it holds
+while that table does not spill, and one that spills fails with `0A000`.
 Aggregates over a join and a `DISTINCT` over one table size their tables
 from the planner's group estimate (`differential_exact/908`). A `Materialize`
 above a merge join's inner sort replays its mark, restore and
@@ -1633,11 +1710,8 @@ buffers and a streaming merge over up to 500 tapes). The sorter holds no
 pointer to the storage: each push and `keep_least` takes the `&Storage` that
 sizes its rows. Not yet done: the
 modeled-join grouping sort and an incremental sort's batches are not charged
-against `work_mem`; a `DISTINCT` of the columns of one table that PostgreSQL
-hashes returns its rows in `simplehash` order, holding every scanned row in the
-statement arena even with an object store attached (`differential_exact/924`; a
-DISTINCT of expressions, or with an `ORDER BY`, is outside the model and still
-sorts), and a one-table `GROUP BY` the
+against `work_mem`; a DISTINCT of expressions, or with an `ORDER BY`, is
+outside the model and still sorts, and a one-table `GROUP BY` the
 planner model does not cover (expression keys, aggregates without a sized
 transition state) likewise (a modeled one hashes in `simplehash` order,
 `differential_exact/922`; one whose key type has no ported hash function
@@ -1927,7 +2001,14 @@ constraint cannot be named by `CLUSTER ON`, `CLUSTER ... USING` or `REPLICA
 IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 `reloptions` lists its options in a fixed order (`security_invoker`,
 `security_barrier`, `check_option`) where PostgreSQL keeps the order they were
-set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
+set, and omits an explicit `security_invoker=false`. A table's or
+materialized view's `fillfactor` and `autovacuum_enabled` keep the order they
+were set in, a `SET` moving the options it names after the others, and
+`autovacuum_enabled` its value as written (`differential_exact/927`); pos3ql
+runs no autovacuum, so either value holds. A table's `fillfactor` prints
+normalized where PostgreSQL repeats it as written (`fillfactor='070'`), and
+other heap storage parameters (`autovacuum_*` thresholds, `toast.*`) fail
+with `22023`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`.
 `pg_constraint` omits the system catalogs' own not-null constraints.
 postgres_fdw's connection cache, `postgres_fdw_get_connections`,

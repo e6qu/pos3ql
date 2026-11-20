@@ -2619,10 +2619,122 @@ impl<B: DefinitionBacking> TableDefinition<B> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableStorageOptions {
     pub fillfactor: Option<u8>,
+    /// `autovacuum_enabled` and its value as written. pos3ql runs no
+    /// autovacuum, so either value holds; the option is kept for
+    /// `pg_class.reloptions`.
+    pub autovacuum_enabled: Option<(bool, ReloptionSpelling)>,
+    /// `pg_class.reloptions` lists `autovacuum_enabled` before `fillfactor`.
+    pub autovacuum_first: bool,
 }
 
 impl TableStorageOptions {
-    pub const DEFAULT: Self = Self { fillfactor: None };
+    pub const DEFAULT: Self = Self {
+        fillfactor: None,
+        autovacuum_enabled: None,
+        autovacuum_first: false,
+    };
+
+    /// The options as `CREATE` writes them.
+    pub const fn created(options: crate::sql::ast::RelationStorageOptions) -> Self {
+        Self {
+            fillfactor: options.fillfactor,
+            autovacuum_enabled: options.autovacuum_enabled,
+            autovacuum_first: options.autovacuum_first
+                && options.fillfactor.is_some()
+                && options.autovacuum_enabled.is_some(),
+        }
+    }
+
+    /// `ALTER ... SET (...)`: each option set leaves its place and follows
+    /// the options kept, in the order written (`transformRelOptions`).
+    pub fn set(&mut self, options: crate::sql::ast::RelationStorageOptions) {
+        let both_set = options.fillfactor.is_some() && options.autovacuum_enabled.is_some();
+        let first = if both_set {
+            options.autovacuum_first
+        } else if options.fillfactor.is_some() {
+            true
+        } else if options.autovacuum_enabled.is_some() {
+            false
+        } else {
+            self.autovacuum_first
+        };
+        if options.fillfactor.is_some() {
+            self.fillfactor = options.fillfactor;
+        }
+        if options.autovacuum_enabled.is_some() {
+            self.autovacuum_enabled = options.autovacuum_enabled;
+        }
+        self.autovacuum_first =
+            first && self.fillfactor.is_some() && self.autovacuum_enabled.is_some();
+    }
+
+    /// `ALTER ... RESET (...)`.
+    pub fn reset(&mut self, names: crate::sql::ast::RelationStorageOptionNames) {
+        if names.fillfactor {
+            self.fillfactor = None;
+        }
+        if names.autovacuum_enabled {
+            self.autovacuum_enabled = None;
+        }
+        if self.fillfactor.is_none() || self.autovacuum_enabled.is_none() {
+            self.autovacuum_first = false;
+        }
+    }
+
+    /// `autovacuum_enabled` as a flags byte (present, value, listed first)
+    /// and its spelling, for the WAL and checkpoint images.
+    pub fn autovacuum_code(&self) -> (u8, &str) {
+        match &self.autovacuum_enabled {
+            None => (0, ""),
+            Some((value, spelling)) => (
+                1 | (u8::from(*value) << 1) | (u8::from(self.autovacuum_first) << 2),
+                spelling.as_str(),
+            ),
+        }
+    }
+
+    /// The inverse of [`Self::autovacuum_code`]; `None` for an image no
+    /// table could have written.
+    pub fn with_autovacuum_code(mut self, flags: u8, spelling: &str) -> Option<Self> {
+        match flags {
+            0 if spelling.is_empty() => {
+                self.autovacuum_enabled = None;
+                self.autovacuum_first = false;
+            }
+            1..=7 if flags & 1 == 1 => {
+                let spelling = ReloptionSpelling::new(spelling)?;
+                let value = crate::sql::eval::parse_bool(spelling.as_str()).ok()?;
+                if value != (flags & 2 != 0) {
+                    return None;
+                }
+                self.autovacuum_enabled = Some((value, spelling));
+                self.autovacuum_first = flags & 4 != 0 && self.fillfactor.is_some();
+            }
+            _ => return None,
+        }
+        Some(self)
+    }
+
+    /// `pg_class.reloptions` entries, in order.
+    pub fn for_each_reloption(&self, mut each: impl FnMut(core::fmt::Arguments<'_>)) {
+        let fillfactor = |each: &mut dyn FnMut(core::fmt::Arguments<'_>)| {
+            if let Some(fillfactor) = self.fillfactor {
+                each(format_args!("fillfactor={fillfactor}"));
+            }
+        };
+        let autovacuum = |each: &mut dyn FnMut(core::fmt::Arguments<'_>)| {
+            if let Some((_, spelling)) = self.autovacuum_enabled {
+                each(format_args!("autovacuum_enabled={}", spelling.as_str()));
+            }
+        };
+        if self.autovacuum_first {
+            autovacuum(&mut each);
+            fillfactor(&mut each);
+        } else {
+            fillfactor(&mut each);
+            autovacuum(&mut each);
+        }
+    }
 }
 
 /// Typed-table membership retains the composite source's complete lifetime.
@@ -18576,6 +18688,9 @@ pub struct Storage {
     /// checkpointer, plus owned reader scratch. `None` without object storage
     /// — then rows never spill and the heap-full error stands.
     spill: Option<std::sync::Arc<SpillReader>>,
+    /// A row write waits for overlay or history slots that the next
+    /// checkpoint's cleanup frees. Paced checkpoint beats capture first.
+    row_capacity_wait: std::sync::atomic::AtomicBool,
     /// Startup-allocated value indexes shared by every table's enforcers.
     /// Retained leases keep a cache valid through replacement and row walks.
     value_indexes: ValueIndexPool,
@@ -25161,6 +25276,7 @@ impl Storage {
             lsn: log_positions::LogPositions::new(budget)?,
             replay_table_rewrite: None,
             spill: None,
+            row_capacity_wait: std::sync::atomic::AtomicBool::new(false),
             value_indexes,
             index_arena: Mutex::new(index_arena),
             comparison_arena: Mutex::new(comparison_arena),
@@ -40686,17 +40802,62 @@ impl Storage {
     }
 
     pub(crate) fn durable_map_pressure(&self) -> bool {
-        self.map_pressure()
-            && self.tables.iter().any(|table| {
-                table.live()
-                    && table.dirty()
-                    && table.definition().persistence != RelationPersistence::Temporary
-                    && table
-                        .rows
-                        .read()
-                        .iter()
-                        .any(|(_, state)| state.checkpoint_change_lsn != 0)
-            })
+        self.map_pressure() && self.checkpoint_reclaims_rows()
+    }
+
+    /// Whether a durable table holds committed resident changes. The next
+    /// checkpoint captures them, and its cleanup then releases their overlay
+    /// and history slots.
+    pub(crate) fn checkpoint_reclaims_rows(&self) -> bool {
+        self.tables.iter().any(|table| {
+            table.live()
+                && table.dirty()
+                && table.definition().persistence != RelationPersistence::Temporary
+                && table
+                    .rows
+                    .read()
+                    .iter()
+                    .any(|(_, state)| state.checkpoint_change_lsn != 0)
+        })
+    }
+
+    /// A row write found its overlay or history slots exhausted. While the
+    /// statement can still yield and a checkpoint can free slots, it waits
+    /// for that checkpoint as PostgreSQL waits for buffer space; otherwise
+    /// the named capacity error stands.
+    pub(super) fn row_capacity_exhausted(&self, error: SqlError) -> SqlError {
+        let restartable = self
+            .spill
+            .as_ref()
+            .and_then(|reader| reader.blocks.as_ref())
+            .is_some_and(|blocks| {
+                blocks
+                    .lock()
+                    .expect("block store lock poisoned")
+                    .async_gets_enabled()
+            });
+        if !restartable || !self.checkpoint_reclaims_rows() {
+            return error;
+        }
+        self.row_capacity_wait
+            .store(true, std::sync::atomic::Ordering::Release);
+        SqlError::cache_space_wait(format_args!(
+            "row write waits for checkpoint cleanup: {}",
+            error.message.as_str()
+        ))
+    }
+
+    /// Whether a row write waits for checkpoint cleanup.
+    pub(crate) fn row_capacity_waiting(&self) -> bool {
+        self.row_capacity_wait
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Checkpoint cleanup finished, or no maintenance can free slots: a
+    /// waiting write runs again and either fits or reports the named error.
+    pub(crate) fn release_row_capacity_wait(&self) {
+        self.row_capacity_wait
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn temporary_map_pressure(&self) -> bool {

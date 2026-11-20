@@ -1078,8 +1078,7 @@ fn coalesce_operands<'a>(
         || !full_clauses
             .as_chunks::<2>()
             .0
-            .iter()
-            .any(|pair| *pair == [(left.rel, left.column), (right.rel, right.column)])
+            .contains(&[(left.rel, left.column), (right.rel, right.column)])
     {
         return Ok(None);
     }
@@ -1123,36 +1122,35 @@ fn analyze_qual<'a>(
             (Some(value), None) if is_coalesce(right) => Some((*right, value)),
             _ => None,
         };
-        if let Some((side, value)) = found {
-            if let Some((one, two, ctype)) =
+        if let Some((side, value)) = found
+            && let Some((one, two, ctype)) =
                 coalesce_operands(scope, expressions, full_clauses, side)?
-            {
-                // The `COALESCE` itself, a member of the constant's class
-                // that `reconsider_full_join_clause` finds by its parts.
-                let Some((whole, ..)) = expressions.member(scope, side)? else {
-                    return Ok(None);
-                };
-                let id = whole.expression_id().expect("an expression");
-                expressions.parts[id] = Some(((one.rel, one.column), (two.rel, two.column)));
-                let Some(constant) = constants.id(value, ctype) else {
-                    return Ok(None);
-                };
-                let Some(vars) = qual_vars(scope, side) else {
-                    return Ok(None);
-                };
-                return Ok(Some(Qual {
-                    rels: whole.base_relids(),
-                    vars,
-                    // `COALESCE` is not strict.
-                    nonnullable: Relids::EMPTY,
-                    strict_vars: VarList::default(),
-                    forced_null: None,
-                    shape: Shape::Constant {
-                        var: (whole.rel, whole.column),
-                        constant,
-                    },
-                }));
-            }
+        {
+            // The `COALESCE` itself, a member of the constant's class
+            // that `reconsider_full_join_clause` finds by its parts.
+            let Some((whole, ..)) = expressions.member(scope, side)? else {
+                return Ok(None);
+            };
+            let id = whole.expression_id().expect("an expression");
+            expressions.parts[id] = Some(((one.rel, one.column), (two.rel, two.column)));
+            let Some(constant) = constants.id(value, ctype) else {
+                return Ok(None);
+            };
+            let Some(vars) = qual_vars(scope, side) else {
+                return Ok(None);
+            };
+            return Ok(Some(Qual {
+                rels: whole.base_relids(),
+                vars,
+                // `COALESCE` is not strict.
+                nonnullable: Relids::EMPTY,
+                strict_vars: VarList::default(),
+                forced_null: None,
+                shape: Shape::Constant {
+                    var: (whole.rel, whole.column),
+                    constant,
+                },
+            }));
         }
     }
     let Some(vars) = qual_vars(scope, expression) else {

@@ -41,6 +41,7 @@ pub(crate) use retained::{
 #[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod routine_contract_tests;
 
+mod hashagg;
 mod setops;
 mod simplehash;
 pub(crate) use cte::{RecursiveChunk, RecursiveCteQuery};

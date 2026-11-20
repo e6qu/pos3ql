@@ -280,7 +280,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 28;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 29;
 const DOMAIN_PAYLOAD_VERSION: u8 = 250;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1316,7 +1316,7 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
             2 + reference.storage_key().len()
         }
     };
-    n += 1;
+    n += 1 + 2 + def.storage_options.autovacuum_code().1.len();
     n += 3 + 16;
     n += def
         .inline_key_names()
@@ -1750,6 +1750,8 @@ fn append_table_payload<B: DefinitionBacking>(
         }
     }
     ok &= buffer.append(&[def.storage_options.fillfactor.unwrap_or(0)]);
+    let (autovacuum, spelling) = def.storage_options.autovacuum_code();
+    ok &= buffer.append(&[autovacuum, spelling.len() as u8]) && buffer.append(spelling.as_bytes());
     ok &= buffer.append(&[
         u8::from(def.row_level_security.enabled),
         u8::from(def.row_level_security.forced),
@@ -9021,6 +9023,14 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.storage_options.fillfactor = (fillfactor != 0).then_some(fillfactor);
+            let autovacuum = *payload.get(at)?;
+            let spelling_len = usize::from(*payload.get(at + 1)?);
+            let spelling =
+                core::str::from_utf8(payload.get(at + 2..at + 2 + spelling_len)?).ok()?;
+            at += 2 + spelling_len;
+            def.storage_options = def
+                .storage_options
+                .with_autovacuum_code(autovacuum, spelling)?;
             def.row_level_security = crate::storage::RowLevelSecurityState {
                 enabled: match *payload.get(at)? {
                     0 => false,

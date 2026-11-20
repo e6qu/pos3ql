@@ -4405,6 +4405,19 @@ impl Checkpointer {
                     if fillfactor != 0 && !(10..=100).contains(&fillfactor) {
                         return Err(CheckpointSetupError::Corrupt("invalid table fillfactor"));
                     }
+                    let storage_options = words
+                        .next()
+                        .and_then(|word| word.split_once('/'))
+                        .and_then(|(flags, spelling)| {
+                            crate::storage::TableStorageOptions {
+                                fillfactor: (fillfactor != 0).then_some(fillfactor),
+                                ..crate::storage::TableStorageOptions::DEFAULT
+                            }
+                            .with_autovacuum_code(flags.parse().ok()?, spelling)
+                        })
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid table autovacuum_enabled",
+                        ))?;
                     let inputs = decode_manifest_hex_bytes(
                         words
                             .next()
@@ -4413,7 +4426,7 @@ impl Checkpointer {
                     let type_inputs = storage
                         .decode_stored_type_inputs(&inputs)
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid table type inputs"))?;
-                    let name = rest_of(line, 13 + inheritance_count)?;
+                    let name = rest_of(line, 14 + inheritance_count)?;
                     let def = TableDefBuilder {
                         type_inputs,
                         // The current format omits `tsch` for the public schema.
@@ -4434,9 +4447,7 @@ impl Checkpointer {
                         access_method,
                         inheritance,
                         type_membership,
-                        storage_options: crate::storage::TableStorageOptions {
-                            fillfactor: (fillfactor != 0).then_some(fillfactor),
-                        },
+                        storage_options,
                         ..TableDefBuilder::empty()
                     };
                     pending_def = Some((mindex, created_at, def, 0));
@@ -11134,6 +11145,10 @@ impl Checkpointer {
                 " {}",
                 definition.storage_options.fillfactor.unwrap_or(0)
             )
+            .and_then(|()| {
+                let (autovacuum, spelling) = definition.storage_options.autovacuum_code();
+                write!(table_line, " {autovacuum}/{spelling}")
+            })
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,

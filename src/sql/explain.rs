@@ -4508,7 +4508,7 @@ pub(crate) fn grouped_scan_context<'a>(
 pub(crate) struct HashedGrouping {
     pub(crate) columns: [usize; query::index_paths::MAX_ORDER_KEYS],
     pub(crate) len: usize,
-    pub(crate) buckets: usize,
+    pub(crate) sizing: query::postgres_memory::HashAggSizing,
 }
 
 /// The hashed grouping PostgreSQL's planner plans over the scan of one
@@ -4538,7 +4538,7 @@ pub(crate) fn hashed_grouping<'a>(
     Ok(path.hashed.then_some(HashedGrouping {
         columns: grouping.columns,
         len: grouping.len,
-        buckets: sizing.buckets,
+        sizing,
     }))
 }
 
@@ -15310,7 +15310,7 @@ pub(super) fn visit_text_rows<E>(
             .flatten()
             .filter(|&partitions| partitions > 0);
         let peak = match node_actual {
-            NodeActual::Ran(counters) => counters.hash_agg_peak,
+            NodeActual::Ran(counters) => counters.hash_agg,
             NodeActual::Unmeasured | NodeActual::NeverExecuted => None,
         };
         let hash_agg_line = (planned.is_some() || peak.is_some()).then(|| {
@@ -15321,11 +15321,19 @@ pub(super) fn visit_text_rows<E>(
             if let Some(partitions) = planned {
                 let _ = write!(line, "Planned Partitions: {partitions}");
             }
-            if let Some(bytes) = peak {
+            if let Some(figures) = peak {
                 if planned.is_some() {
                     let _ = write!(line, "  ");
                 }
-                let _ = write!(line, "Batches: 1  Memory Usage: {}kB", bytes.div_ceil(1024));
+                let _ = write!(
+                    line,
+                    "Batches: {}  Memory Usage: {}kB",
+                    figures.batches,
+                    figures.peak.div_ceil(1024)
+                );
+                if figures.batches > 1 {
+                    let _ = write!(line, "  Disk Usage: {}kB", figures.disk_kb);
+                }
             }
             line
         });
@@ -16732,13 +16740,13 @@ fn structured_node(
         document.number("Planned Partitions", partitions);
     }
     if let NodeActual::Ran(NodeCounters {
-        hash_agg_peak: Some(bytes),
+        hash_agg: Some(figures),
         ..
     }) = node_actual
     {
-        document.number("HashAgg Batches", 1);
-        document.number("Peak Memory Usage", bytes.div_ceil(1024));
-        document.number("Disk Usage", 0);
+        document.number("HashAgg Batches", figures.batches);
+        document.number("Peak Memory Usage", figures.peak.div_ceil(1024));
+        document.number("Disk Usage", figures.disk_kb);
     }
     let counters = match node_actual {
         NodeActual::Unmeasured => None,

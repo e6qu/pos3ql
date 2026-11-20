@@ -309,8 +309,6 @@ pub(crate) struct ModeledGroup<'a> {
     /// in the `GROUP BY` (a `DISTINCT`'s in the select list), each with the
     /// direction its sort orders it.
     pub(crate) keys: &'a [(usize, u8)],
-    /// The buckets the hash table starts with (`build_hash_table`).
-    pub(crate) buckets: usize,
     /// What sizes a grouping `HashAggregate`'s memory, when the model
     /// covers it.
     pub(crate) hash_agg: Option<crate::sql::query::postgres_memory::HashAggSizing>,
@@ -4754,9 +4752,6 @@ fn modeled_join_over<'a>(
                     (position, key & !KEY_CLASS)
                 })
                 .map_err(|_| crate::sql::eval::arena_full())?;
-            let buckets = problem_group_aggregates.map_or(0, |aggregates| {
-                super::aggregate::hash_agg_buckets(&aggregates, chosen.groups, output_width)
-            });
             let hash_agg =
                 problem_group_aggregates
                     .filter(|_| chosen.hashed)
@@ -4778,7 +4773,6 @@ fn modeled_join_over<'a>(
                 presorted: arena
                     .alloc_slice_copy(&presort_tail[..presort_count])
                     .map_err(|_| crate::sql::eval::arena_full())?,
-                buckets,
             })
         }
         None => None,

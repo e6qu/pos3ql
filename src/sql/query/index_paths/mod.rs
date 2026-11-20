@@ -26,7 +26,7 @@ use crate::storage::{
 
 use super::scope::{QueryScope, ResolvedColumn};
 
-mod aggregate;
+pub(super) mod aggregate;
 mod append;
 mod clauses;
 mod expressions;
@@ -43,7 +43,7 @@ pub(crate) use expressions::{ExpressionVariables, KeyReader};
 
 pub(crate) use aggregate::{
     AggInput, AggStrategy, AggregateCosts, aggregate_costs, cost_agg, hash_agg_sizing,
-    having_quals, plain_hash_buckets,
+    having_quals, plain_hash_sizing,
 };
 pub(crate) use append::{AppendKind, MemberPath, TreePath, member_path, member_scope};
 pub(crate) use grouping_sets::{

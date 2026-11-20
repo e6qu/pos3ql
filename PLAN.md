@@ -1577,22 +1577,49 @@ the sort keys that are not among them and the `ctid`s a row lock reads; a
 `GroupAggregate`'s input sort is sized only when its aggregates read no
 column (pos3ql's grouping keys lack the aggregates' inputs), and a value of
 a type without a PostgreSQL size here (`jsonb`, arrays, records) or a sort
-past `work_mem` keeps pos3ql's own figure. A hash aggregate prints `Batches:
-1  Memory Usage` as `hash_agg_update_metrics` measures it once its input
-ends: the meta context (first block, the bucket array `simplehash` sizes
+past `work_mem` keeps pos3ql's own figure. A hash aggregate prints
+`Batches`, `Memory Usage` and, once it spilled, `Disk Usage` as
+`hash_agg_update_metrics` measures them after its input and each batch: the meta context (first block, the bucket array `simplehash` sizes
 from the planned groups and grows at its 0.9 fill factor, the table's
 expressions measured on PostgreSQL 18.6 for one to seven grouping columns,
 and the expression context under it), the bump context of the entries and
 the context of by-reference transition states (array initial values and the
-`Int128AggState` of integer averages and sums are modelled). `EXPLAIN
-ANALYZE` of a hash aggregate with another by-reference state (`numeric`
-sums, text `min`/`max`, collecting aggregates) or more than seven grouping
-columns fails with `0A000`, as does a table that spills
-(`hash_agg_check_limits`'s memory or group limit, from `hash_agg_set_limits`;
-its `Batches`, `Disk Usage` and partitions need the tapes' block allocation,
-`hash_bytes_uint32` hashes and the hyperloglog cardinalities of
-`nodeAgg.c`'s spill batches) and a hash aggregate whose group estimate lies
-outside the cost model (an expression key, a join pos3ql does not plan).
+`Int128AggState` of integer averages and sums are modelled), plus one
+8 kB buffer per open partition tape and the batch's read buffer. A
+`HashAggregate` runs as `nodeAgg.c` does (`differential_exact/926`): once
+`hash_agg_check_limits` finds the table past the memory or group limit of
+`hash_agg_set_limits`, rows of new groups go to a power of two of partitions
+(`hash_choose_num_partitions`) by the next hash bits, each partition's
+groups estimated by a 5-bit hyperloglog of `hash_bytes_uint32` of the hash;
+the partitions become a stack of batches read back last first into the
+emptied table, which keeps its buckets, and a batch that does not fit
+spills again. Partitions are tapes of a port of `logtape.c`'s allocation
+(blocks preallocated to each tape 8 to 128 at a time, freed as a batch
+reads them and reused lowest first), run twice: over PostgreSQL's
+`t_len`s, giving `Disk Usage`, and over pos3ql's own rows, which it holds in
+8 kB blocks leased from `plan_build_bytes`, so a batch reads only its own
+blocks and a spill that outgrows the pool fails with `54000`. The same
+aggregate streams a one-table hashed `DISTINCT` (with or without an
+object store), orders a hashed one-table or join `GROUP BY`, a join's
+hashed `DISTINCT` and a hashed unique-ified relation, and measures
+`EXPLAIN ANALYZE`. Still open: PostgreSQL's meta context may be a context
+`aset.c` recycles from its per-backend freelist without resetting its block
+sizes. After a statement whose plan created its contexts in another order
+(an `EXPLAIN` without `ANALYZE` of a hash aggregate, a filter's expression
+context), a hash aggregate under a small `work_mem` (below 1MB, whose work
+context's 8 kB to 32 kB largest block lowers the chunk limit) can inherit
+that context: its bucket arrays become dedicated blocks freed on growth, it
+counts less memory and holds more groups before it spills. pos3ql models a
+meta context with default block sizes, so such a statement returns its
+groups in another order and reports other figures than PostgreSQL's (a 64kB
+`SELECT DISTINCT` of 5000 groups after an `EXPLAIN` holds 676 rather than
+461 in its first table); matching it needs the session's freelist of
+executor contexts modelled. `EXPLAIN ANALYZE` of a hash aggregate with another
+by-reference state (`numeric` sums, text `min`/`max`, collecting
+aggregates) or more than seven grouping columns fails with `0A000`, as does
+one that spills rows holding columns besides its keys (their tape bytes
+are not modelled) and a hash aggregate whose group estimate lies outside
+the cost model (an expression key, a join pos3ql does not plan).
 Aggregates over a join and a `DISTINCT` over one table size their tables
 from the planner's group estimate (`differential_exact/908`). A `Materialize`
 above a merge join's inner sort replays its mark, restore and
@@ -1633,11 +1660,8 @@ buffers and a streaming merge over up to 500 tapes). The sorter holds no
 pointer to the storage: each push and `keep_least` takes the `&Storage` that
 sizes its rows. Not yet done: the
 modeled-join grouping sort and an incremental sort's batches are not charged
-against `work_mem`; a `DISTINCT` of the columns of one table that PostgreSQL
-hashes returns its rows in `simplehash` order, holding every scanned row in the
-statement arena even with an object store attached (`differential_exact/924`; a
-DISTINCT of expressions, or with an `ORDER BY`, is outside the model and still
-sorts), and a one-table `GROUP BY` the
+against `work_mem`; a DISTINCT of expressions, or with an `ORDER BY`, is
+outside the model and still sorts, and a one-table `GROUP BY` the
 planner model does not cover (expression keys, aggregates without a sized
 transition state) likewise (a modeled one hashes in `simplehash` order,
 `differential_exact/922`; one whose key type has no ported hash function
@@ -1927,7 +1951,14 @@ constraint cannot be named by `CLUSTER ON`, `CLUSTER ... USING` or `REPLICA
 IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 `reloptions` lists its options in a fixed order (`security_invoker`,
 `security_barrier`, `check_option`) where PostgreSQL keeps the order they were
-set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
+set, and omits an explicit `security_invoker=false`. A table's or
+materialized view's `fillfactor` and `autovacuum_enabled` keep the order they
+were set in, a `SET` moving the options it names after the others, and
+`autovacuum_enabled` its value as written (`differential_exact/927`); pos3ql
+runs no autovacuum, so either value holds. A table's `fillfactor` prints
+normalized where PostgreSQL repeats it as written (`fillfactor='070'`), and
+other heap storage parameters (`autovacuum_*` thresholds, `toast.*`) fail
+with `22023`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`.
 `pg_constraint` omits the system catalogs' own not-null constraints.
 postgres_fdw's connection cache, `postgres_fdw_get_connections`,

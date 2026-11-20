@@ -6481,13 +6481,22 @@ impl<'a> Parser<'a> {
         }
         loop {
             let option = self.any_ident("table storage parameter")?;
-            self.expect_op("=")?;
             if option.eq_ignore_ascii_case("fillfactor") {
+                self.expect_op("=")?;
                 if options.fillfactor.is_some() {
-                    return Err(self.err_here("parameter \"fillfactor\" specified more than once"));
+                    return Err(Self::duplicate_reloption(self.peek_at, "fillfactor"));
                 }
                 let value = self.integer_reloption("fillfactor", 10, 100)?;
                 options.fillfactor = Some(value as u8);
+            } else if option.eq_ignore_ascii_case("autovacuum_enabled") {
+                if options.autovacuum_enabled.is_some() {
+                    return Err(Self::duplicate_reloption(
+                        self.peek_at,
+                        "autovacuum_enabled",
+                    ));
+                }
+                options.autovacuum_enabled = Some(self.reloption_bool(option)?);
+                options.autovacuum_first = options.fillfactor.is_none();
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
@@ -6520,6 +6529,8 @@ impl<'a> Parser<'a> {
             let option = self.any_ident("table storage parameter")?;
             if option.eq_ignore_ascii_case("fillfactor") {
                 names.fillfactor = true;
+            } else if option.eq_ignore_ascii_case("autovacuum_enabled") {
+                names.autovacuum_enabled = true;
             } else if option.eq_ignore_ascii_case("security_invoker") {
                 names.security_invoker = true;
             } else if option.eq_ignore_ascii_case("security_barrier") {

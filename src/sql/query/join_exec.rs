@@ -3045,6 +3045,102 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// Runs path `path` of relation `rel` (search path `id`) as planned: the
     /// scan's own planning describes that path again, and a parameterized
     /// path reads the bound outer rows' values.
+    /// The bound rows of `relids`, flat by the query's FROM positions: the
+    /// outer row a parameterized scan or a `LATERAL` subquery reads.
+    fn outer_values(
+        &self,
+        bound: &Bound<'a>,
+        relids: Relids,
+    ) -> Result<(&'a [Datum<'a>], &'a [usize]), SqlError> {
+        let n = self.scope.n;
+        let offsets = self
+            .arena
+            .alloc_slice_with(n, |_| 0usize)
+            .map_err(|_| arena_full())?;
+        let mut width = 0;
+        for (table, offset) in offsets.iter_mut().enumerate() {
+            *offset = width;
+            width += self.scope.stored_width(table);
+        }
+        let values = self
+            .arena
+            .alloc_slice_with(width, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for table in 0..n {
+            if let Some(row) = bound[table]
+                && relids.contains(table as u32)
+            {
+                let columns = self.columns_of(row.values);
+                values[offsets[table]..offsets[table] + columns.len()].copy_from_slice(columns);
+            }
+        }
+        Ok((values, offsets))
+    }
+
+    /// A `LATERAL` subquery's rows for the bound outer row: its query run
+    /// with the outer columns it reads bound, its nodes counted in the
+    /// relation's block as `EXPLAIN` plans them.
+    fn lateral_scan(
+        &self,
+        rel: usize,
+        lateral: &super::index_paths::join_query::LateralRel<'a>,
+        bound: &mut Bound<'a>,
+        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
+    ) -> Result<bool, SqlError> {
+        let (values, offsets) = self.outer_values(bound, lateral.relids)?;
+        let outer_row = JoinRow {
+            scope: self.scope,
+            values: JoinRowValues::Flat { values, offsets },
+            rowids: &[],
+            visible: self.scope.n,
+        };
+        let mut rows = ArenaList::new(self.arena);
+        {
+            let _block = super::instrument::enter_block(self.block.child(scan_segment(rel)));
+            super::select_into_rows(
+                self.storage,
+                self.txid,
+                lateral.select,
+                self.arena,
+                self.params,
+                Some(&outer_row),
+                self.hooks.sequences,
+                &mut |values| {
+                    let encoded = crate::sql::exec::encode_projected_pub(values, self.arena)?;
+                    rows.push(encoded).map_err(|_| arena_full())
+                },
+            )?;
+        }
+        let columns = lateral.widths.len();
+        let rows = rows.into_mut_slice().map_err(|_| arena_full())?;
+        for (at, encoded) in rows.iter().enumerate() {
+            let values = self
+                .arena
+                .alloc_slice_with(columns + self.model.expressions.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (column, value) in values.iter_mut().take(columns).enumerate() {
+                *value =
+                    crate::sql::exec::decode_projected_col_record(encoded, column, self.arena)?;
+            }
+            bound[rel] = Some(BaseRow {
+                values,
+                rowid: None,
+            });
+            if !sink(bound)? {
+                // The subquery ran to its end: its nodes' counts would
+                // exceed PostgreSQL's, which stops reading it here.
+                if at + 1 < rows.len() && super::instrument::active() {
+                    return Err(crate::sql_err!(
+                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN ANALYZE of a LATERAL subquery its join stops reading is not supported"
+                    ));
+                }
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn scan(
         &self,
         id: u32,
@@ -3054,6 +3150,9 @@ impl<'r, 'a> Runner<'r, 'a> {
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         let modeled = self.model.rels[rel];
+        if let Some(lateral) = modeled.lateral.as_ref() {
+            return self.lateral_scan(rel, lateral, bound, sink);
+        }
         let scan = match self.scans[id as usize].get() {
             Some(scan) => scan,
             None => {
@@ -3075,29 +3174,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         let outer_values;
         let outer_row;
         let outer: Option<&dyn ColumnLookup<'a>> = if scan.param != Relids::EMPTY {
-            let n = self.scope.n;
-            let offsets = self
-                .arena
-                .alloc_slice_with(n, |_| 0usize)
-                .map_err(|_| arena_full())?;
-            let mut width = 0;
-            for (table, offset) in offsets.iter_mut().enumerate() {
-                *offset = width;
-                width += self.scope.stored_width(table);
-            }
-            let values = self
-                .arena
-                .alloc_slice_with(width, |_| Datum::Null)
-                .map_err(|_| arena_full())?;
-            for table in 0..n {
-                if let Some(row) = bound[table]
-                    && scan.param.contains(table as u32)
-                {
-                    let columns = self.columns_of(row.values);
-                    values[offsets[table]..offsets[table] + columns.len()].copy_from_slice(columns);
-                }
-            }
-            outer_values = (&*values, &*offsets);
+            outer_values = self.outer_values(bound, scan.param)?;
             outer_row = JoinRow {
                 scope: self.scope,
                 values: JoinRowValues::Flat {
@@ -3105,7 +3182,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                     offsets: outer_values.1,
                 },
                 rowids: &[],
-                visible: n,
+                visible: self.scope.n,
             };
             Some(&outer_row)
         } else {

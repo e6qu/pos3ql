@@ -2813,7 +2813,18 @@ fn target_entry<'a>(
         }
         _ => false,
     };
-    if expression.contains_subquery() && !subquery_parameter {
+    // A correlated scalar subquery is a subplan run per row: its recorded
+    // `cost_subplan` charge (`cost_qual_eval_walker`).
+    let subplan = match expression {
+        Expr::Subquery(_) if !subquery_parameter => {
+            match crate::sql::query::subplan_qual_cost(expression)? {
+                (0.0, per_tuple) => Some(per_tuple),
+                _ => return None,
+            }
+        }
+        _ => None,
+    };
+    if expression.contains_subquery() && !subquery_parameter && subplan.is_none() {
         return None;
     }
     let (type_oid, type_mod) =
@@ -2830,7 +2841,9 @@ fn target_entry<'a>(
     };
     Some((
         type_average_width(ctype, i32::from(type_mod)) as u32,
-        if subquery_parameter {
+        if let Some(per_tuple) = subplan {
+            per_tuple
+        } else if subquery_parameter {
             0.0
         } else {
             super::plan::qual_cost(expression, &columns, storage, txid, arena) / 2.0

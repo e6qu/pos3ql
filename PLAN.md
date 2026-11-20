@@ -238,9 +238,13 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 - [ ] *In progress:* a retained pull-based executor whose merge join, sort,
   hash and hash aggregate nodes keep their state between rows, as the retained
   nested-loop and hash levels do.
-- [ ] *In progress:* `LATERAL` subqueries planned by the search, with
-  `Memoize` and exact `EXPLAIN ANALYZE` counters (`EXPLAIN` fails with
-  `0A000` while `enable_memoize` is on today).
+- [x] `LATERAL` subqueries of one table planned by the search, with `Memoize`
+  and exact `EXPLAIN ANALYZE` counters (`977`).
+- [ ] Other `LATERAL` subqueries in the search: joins, grouping or volatile
+  calls inside them, outer columns read outside their `WHERE`, a target list
+  other than all their columns in order (a kept `Subquery Scan`), `LEFT JOIN
+  LATERAL`, and queries filtering, grouping or ordering by their columns
+  (`EXPLAIN` of them fails with `0A000` while `enable_memoize` is on).
 - [ ] *In progress:* relation sets sized at startup, so queries of more than
   128 relations are searched (they run pos3ql's join order today), and an
   indexed relation equated with more than 16 others no longer fails with

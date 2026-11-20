@@ -752,6 +752,10 @@ pub struct Engine {
     checkpoint_failure: Option<(u64, SqlError)>,
     cache_capacity_generation: u64,
     cache_capacity_failure: Option<(u64, SqlError)>,
+    /// A statement parked on cache space since the generation last moved.
+    /// When maintenance stops before freeing space, the generation moves so
+    /// the waiter runs again rather than sleeping until an unrelated change.
+    cache_waiters: core::cell::Cell<bool>,
     /// A COPY FROM STDIN the last statement started: the connection takes
     /// it, switches into copy-in mode, and feeds data lines back through
     /// [`Engine::copy_row_line`] until CopyDone.
@@ -1014,6 +1018,20 @@ pub enum StatementWait {
     Timer,
     /// `DROP_REPLICATION_SLOT ... WAIT` waits for the slot's release.
     ReplicationSlot,
+}
+
+impl StatementWait {
+    /// The wait an internal lock or I/O control names.
+    pub(crate) fn of_internal(state: eval::SqlState) -> Self {
+        if state == sqlstate::INTERNAL_LOCK_WAIT {
+            Self::Lock
+        } else if state.awaits_cache_space() {
+            Self::CacheCapacity
+        } else {
+            debug_assert!(state == sqlstate::INTERNAL_IO_WAIT);
+            Self::ObjectIo
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5293,6 +5311,7 @@ impl Engine {
             local_cleanup: None,
             checkpoint_failure: None,
             cache_capacity_generation: 0,
+            cache_waiters: core::cell::Cell::new(false),
             cache_capacity_failure: None,
             pending_copy: None,
             pending_copy_refusal: None,
@@ -11941,6 +11960,11 @@ impl Engine {
         let result = self.advance_local_cleanup(cleanup, mode);
         if result.is_ok() {
             let cleared_failure = self.cache_capacity_failure.take().is_some();
+            if self.local_cleanup.is_none() {
+                // The cleanup released what this checkpoint captured; a
+                // waiting row write runs again and asks anew if still full.
+                self.storage.release_row_capacity_wait();
+            }
             if self.storage.heap.used() != heap_bytes
                 || self.local_cleanup.is_none()
                 || cleared_failure
@@ -12060,6 +12084,44 @@ impl Engine {
         self.cache_capacity_generation
     }
 
+    /// Writers wait for cache space while this holds: the resident heap is
+    /// nearly full, temporary rows crowd the overlay, or a row write waits
+    /// for overlay or history slots.
+    fn cache_space_pressure(&self) -> bool {
+        self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85
+            || self.storage.temporary_map_pressure()
+            || self.storage.row_capacity_waiting()
+            || self.local_cleanup.is_some_and(|cleanup| {
+                matches!(cleanup.source, LocalCleanupSource::TemporaryTable { .. })
+            })
+    }
+
+    /// Maintenance whose completion can free cache space.
+    fn cache_maintenance_active(&self) -> bool {
+        self.local_cleanup.is_some()
+            || self.ckpt.as_ref().is_some_and(|checkpointer| {
+                checkpointer.sweep_active()
+                    || checkpointer.manifest_publication_pending()
+                    || checkpointer.physical_maintenance_pending(&self.storage)
+                    || checkpointer.merge_work_pending(&self.storage)
+            })
+    }
+
+    /// Wakes cache-space waiters once their wait can no longer end through
+    /// maintenance: the pressure is gone, or no maintenance can relieve it.
+    /// A rerun then fits or reports the named capacity error.
+    pub(crate) fn observe_cache_capacity(&mut self) {
+        if !self.cache_waiters.get() && !self.storage.row_capacity_waiting() {
+            return;
+        }
+        if self.cache_space_pressure() && self.cache_maintenance_active() {
+            return;
+        }
+        self.cache_waiters.set(false);
+        self.storage.release_row_capacity_wait();
+        self.cache_capacity_generation = self.cache_capacity_generation.wrapping_add(1);
+    }
+
     pub(crate) fn statement_wait_generation(&self, wait: StatementWait, connection: i32) -> u64 {
         match wait {
             StatementWait::Lock => self.storage.lock_wait_generation(connection),
@@ -12107,13 +12169,7 @@ impl Engine {
         {
             return Ok(false);
         }
-        let temporary_cleanup = self.local_cleanup.is_some_and(|cleanup| {
-            matches!(cleanup.source, LocalCleanupSource::TemporaryTable { .. })
-        });
-        let pressure = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85
-            || self.storage.temporary_map_pressure()
-            || temporary_cleanup;
-        if !pressure {
+        if !self.cache_space_pressure() {
             return Ok(false);
         }
         let mut command = statement;
@@ -12134,13 +12190,10 @@ impl Engine {
         // Existing pending writes can pin the very space they would wait for.
         // They keep the normal named capacity error, as does an unreclaimable
         // working set after the current maintenance task has completed.
-        let active = self.local_cleanup.is_some()
-            || self.ckpt.as_ref().is_some_and(|checkpointer| {
-                checkpointer.sweep_active()
-                    || checkpointer.manifest_publication_pending()
-                    || checkpointer.physical_maintenance_pending(&self.storage)
-                    || checkpointer.merge_work_pending(&self.storage)
-            });
+        let active = self.cache_maintenance_active();
+        if active {
+            self.cache_waiters.set(true);
+        }
         if active && txn.cache_capacity_wait.is_none() {
             query::check_timeout()?;
             // Old maintenance failures belong to their original requests. A
@@ -12567,6 +12620,7 @@ impl Engine {
             || self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50
             || self.storage.history_pressure()
             || self.storage.durable_map_pressure()
+            || self.storage.row_capacity_waiting()
     }
 
     /// Heap and history cleanup use no object client. Retained output jobs have
@@ -12945,6 +12999,7 @@ impl Engine {
             .ckpt
             .as_ref()
             .is_some_and(|c| self.checkpoint_capture_due(c));
+        let cache_pressure = self.cache_space_pressure();
         let Some(ckpt) = self.ckpt.as_mut() else {
             return progress;
         };
@@ -12956,7 +13011,12 @@ impl Engine {
             return CheckpointBeat::WaitingForReads;
         }
         let remote_maintenance_was_pending = ckpt.published_maintenance_pending();
-        let checkpoint = ckpt.checkpoint_step(&mut self.storage);
+        let priority = if cache_pressure {
+            crate::checkpoint::CapturePriority::CacheWaiters
+        } else {
+            crate::checkpoint::CapturePriority::Ordinary
+        };
+        let checkpoint = ckpt.checkpoint_step(&mut self.storage, priority);
         let remote_maintenance_finished =
             remote_maintenance_was_pending && !ckpt.published_maintenance_pending();
         match checkpoint {
@@ -13163,12 +13223,10 @@ impl Engine {
                     return Ok(ExecutionStatus::Blocked {
                         completed_statements: resume_statement,
                         output_mark: responder.mark(),
-                        wait: if txn.staged_commit().is_some()
-                            || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                        {
+                        wait: if txn.staged_commit().is_some() {
                             StatementWait::ObjectIo
                         } else {
-                            StatementWait::Lock
+                            StatementWait::of_internal(error.sqlstate)
                         },
                     });
                 }
@@ -13318,11 +13376,7 @@ impl Engine {
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
                                 output_mark: responder.mark(),
-                                wait: if error.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                                    StatementWait::ObjectIo
-                                } else {
-                                    StatementWait::Lock
-                                },
+                                wait: StatementWait::of_internal(error.sqlstate),
                             });
                         }
                         Err(error) => {
@@ -13592,11 +13646,7 @@ impl Engine {
                                 return Ok(ExecutionStatus::Blocked {
                                     completed_statements: statement_index,
                                     output_mark: responder.mark(),
-                                    wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                                        StatementWait::ObjectIo
-                                    } else {
-                                        StatementWait::Lock
-                                    },
+                                    wait: StatementWait::of_internal(e.sqlstate),
                                 });
                             }
                             txn.pending_procedure = None;
@@ -13607,11 +13657,7 @@ impl Engine {
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
                                 output_mark: responder.mark(),
-                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                                    StatementWait::ObjectIo
-                                } else {
-                                    StatementWait::Lock
-                                },
+                                wait: StatementWait::of_internal(e.sqlstate),
                             });
                         }
                         if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
@@ -13627,12 +13673,10 @@ impl Engine {
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
                                 output_mark: responder.mark(),
-                                wait: if txn.staged_commit().is_some()
-                                    || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                                {
+                                wait: if txn.staged_commit().is_some() {
                                     StatementWait::ObjectIo
                                 } else {
-                                    StatementWait::Lock
+                                    StatementWait::of_internal(e.sqlstate)
                                 },
                             });
                         }
@@ -13641,11 +13685,7 @@ impl Engine {
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
                                 output_mark,
-                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                                    StatementWait::ObjectIo
-                                } else {
-                                    StatementWait::Lock
-                                },
+                                wait: StatementWait::of_internal(e.sqlstate),
                             });
                         }
                         if procedure_timed_out || txn.concurrent_index.is_some() {
@@ -13672,11 +13712,7 @@ impl Engine {
                                 return Ok(ExecutionStatus::Blocked {
                                     completed_statements: statement_index,
                                     output_mark,
-                                    wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                                        StatementWait::ObjectIo
-                                    } else {
-                                        StatementWait::Lock
-                                    },
+                                    wait: StatementWait::of_internal(e.sqlstate),
                                 });
                             }
                             self.storage
@@ -13719,12 +13755,10 @@ impl Engine {
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
                                 output_mark,
-                                wait: if txn.staged_commit().is_some()
-                                    || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                                {
+                                wait: if txn.staged_commit().is_some() {
                                     StatementWait::ObjectIo
                                 } else {
-                                    StatementWait::Lock
+                                    StatementWait::of_internal(error.sqlstate)
                                 },
                             });
                         }
@@ -13800,12 +13834,10 @@ impl Engine {
                     return Ok(ExecutionStatus::Blocked {
                         completed_statements: statement_count,
                         output_mark: responder.mark(),
-                        wait: if txn.staged_commit().is_some()
-                            || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                        {
+                        wait: if txn.staged_commit().is_some() {
                             StatementWait::ObjectIo
                         } else {
-                            StatementWait::Lock
+                            StatementWait::of_internal(e.sqlstate)
                         },
                     });
                 }
@@ -13885,11 +13917,7 @@ impl Engine {
                     || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                 {
                     return Ok(ExtendedExecutionStatus::Blocked {
-                        wait: if error.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                            StatementWait::ObjectIo
-                        } else {
-                            StatementWait::Lock
-                        },
+                        wait: StatementWait::of_internal(error.sqlstate),
                     });
                 }
                 if txn.is_explicit() {
@@ -13985,12 +14013,10 @@ impl Engine {
                         && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
                     {
                         return Ok(ExtendedExecutionStatus::Blocked {
-                            wait: if txn.staged_commit().is_some()
-                                || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                            {
+                            wait: if txn.staged_commit().is_some() {
                                 StatementWait::ObjectIo
                             } else {
-                                StatementWait::Lock
+                                StatementWait::of_internal(error.sqlstate)
                             },
                         });
                     }
@@ -14334,12 +14360,10 @@ impl Engine {
                                                 || txn.commit_admission().is_some())
                                         {
                                             return Ok(ExtendedExecutionStatus::Blocked {
-                                                wait: if txn.staged_commit().is_some()
-                                                    || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                                                {
+                                                wait: if txn.staged_commit().is_some() {
                                                     StatementWait::ObjectIo
                                                 } else {
-                                                    StatementWait::Lock
+                                                    StatementWait::of_internal(error.sqlstate)
                                                 },
                                             });
                                         }
@@ -14403,11 +14427,7 @@ impl Engine {
                                             }
                                             self.storage.preserve_advisory_statement();
                                             return Ok(ExtendedExecutionStatus::Blocked {
-                                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                                                    StatementWait::ObjectIo
-                                                } else {
-                                                    StatementWait::Lock
-                                                },
+                                                wait: StatementWait::of_internal(e.sqlstate),
                                             });
                                         }
                                         txn.pending_procedure = None;
@@ -14418,11 +14438,7 @@ impl Engine {
                                     {
                                         self.storage.preserve_advisory_statement();
                                         return Ok(ExtendedExecutionStatus::Blocked {
-                                            wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                                                StatementWait::ObjectIo
-                                            } else {
-                                                StatementWait::Lock
-                                            },
+                                            wait: StatementWait::of_internal(e.sqlstate),
                                         });
                                     }
                                     if txn.staged_commit().is_some()
@@ -14434,23 +14450,17 @@ impl Engine {
                                             sequence_scope.discard(guc.seq_session());
                                         }
                                         return Ok(ExtendedExecutionStatus::Blocked {
-                                            wait: if txn.staged_commit().is_some()
-                                                || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                                            {
+                                            wait: if txn.staged_commit().is_some() {
                                                 StatementWait::ObjectIo
                                             } else {
-                                                StatementWait::Lock
+                                                StatementWait::of_internal(e.sqlstate)
                                             },
                                         });
                                     }
                                     if txn.concurrent_index.is_some() && !lock_timeout_expired {
                                         self.storage.preserve_advisory_statement();
                                         return Ok(ExtendedExecutionStatus::Blocked {
-                                            wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                                                StatementWait::ObjectIo
-                                            } else {
-                                                StatementWait::Lock
-                                            },
+                                            wait: StatementWait::of_internal(e.sqlstate),
                                         });
                                     }
                                     if procedure_timed_out || txn.concurrent_index.is_some() {
@@ -14476,11 +14486,7 @@ impl Engine {
                                         let withdrawn = responder.truncate_to(output_mark);
                                         if withdrawn.is_ok() && !lock_timeout_expired {
                                             return Ok(ExtendedExecutionStatus::Blocked {
-                                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                                                    StatementWait::ObjectIo
-                                                } else {
-                                                    StatementWait::Lock
-                                                },
+                                                wait: StatementWait::of_internal(e.sqlstate),
                                             });
                                         }
                                         self.storage
@@ -14628,11 +14634,7 @@ impl Engine {
                         exec::PlpgsqlTransactionContext::Atomic,
                     );
                     return Ok(ExtendedExecutionStatus::Blocked {
-                        wait: if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
-                            StatementWait::Lock
-                        } else {
-                            StatementWait::ObjectIo
-                        },
+                        wait: StatementWait::of_internal(error.sqlstate),
                     });
                 }
                 Err(error) => {
@@ -14672,12 +14674,10 @@ impl Engine {
                     && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
                 {
                     return Ok(ExtendedExecutionStatus::Blocked {
-                        wait: if txn.staged_commit().is_some()
-                            || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                        {
+                        wait: if txn.staged_commit().is_some() {
                             StatementWait::ObjectIo
                         } else {
-                            StatementWait::Lock
+                            StatementWait::of_internal(error.sqlstate)
                         },
                     });
                 }

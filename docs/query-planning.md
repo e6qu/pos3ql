@@ -152,6 +152,9 @@ plan. Covered:
   memory as `ExecMemoize` counts them), star-schema parameterization, foreign
   key join selectivity (`844`, `849`, `850`).
 - Constants propagated through classes (`845`, `853`, `872`, `876`, `877`);
+  an equality of two columns of one relation joins their classes, as
+  `process_equivalence` does, so the join clause a class derives names the
+  members PostgreSQL's does (`976`);
   `remove_useless_joins` (`851`); `remove_useless_self_joins`, which merges
   two scans of one table joined on a unique key into one scan whose filter
   holds both scans' conditions and `IS NOT NULL` of each joined column not

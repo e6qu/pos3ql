@@ -5643,8 +5643,7 @@ fn remove_self_joins<'a>(
     for problem in 0..prepared.subproblem_count {
         let super::joins::Subproblem { first, count } = prepared.subproblems[problem];
         let mut candidates = Relids::EMPTY;
-        for index in usize::from(first)..usize::from(first + count) {
-            let item = prepared.subproblem_items[index];
+        for &item in &prepared.subproblem_items[usize::from(first)..usize::from(first + count)] {
             if item.count_ones() == 1
                 && item & !BASE_RELIDS == Relids::EMPTY
                 && item & removed == Relids::EMPTY
@@ -5863,7 +5862,7 @@ fn remove_self_joins_one_group<'a>(
             }
             let rename = |table: usize| (table == r).then_some(k);
             for qual in quals.iter_mut() {
-                *qual = rename_relations(scope, &rename, *qual, arena)?;
+                *qual = rename_relations(scope, &rename, qual, arena)?;
             }
             let (restrictions, join_clauses) =
                 match prepared.remove_self_join(r as u8, k as u8, arena) {

@@ -2325,9 +2325,7 @@ fn create_table_kind(
             }
         }
     };
-    def.storage_options = crate::storage::TableStorageOptions {
-        fillfactor: statement.storage_options.fillfactor,
-    };
+    def.storage_options = crate::storage::TableStorageOptions::created(statement.storage_options);
     def.tablespace = match resolve_relation_tablespace(storage, statement.tablespace, txn.txid) {
         Ok(tablespace) => tablespace,
         Err(error) => return sql_fail(error),
@@ -58881,8 +58879,11 @@ pub(crate) fn alter_view_table_actions(
             AlterAction::SetViewOptions { options, storage } if storage.is_empty() => {
                 AlterViewAction::SetOptions(options)
             }
-            AlterAction::SetStorageOptions(_) | AlterAction::SetViewOptions { .. } => {
-                return sql_fail(unrecognized_relation_parameter("fillfactor"));
+            AlterAction::SetStorageOptions(storage)
+            | AlterAction::SetViewOptions { storage, .. } => {
+                return sql_fail(unrecognized_relation_parameter(
+                    storage.first_name().unwrap_or("fillfactor"),
+                ));
             }
             // Identity subcommands reach their columns, which on a view are
             // never NOT NULL and never identities.
@@ -62761,9 +62762,7 @@ pub fn create_table_as(
         Ok(tablespace) => tablespace,
         Err(error) => return sql_fail(error),
     };
-    def.storage_options = crate::storage::TableStorageOptions {
-        fillfactor: storage_options.fillfactor,
-    };
+    def.storage_options = crate::storage::TableStorageOptions::created(storage_options);
     def.n_columns = n_cols;
     for i in 0..n_cols {
         let Some((ctype, user_type)) = catalog_column_type(storage, txn.txid, columns[i].type_oid)
@@ -103206,14 +103205,10 @@ fn alter_table_relation(
                     new_def.columns[column].identity_always = *always;
                 }
                 AlterAction::SetStorageOptions(options) => {
-                    if let Some(fillfactor) = options.fillfactor {
-                        new_def.storage_options.fillfactor = Some(fillfactor);
-                    }
+                    new_def.storage_options.set(*options);
                 }
                 AlterAction::ResetStorageOptions(options) => {
-                    if options.fillfactor {
-                        new_def.storage_options.fillfactor = None;
-                    }
+                    new_def.storage_options.reset(*options);
                 }
                 AlterAction::AlterIdentitySequence { column, options } => {
                     let Some(column) = new_def.column_index(column) else {

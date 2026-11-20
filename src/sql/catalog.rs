@@ -21614,18 +21614,26 @@ fn pg_class<'a>(
             },
         );
         let relation_owner = storage.role_oid(storage.object_owner(relation_object, txid));
-        let reloptions = match table_def.storage_options.fillfactor {
-            Some(fillfactor) => Datum::Array {
+        let mut entries = [Datum::Null; 2];
+        let mut count = 0usize;
+        let mut failed = None;
+        table_def.storage_options.for_each_reloption(|entry| {
+            match text(stack_format!(48, "{entry}").as_str(), arena) {
+                Ok(value) => entries[count] = value,
+                Err(error) => failed = Some(error),
+            }
+            count += 1;
+        });
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        let reloptions = if count == 0 {
+            Datum::Null
+        } else {
+            Datum::Array {
                 element: super::types::ArrElem::Text,
-                raw: super::array::build(
-                    &[text(
-                        stack_format!(32, "fillfactor={fillfactor}").as_str(),
-                        arena,
-                    )?],
-                    arena,
-                )?,
-            },
-            None => Datum::Null,
+                raw: super::array::build(&entries[..count], arena)?,
+            }
         };
         out[n] = row(
             &[

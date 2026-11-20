@@ -1053,6 +1053,10 @@ pub(crate) struct HashAggSizing {
     pub(crate) groups_limit: u64,
     /// The buckets `build_hash_table` asks for.
     pub(crate) buckets: usize,
+    /// The planner's estimate of a group's bytes (`hash_agg_entry_size`) and
+    /// of the groups, which size the partitions of a first spill.
+    pub(crate) entry_size: f64,
+    pub(crate) groups: f64,
     /// The grouping columns the table hashes.
     pub(crate) columns: usize,
     /// The transition states (`numtrans`).
@@ -1260,6 +1264,39 @@ impl HashAggMemory {
         {
             self.spilled = true;
         }
+    }
+
+    /// Brings the bucket array up to `size` buckets after the table grew
+    /// for a run that grew too long, which no fill factor announced.
+    pub(crate) fn grow_buckets_to(&mut self, size: usize) {
+        while self.buckets < size {
+            self.allocate_buckets(self.buckets * 2);
+        }
+    }
+
+    /// `agg_refill_hash_table` starting a batch: the entries and transition
+    /// values contexts are reset to their first blocks, the bucket array
+    /// stays, and `hash_agg_set_limits` gives new limits.
+    pub(crate) fn start_batch(&mut self, memory_limit: f64, groups_limit: u64) {
+        self.entries = 0;
+        self.entry_blocks = DEFAULT_INIT_BLOCK;
+        self.entry_free = DEFAULT_INIT_BLOCK - BUMP_CONTEXT - BUMP_BLOCK_HEADER;
+        self.entry_next_block = DEFAULT_INIT_BLOCK;
+        self.transition = AllocSetBlocks::new(work_mem_block());
+        self.sizing.memory_limit = memory_limit;
+        self.sizing.groups_limit = groups_limit;
+        self.spilled = false;
+    }
+
+    /// The groups in the table.
+    pub(crate) fn entries(&self) -> usize {
+        self.entries
+    }
+
+    /// The bytes the by-reference transition values' context holds
+    /// (`hashkey_mem` of `hash_agg_update_metrics`).
+    pub(crate) fn transition_allocated(&self) -> usize {
+        self.transition.allocated
     }
 
     /// Whether the aggregate spilled (`hash_agg_enter_spill_mode`).

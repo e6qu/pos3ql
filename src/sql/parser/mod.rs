@@ -7088,8 +7088,8 @@ impl<'a> Parser<'a> {
 
     fn view_options(&mut self) -> Result<&'a [crate::sql::ast::ViewOption], ParseError> {
         let (storage, options) = self.relation_options()?;
-        if storage.fillfactor.is_some() {
-            return Err(self.unrecognized_parameter("fillfactor"));
+        if let Some(name) = storage.first_name() {
+            return Err(self.unrecognized_parameter(name));
         }
         Ok(options)
     }
@@ -7127,7 +7127,7 @@ impl<'a> Parser<'a> {
             spelling: crate::storage::ReloptionSpelling::EMPTY,
         }; 3];
         let mut count = 0usize;
-        let mut seen = [false; 4];
+        let mut seen = [false; 5];
         loop {
             let option = self.any_ident("relation option name")?;
             let index = if option.eq_ignore_ascii_case("security_invoker") {
@@ -7180,6 +7180,10 @@ impl<'a> Parser<'a> {
                 self.expect_op("=")?;
                 storage.fillfactor = Some(self.integer_reloption("fillfactor", 10, 100)? as u8);
                 3
+            } else if option.eq_ignore_ascii_case("autovacuum_enabled") {
+                storage.autovacuum_enabled = Some(self.reloption_bool(option)?);
+                storage.autovacuum_first = storage.fillfactor.is_none();
+                4
             } else {
                 return Err(self.unrecognized_parameter(option));
             };

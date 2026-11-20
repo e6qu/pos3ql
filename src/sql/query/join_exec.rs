@@ -3640,7 +3640,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         let column = |member: &super::index_paths::joins::Member| {
             (usize::from(member.rel), usize::from(member.column))
         };
-        let mut row_hash = |row: usize| -> Result<u32, SqlError> {
+        let row_hash = |row: usize| -> Result<u32, SqlError> {
             let mut hash = 0u32;
             for (at, member) in keys.iter().enumerate() {
                 if at != 0 {
@@ -3659,7 +3659,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             }
             Ok(super::simplehash::murmur32(hash))
         };
-        let mut same = |a: usize, b: usize| -> Result<bool, SqlError> {
+        let same = |a: usize, b: usize| -> Result<bool, SqlError> {
             for member in keys {
                 let (one, two) = (
                     self.value(rows[a], column(member)),
@@ -3684,15 +3684,45 @@ impl<'r, 'a> Runner<'r, 'a> {
             }
             Ok(true)
         };
-        // `SH_CREATE` of the planned buckets.
-        let buckets = super::index_paths::plain_hash_buckets(width, groups);
-        let order = super::simplehash::iteration_order(
-            rows.len(),
-            buckets,
-            self.arena,
-            &mut row_hash,
-            &mut same,
+        let sizing =
+            super::index_paths::plain_hash_sizing(width, groups, keys.len()).ok_or_else(|| {
+                crate::sql_err!(
+                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                    "a hashed unique-ified relation over {} columns is not supported",
+                    keys.len()
+                )
+            })?;
+        let hashes = self
+            .arena
+            .alloc_slice_with(rows.len(), |_| 0u32)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let lens = self
+            .arena
+            .alloc_slice_with(rows.len(), |_| 0usize)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        for row in 0..rows.len() {
+            hashes[row] = row_hash(row)?;
+            lens[row] = super::postgres_memory::minimal_tuple_len_with_tids(
+                None,
+                keys.iter()
+                    .map(|member| self.value(rows[row], column(member))),
+                0,
+            )
+            .ok_or_else(super::instrument::unsized_value)?;
+        }
+        let order = self
+            .arena
+            .alloc_slice_with(rows.len(), |_| 0u32)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let (count, _) = super::hashagg::hashed_row_order(
+            self.storage.plan_build(),
+            sizing,
+            hashes,
+            lens,
+            same,
+            order,
         )?;
+        let order = &order[..count];
         for &row in order {
             self.bind(bound, rows[row as usize], relids);
             if !sink(bound)? {

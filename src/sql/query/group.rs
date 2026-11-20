@@ -526,6 +526,9 @@ pub(super) fn groups_for_mask<'a>(
             &group_of[..row_count],
             rep_keys,
             &columns[..count],
+            grouping_sort_is_keys(statement, agg_nodes, mask),
+            storage,
+            txid,
             arena,
         )?;
     }
@@ -1004,24 +1007,18 @@ pub(super) fn groups_for_mask<'a>(
     Ok(out_rows)
 }
 
-/// Puts `order` (each group's index) in the order a `HashAggregate`'s table
-/// returns the groups: each group's hash is its keys' hashes, each earlier
-/// one rotated left a bit, a null key hashing to zero
-/// (`ExecBuildHash32FromAttrs`), then `murmurhash32` (`TupleHashTableHash`),
-/// and the groups are inserted in the order their first row arrives.
-/// `positions` are the key columns of `keys` in hashing order. Returns
-/// `false` when a key's type has no ported hash function.
-#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
-fn hashed_order(
+/// Each group's table hash: its keys' hashes, each earlier one rotated left
+/// a bit, a null key hashing to zero (`ExecBuildHash32FromAttrs`), then
+/// `murmurhash32` (`TupleHashTableHash`). `positions` are the key columns
+/// of `keys` in hashing order. `None` when a key's type has no ported hash
+/// function.
+fn group_hashes<'a>(
     storage: &Storage,
     txid: u32,
-    arena: &Arena,
-    group_of: &[u32],
+    arena: &'a Arena,
     keys: &[&[u8]],
     positions: &[usize],
-    buckets: usize,
-    order: &mut [u32],
-) -> Result<bool, SqlError> {
+) -> Result<Option<&'a [u32]>, SqlError> {
     let hashes = arena
         .alloc_slice_with(keys.len(), |_| 0u32)
         .map_err(|_| arena_full())?;
@@ -1032,24 +1029,58 @@ fn hashed_order(
             let value = crate::sql::exec::decode_projected_col_record(key, position, arena)?;
             if !matches!(value, Datum::Null) {
                 let Some(hashed) = super::join_exec::key_hash(&value, storage, txid)? else {
-                    return Ok(false);
+                    return Ok(None);
                 };
                 combined ^= hashed;
             }
         }
         *hash = super::simplehash::murmur32(combined);
     }
-    let firsts = super::simplehash::iteration_order(
-        group_of.len(),
-        buckets,
-        arena,
-        &mut |row| Ok(hashes[group_of[row] as usize]),
-        &mut |left, right| Ok(group_of[left] == group_of[right]),
-    )?;
-    for (slot, &row) in order.iter_mut().zip(firsts) {
-        *slot = group_of[row as usize];
+    Ok(Some(hashes))
+}
+
+/// Puts `order` (each group's index) in the order a `HashAggregate` sized
+/// by `sizing` returns the groups: inserted in the order their first row
+/// arrives, spilling as PostgreSQL's does. `group_of` gives each input
+/// row's group and `keys` each group's key row, whose `positions` are its
+/// key columns in hashing order. Returns what `EXPLAIN ANALYZE` reports,
+/// or `None` when a key's type has no ported hash function.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+pub(super) fn hashed_order(
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    group_of: &[u32],
+    keys: &[&[u8]],
+    positions: &[usize],
+    sizing: super::postgres_memory::HashAggSizing,
+    order: &mut [u32],
+) -> Result<Option<super::hashagg::HashAggFigures>, SqlError> {
+    let Some(hashes) = group_hashes(storage, txid, arena, keys, positions)? else {
+        return Ok(None);
+    };
+    let entry_lens = arena
+        .alloc_slice_with(keys.len(), |_| 0usize)
+        .map_err(|_| arena_full())?;
+    for (length, key) in entry_lens.iter_mut().zip(keys) {
+        *length = super::postgres_memory::projected_tuple_len(None, key, Some(positions))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "a hash aggregate grouping by a value without a PostgreSQL storage size is not supported"
+                )
+            })?;
     }
-    Ok(true)
+    super::hashagg::hashed_group_order(
+        storage.plan_build(),
+        sizing,
+        group_of,
+        hashes,
+        entry_lens,
+        None,
+        order,
+    )
+    .map(Some)
 }
 
 /// Whether the hash order of `hashed`'s key types is known: `false` when
@@ -1088,7 +1119,14 @@ pub(super) fn hashed_distinct_plan<'a>(
     txid: u32,
     statement: &'a Select<'a>,
     arena: &'a Arena,
-) -> Result<Option<([usize; super::index_paths::MAX_ORDER_KEYS], usize, usize)>, SqlError> {
+) -> Result<
+    Option<(
+        [usize; super::index_paths::MAX_ORDER_KEYS],
+        usize,
+        super::postgres_memory::HashAggSizing,
+    )>,
+    SqlError,
+> {
     let Some(grouping) = crate::sql::explain::distinct_as_grouping(statement, scope, arena)? else {
         return Ok(None);
     };
@@ -1131,7 +1169,7 @@ pub(super) fn hashed_distinct_plan<'a>(
             })
             .expect("a hashed column is an output column");
     }
-    Ok(Some((positions, hashed.len, hashed.buckets)))
+    Ok(Some((positions, hashed.len, hashed.sizing)))
 }
 
 /// Puts the distinct rows of a one-table `SELECT DISTINCT` of columns in
@@ -1150,52 +1188,55 @@ pub(super) fn hashed_distinct_rows<'a>(
     rows: &mut [&'a [u8]],
     collations: &[Collation],
 ) -> Result<Option<usize>, SqlError> {
-    let Some((positions, len, buckets)) =
+    let Some((positions, len, sizing)) =
         hashed_distinct_plan(storage, scope, txid, statement, arena)?
     else {
         return Ok(None);
     };
-    let positions = &positions[..len];
-    super::materialize::validate_row_collations(storage, rows, statement.items.len(), collations)?;
-    let hashes = arena
+    let width = statement.items.len();
+    let columns = arena
+        .alloc_slice_with(width, |column| column)
+        .map_err(|_| arena_full())?;
+    let order = arena
         .alloc_slice_with(rows.len(), |_| 0u32)
         .map_err(|_| arena_full())?;
-    for (hash, row) in hashes.iter_mut().zip(rows.iter()) {
-        *hash = super::simplehash::murmur32(hash_row_keys(storage, txid, row, positions, arena)?);
-    }
-    let width = statement.items.len();
-    let firsts = super::simplehash::iteration_order(
-        rows.len(),
-        buckets,
-        arena,
-        &mut |row| Ok(hashes[row]),
-        &mut |left, right| {
-            for (index, &collation) in collations.iter().take(width).enumerate() {
-                let ordering = super::materialize::compare_materialized_key(
-                    storage,
-                    txid,
-                    collation,
-                    crate::sql::exec::ProjectedValue::column(rows[left], index),
-                    crate::sql::exec::ProjectedValue::column(rows[right], index),
-                )?;
-                if !ordering.is_eq() {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
+    let mut hashed = super::hashagg::HashAgg::new(
+        super::hashagg::HeldRows {
+            keys: super::hashagg::ProjectedKeys {
+                storage,
+                txid,
+                arena,
+                positions: &positions[..len],
+                collations: &collations[..width.min(collations.len())],
+                columns,
+            },
+            rows: &*rows,
         },
+        sizing,
+        storage.plan_build(),
     )?;
+    for row in 0..rows.len() {
+        hashed.offer(&(row as u32).to_le_bytes())?;
+    }
+    hashed.finish_input()?;
+    let mut kept = 0;
+    hashed.emit(&mut |offered| {
+        order[kept] = u32::from_le_bytes(offered.try_into().expect("a row index"));
+        kept += 1;
+        Ok(true)
+    })?;
+    drop(hashed);
     let ordered = arena
-        .alloc_slice_with(firsts.len(), |at| rows[firsts[at] as usize])
+        .alloc_slice_with(kept, |at| rows[order[at] as usize])
         .map_err(|_| arena_full())?;
-    rows[..ordered.len()].copy_from_slice(ordered);
-    Ok(Some(ordered.len()))
+    rows[..kept].copy_from_slice(ordered);
+    Ok(Some(kept))
 }
 
 /// A row's keys combined as `ExecBuildHash32FromAttrs` does: each earlier
 /// hash rotated left a bit, a null key hashing to zero. Every key type was
 /// checked to have a ported hash function.
-fn hash_row_keys(
+pub(super) fn hash_row_keys(
     storage: &Storage,
     txid: u32,
     row: &[u8],
@@ -1297,11 +1338,11 @@ fn hashed_table_group_order<'a>(
         group_of,
         keys,
         &positions[..hashed.len],
-        hashed.buckets,
+        hashed.sizing,
         order,
     )?;
     // Every key type was checked to have a ported hash function.
-    debug_assert!(hashed_all);
+    debug_assert!(hashed_all.is_some());
     Ok(Some(order))
 }
 
@@ -1336,16 +1377,25 @@ fn modeled_group_order<'a>(
         let positions = arena
             .alloc_slice_with(group.keys.len(), |at| group.keys[at].0)
             .map_err(|_| arena_full())?;
-        if !hashed_order(
-            storage,
-            txid,
-            arena,
-            group_of,
-            keys,
-            positions,
-            group.buckets,
-            order,
-        )? {
+        let not_modeled = || {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a hashed grouping over a join that spills transition states of unmodeled size is not supported"
+            )
+        };
+        let sizing = group
+            .hash_agg
+            .or(group.order_sizing)
+            .ok_or_else(not_modeled)?;
+        let figures = hashed_order(
+            storage, txid, arena, group_of, keys, positions, sizing, order,
+        )?;
+        // Without every state sized the model's memory is a lower bound:
+        // its order holds only while even that bound does not spill.
+        if group.hash_agg.is_none() && figures.is_some_and(|figures| figures.batches > 1) {
+            return Err(not_modeled());
+        }
+        if figures.is_none() {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "the hash order of this grouping key type is not supported"
@@ -2159,49 +2209,42 @@ pub(super) fn ungrouped_column<'e, 'a>(
     }
 }
 
-/// Under `EXPLAIN ANALYZE`, records the memory PostgreSQL's hash aggregate
+/// Under `EXPLAIN ANALYZE`, records what PostgreSQL's hash aggregate
 /// reports for these groups: each input row, in arrival order, looks its
 /// group (`group_of`) up, and a group's first row adds its representative
-/// tuple of the hashed `columns` of its key (`rep_keys`).
+/// tuple of the hashed `columns` of its key (`rep_keys`). `keys_spill` says
+/// a spilled row holds only its keys, so its tape bytes are known.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(super) fn record_hash_agg_memory(
     aggregate: instrument::Node,
     sizing: super::postgres_memory::HashAggSizing,
     group_of: &[u32],
     rep_keys: &[&[u8]],
     columns: &[usize],
+    keys_spill: bool,
+    storage: &Storage,
+    txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    let Some(mut memory) = super::postgres_memory::HashAggMemory::new(sizing) else {
-        return Ok(());
-    };
-    let seen = arena
-        .alloc_slice_with(rep_keys.len(), |_| false)
+    let order = arena
+        .alloc_slice_with(rep_keys.len(), |_| 0u32)
         .map_err(|_| arena_full())?;
-    for &group in group_of {
-        let group = group as usize;
-        let new = if seen.get(group).copied() == Some(false) {
-            seen[group] = true;
-            let Some(length) =
-                super::postgres_memory::projected_tuple_len(None, rep_keys[group], Some(columns))
-            else {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "EXPLAIN ANALYZE of a hash aggregate grouping by a value without a PostgreSQL storage size is not supported"
-                ));
-            };
-            Some(length)
-        } else {
-            None
-        };
-        memory.lookup(new);
-    }
-    if memory.spilled() {
+    let Some(figures) = hashed_order(
+        storage, txid, arena, group_of, rep_keys, columns, sizing, order,
+    )?
+    else {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "EXPLAIN ANALYZE of a hash aggregate that spills is not supported"
+            "EXPLAIN ANALYZE of a hash aggregate over a key type without a ported hash function is not supported"
+        ));
+    };
+    if figures.batches > 1 && !keys_spill {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN ANALYZE of a hash aggregate that spills rows holding more than its keys is not supported"
         ));
     }
-    aggregate.hash_agg_peak(memory.peak());
+    aggregate.hash_agg_figures(figures);
     Ok(())
 }
 
@@ -2273,6 +2316,9 @@ pub(super) fn record_distinct_hash_memory(
         group_of,
         &keys[..groups as usize],
         columns,
+        true,
+        storage,
+        txid,
         arena,
     )
 }

@@ -1072,6 +1072,26 @@ fn hashed_table_group_order<'a>(
     else {
         return Ok(None);
     };
+    // The table column a `GROUP BY` or `ORDER BY` entry names (an ordinal
+    // names a select-list item).
+    let column_of = |key: &'a Expr<'a>| -> Option<usize> {
+        let key = match key {
+            Expr::Int(ordinal) if *ordinal >= 1 => {
+                match statement.items.get(*ordinal as usize - 1) {
+                    Some(SelectItem::Expr { expression, .. }) => *expression,
+                    _ => key,
+                }
+            }
+            _ => key,
+        };
+        match key {
+            Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
+                Ok(super::ResolvedColumn::Table(0, found)) => Some(found),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
     // Each hashed column's position among the stored group keys: the first
     // `GROUP BY` entry naming it.
     let mut positions = [0usize; super::index_paths::MAX_ORDER_KEYS];
@@ -1079,26 +1099,39 @@ fn hashed_table_group_order<'a>(
         *slot = statement
             .group_by
             .iter()
-            .position(|key| {
-                let key = match key {
-                    Expr::Int(ordinal) if *ordinal >= 1 => {
-                        match statement.items.get(*ordinal as usize - 1) {
-                            Some(SelectItem::Expr { expression, .. }) => *expression,
-                            _ => key,
-                        }
-                    }
-                    _ => key,
-                };
-                matches!(key, Expr::Column { qualifier, name }
-                    if matches!(scope.find_column(*qualifier, name),
-                        Ok(super::ResolvedColumn::Table(0, found)) if found == column))
-            })
+            .position(|&key| column_of(key) == Some(column))
             .expect("a hashed grouping column has its GROUP BY entry");
+    }
+    // An `ORDER BY` over every grouping column orders the groups whatever
+    // the table's order was.
+    if hashed.columns[..hashed.len].iter().all(|&column| {
+        statement
+            .order_by
+            .iter()
+            .any(|order| column_of(order.expression) == Some(column))
+    }) {
+        return Ok(None);
+    }
+    let definition = scope.defs.stored(0).expect("a plain table");
+    for &column in &hashed.columns[..hashed.len] {
+        use crate::sql::types::ColType;
+        let ctype = definition.columns()[column].ctype;
+        // `tsvector` and `tsquery` have no hash operator class: PostgreSQL
+        // sorts the rows to group them.
+        if matches!(ctype, ColType::TsVector | ColType::TsQuery) {
+            return Ok(None);
+        }
+        if !super::join_exec::datum_type_hashable(ctype) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "the hash order of a grouping key of type {} is not supported; order the groups by every grouping column",
+                ctype.name()
+            ));
+        }
     }
     let order = arena
         .alloc_slice_with(keys.len(), |at| at as u32)
         .map_err(|_| arena_full())?;
-    // Key types without a ported hash function keep the sort order.
     let hashed_all = hashed_order(
         arena,
         group_of,
@@ -1107,7 +1140,9 @@ fn hashed_table_group_order<'a>(
         hashed.buckets,
         order,
     )?;
-    Ok(hashed_all.then_some(&*order))
+    // Every key type was checked to have a ported hash function.
+    debug_assert!(hashed_all);
+    Ok(Some(order))
 }
 
 /// The order a join's grouping PostgreSQL's planner plans returns its

@@ -1637,7 +1637,9 @@ against `work_mem`; a hashed `DISTINCT` returns
 groups in sort order, not `simplehash` order, and a one-table `GROUP BY` the
 planner model does not cover (expression keys, aggregates without a sized
 transition state) likewise (a modeled one hashes in `simplehash` order,
-`differential_exact/922`); `DISTINCT` with an `ORDER BY` on some of its
+`differential_exact/922`; one whose key type has no ported hash function
+(arrays, records, ranges, jsonb, enums, bit strings, money) and whose
+`ORDER BY` does not name every key fails with `0A000`); `DISTINCT` with an `ORDER BY` on some of its
 columns sorts by the rest in select-list order (`differential_exact/923`); the arrival order of a table
 whose rows vary in width differs from PostgreSQL's where its free space map
 places a later, smaller tuple on an earlier page. A bounded sort

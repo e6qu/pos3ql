@@ -79,6 +79,8 @@ pub(crate) use scan::Chained;
 #[cfg(test)]
 pub(crate) use scan::JOIN_CANDIDATES;
 pub use scan::JoinRow;
+#[cfg(test)]
+pub(crate) use scan::PathScan;
 pub(crate) use scan::predicate_is_implied;
 pub(crate) use scan::select_hash_join_plan;
 pub(crate) use scan::{

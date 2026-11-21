@@ -103045,6 +103045,7 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
 }
 
 mod engine_triggers;
+mod path_scan_waits;
 mod relation_input_granularity;
 mod row_progress;
 

@@ -29,6 +29,25 @@ impl CursorRow<'_> {
     }
 }
 
+impl<'a> CursorRow<'a> {
+    /// The row's bytes or values in `arena`, outliving the cursor row: a
+    /// heap row's bytes are copied there.
+    pub(crate) fn into_representation(
+        self,
+        arena: &'a Arena,
+    ) -> Result<SpilledRowRepresentation<'a>, SqlError> {
+        match self.bytes {
+            CursorRowBytes::Heap(bytes) => {
+                let bytes: &[u8] = &bytes;
+                Ok(SpilledRowRepresentation::Encoded(
+                    arena.alloc_slice_copy(bytes).map_err(cursor_capacity)?,
+                ))
+            }
+            CursorRowBytes::Spilled(representation) => Ok(representation),
+        }
+    }
+}
+
 pub(crate) struct RowCursor {
     source: Option<RowScanSource>,
 }
@@ -48,6 +67,17 @@ struct RowScanSource {
     saved_done: bool,
     done: bool,
     spill: SpillWalkProgress,
+}
+
+/// The scratch a row cursor reads through.
+pub(crate) enum CursorScratch<'b> {
+    /// A resumable reader's own buffers, which keep an unfinished row's
+    /// bytes across a storage wait so the same call resumes it.
+    Reader(&'b mut RowCursorBuffers),
+    /// The storage's shared scan contexts, held only during each call, as
+    /// the general executor's walks hold them: a statement it runs starts
+    /// again after a wait, so no unfinished row has to survive one.
+    Statement,
 }
 
 pub(crate) struct RowCursorBuffers {
@@ -208,7 +238,7 @@ impl RowCursor {
 
     pub(crate) fn next<'arena>(
         &mut self,
-        buffers: &mut RowCursorBuffers,
+        scratch: CursorScratch<'_>,
         state_arena: &Arena,
         arena: &'arena Arena,
         decoded_columns: Option<&[bool; crate::storage::MAX_COLUMNS]>,
@@ -226,6 +256,10 @@ impl RowCursor {
         if source.done {
             return Ok(None);
         }
+        let (scan_context, mut row_buffers) = match scratch {
+            CursorScratch::Reader(buffers) => (Some(&buffers.scan), Some(&mut buffers.row)),
+            CursorScratch::Statement => (None, None),
+        };
         // A sequential scan reads the saved rows no resident version
         // shadows first, by row identity, then the resident rows by heap
         // position, as `CapturedRowScan::for_each_home_physically` does.
@@ -245,11 +279,7 @@ impl RowCursor {
                     decoded_columns,
                     true,
                     crate::storage::SpillOverlayMode::VisibleScan(&RowScanIds::Captured(&rows)),
-                    Some(
-                        source
-                            .spill
-                            .resume(&mut members, &buffers.scan, 1, u64::MAX),
-                    ),
+                    Some(source.spill.resume(&mut members, scan_context, 1, u64::MAX)),
                     &mut |rowid, commit_lsn, representation| {
                         row = Some(CursorRow {
                             rowid,
@@ -290,9 +320,10 @@ impl RowCursor {
                     CursorRowBytes::Heap(bytes)
                 }
                 crate::storage::row_images::VisibleRowBytes::Spilled(row) => {
-                    CursorRowBytes::Spilled(SpilledRowRepresentation::Encoded(
-                        row.with_bytes_in(&mut buffers.row, copy)?,
-                    ))
+                    CursorRowBytes::Spilled(SpilledRowRepresentation::Encoded(match row_buffers {
+                        Some(ref mut buffers) => row.with_bytes_in(buffers, copy)?,
+                        None => row.copy_bytes(arena)?,
+                    }))
                 }
             };
             let rowid = record.rowid;
@@ -587,7 +618,12 @@ mod tests {
         assert!(storage.heap.test_exclusive_write().is_ok());
         crate::mem::guard::forbid_alloc(|| cursor.open(&storage, table, 0, &metadata)).unwrap();
         let row = crate::mem::guard::forbid_alloc(|| {
-            cursor.next(&mut buffers, &metadata, &tiny_output, None)
+            cursor.next(
+                CursorScratch::Reader(&mut buffers),
+                &metadata,
+                &tiny_output,
+                None,
+            )
         })
         .unwrap()
         .unwrap();
@@ -607,7 +643,7 @@ mod tests {
         for expected in 1..=3 {
             arena.reset();
             let row = crate::mem::guard::forbid_alloc(|| {
-                cursor.next(&mut buffers, &metadata, &arena, None)
+                cursor.next(CursorScratch::Reader(&mut buffers), &metadata, &arena, None)
             })
             .unwrap()
             .unwrap();
@@ -620,19 +656,24 @@ mod tests {
             assert_eq!(values[0], Datum::Int4(expected as i32));
         }
         assert!(
-            crate::mem::guard::forbid_alloc(|| cursor.next(&mut buffers, &metadata, &arena, None))
-                .unwrap()
-                .is_none()
+            crate::mem::guard::forbid_alloc(|| cursor.next(
+                CursorScratch::Reader(&mut buffers),
+                &metadata,
+                &arena,
+                None
+            ))
+            .unwrap()
+            .is_none()
         );
         assert!(
             cursor
-                .next(&mut buffers, &metadata, &arena, None)
+                .next(CursorScratch::Reader(&mut buffers), &metadata, &arena, None)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
             crate::mem::guard::forbid_alloc(|| cursor.next(
-                &mut buffers,
+                CursorScratch::Reader(&mut buffers),
                 &tiny_metadata,
                 &arena,
                 None
@@ -645,7 +686,7 @@ mod tests {
         cursor.rewind(&metadata).unwrap();
         assert_eq!(
             cursor
-                .next(&mut buffers, &metadata, &arena, None)
+                .next(CursorScratch::Reader(&mut buffers), &metadata, &arena, None)
                 .unwrap()
                 .unwrap()
                 .rowid,
@@ -655,7 +696,7 @@ mod tests {
         assert!(storage.heap.test_exclusive_write().is_ok());
         assert_eq!(
             cursor
-                .next(&mut buffers, &metadata, &arena, None)
+                .next(CursorScratch::Reader(&mut buffers), &metadata, &arena, None)
                 .err()
                 .unwrap()
                 .sqlstate,

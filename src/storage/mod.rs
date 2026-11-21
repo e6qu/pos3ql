@@ -231,8 +231,8 @@ pub(crate) use row_map::{RowEntries, RowMap, RowOverlayPool};
 use row_reads::RowReadView;
 pub(crate) use row_reads::RowReadVisitor;
 pub(crate) use row_reads::{LockedRowRecheck, RowRead, RowSelfChange};
-pub(crate) use row_scans::candidates::CandidateCursor;
-pub(crate) use row_scans::cursor::{CursorRow, RowCursor, RowCursorBuffers};
+pub(crate) use row_scans::candidates::{CandidateCursor, Candidates};
+pub(crate) use row_scans::cursor::{CursorRow, CursorScratch, RowCursor, RowCursorBuffers};
 pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
 #[cfg(test)]
 use row_versions::push_committed_version;
@@ -19092,7 +19092,10 @@ struct SpillWalkResume<'a> {
     identity: &'a mut u64,
     initialized: &'a mut usize,
     pending_advance: &'a mut Option<u64>,
-    context: &'a Mutex<ScanContext>,
+    /// The walk's own scan context, which keeps an unfinished row's bytes
+    /// across a storage wait; `None` reads through the reader's shared
+    /// contexts, held only during each step.
+    context: Option<&'a Mutex<ScanContext>>,
     max_rows: usize,
     max_object_gets: u64,
 }
@@ -19134,7 +19137,7 @@ impl SpillWalkProgress {
     fn resume<'a>(
         &'a mut self,
         members: &'a mut [MemberCursor],
-        context: &'a Mutex<ScanContext>,
+        context: Option<&'a Mutex<ScanContext>>,
         max_rows: usize,
         max_object_gets: u64,
     ) -> SpillWalkResume<'a> {
@@ -19198,7 +19201,7 @@ impl CheckpointRowCursor {
             SpillOverlayMode::CommittedCheckpoint(&self.resident_rowids),
             Some(self.spill_progress.resume(
                 &mut self.members,
-                &self.scan_context,
+                Some(&self.scan_context),
                 max_rows,
                 max_object_gets,
             )),
@@ -19290,7 +19293,7 @@ impl CheckpointRowCursor {
             SpillOverlayMode::CommittedCheckpoint(&self.resident_rowids),
             Some(self.spill_progress.resume(
                 &mut self.members,
-                &self.scan_context,
+                Some(&self.scan_context),
                 max_rows,
                 max_object_gets,
             )),
@@ -37419,7 +37422,7 @@ impl Storage {
                     walk_id,
                     initialized,
                     pending_advance,
-                    core::slice::from_ref(context),
+                    context.map_or(&spill.scan_contexts[..], core::slice::from_ref),
                     max_rows,
                     max_object_gets,
                 )

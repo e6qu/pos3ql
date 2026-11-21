@@ -3710,7 +3710,12 @@ mod tests {
             let reader = if is_old { &mut old } else { &mut current };
             arena.reset();
             let row = crate::mem::guard::forbid_alloc(|| {
-                reader.next(&mut buffers, &metadata, &arena, None)
+                reader.next(
+                    crate::storage::CursorScratch::Reader(&mut buffers),
+                    &metadata,
+                    &arena,
+                    None,
+                )
             })
             .unwrap()
             .unwrap();
@@ -3725,14 +3730,24 @@ mod tests {
             assert_eq!(values, [Datum::Int4(expected_value)]);
         }
         assert!(
-            crate::mem::guard::forbid_alloc(|| current.next(&mut buffers, &metadata, &arena, None))
-                .unwrap()
-                .is_none()
+            crate::mem::guard::forbid_alloc(|| current.next(
+                crate::storage::CursorScratch::Reader(&mut buffers),
+                &metadata,
+                &arena,
+                None
+            ))
+            .unwrap()
+            .is_none()
         );
         assert!(
-            crate::mem::guard::forbid_alloc(|| old.next(&mut buffers, &metadata, &arena, None))
-                .unwrap()
-                .is_none()
+            crate::mem::guard::forbid_alloc(|| old.next(
+                crate::storage::CursorScratch::Reader(&mut buffers),
+                &metadata,
+                &arena,
+                None
+            ))
+            .unwrap()
+            .is_none()
         );
         old.close();
         current.close();

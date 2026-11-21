@@ -241,11 +241,14 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   executor below so the result-stream and cursor tests keep streaming.
 - [ ] *In progress:* a retained pull-based executor whose merge join, sort,
   hash and hash aggregate nodes keep their state between rows, as the retained
-  nested-loop and hash levels do. Index, index-only and bitmap scans read
-  their candidates through `CandidateCursor`, which resumes the candidate a
-  storage wait interrupted; the scan node still has to hold it, with the
-  chosen path's counts and `LIMIT` stop as node state. A `LATERAL`
-  subquery's rows become a subtree of the same plan.
+  nested-loop and hash levels do. A join's base relations already read
+  through its scan node (`PathScan`), which holds its sequential cursor or
+  its path's candidates, its filter, the chosen path's counts and its
+  `LIMIT` stop, and resumes a storage wait without counting twice; the
+  nested-loop, `Materialize`, hash, merge, `Memoize` and `Unique` nodes
+  above it still push rows in `join_exec.rs`, whose statement starts again
+  after a wait. A `LATERAL` subquery's rows become a subtree of the same
+  plan.
 - [x] `LATERAL` subqueries of one table planned by the search, with `Memoize`
   and exact `EXPLAIN ANALYZE` counters (`977`). A scan reading spilled rows
   decodes the columns a `LATERAL` body reads of it, so an aggregate over

@@ -25,7 +25,7 @@ use super::index_paths::joins::{
     ClauseList, JoinType, KEY_CLASS, KEY_DESCENDING, KEY_NULLS_FIRST, Keys, Member, PathKind,
     RELATION_NUMBERS, Relids,
 };
-use super::scan::{JoinRow, JoinRowValues, PaxFullRowReason, PaxReadDemand};
+use super::scan::{JoinRow, JoinRowValues, PaxReadDemand};
 use super::{QueryScope, arena_full};
 
 /// The plan node numbers of a join's nodes under `EXPLAIN ANALYZE`, past
@@ -1017,8 +1017,9 @@ struct Runner<'r, 'a> {
     built: &'a [core::cell::Cell<Option<Built<'a>>>],
     /// Each hash join's one-batch table, which a rescan probes again.
     frozen: &'a [core::cell::Cell<Option<Frozen<'a>>>],
-    /// Each base scan's planned path, planned once.
-    scans: &'a [core::cell::Cell<Option<super::index_paths::join_query::RelScan<'a>>>],
+    /// Each base scan's node, made at its first execution and rescanned
+    /// for each later one.
+    scan_nodes: &'r [core::cell::RefCell<Option<ScanRecord<'a>>>],
     /// Each `Memoize` node's cache.
     memos: &'r [core::cell::Cell<Option<MemoCache<'a>>>],
     /// The block the join's nodes count in.
@@ -1330,12 +1331,16 @@ pub(super) fn run_modeled<'a>(
             .map_err(|_| arena_full())?,
     )
     .as_slice_of_cells();
-    let scans = core::cell::Cell::from_mut(
-        arena
-            .alloc_slice_with(model.plan.paths.len(), |_| None)
-            .map_err(|_| arena_full())?,
-    )
-    .as_slice_of_cells();
+    // The plan's node records, in one `plan_build_bytes` lease.
+    let mut scan_nodes = storage
+        .plan_build()
+        .lease::<core::cell::RefCell<Option<ScanRecord<'a>>>>(model.plan.paths.len())
+        .map_err(node_pool_full)?;
+    for _ in 0..model.plan.paths.len() {
+        scan_nodes
+            .push_reserved(core::cell::RefCell::new(None))
+            .map_err(node_pool_full)?;
+    }
     let memos = arena
         .alloc_owned_slice_with(model.plan.paths.len(), |_| core::cell::Cell::new(None))
         .map_err(|_| arena_full())?;
@@ -1355,7 +1360,7 @@ pub(super) fn run_modeled<'a>(
     let runner = Runner {
         built,
         frozen,
-        scans,
+        scan_nodes: &scan_nodes,
         memos: &memos,
         block,
         storage,
@@ -1452,6 +1457,25 @@ pub(super) fn run_modeled<'a>(
         })
     })?;
     runner.check()
+}
+
+/// A base relation's scan node and the outer row its condition reads.
+struct ScanRecord<'a> {
+    node: super::scan::PathScan<'a>,
+    /// The relations whose values the scan's condition reads.
+    param: Relids,
+    /// Their bound values, flat by the query's FROM positions; the other
+    /// relations' values are NULL.
+    outer: &'a mut [Datum<'a>],
+}
+
+fn node_pool_full(error: crate::mem::lease_pool::LeaseError) -> SqlError {
+    crate::sql_err!(
+        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "a join's plan nodes exceed plan_build_bytes: {}",
+        error
+    )
+    .plan_build_exhausted()
 }
 
 /// The rows a materialized input holds: each one's base rows, by FROM
@@ -3158,33 +3182,64 @@ impl<'r, 'a> Runner<'r, 'a> {
         if let Some(lateral) = modeled.lateral.as_ref() {
             return self.lateral_scan(rel, lateral, bound, sink);
         }
-        let scan = match self.scans[id as usize].get() {
-            Some(scan) => scan,
-            None => {
-                let scan = modeled.scan(self.storage, self.txid, path, self.params, self.arena)?;
-                self.scans[id as usize].set(Some(scan));
-                scan
-            }
-        };
-        let single = QueryScope::resolve_exec(
-            self.storage,
-            modeled.from,
-            scan.condition,
-            self.txid,
-            self.arena,
-            self.params,
-            self.hooks.sequences,
-        )?;
+        let mut record = self.scan_nodes[id as usize].try_borrow_mut().map_err(|_| {
+            crate::sql_err!(
+                crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                "a join's scan ran inside itself"
+            )
+        })?;
+        // The scan's nodes and the rows it returns count in its relation's
+        // block.
+        let _block = super::instrument::enter_block(self.block.child(scan_segment(rel)));
+        if record.is_none() {
+            let scan = modeled.scan(self.storage, self.txid, path, self.params, self.arena)?;
+            let node = super::scan::PathScan::new(
+                self.storage,
+                self.txid,
+                modeled.from,
+                scan.condition,
+                scan.path,
+                self.arena,
+                self.params,
+                self.hooks,
+            )?;
+            let outer = self
+                .arena
+                .alloc_slice_with(self.width, |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            *record = Some(ScanRecord {
+                node,
+                param: scan.param,
+                outer,
+            });
+        }
+        let record = record.as_mut().expect("the scan's node was made");
+        let ScanRecord {
+            node,
+            param,
+            outer: outer_values,
+        } = record;
         // The bound rows of the relations the scan's join clauses read.
-        let outer_values;
         let outer_row;
-        let outer: Option<&dyn ColumnLookup<'a>> = if scan.param != Relids::EMPTY {
-            outer_values = self.outer_values(bound, scan.param)?;
+        let outer: Option<&dyn ColumnLookup<'a>> = if *param != Relids::EMPTY {
+            for table in 0..self.scope.n {
+                let start = self.offsets[table];
+                let width = self.scope.stored_width(table);
+                let slots = &mut outer_values[start..start + width];
+                match bound[table] {
+                    Some(row) if param.contains(table as u32) => {
+                        let columns = self.columns_of(row.values);
+                        slots[..columns.len()].copy_from_slice(columns);
+                        slots[columns.len()..].fill(Datum::Null);
+                    }
+                    _ => slots.fill(Datum::Null),
+                }
+            }
             outer_row = JoinRow {
                 scope: self.scope,
                 values: JoinRowValues::Flat {
-                    values: outer_values.0,
-                    offsets: outer_values.1,
+                    values: outer_values,
+                    offsets: self.offsets,
                 },
                 rowids: &[],
                 visible: self.scope.n,
@@ -3193,50 +3248,39 @@ impl<'r, 'a> Runner<'r, 'a> {
         } else {
             None
         };
-        let mut keep = true;
-        let _block = super::instrument::enter_block(self.block.child(scan_segment(rel)));
-        super::scan::scan_described_path(
-            self.storage,
-            &single,
-            modeled.from,
-            self.txid,
-            scan.condition,
-            self.arena,
-            self.params,
-            self.hooks,
-            outer,
-            PaxReadDemand::full_row(PaxFullRowReason::WildcardProjection),
-            scan.path,
-            &mut |row| {
-                let columns = row.table_values(0).unwrap_or(&[]);
-                let values = self
-                    .arena
-                    .alloc_slice_with(columns.len() + self.model.expressions.len(), |_| {
-                        Datum::Null
-                    })
-                    .map_err(|_| arena_full())?;
-                values[..columns.len()].copy_from_slice(columns);
-                // The relation's expression members, computed by its scan.
-                for (id, expression) in self.model.expressions.iter().enumerate() {
-                    if expression.of(rel) {
-                        values[columns.len() + id] = crate::sql::eval::eval_full(
-                            expression.expression,
-                            self.arena,
-                            self.params,
-                            row,
-                            self.hooks,
-                        )?;
-                    }
+        node.rescan();
+        while node.next(self.arena, self.params, self.hooks, outer)? {
+            let columns = node.values();
+            let values = self
+                .arena
+                .alloc_slice_with(columns.len() + self.model.expressions.len(), |_| {
+                    Datum::Null
+                })
+                .map_err(|_| arena_full())?;
+            values[..columns.len()].copy_from_slice(columns);
+            // The relation's expression members, computed by its scan.
+            let row = node.row();
+            for (id, expression) in self.model.expressions.iter().enumerate() {
+                if expression.of(rel) {
+                    values[columns.len() + id] = crate::sql::eval::eval_full(
+                        expression.expression,
+                        self.arena,
+                        self.params,
+                        &row,
+                        self.hooks,
+                    )?;
                 }
-                bound[rel] = Some(BaseRow {
-                    values,
-                    rowid: row.rowids.first().copied().flatten(),
-                });
-                keep = sink(bound)?;
-                Ok(keep)
-            },
-        )?;
-        Ok(keep)
+            }
+            bound[rel] = Some(BaseRow {
+                values,
+                rowid: node.rowid(),
+            });
+            if !sink(bound)? {
+                node.stop();
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Every row of path `id`, in its order.

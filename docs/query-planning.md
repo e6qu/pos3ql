@@ -276,12 +276,17 @@ plan needs more), each exposing its current row as per-relation slots that
 stay valid until its next advance, so no row grows the statement arena.
 Sort runs `tuplesort.c`'s port, HashAggregate drives `hashagg.rs`, and
 `EXPLAIN ANALYZE` counters live in the node records. Its scan node
+already reads a join's base relations: one record per plan path in a
+`plan_build_bytes` lease (`54000` naming the pool when it is full), which
 resumes mid-scan after a storage wait: sequential heap scans through
 `RowCursor`, and index, index-only and bitmap scans through
 `CandidateCursor`, which keeps its place in the path's candidates and
-reads each row under the snapshot captured when it opened. Built-in
-set-returning functions advance one row at a time (`FunctionRows`); a
-`LATERAL` subquery will run as a subtree of the same plan.
+reads each row under the snapshot captured when it opened. A rescan finds
+the candidates for the new outer row in the node's own storage, which grows
+to at most twice the most candidates one execution found; a row the scan's
+condition rejects releases its bytes. Built-in set-returning functions
+advance one row at a time (`FunctionRows`); a `LATERAL` subquery will run as
+a subtree of the same plan.
 
 ## Sorting, hashing and memory figures
 

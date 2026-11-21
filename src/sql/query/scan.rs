@@ -35,6 +35,9 @@ use super::{
     reorder_qual, simplify_qual, where_passes,
 };
 
+mod path_node;
+pub(crate) use path_node::PathScan;
+
 #[derive(Clone, Copy)]
 struct TableSamplePlan {
     method: TableSampleMethod,
@@ -1117,9 +1120,6 @@ pub(crate) struct IndexedCandidates<'a> {
     payload_mask: ColumnSet,
     keys: Option<&'a [IndexKeyCandidate]>,
     encoded_keys: &'a [u8],
-    /// The candidates hold every row the chosen path's index conditions
-    /// reach, so `EXPLAIN ANALYZE` counts the path over them.
-    reaches_path: bool,
 }
 
 /// The `AND` of an index or index-only scan's index conditions, or of a
@@ -4133,7 +4133,6 @@ fn ranked_knn_candidates<'a>(
             payload_mask: storage.value_binding_include_mask(slot, plan.binding),
             keys: Some(&[]),
             encoded_keys: &[],
-            reaches_path: false,
         }));
     }
     let origin_bounds = crate::sql::geometry::index_bounds(origin)?;
@@ -4318,7 +4317,6 @@ fn ranked_knn_candidates<'a>(
         payload_mask: storage.value_binding_include_mask(slot, plan.binding),
         keys: Some(keys),
         encoded_keys: encoded,
-        reaches_path: false,
     }))
 }
 
@@ -4379,7 +4377,6 @@ fn indexed_candidates_for_plan<'a>(
                     payload_mask: storage.value_binding_include_mask(slot, plan.binding),
                     keys: None,
                     encoded_keys: &[],
-                    reaches_path: false,
                 }));
             }
             if is_inclusion_operator(constraint.operator) {
@@ -4934,7 +4931,6 @@ fn indexed_candidates_for_plan<'a>(
         payload_mask: storage.value_binding_include_mask(slot, plan.binding),
         keys: ordered_keys,
         encoded_keys: retained_key_bytes,
-        reaches_path: false,
     }))
 }
 
@@ -6494,46 +6490,6 @@ pub(super) fn scan_source_with_pax_columns<'a>(
         pax_demand,
         None,
         true,
-        None,
-        f,
-    )
-}
-
-/// The scan of one relation by `planned`, the path the running query's
-/// shape describes (a join's base relation, [`super::join_exec`]), planned
-/// once for every rescan: pos3ql's own lookups of an outer row's key never
-/// replace that path, whose order and counts are PostgreSQL's.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn scan_described_path<'a>(
-    storage: &'a Storage,
-    scope: &QueryScope<'a>,
-    from: &'a FromClause<'a>,
-    txid: u32,
-    where_clause: Option<&'a Expr<'a>>,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    hooks: &EvalHooks<'_, 'a>,
-    outer: Option<&dyn ColumnLookup<'a>>,
-    pax_demand: PaxReadDemand,
-    planned: super::index_paths::ScanPath<'a>,
-    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
-) -> Result<(), SqlError> {
-    scan_source_mode(
-        storage,
-        scope,
-        from,
-        txid,
-        where_clause,
-        arena,
-        params,
-        hooks,
-        outer,
-        false,
-        None,
-        pax_demand,
-        None,
-        false,
-        Some(planned),
         f,
     )
 }
@@ -6569,7 +6525,6 @@ pub(super) fn scan_source_recycling_with_pax_columns<'a>(
         pax_demand,
         None,
         true,
-        None,
         f,
     )
 }
@@ -6606,7 +6561,6 @@ pub(super) fn scan_source_recycling_retaining_match_with_pax_columns<'a>(
         pax_demand,
         None,
         true,
-        None,
         f,
     )
 }
@@ -6645,7 +6599,6 @@ pub(super) fn scan_source_recycling_with_indexed_candidates<'a>(
         pax_demand,
         Some(indexed),
         false,
-        None,
         f,
     )
 }
@@ -8041,66 +7994,47 @@ struct ChosenScanCounts {
     visible_pages: u64,
 }
 
-thread_local! {
-    static CHOSEN_SCAN: core::cell::Cell<Option<ChosenScanCounts>> =
-        const { core::cell::Cell::new(None) };
+/// What the leaf of one scan of a single relation counts and stops by: the
+/// chosen path's counts of the rows it reaches, and the rows a `LIMIT`
+/// still takes from an ordered scan. Each scan holds its own, so a scan a
+/// row's evaluation runs inside it neither sees nor changes them.
+struct ScanLeaf {
+    counts: core::cell::Cell<Option<ChosenScanCounts>>,
+    stop_after: core::cell::Cell<Option<u64>>,
 }
 
-thread_local! {
-    /// The rows a `LIMIT` still takes from the running ordered scan.
-    static STOP_AFTER: core::cell::Cell<Option<(usize, u64)>> =
-        const { core::cell::Cell::new(None) };
-}
-
-/// Restores the enclosing scan's row limit when an ordered scan ends.
-struct StopAfterScope(Option<(usize, u64)>);
-
-impl StopAfterScope {
-    /// The scan of the table in `slot` stops after `rows` rows.
-    fn enter(slot: usize, rows: Option<u64>) -> Self {
-        let limit = rows.filter(|&rows| rows > 0).map(|rows| (slot, rows));
-        Self(STOP_AFTER.with(|stop| stop.replace(limit)))
-    }
-}
-
-/// Whether the ordered scan of the table in `slot` has returned the last
-/// row its `LIMIT` takes, counting the one just returned.
-fn limit_reached(slot: usize) -> bool {
-    STOP_AFTER.with(|stop| match stop.get() {
-        Some((owner, 1)) if owner == slot => true,
-        Some((owner, rows)) if owner == slot => {
-            stop.set(Some((owner, rows - 1)));
-            false
+impl ScanLeaf {
+    const fn new() -> Self {
+        Self {
+            counts: core::cell::Cell::new(None),
+            stop_after: core::cell::Cell::new(None),
         }
-        _ => false,
-    })
-}
-
-impl Drop for StopAfterScope {
-    fn drop(&mut self) {
-        STOP_AFTER.with(|stop| stop.set(self.0));
     }
-}
 
-/// Restores the enclosing scan's counts when a scan of one relation ends.
-struct ChosenScanScope(Option<ChosenScanCounts>);
-
-impl ChosenScanScope {
-    fn enter(counts: Option<ChosenScanCounts>) -> Self {
-        Self(CHOSEN_SCAN.with(|chosen| chosen.replace(counts)))
+    /// The ordered scan stops after `rows` rows.
+    fn stop_after(&self, rows: Option<u64>) {
+        self.stop_after.set(rows.filter(|&rows| rows > 0));
     }
-}
 
-impl Drop for ChosenScanScope {
-    fn drop(&mut self) {
-        CHOSEN_SCAN.with(|chosen| chosen.set(self.0));
+    /// Whether the ordered scan has returned the last row its `LIMIT`
+    /// takes, counting the one just returned.
+    fn limit_reached(&self) -> bool {
+        match self.stop_after.get() {
+            Some(1) => true,
+            Some(rows) => {
+                self.stop_after.set(Some(rows - 1));
+                false
+            }
+            None => false,
+        }
     }
 }
 
 /// Whether the row the leaf of a one-relation scan checks is one the
-/// chosen path's index conditions reach, counting what the path reads for
-/// it.
-fn chosen_scan_reaches<'a>(
+/// chosen path whose counts are `counts` reaches, counting what the path
+/// reads for it.
+fn chosen_path_reaches<'a>(
+    counts: Option<ChosenScanCounts>,
     rowid: Option<u64>,
     passed: bool,
     arena: &'a Arena,
@@ -8108,7 +8042,7 @@ fn chosen_scan_reaches<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<bool, SqlError> {
-    let Some(counts) = CHOSEN_SCAN.with(core::cell::Cell::get) else {
+    let Some(counts) = counts else {
         return Ok(true);
     };
     // SAFETY: the conditions and the tree are the scan's own, in its arena;
@@ -8557,8 +8491,8 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
             }
             None => true,
         };
-        let _chosen_scope = ChosenScanScope::enter(member.counts);
-        if chosen_scan_reaches(
+        if chosen_path_reaches(
+            member.counts,
             Some(rowid),
             passed,
             self.arena,
@@ -8679,8 +8613,8 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
                 member.head = at;
                 return Ok(Some(at));
             }
-            let _chosen_scope = ChosenScanScope::enter(member.counts);
-            if chosen_scan_reaches(
+            if chosen_path_reaches(
+                member.counts,
                 Some(member.rows[at]),
                 false,
                 self.arena,
@@ -8714,8 +8648,8 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
             inner: &row,
             outer: self.outer,
         };
-        let _chosen_scope = ChosenScanScope::enter(member.counts);
-        chosen_scan_reaches(
+        chosen_path_reaches(
+            member.counts,
             Some(rowid),
             true,
             self.arena,
@@ -9046,12 +8980,38 @@ fn sort_by_index_key<'a>(
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let slot = scope.slots[0];
+    let order = index_key_permutation(storage, scope, txid, path, rows.len(), arena, |position| {
+        let row = rows[position].expect("row snapshots are initialized");
+        storage.row_bytes(slot, row.rowid(), row.read()?, arena)
+    })?;
+    let original = arena
+        .alloc_slice_with(rows.len(), |position| rows[position])
+        .map_err(|_| arena_full())?;
+    for (position, &from) in order.iter().enumerate() {
+        rows[position] = original[from];
+    }
+    Ok(())
+}
+
+/// The order in which the index scan of `path` reads `count` rows given in
+/// row identity order, `row` reading each one's bytes: by the index keys in
+/// the index's order, equal keys by identity.
+fn index_key_permutation<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    txid: u32,
+    path: &super::index_paths::ScanPath<'a>,
+    count: usize,
+    arena: &'a Arena,
+    mut row: impl FnMut(usize) -> Result<&'a [u8], SqlError>,
+) -> Result<&'a [usize], SqlError> {
+    let slot = scope.slots[0];
     let definition = scope.defs.stored(0).expect("a chosen path scans a table");
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     let n_columns = definition.schema(&mut schema);
     let width = path.keys.len();
     let values = arena
-        .alloc_slice_with(rows.len() * width, |_| Datum::Null)
+        .alloc_slice_with(count * width, |_| Datum::Null)
         .map_err(|_| arena_full())?;
     let reader = super::index_paths::KeyReader::new(
         storage,
@@ -9061,9 +9021,8 @@ fn sort_by_index_key<'a>(
         path.keys,
         arena,
     )?;
-    for (position, row) in rows.iter().enumerate() {
-        let row = row.expect("row snapshots are initialized");
-        let bytes = storage.row_bytes(slot, row.rowid(), row.read()?, arena)?;
+    for position in 0..count {
+        let bytes = row(position)?;
         let mut decoded = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
         for at in 0..width {
@@ -9078,7 +9037,7 @@ fn sort_by_index_key<'a>(
             )?;
         }
     }
-    let order = index_key_order(
+    index_key_order(
         storage,
         txid,
         definition,
@@ -9087,14 +9046,7 @@ fn sort_by_index_key<'a>(
         path.deduplicated,
         values,
         arena,
-    )?;
-    let original = arena
-        .alloc_slice_with(rows.len(), |position| rows[position])
-        .map_err(|_| arena_full())?;
-    for (position, &from) in order.iter().enumerate() {
-        rows[position] = original[from];
-    }
-    Ok(())
+    )
 }
 
 /// The order in which an index scan of the index `keys` (read `backward`
@@ -9262,7 +9214,6 @@ fn scan_source_mode<'a>(
     pax_demand: PaxReadDemand,
     indexed_override: Option<&IndexedCandidates<'a>>,
     automatic_index: bool,
-    planned: Option<super::index_paths::ScanPath<'a>>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     // A parenthesized join whose query waits is read only by the join
@@ -9278,6 +9229,7 @@ fn scan_source_mode<'a>(
     if !one_time_filter_passes(where_clause, scope, arena, params, hooks, outer)? {
         return Ok(());
     }
+    let leaf = ScanLeaf::new();
     let sample_plans = arena
         .alloc_slice_with(scope.n, |_| None::<TableSamplePlan>)
         .map_err(|_| arena_full())?;
@@ -10638,7 +10590,7 @@ fn scan_source_mode<'a>(
         recycle_rows: bool,
         retain_match: Option<&core::cell::Cell<bool>>,
         pax_demand: PaxReadDemand,
-        planned: Option<super::index_paths::ScanPath<'a>>,
+        leaf: &ScanLeaf,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
@@ -10658,7 +10610,15 @@ fn scan_source_mode<'a>(
                 let chained_row = Chained { inner: &row, outer };
                 if !where_passes(w, arena, params, &chained_row, hooks)? {
                     if scope.n != 1
-                        || chosen_scan_reaches(rowid, false, arena, params, &chained_row, hooks)?
+                        || chosen_path_reaches(
+                            leaf.counts.get(),
+                            rowid,
+                            false,
+                            arena,
+                            params,
+                            &chained_row,
+                            hooks,
+                        )?
                     {
                         count_leaf(depth_nodes, false);
                     }
@@ -10667,12 +10627,20 @@ fn scan_source_mode<'a>(
             }
             if scope.n == 1 {
                 let chained_row = Chained { inner: &row, outer };
-                chosen_scan_reaches(rowid, true, arena, params, &chained_row, hooks)?;
+                chosen_path_reaches(
+                    leaf.counts.get(),
+                    rowid,
+                    true,
+                    arena,
+                    params,
+                    &chained_row,
+                    hooks,
+                )?;
             }
             count_leaf(depth_nodes, true);
             let keep = f(&row)?;
             // An ordered scan under a `LIMIT` ends with the limit's rows.
-            let stop = scope.n == 1 && limit_reached(scope.slots[0]);
+            let stop = scope.n == 1 && leaf.limit_reached();
             return Ok(keep && !stop);
         }
         // One execution of this depth's scan, or of the materialized copy a
@@ -10781,7 +10749,7 @@ fn scan_source_mode<'a>(
                                 recycle_rows,
                                 retain_match,
                                 pax_demand,
-                                planned,
+                                leaf,
                                 f,
                             )?,
                         );
@@ -10818,7 +10786,7 @@ fn scan_source_mode<'a>(
                         recycle_rows,
                         retain_match,
                         pax_demand,
-                        planned,
+                        leaf,
                         f,
                     )
                     .map(|keep| filter_join_resumed(depth + 1, keep))
@@ -11305,7 +11273,7 @@ fn scan_source_mode<'a>(
                         None
                     };
                     if let Some(tree) = tree {
-                        let _stop_after = StopAfterScope::enter(slot, tree.stop_after);
+                        leaf.stop_after(tree.stop_after);
                         let scan = TreeScan::new(
                             storage,
                             txid,
@@ -11368,11 +11336,7 @@ fn scan_source_mode<'a>(
                                         member.node
                                     },
                                 );
-                                let _chosen_scope = ChosenScanScope::enter(if sorted {
-                                    None
-                                } else {
-                                    member.counts
-                                });
+                                leaf.counts.set(if sorted { None } else { member.counts });
                                 let this = index;
                                 index += 1;
                                 recycled(arena, recycle_rows, retain_match, || {
@@ -11573,12 +11537,8 @@ fn scan_source_mode<'a>(
                     && hashed.is_none()
                     && (!ordered_access || instrument::active())
                 {
-                    match (
-                        planned,
-                        super::index_paths::running_query(slot, where_clause),
-                    ) {
-                        (Some(path), _) => Some(path),
-                        (None, Some((shape, needed))) => super::index_paths::scan_path(
+                    match super::index_paths::running_query(slot, where_clause) {
+                        Some((shape, needed)) => super::index_paths::scan_path(
                             storage,
                             scope,
                             txid,
@@ -11589,15 +11549,13 @@ fn scan_source_mode<'a>(
                             shape,
                         )?
                         .chosen(),
-                        (None, None) => None,
+                        None => None,
                     }
                 } else {
                     None
                 };
                 let chosen = described.filter(|_| !ordered_access);
-                let access = access.filter(|access| {
-                    chosen.is_none() || !instrument::active() || access.reaches_path
-                });
+                let access = access.filter(|_| chosen.is_none() || !instrument::active());
                 let candidates = access.map(|access| access.rowids).or(hashed);
                 let index_order = match chosen {
                     Some(path) => path.kind != super::index_paths::ScanKind::Seq,
@@ -11614,12 +11572,11 @@ fn scan_source_mode<'a>(
                             | super::index_paths::ScanKind::IndexOnly
                     )
                 });
-                let _stop_after =
-                    StopAfterScope::enter(slot, chosen.and_then(|path| path.stop_after));
+                leaf.stop_after(chosen.and_then(|path| path.stop_after));
                 let _bitmap_loop;
                 let _tree_loops;
                 let counted = chosen.or(described);
-                let _chosen_scope = match counted {
+                leaf.counts.set(match counted {
                     Some(path) if instrument::active() => {
                         use super::index_paths::ScanKind;
                         let bitmap = if path.kind == ScanKind::Bitmap {
@@ -11641,7 +11598,7 @@ fn scan_source_mode<'a>(
                             })
                             .map_err(|_| arena_full())?;
                         _tree_loops = instrument::Loops::start(tree_nodes);
-                        Some(ChosenScanScope::enter(Some(chosen_scan_counts(
+                        Some(chosen_scan_counts(
                             storage,
                             txid,
                             slot,
@@ -11654,10 +11611,10 @@ fn scan_source_mode<'a>(
                                 &[]
                             },
                             arena,
-                        )?)))
+                        )?)
                     }
-                    _ => Some(ChosenScanScope::enter(None)),
-                };
+                    _ => None,
+                });
                 // Saved rows stream in physical order unless the chosen path
                 // orders several rows otherwise.
                 if candidates.is_none()
@@ -11753,12 +11710,12 @@ fn scan_source_mode<'a>(
                 // and fetch one row at a time so LIMIT can stop before unrelated
                 // object-resident table rows are point-read.
                 if let Some(access) = access.filter(|access| access.preserves_order) {
-                    let mut cursor =
-                        crate::storage::CandidateCursor::open(storage, slot, txid, access.rowids);
+                    let mut cursor = crate::storage::CandidateCursor::open(storage, slot, txid);
+                    let candidates = crate::storage::Candidates::Rowids(access.rowids);
                     loop {
                         // A recycled row's bytes go with it.
                         let mark = arena.mark();
-                        let Some(row) = cursor.next(storage, arena)? else {
+                        let Some(row) = cursor.next(storage, arena, candidates)? else {
                             break;
                         };
                         storage.record_relation_tuple_read(
@@ -11837,15 +11794,11 @@ fn scan_source_mode<'a>(
                         });
                     }
                 }
-                let mut cursor = crate::storage::CandidateCursor::open_selected(
-                    storage,
-                    slot,
-                    txid,
-                    &ordered[..fill],
-                );
+                let mut cursor = crate::storage::CandidateCursor::open(storage, slot, txid);
+                let candidates = crate::storage::Candidates::Selected(&ordered[..fill]);
                 loop {
                     let mark = arena.mark();
-                    let Some(row) = cursor.next(storage, arena)? else {
+                    let Some(row) = cursor.next(storage, arena, candidates)? else {
                         break;
                     };
                     if hashed.is_none() {
@@ -11912,7 +11865,7 @@ fn scan_source_mode<'a>(
                     recycle_rows,
                     retain_match,
                     pax_demand,
-                    planned,
+                    leaf,
                     f,
                 )?,
             ) {
@@ -12103,43 +12056,6 @@ fn scan_source_mode<'a>(
 
     let automatic_indexed = if sample_plans.iter().any(Option::is_some) {
         None
-    } else if let Some(path) = planned {
-        // A join's described scan reads only the rows an index finds for
-        // its outer row's keys, a superset its conditions filter, in the
-        // order its path gives them. `EXPLAIN ANALYZE` counts the path's
-        // own reads: it reads the rows an index finds for the path's own
-        // index conditions, every row they reach among them.
-        if instrument::active() {
-            match path_index_conditions(&path, arena)? {
-                Some(conditions) => indexed_candidates(
-                    storage,
-                    scope,
-                    txid,
-                    Some(conditions),
-                    arena,
-                    params,
-                    hooks,
-                    outer,
-                )?
-                .map(|candidates| IndexedCandidates {
-                    reaches_path: true,
-                    ..candidates.unordered()
-                }),
-                None => None,
-            }
-        } else {
-            indexed_candidates(
-                storage,
-                scope,
-                txid,
-                where_clause,
-                arena,
-                params,
-                hooks,
-                outer,
-            )?
-            .map(IndexedCandidates::unordered)
-        }
     } else if automatic_index {
         indexed_candidates(
             storage,
@@ -12429,7 +12345,7 @@ fn scan_source_mode<'a>(
             recycle_rows,
             retain_match,
             pax_demand,
-            planned,
+            &leaf,
             f,
         )?;
     }
@@ -12552,7 +12468,7 @@ fn scan_source_mode<'a>(
                     recycle_rows,
                     retain_match,
                     pax_demand,
-                    planned,
+                    &leaf,
                     f,
                 )
             };

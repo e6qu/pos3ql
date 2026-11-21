@@ -2,6 +2,10 @@
 //! path returns them. A storage wait leaves the position on the candidate it
 //! was reading, so the same call after the wait resumes that row; rows
 //! already returned are never read again.
+//!
+//! The cursor holds only its position and snapshot: the caller owns the
+//! candidates and passes the same ones to every call, so a plan node can keep
+//! them in its own storage across waits and rescans.
 
 use super::*;
 use crate::storage::row_images::OrderedRowSnapshot;
@@ -15,72 +19,61 @@ pub(crate) struct CandidateRow<'a> {
     pub(crate) bytes: &'a [u8],
 }
 
-/// The candidates of one index, index-only or bitmap scan and how far it
-/// has read them. Visibility is fixed when the cursor opens: the command
-/// and commit snapshots are captured then, as a scan's snapshot is.
-pub(crate) struct CandidateCursor<'s, 'a> {
+/// The candidates one cursor reads.
+#[derive(Clone, Copy)]
+pub(crate) enum Candidates<'c, 's, 'a> {
+    /// Row identities, each resolved under the cursor's snapshot as it is
+    /// read.
+    Rowids(&'c [u64]),
+    /// Versions a table snapshot already selected, in scan order.
+    Selected(&'c [Option<OrderedRowSnapshot<'s, 'a>>]),
+}
+
+impl Candidates<'_, '_, '_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Rowids(rowids) => rowids.len(),
+            Self::Selected(selected) => selected.len(),
+        }
+    }
+}
+
+/// How far one index, index-only or bitmap scan has read its candidates.
+/// Visibility is fixed when the cursor opens: the command and commit
+/// snapshots are captured then, as a scan's snapshot is.
+pub(crate) struct CandidateCursor {
     table: usize,
     txid: u32,
     command: u32,
     commit: u64,
-    candidates: Candidates<'s, 'a>,
     next: usize,
 }
 
-enum Candidates<'s, 'a> {
-    /// Row identities, each resolved under the cursor's snapshot as it is
-    /// read.
-    Rowids(&'a [u64]),
-    /// Versions a table snapshot already selected, in scan order.
-    Selected(&'a [Option<OrderedRowSnapshot<'s, 'a>>]),
-}
-
-impl<'s, 'a> CandidateCursor<'s, 'a> {
-    /// Opens on `rowids`, the candidates in their scan order. Nothing is read.
-    pub(crate) fn open(storage: &Storage, table: usize, txid: u32, rowids: &'a [u64]) -> Self {
-        Self::with(storage, table, txid, Candidates::Rowids(rowids))
-    }
-
-    /// Opens on versions `selected` already chose, in their scan order.
-    pub(crate) fn open_selected(
-        storage: &Storage,
-        table: usize,
-        txid: u32,
-        selected: &'a [Option<OrderedRowSnapshot<'s, 'a>>],
-    ) -> Self {
-        Self::with(storage, table, txid, Candidates::Selected(selected))
-    }
-
-    fn with(storage: &Storage, table: usize, txid: u32, candidates: Candidates<'s, 'a>) -> Self {
+impl CandidateCursor {
+    /// Opens before the first candidate. Nothing is read.
+    pub(crate) fn open(storage: &Storage, table: usize, txid: u32) -> Self {
         Self {
             table,
             txid,
             command: storage.read_snapshot(),
             commit: storage.commit_snapshot(),
-            candidates,
             next: 0,
         }
     }
 
-    fn len(&self) -> usize {
-        match self.candidates {
-            Candidates::Rowids(rowids) => rowids.len(),
-            Candidates::Selected(selected) => selected.len(),
-        }
-    }
-
-    /// The next candidate the snapshot sees, its bytes copied into `arena`.
-    /// A failed read, a storage wait among them, keeps the position and
-    /// releases what the read allocated.
+    /// The next of `candidates` the snapshot sees, its bytes copied into
+    /// `arena`. A failed read, a storage wait among them, keeps the position
+    /// and releases what the read allocated.
     pub(crate) fn next<'arena>(
         &mut self,
         storage: &Storage,
         arena: &'arena Arena,
+        candidates: Candidates<'_, '_, '_>,
     ) -> Result<Option<CandidateRow<'arena>>, SqlError> {
-        while self.next < self.len() {
+        while self.next < candidates.len() {
             crate::sql::query::check_timeout()?;
             let mark = arena.mark();
-            match self.read(storage, arena) {
+            match self.read(storage, arena, candidates) {
                 Ok(read) => {
                     let position = self.next;
                     self.next += 1;
@@ -106,8 +99,9 @@ impl<'s, 'a> CandidateCursor<'s, 'a> {
         &self,
         storage: &Storage,
         arena: &'arena Arena,
+        candidates: Candidates<'_, '_, '_>,
     ) -> Result<Option<(u64, &'arena [u8])>, SqlError> {
-        let rowid = match self.candidates {
+        let rowid = match candidates {
             Candidates::Rowids(rowids) => rowids[self.next],
             Candidates::Selected(selected) => {
                 let Some(row) = selected[self.next] else {

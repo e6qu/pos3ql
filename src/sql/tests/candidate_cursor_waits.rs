@@ -5,7 +5,7 @@
 use super::object_reads::{advance, read_request, replace_uncached_blocks, reply};
 use super::*;
 use crate::sql::types::ColType;
-use crate::storage::{CandidateCursor, rowenc};
+use crate::storage::{CandidateCursor, Candidates, rowenc};
 use std::net::TcpListener;
 use std::time::Instant;
 
@@ -36,7 +36,7 @@ fn read_all(
         let _snapshot = engine
             .storage
             .nested_statement_snapshot(engine.storage.lsn());
-        CandidateCursor::open(&engine.storage, table, 0, candidates)
+        CandidateCursor::open(&engine.storage, table, 0)
     };
     let owner = ExecutionIdentity::new(41, engine.execution_identity().database_oid).read_owner();
     let mut ids = Vec::new();
@@ -46,7 +46,9 @@ fn read_all(
         advance(engine);
         let used = output.used();
         let prior = engine.replace_read_owner(Some(owner));
-        let result = crate::mem::guard::forbid_alloc(|| cursor.next(&engine.storage, &output));
+        let result = crate::mem::guard::forbid_alloc(|| {
+            cursor.next(&engine.storage, &output, Candidates::Rowids(candidates))
+        });
         let _ = engine.replace_read_owner(prior);
         match result {
             Ok(Some(row)) => {

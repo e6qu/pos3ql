@@ -1627,7 +1627,12 @@ fn next_source_row<'a>(
 ) -> Result<Option<RetainedRow<'a>>, SqlError> {
     match source {
         RetainedSource::Physical(source) => source
-            .next(buffers, state_arena, state_arena, decoded_columns)
+            .next(
+                crate::storage::CursorScratch::Reader(buffers),
+                state_arena,
+                state_arena,
+                decoded_columns,
+            )
             .map(|row| row.map(RetainedRow::Physical)),
         RetainedSource::Singleton { available } => {
             Ok(core::mem::replace(available, false).then_some(RetainedRow::Singleton))

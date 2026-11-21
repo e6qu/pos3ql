@@ -1523,11 +1523,22 @@ fn pax_column_demand_bounded(
         });
         complete
     }
-    if !collect_table_function_arguments(&from.base, scope, &mut columns)
+    // A `LATERAL` item's body runs per row of the items to its left, so the
+    // columns it reads of them are this scan's demand, as a function item's
+    // arguments are.
+    let item_demand = |table: usize, item: &TableRef, columns: &mut PaxColumnDemand| {
+        if scope.lateral[table] {
+            collect_table(item, scope, columns)
+        } else {
+            collect_table_function_arguments(item, scope, columns)
+        }
+    };
+    if !item_demand(0, &from.base, &mut columns)
         || from
             .joins
             .iter()
-            .any(|join| !collect_table_function_arguments(&join.table, scope, &mut columns))
+            .enumerate()
+            .any(|(index, join)| !item_demand(index + 1, &join.table, &mut columns))
     {
         return None;
     }

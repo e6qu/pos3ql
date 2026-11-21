@@ -214,15 +214,25 @@ search out of such joins. Merge joins sort with PostgreSQL's quicksort and
 replay a `Materialize`'s mark and restore (`910`); a merge join reads an index
 scan in order as far as it fetches (`945`).
 
-**Capacities.** The search plans up to 128 relations, 256 conditions, 64
-equivalence classes of up to 255 members, 32 clauses of one join and 65,535
-clauses, in the statement arena (`sql_arena_bytes`); past any of them a query
-fails with `54000` naming the capacity. Paths take 288 bytes each. A
-relation with a btree index holds 16 join parameters, so an indexed relation
-equated with more than 16 others fails with `54000`. `EXPLAIN` of a
-64-relation `USING` chain takes about 4 MB of the arena and a 128-relation
-chain's GEQO search about 8 MB. Queries of more than 128 relations run
-pos3ql's own join order.
+**Capacities.** The startup setting `max_join_relations` (2 to 255, default
+128) sets how many relations one query's search plans; a query of more fails
+with `54000` naming the setting, where PostgreSQL would plan it. Each
+relation of the setting adds two conditions to the query's capacity (256 at
+the default). The search also holds 64 equivalence classes of up to 255
+members, 32 clauses of one join and 65,535 clauses; past any of them a query
+fails with `54000` naming the capacity. Everything else it holds per
+relation, join tree node, condition or join parameter (an indexed
+relation's columns equated with other relations') is sized by the query and
+taken from the statement arena (`sql_arena_bytes`), which a query too large
+for it exhausts with `54000`. `EXPLAIN` of a 64-relation `USING` chain takes
+about 4 MB of the arena and a 128-relation chain's GEQO search about 8 MB;
+the GEQO search keeps memory per tour it evaluates, so at the default 32 MiB
+arena a 140-relation chain plans (`978`) and a 150-relation one fails with
+`54000`. A chain of left joins holds one equivalence class per join clause,
+so more than 64 of them fail with `54000`. The genetic search's pool,
+`(500 + 2) * (max_join_relations + 1)` four-byte genes plus an edge table
+(about 260 KB at the default, 520 KB at 255), is reserved at startup and
+shared by the server's connections one search at a time.
 
 **Outside the search** (never-analyzed tables, row locks, and the shapes
 listed in [PLAN.md](../PLAN.md#close-application-compatibility-gaps)), pos3ql

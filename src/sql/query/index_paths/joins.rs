@@ -15,18 +15,20 @@
 //! <https://github.com/postgres/postgres/blob/REL_18_6/src/backend/optimizer/path/joinpath.c>
 //! <https://github.com/postgres/postgres/blob/REL_18_6/src/backend/optimizer/path/costsize.c>
 
-use crate::mem::arena::{Arena, ArenaChunks, ArenaList};
+use crate::mem::arena::{Arena, ArenaChunks, ArenaList, OwnedArenaSlice};
 use crate::sql::eval::SqlError;
 
 use super::{Costs, clamp_row_est};
 
 mod geqo;
-pub(crate) use geqo::GeqoSettings;
+pub(crate) use geqo::{GeqoSettings, JoinSearchPool};
 
-/// Base relations of one modeled query. Its join problems are split by
+/// Base relations a query can number: relation numbers are bytes. The
+/// startup setting `max_join_relations` sets how many one query plans,
+/// at most this many. Its join problems are split by
 /// `join_collapse_limit` and `from_collapse_limit` and each is searched
 /// exhaustively or, from `geqo_threshold` on, genetically.
-pub(crate) const MAX_JOIN_RELS: usize = 128;
+pub(crate) const RELATION_NUMBERS: usize = u8::MAX as usize;
 /// Members of one equivalence class, numbered by `u8`; the members
 /// themselves live in the statement arena.
 pub(crate) const MAX_MEMBERS: usize = u8::MAX as usize;
@@ -47,9 +49,9 @@ const SEARCH_CHUNK: usize = 128;
 /// (PostgreSQL's join relids), each at [`OJ_SHIFT`] past its number.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
 pub(crate) struct Relids([u64; RELIDS_WORDS]);
-const RELIDS_WORDS: usize = 2 * MAX_JOIN_RELS / 64;
+const RELIDS_WORDS: usize = 2 * (RELATION_NUMBERS + 1) / 64;
 /// The first outer join's bit.
-pub(crate) const OJ_SHIFT: u32 = MAX_JOIN_RELS as u32;
+pub(crate) const OJ_SHIFT: u32 = RELATION_NUMBERS as u32 + 1;
 /// The base relations' bits of a [`Relids`].
 pub(crate) const BASE_RELIDS: Relids = Relids::below(OJ_SHIFT);
 
@@ -331,6 +333,10 @@ impl<'a> EquivalenceClass<'a> {
 
 /// How a join clause compares its sides.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "held by value in the search's clause list, never boxed; members carry relation sets"
+)]
 pub(crate) enum ClauseForm {
     /// `left = right` of two members of an equivalence class: mergeable
     /// and hashable.
@@ -1135,6 +1141,8 @@ pub(crate) struct UpperPlan {
 
 /// The join problem.
 pub(crate) struct JoinProblem<'p> {
+    /// The startup reservation the search plans within.
+    pub(crate) pool: &'p JoinSearchPool,
     pub(crate) rels: &'p [BaseRel<'p>],
     pub(crate) classes: &'p [EquivalenceClass<'p>],
     /// The outer, semi and anti joins (`join_info_list`).
@@ -1187,7 +1195,7 @@ struct Search<'p, 'a, 's> {
     rel_buckets: &'a mut [u32],
     /// The joinrels of each level of the current problem in the order they
     /// were built; its items are the first level (`initial_rels`).
-    levels: [ArenaList<'a, Relids>; MAX_JOIN_RELS + 1],
+    levels: OwnedArenaSlice<'a, ArenaList<'a, Relids>>,
     /// A shape outside the model met while generating paths.
     outside: Option<Outside>,
     /// Each Memoize path's `cost_memoize_rescan`.
@@ -1228,8 +1236,11 @@ pub(crate) fn search<'a>(
     } else {
         2
     };
-    if !(least..=MAX_JOIN_RELS).contains(&n) {
-        return Ok(Err("a join of more relations than the join search holds"));
+    if n < least {
+        return Ok(Err("a join of fewer relations than the join search plans"));
+    }
+    if n > problem.pool.max_relations() {
+        return Err(too_many_relations(n, problem.pool.max_relations()));
     }
     if problem.clauses.len() > MAX_CLAUSES {
         return Err(too_many_clauses());
@@ -1245,7 +1256,9 @@ pub(crate) fn search<'a>(
         member_keys: ArenaList::new(arena),
         rels: ArenaChunks::new(arena, SEARCH_CHUNK),
         rel_buckets: arena_slice(arena, REL_BUCKETS, |_| NO_REL)?,
-        levels: core::array::from_fn(|_| ArenaList::new(arena)),
+        levels: arena
+            .alloc_owned_slice_with(n + 1, |_| ArenaList::new(arena))
+            .map_err(|_| arena_full())?,
         outside: None,
         memoize_rescans: ArenaList::new(arena),
         param_rows: ArenaList::new(arena),
@@ -1354,7 +1367,9 @@ pub(crate) fn search<'a>(
         if items.len() < 2 {
             continue;
         }
-        search.levels = core::array::from_fn(|_| ArenaList::new(arena));
+        for level in search.levels.iter_mut() {
+            *level = ArenaList::new(arena);
+        }
         for &item in items {
             // A lower problem's relation, with the outer joins it performs.
             let relids = search.rel(item).relids;
@@ -1648,7 +1663,16 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             self.rel_buckets[bucket] = rel.next;
         }
         self.rels.truncate(saved.rels);
-        let mut kept = [(0usize, None::<(Path, [Member; MAX_KEYS])>); 2 * MAX_JOIN_RELS];
+        let built_here =
+            |rel: &Rel| matches!(rel.unique, Some(Some(id)) if id as usize >= saved.paths);
+        let kept_count = self.rels.iter().filter(|rel| built_here(rel)).count();
+        if kept_count == 0 {
+            self.truncate_joins(saved);
+            return Ok(());
+        }
+        let kept = arena_slice(self.arena, kept_count, |_| {
+            (0usize, None::<(Path, [Member; MAX_KEYS])>)
+        })?;
         let mut kept_count = 0;
         for (at, rel) in self.rels.iter().enumerate() {
             if let Some(Some(id)) = rel.unique
@@ -1661,16 +1685,12 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     }
                     _ => unreachable!("a unique-ified path"),
                 };
-                *kept.get_mut(kept_count).ok_or_else(too_many_paths)? = (at, Some((path, keys)));
+                kept[kept_count] = (at, Some((path, keys)));
                 kept_count += 1;
             }
         }
-        self.paths.truncate(saved.paths);
-        self.materials.truncate(saved.materials);
-        self.member_keys.truncate(saved.member_keys);
-        self.memoize_rescans.truncate(saved.memoize_rescans);
-        self.param_rows.truncate(saved.param_rows);
-        for &(at, held) in &kept[..kept_count] {
+        self.truncate_joins(saved);
+        for &(at, held) in &*kept {
             let (mut path, members) = held.expect("a kept path");
             if let PathKind::Unique { keys, .. } = &mut path.kind {
                 *keys = self.push_member_keys(members)?;
@@ -1679,6 +1699,15 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             self.rels.entry_mut(at).unique = Some(Some(id));
         }
         Ok(())
+    }
+
+    /// Drops the paths and their side lists built since `saved`.
+    fn truncate_joins(&mut self, saved: SavedJoins) {
+        self.paths.truncate(saved.paths);
+        self.materials.truncate(saved.materials);
+        self.member_keys.truncate(saved.member_keys);
+        self.memoize_rescans.truncate(saved.memoize_rescans);
+        self.param_rows.truncate(saved.param_rows);
     }
 
     fn special(&self, id: u8) -> &SpecialJoin {
@@ -5293,6 +5322,16 @@ pub(crate) fn too_many_clauses() -> SqlError {
     )
 }
 
+/// A query of more relations than `max_join_relations`.
+pub(crate) fn too_many_relations(n: usize, max: usize) -> SqlError {
+    crate::sql_err!(
+        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "join search capacity exceeded: a query of {} relations, more than max_join_relations ({})",
+        n,
+        max
+    )
+}
+
 fn too_many_paths() -> SqlError {
     crate::sql_err!(
         crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -5767,6 +5806,12 @@ mod tests {
         }
     }
 
+    /// The startup reservation of the default `max_join_relations`.
+    fn test_pool() -> JoinSearchPool {
+        let mut budget = crate::mem::budget::Budget::new(1 << 20);
+        JoinSearchPool::new(&mut budget, 128).expect("a join search pool")
+    }
+
     /// A sequential scan of `rows` rows over `total` cost.
     fn seq(rows: f64, total: f64) -> BasePath {
         BasePath {
@@ -5793,7 +5838,9 @@ mod tests {
             members: &[Member::plain(0, 0), Member::plain(1, 0)],
             has_const: false,
         };
+        let pool = test_pool();
         let problem = JoinProblem {
+            pool: &pool,
             rels: &[
                 BaseRel {
                     rows: 1000.0,
@@ -5948,7 +5995,9 @@ mod tests {
             base(1000.0, 8.0, &outer_paths, Relids::EMPTY, &[]),
             base(1.0, 8.0, &lateral_paths, Relids::of(0u8), &lateral_vars),
         ];
+        let pool = test_pool();
         let mut problem = JoinProblem {
+            pool: &pool,
             rels: &rels,
             classes: &[],
             specials: &[],

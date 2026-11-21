@@ -89,7 +89,7 @@ pub(crate) fn write_shape<'a>(
     alias: Option<&'a str>,
     assignments: &[(&str, &'a Expr<'a>)],
     arena: &'a Arena,
-) -> Result<(QueryScope<'a>, QueryShape), SqlError> {
+) -> Result<(QueryScope<'a>, QueryShape<'a>), SqlError> {
     let from = arena
         .alloc(crate::sql::ast::FromClause {
             base: super::dml_target_ref(target, alias),
@@ -2139,7 +2139,7 @@ pub(crate) enum OrderKey {
 /// What the query does with the scan's rows that its path depends on: its
 /// ordering and a `LIMIT` (count, when given, and offset).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct QueryShape {
+pub(crate) struct QueryShape<'a> {
     pub(crate) order: [OrderKey; MAX_ORDER_KEYS],
     pub(crate) order_len: usize,
     pub(crate) limit: Option<(Option<f64>, f64)>,
@@ -2164,7 +2164,7 @@ pub(crate) struct QueryShape {
     /// width and the per-row cost of its expressions.
     pub(crate) projection: Option<Projection>,
     /// The scan is of one member of a partition or inheritance tree.
-    pub(crate) member: Member,
+    pub(crate) member: Member<'a>,
     /// The width of the row identity a write's scan returns beside its
     /// columns: `ctid`, and `tableoid` for a tree's member.
     pub(crate) identity_width: u32,
@@ -2249,7 +2249,7 @@ pub(crate) struct GroupedPath {
     clippy::large_enum_variant,
     reason = "a join scan is carried inline on the stack; boxing would heap-allocate"
 )]
-pub(crate) enum Member {
+pub(crate) enum Member<'a> {
     /// The relation is planned on its own.
     No,
     /// Its paths, as [`Planned::Members`].
@@ -2258,30 +2258,27 @@ pub(crate) enum Member {
     Describe(paths::Candidate),
     /// A base relation of a join PostgreSQL's join search plans: its paths
     /// with their merge pathkeys and parameterizations, or the scan of one.
-    Join(JoinScan),
+    Join(JoinScan<'a>),
 }
-
-/// Join clauses an index of a join's base relation may apply, as
-/// `generate_implied_equalities_for_column` derives them.
-pub(crate) const MAX_JOIN_PARAMS: usize = 16;
 
 /// What the paths of one base relation of a join depend on beyond its own
 /// conditions (`create_index_paths` with its join clauses).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct JoinScan {
-    /// The last `param_count` conjuncts of the scan's condition equate one
-    /// of its columns with another relation's: `(class, other relation)`,
-    /// each class's in the order of its members.
-    pub(crate) params: [(u8, u8); MAX_JOIN_PARAMS],
-    pub(crate) param_count: u8,
-    /// The parameters, by bit, that are join clauses of the relation's
-    /// `joininfo` (`match_join_clauses_to_index`), each applied on its own,
-    /// rather than equalities a class implies, of which a scan applies one.
-    pub(crate) clause_params: u16,
+pub(crate) struct JoinScan<'a> {
+    /// The join clauses an index of the relation may apply, as
+    /// `generate_implied_equalities_for_column` derives them: the last
+    /// conjuncts of the scan's condition, each equating one of its columns
+    /// with another relation's: `(class, other relation)`, each class's in
+    /// the order of its members.
+    pub(crate) params: &'a [(u8, u8)],
+    /// Whether each parameter is a join clause of the relation's
+    /// `joininfo` (`match_join_clauses_to_index`), applied on its own,
+    /// rather than an equality a class implies, of which a scan applies one.
+    pub(crate) clause_params: &'a [bool],
     /// The other relations each parameter reads beyond its first (an
     /// expression of several relations') and the outer joins that null
     /// them, which a path applying it is parameterized by too.
-    pub(crate) param_others: [joins::Relids; MAX_JOIN_PARAMS],
+    pub(crate) param_others: &'a [joins::Relids],
     /// Each column's equivalence class when it has a member in another
     /// relation (`eclass_useful_for_merging`) or the query orders by it,
     /// else [`NO_CLASS`].
@@ -2291,7 +2288,7 @@ pub(crate) struct JoinScan {
     /// The query's pathkeys (`query_pathkeys`).
     pub(crate) order: joins::Keys,
     /// Each relation's rows by FROM position (`get_loop_count`).
-    pub(crate) rel_rows: [f64; joins::MAX_JOIN_RELS],
+    pub(crate) rel_rows: &'a [f64],
     /// `root->total_table_pages`.
     pub(crate) total_table_pages: f64,
     /// The path to describe, or `None` for the relation's paths.
@@ -2342,7 +2339,7 @@ impl Projection {
     }
 }
 
-impl Default for QueryShape {
+impl Default for QueryShape<'_> {
     fn default() -> Self {
         Self {
             order: [OrderKey::Expression; MAX_ORDER_KEYS],
@@ -2362,7 +2359,7 @@ impl Default for QueryShape {
     }
 }
 
-impl QueryShape {
+impl QueryShape<'_> {
     pub(crate) fn order(&self) -> &[OrderKey] {
         &self.order[..self.order_len]
     }
@@ -2444,7 +2441,7 @@ pub(crate) fn query_shape<'a>(
     offset: Option<&'a Expr<'a>>,
     params: &[Datum<'a>],
     arena: &'a Arena,
-) -> Result<QueryShape, SqlError> {
+) -> Result<QueryShape<'a>, SqlError> {
     let mut shape = QueryShape::default();
     let variables = if order_by.is_empty() {
         None
@@ -2891,7 +2888,7 @@ fn query_variables<'a>(
 struct ScanContext {
     slot: usize,
     needed: Option<ColumnSet>,
-    shape: QueryShape,
+    shape: QueryShape<'static>,
 }
 
 thread_local! {
@@ -2915,13 +2912,23 @@ pub(crate) fn enter_query(
     slot: usize,
     condition: Option<&Expr<'_>>,
     needed: Option<ColumnSet>,
-    shape: Option<QueryShape>,
+    shape: Option<QueryShape<'_>>,
 ) -> ScanContextScope {
     let _ = condition;
     let context = shape.map(|shape| ScanContext {
         slot,
         needed,
-        shape,
+        shape: QueryShape {
+            member: match shape.member {
+                Member::No => Member::No,
+                Member::Paths => Member::Paths,
+                Member::Describe(candidate) => Member::Describe(candidate),
+                // A join's base relation runs the path its plan describes,
+                // planned from the join's shape, never a running query's.
+                Member::Join(_) => unreachable!("a join's base relation runs its described path"),
+            },
+            ..shape
+        },
     });
     ScanContextScope(SCAN_CONTEXT.with(|current| current.replace(context)))
 }
@@ -2931,7 +2938,7 @@ pub(crate) fn enter_query(
 pub(crate) fn running_query(
     slot: usize,
     condition: Option<&Expr<'_>>,
-) -> Option<(QueryShape, Option<ColumnSet>)> {
+) -> Option<(QueryShape<'static>, Option<ColumnSet>)> {
     let context = SCAN_CONTEXT.with(core::cell::Cell::get)?;
     let _ = condition;
     (context.slot == slot).then_some((context.shape, context.needed))

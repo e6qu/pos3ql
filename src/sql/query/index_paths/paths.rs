@@ -244,7 +244,7 @@ struct Paths<'p, 's, 'a> {
 /// parameterized paths reads.
 #[derive(Clone, Copy)]
 struct JoinClauses<'a> {
-    scan: super::JoinScan,
+    scan: super::JoinScan<'a>,
     /// `column = other relation's column`, each with that value unknown.
     params: &'a [Restriction<'a>],
 }
@@ -289,7 +289,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     /// Whether join clause `at` is one of the relation's own join clauses
     /// rather than an equality its class implies.
     fn clause_param(&self, at: usize) -> bool {
-        self.join.expect("a join clause").scan.clause_params & 1 << at != 0
+        self.join.expect("a join clause").scan.clause_params[at]
     }
 
     /// Whether `clauses` apply join clause `at`
@@ -340,53 +340,45 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     /// relations, then per equivalence class the clause with its first
     /// member among `param`, as `generate_join_implied_equalities` chooses
     /// it.
-    fn moved_clauses(&self, param: Relids, out: &mut [usize; super::MAX_JOIN_PARAMS]) -> usize {
-        let Some(join) = self.join.filter(|_| !param.is_empty()) else {
-            return 0;
-        };
-        let mut count = 0;
-        let params = &join.scan.params[..usize::from(join.scan.param_count)];
-        for (at, &(class, _)) in params.iter().enumerate() {
-            if self.join_rel(at) & !param == Relids::EMPTY
+    fn moved_clauses(&self, param: Relids) -> impl Iterator<Item = usize> + '_ {
+        let params = self
+            .join
+            .filter(|_| !param.is_empty())
+            .map_or(&[][..], |join| join.scan.params);
+        let applies = move |at: usize| self.join_rel(at) & !param == Relids::EMPTY;
+        // A class's equality moves when no earlier one of its class does.
+        (0..params.len()).filter(move |&at| {
+            applies(at)
                 && (self.clause_param(at)
-                    || !out[..count]
-                        .iter()
-                        .any(|&held| !self.clause_param(held) && params[held].0 == class))
-            {
-                out[count] = at;
-                count += 1;
-            }
-        }
-        count
+                    || !(0..at).any(|held| {
+                        !self.clause_param(held) && params[held].0 == params[at].0 && applies(held)
+                    }))
+        })
     }
 
     /// `has_indexed_join_quals` of a path parameterized by `param` whose
     /// index applies `clauses`: each moved join clause is an index
     /// condition, a class's equality by any of the class's.
     fn indexed_join_quals(&self, clauses: &[IndexClause<'a>], param: Relids) -> bool {
-        let mut moved = [0usize; super::MAX_JOIN_PARAMS];
-        let moved_count = self.moved_clauses(param, &mut moved);
-        moved_count > 0
-            && moved[..moved_count]
-                .iter()
-                .all(|&at| self.applies(clauses, at))
+        let mut moved = self.moved_clauses(param).peekable();
+        moved.peek().is_some() && moved.all(|at| self.applies(clauses, at))
     }
 
     /// The rows of the relation's paths parameterized by `param`
     /// (`get_parameterized_baserel_size`): its restrictions and the moved
     /// join clauses, at most its own rows.
     fn param_rows(&self, param: Relids) -> Result<f64, SqlError> {
-        let mut moved = [0usize; super::MAX_JOIN_PARAMS];
-        let moved_count = self.moved_clauses(param, &mut moved);
+        let moved_count = self.moved_clauses(param).count();
         if moved_count == 0 {
             return Ok(self.rows);
         }
         let params = self.join.expect("parameterized").params;
+        let mut moved = self.moved_clauses(param);
         let all = self
             .arena
             .alloc_slice_with(moved_count + self.restrictions.len(), |at| {
                 if at < moved_count {
-                    params[moved[at]]
+                    params[moved.next().expect("a moved clause")]
                 } else {
                     self.restrictions[at - moved_count]
                 }
@@ -1192,9 +1184,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
                 other = other.add(restriction.cost);
             }
         }
-        let mut moved = [0usize; super::MAX_JOIN_PARAMS];
-        let moved_count = self.moved_clauses(param, &mut moved);
-        for &at in &moved[..moved_count] {
+        for at in self.moved_clauses(param) {
             if !self.applies(clauses, at) {
                 other = other.add(self.join.expect("parameterized").params[at].cost);
             }
@@ -1329,9 +1319,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         // `get_restriction_qual_cost`: the restrictions and every join
         // clause the parameterization moves into the scan.
         let mut quals = self.all_cost;
-        let mut moved = [0usize; super::MAX_JOIN_PARAMS];
-        let moved_count = self.moved_clauses(param, &mut moved);
-        for &at in &moved[..moved_count] {
+        for at in self.moved_clauses(param) {
             quals = quals.add(self.join.expect("parameterized").params[at].cost);
         }
         let startup = tree_cost + quals.startup;
@@ -2361,7 +2349,7 @@ pub(crate) fn scan_path<'a>(
     needed: Option<ColumnSet>,
     params: &[Datum<'a>],
     arena: &'a Arena,
-    shape: QueryShape,
+    shape: QueryShape<'a>,
 ) -> Result<Planned<'a>, SqlError> {
     // A generic plan knows no parameter's value; a custom plan knows the
     // values it was planned for.
@@ -2494,14 +2482,16 @@ pub(crate) fn scan_path<'a>(
         super::Member::Join(scan) => Some(scan),
         _ => None,
     };
-    let join_count = join_scan.map_or(0, |scan| usize::from(scan.param_count));
+    let join_count = join_scan.map_or(0, |scan| scan.params.len());
     if join_count > count {
         return Ok(Planned::Outside("a join clause the scan does not hold"));
     }
     count -= join_count;
     let join_conjuncts = &conjuncts[count..count + join_count];
-    let mut outer_operands = [&Expr::Null; super::MAX_JOIN_PARAMS];
-    let clause_params = join_scan.map_or(0, |scan| scan.clause_params);
+    let outer_operands = arena
+        .alloc_slice_with(join_count, |_| &Expr::Null)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let clause_params = join_scan.map_or(&[][..], |scan| scan.clause_params);
     for (at, &conjunct) in join_conjuncts.iter().enumerate() {
         // A class's equality, or a join clause comparing the columns.
         let Expr::Binary {
@@ -2514,7 +2504,7 @@ pub(crate) fn scan_path<'a>(
             return Ok(Planned::Outside("a join clause other than a comparison"));
         };
         if !(*operator == BinaryOp::Eq
-            || (clause_params & 1 << at != 0
+            || (clause_params[at]
                 && matches!(
                     operator,
                     BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
@@ -2596,7 +2586,9 @@ pub(crate) fn scan_path<'a>(
     };
     // The join clauses, each `column = value` of a value unknown until
     // the outer row is read, costing one operator.
-    let mut join_params = [None::<Restriction<'a>>; super::MAX_JOIN_PARAMS];
+    let join_params = arena
+        .alloc_slice_with(join_count, |_| None::<Restriction<'a>>)
+        .map_err(|_| crate::sql::eval::arena_full())?;
     for (at, &conjunct) in join_conjuncts.iter().enumerate() {
         let restriction = match analyzer.restriction(conjunct, 0)? {
             Ok(restriction) => restriction,
@@ -3899,14 +3891,19 @@ fn join_candidates<'a>(
         // clauses before its classes' equalities.
         let keys = paths.index(index).catalog.n_cols;
         let params = join.params;
-        let mut by_column = [[usize::MAX; super::MAX_JOIN_PARAMS]; crate::storage::MAX_INDEX_COLS];
-        let mut column_count = [0usize; crate::storage::MAX_INDEX_COLS];
+        // Each clause's key column, then the clauses by column: those of
+        // column `position` are `by_column[starts[position]..starts[position + 1]]`.
+        let column_of = paths
+            .arena
+            .alloc_slice_with(params.len(), |_| usize::MAX)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let mut starts = [0usize; crate::storage::MAX_INDEX_COLS + 1];
         let mut clause_count = [0usize; crate::storage::MAX_INDEX_COLS];
         for (at, param) in params.iter().enumerate() {
             for position in 0..keys {
                 if outside!(paths.match_clause(param, index, position)?).is_some() {
-                    by_column[position][column_count[position]] = at;
-                    column_count[position] += 1;
+                    column_of[at] = position;
+                    starts[position + 1] += 1;
                     if paths.clause_param(at) {
                         clause_count[position] += 1;
                     }
@@ -3914,6 +3911,24 @@ fn join_candidates<'a>(
                 }
             }
         }
+        for position in 0..crate::storage::MAX_INDEX_COLS {
+            starts[position + 1] += starts[position];
+        }
+        let mut filled = starts;
+        let by_column = paths
+            .arena
+            .alloc_slice_with(starts[crate::storage::MAX_INDEX_COLS], |_| 0)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        for (at, &position) in column_of.iter().enumerate() {
+            if position != usize::MAX {
+                by_column[filled[position]] = at;
+                filled[position] += 1;
+            }
+        }
+        let by_column = ColumnClauses {
+            clauses: by_column,
+            starts,
+        };
         // `consider_index_join_outer_rels`: per key column, its join
         // clauses then its classes' equalities, each clause's relation
         // alone and with each set tried before.
@@ -3921,7 +3936,7 @@ fn join_candidates<'a>(
         let mut considered_count = 0usize;
         let mut considered_clauses = 0usize;
         for position in 0..keys {
-            let all_at = &by_column[position][..column_count[position]];
+            let all_at = by_column.of(position);
             for list in [
                 &all_at[..clause_count[position]],
                 &all_at[clause_count[position]..],
@@ -3956,7 +3971,6 @@ fn join_candidates<'a>(
                             index,
                             all,
                             &by_column,
-                            &column_count,
                             relids | old,
                             &mut considered,
                             &mut considered_count,
@@ -3971,7 +3985,6 @@ fn join_candidates<'a>(
                         index,
                         all,
                         &by_column,
-                        &column_count,
                         relids,
                         &mut considered,
                         &mut considered_count,
@@ -4055,6 +4068,19 @@ fn join_candidates<'a>(
         .map_err(|_| crate::sql::eval::arena_full())?))
 }
 
+/// A relation's join clauses an index may apply, by the key column they fit.
+struct ColumnClauses<'c> {
+    clauses: &'c [usize],
+    starts: [usize; crate::storage::MAX_INDEX_COLS + 1],
+}
+
+impl ColumnClauses<'_> {
+    /// The clauses of key column `position`.
+    fn of(&self, position: usize) -> &[usize] {
+        &self.clauses[self.starts[position]..self.starts[position + 1]]
+    }
+}
+
 /// `get_join_index_paths` of `index` for the join clause set `relids`:
 /// per key column the first join clause it allows, then the restrictions.
 #[expect(clippy::too_many_arguments, reason = "planner state is explicit")]
@@ -4062,8 +4088,7 @@ fn join_index_paths_for<'a>(
     paths: &mut Paths<'_, '_, 'a>,
     index: usize,
     all: &'a [&'a Restriction<'a>],
-    by_column: &[[usize; super::MAX_JOIN_PARAMS]; crate::storage::MAX_INDEX_COLS],
-    column_count: &[usize; crate::storage::MAX_INDEX_COLS],
+    by_column: &ColumnClauses<'_>,
     relids: Relids,
     considered: &mut [Relids; 64],
     considered_count: &mut usize,
@@ -4076,12 +4101,15 @@ fn join_index_paths_for<'a>(
         return Ok(Ok(()));
     }
     let join = paths.join.expect("a join's relation");
-    let mut selected = [None::<&'a Restriction<'a>>; super::MAX_JOIN_PARAMS];
+    let selected = paths
+        .arena
+        .alloc_slice_with(join.params.len(), |_| None::<&'a Restriction<'a>>)
+        .map_err(|_| crate::sql::eval::arena_full())?;
     let mut selected_count = 0;
     for position in 0..paths.index(index).catalog.n_cols {
         // Every join clause of the relations, then one class equality.
         let mut class_taken = false;
-        for &at in &by_column[position][..column_count[position]] {
+        for &at in by_column.of(position) {
             if paths.join_rel(at) & !relids != Relids::EMPTY
                 || (class_taken && !paths.clause_param(at))
             {

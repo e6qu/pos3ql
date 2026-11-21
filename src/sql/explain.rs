@@ -4186,7 +4186,7 @@ struct GroupedScan<'a> {
     path: query::index_paths::ScanPath<'a>,
     /// The query shape and read columns the path was planned for, which
     /// the scan's execution plans it from again.
-    shape: query::index_paths::QueryShape,
+    shape: query::index_paths::QueryShape<'a>,
     needed: Option<crate::storage::ColumnSet>,
     sort_keys: &'a [KeyItem<'a>],
     group_keys: &'a [KeyItem<'a>],
@@ -4594,7 +4594,7 @@ pub(crate) fn grouped_scan_context<'a>(
     arena: &'a Arena,
 ) -> Result<
     Option<(
-        query::index_paths::QueryShape,
+        query::index_paths::QueryShape<'a>,
         Option<crate::storage::ColumnSet>,
     )>,
     SqlError,

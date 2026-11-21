@@ -74,6 +74,10 @@ pub struct Config {
     /// Per query workspace: images of the catalog relations a statement
     /// reads under its catalog snapshot.
     pub catalog_image_bytes: usize,
+    /// Base relations one query's join search plans (2 to 255). Sizes the
+    /// genetic join search's pool, reserved at startup; a query of more
+    /// relations fails with 54000.
+    pub max_join_relations: usize,
     /// Prepared-statement slots in each connection's wire and SQL pools.
     pub max_prepared: usize,
     /// Stored query text and metadata per wire or SQL prepared statement.
@@ -495,6 +499,7 @@ impl Config {
             sql_arena_bytes: 32 * MIB,
             work_arena_bytes: 64 * MIB,
             catalog_image_bytes: 8 * MIB,
+            max_join_relations: 128,
             max_prepared: 64,
             prepared_bytes: 8 * KIB,
             routine_input_slots: 128,
@@ -860,6 +865,10 @@ impl Config {
                 "catalog_image_bytes" => {
                     config.catalog_image_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "max_join_relations" => {
+                    config.max_join_relations =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_prepared" => {
                     config.max_prepared =
@@ -2095,6 +2104,17 @@ impl Config {
 
     /// Shared resource validation for file and direct embedded startup.
     pub fn validate_runtime_resources(&self) -> Result<(), ConfigError> {
+        if !(2..=crate::sql::query::index_paths::joins::RELATION_NUMBERS)
+            .contains(&self.max_join_relations)
+        {
+            return Err(ConfigError::at(
+                0,
+                format!(
+                    "max_join_relations must be between 2 and {}",
+                    crate::sql::query::index_paths::joins::RELATION_NUMBERS
+                ),
+            ));
+        }
         if self.result_stream_bytes != 0 && self.result_stream_bytes < Self::MIN_RESULT_STREAM_BYTES
         {
             return Err(ConfigError::at(

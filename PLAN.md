@@ -231,10 +231,10 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 
 - [x] Full join merged keys: a `COALESCE` of a full join's compared columns
   equated with a constant (PR #779, `975`).
-- [ ] A hash join whose inner side PostgreSQL splits into batches under a
-  small `work_mem` (two 5,000-row tables joined on an integer key under
-  `64kB`) fails with `query result exceeds the statement arena` instead of
-  returning its rows.
+- [x] A hash join PostgreSQL splits into batches under a small `work_mem`
+  saves each later batch's outer rows as the query's relations only, not a
+  row slot per possible relation, and reads a batch's saved rows in place
+  (`979`).
 - [x] Self-join removal (`remove_useless_self_joins`, `976`).
 - [ ] *In progress:* plan joins of never-analyzed tables by PostgreSQL's
   search (they keep pos3ql's join order today). Needs the retained pull-based
@@ -243,16 +243,22 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   hash and hash aggregate nodes keep their state between rows, as the retained
   nested-loop and hash levels do.
 - [x] `LATERAL` subqueries of one table planned by the search, with `Memoize`
-  and exact `EXPLAIN ANALYZE` counters (`977`).
+  and exact `EXPLAIN ANALYZE` counters (`977`). A scan reading spilled rows
+  decodes the columns a `LATERAL` body reads of it, so an aggregate over
+  such a join no longer sees them as NULL.
 - [ ] Other `LATERAL` subqueries in the search: joins, grouping or volatile
   calls inside them, outer columns read outside their `WHERE`, a target list
   other than all their columns in order (a kept `Subquery Scan`), `LEFT JOIN
   LATERAL`, and queries filtering, grouping or ordering by their columns
   (`EXPLAIN` of them fails with `0A000` while `enable_memoize` is on).
-- [ ] *In progress:* relation sets sized at startup, so queries of more than
-  128 relations are searched (they run pos3ql's join order today), and an
-  indexed relation equated with more than 16 others no longer fails with
-  `54000`.
+- [x] Relation capacity set at startup (`max_join_relations`, up to 255,
+  `978`): the search's per-relation, per-node, per-condition and
+  per-parameter state is sized by the query in the statement arena, and an
+  indexed relation's join parameters are unbounded.
+- [ ] GEQO reclaims each tour's arena memory, as PostgreSQL frees a tour's
+  memory context, so joins up to `max_join_relations` plan in the default
+  statement arena (a 150-relation `USING` chain exhausts 32 MiB today), and
+  equivalence classes past 64 (a chain of more than 64 left joins) fit.
 - [ ] *In progress:* `ORDER BY` over a large join streams the joined rows into
   the retained, spilling sort (seven 8-row tables cross joined with `ORDER BY
   1 LIMIT 1` fails with `54000` today).

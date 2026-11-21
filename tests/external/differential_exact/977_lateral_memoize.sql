@@ -30,6 +30,8 @@ SELECT * FROM lo, LATERAL (SELECT c FROM li WHERE li.b = lo.a ORDER BY c LIMIT 2
   WHERE lo.x BETWEEN 5 AND 8;
 SELECT count(*), sum(s.count) FROM lo, LATERAL (SELECT count(*) FROM li WHERE li.b = lo.a) s
   WHERE lo.x <= 30;
+SELECT array_agg(s.count ORDER BY lo.x) FROM lo, LATERAL (SELECT count(*) FROM li WHERE li.b = lo.a) s
+  WHERE lo.x <= 3;
 SET enable_memoize = off;
 EXPLAIN SELECT * FROM lo, LATERAL (SELECT count(*) FROM li WHERE li.b = lo.a) s;
 EXPLAIN SELECT * FROM lo, LATERAL (SELECT c FROM li WHERE li.b = lo.a ORDER BY c LIMIT 2) s;

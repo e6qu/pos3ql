@@ -22,7 +22,15 @@ ALTER TABLE ts ALTER COLUMN a SET STORAGE MAIN;
 INSERT INTO ts VALUES (9, repeat('m', 3000), repeat('n', 30), NULL);
 SELECT id, pg_column_size(a), pg_column_size(b), pg_column_size(c) FROM ts ORDER BY id;
 CREATE TABLE tp (id int, v text);
-INSERT INTO tp SELECT i, repeat(chr(65 + i % 26), 2100 + i % 50) FROM generate_series(1, 400) i;
+-- Eight transactions keep each under the forced-spill run's 256 KiB memtable.
+INSERT INTO tp SELECT i, repeat(chr(65 + i % 26), 2100 + i % 50) FROM generate_series(1, 50) i;
+INSERT INTO tp SELECT i, repeat(chr(65 + i % 26), 2100 + i % 50) FROM generate_series(51, 100) i;
+INSERT INTO tp SELECT i, repeat(chr(65 + i % 26), 2100 + i % 50) FROM generate_series(101, 150) i;
+INSERT INTO tp SELECT i, repeat(chr(65 + i % 26), 2100 + i % 50) FROM generate_series(151, 200) i;
+INSERT INTO tp SELECT i, repeat(chr(65 + i % 26), 2100 + i % 50) FROM generate_series(201, 250) i;
+INSERT INTO tp SELECT i, repeat(chr(65 + i % 26), 2100 + i % 50) FROM generate_series(251, 300) i;
+INSERT INTO tp SELECT i, repeat(chr(65 + i % 26), 2100 + i % 50) FROM generate_series(301, 350) i;
+INSERT INTO tp SELECT i, repeat(chr(65 + i % 26), 2100 + i % 50) FROM generate_series(351, 400) i;
 VACUUM ANALYZE tp;
 SELECT relpages, reltuples FROM pg_class WHERE relname = 'tp';
 SELECT max(pg_column_size(v)), min(pg_column_size(v)) FROM tp;

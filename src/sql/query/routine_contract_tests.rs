@@ -67,11 +67,11 @@ fn bounded_consumer_stops_before_another_row_effect_and_keeps_unowned_errors() {
                 |emit| {
                     for value in 0..4 {
                         evaluated += 1;
-                        emit(&[Datum::Int4(value)])?;
+                        emit(&[Datum::Int4(value)], &[StoredForm::Inline])?;
                     }
                     Ok(())
                 },
-                &mut |_| {
+                &mut |_, _| {
                     emitted += 1;
                     Ok(())
                 },
@@ -88,7 +88,7 @@ fn bounded_consumer_stops_before_another_row_effect_and_keeps_unowned_errors() {
                     "unowned source error"
                 ))
             },
-            &mut |_| panic!("source failed before any row"),
+            &mut |_, _| panic!("source failed before any row"),
         )
         .unwrap_err();
         assert_eq!(error.message.as_str(), "unowned source error");

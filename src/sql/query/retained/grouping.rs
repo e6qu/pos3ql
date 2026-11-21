@@ -1184,6 +1184,7 @@ fn fold_group<'t: 'w, 'w>(
             values: scan::JoinRowValues::Flat {
                 values: input,
                 offsets: &offsets[..scope.n],
+                forms: None,
             },
             rowids: &[None; MAX_RETAINED_SOURCES][..scope.n],
             visible: scope.n,

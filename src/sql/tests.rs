@@ -5454,7 +5454,9 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
                     crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)?;
                     &decoded[..]
                 }
-                crate::storage::SpilledRowRepresentation::Values(values) => values,
+                crate::storage::SpilledRowRepresentation::Values(
+                    &crate::storage::SpilledValues { values, .. },
+                ) => values,
             };
             let Datum::Int4(value) = decoded[0] else {
                 panic!("integer fixture")
@@ -18352,6 +18354,57 @@ fn ordered_catalog_query_recycles_correlated_subquery_scratch() {
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(data_rows(&output).len(), 14, "{text}");
+}
+
+#[test]
+fn toast_forms_the_executor_does_not_carry_fail_where_they_are_observed() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE toasted (id integer, a text, b text); \
+         INSERT INTO toasted VALUES (1, repeat('y', 1500), repeat('y', 1500)); \
+         CREATE TABLE copied (a text); \
+         SELECT pg_column_size(a), pg_column_size(b) FROM toasted",
+    );
+    // The first value is stored compressed, the second as formed.
+    assert_eq!(
+        data_rows(&setup),
+        ["28|1504"],
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for sql in [
+        "SELECT pg_column_size(max(a)) FROM toasted",
+        "SELECT pg_column_size((SELECT a FROM toasted))",
+        "SELECT pg_column_size(a) FROM toasted GROUP BY a",
+    ] {
+        assert_eq!(
+            error_sqlstates(&run_with(&mut engine, &mut budget, sql)),
+            ["0A000"],
+            "{sql}"
+        );
+    }
+    // A grouped value the statement may pass on is stored in a form the
+    // model does not know: reading its size or the table's pages fails.
+    let stored = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO copied SELECT a FROM toasted GROUP BY a; \
+         INSERT INTO copied SELECT b || '' FROM toasted",
+    );
+    assert!(
+        error_sqlstates(&stored).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&stored)
+    );
+    for sql in ["SELECT pg_column_size(a) FROM copied", "ANALYZE copied"] {
+        assert_eq!(
+            error_sqlstates(&run_with(&mut engine, &mut budget, sql)),
+            ["0A000"],
+            "{sql}"
+        );
+    }
 }
 
 fn test_engine() -> (Engine, Budget) {
@@ -82949,7 +83002,9 @@ fn retained_sst_next(
                     )?;
                     &decoded[..]
                 }
-                crate::storage::SpilledRowRepresentation::Values(values) => values,
+                crate::storage::SpilledRowRepresentation::Values(
+                    &crate::storage::SpilledValues { values, .. },
+                ) => values,
             };
             let crate::sql::types::Datum::Int4(value) = values[0] else {
                 panic!("retained schema changed")

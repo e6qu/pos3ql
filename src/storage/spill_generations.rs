@@ -3720,7 +3720,10 @@ mod tests {
                 SpilledRowRepresentation::Encoded(bytes) => {
                     crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values).unwrap()
                 }
-                SpilledRowRepresentation::Values(source) => values.copy_from_slice(source),
+                SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                    values: source,
+                    ..
+                }) => values.copy_from_slice(source),
             }
             assert_eq!(values, [Datum::Int4(expected_value)]);
         }
@@ -4269,7 +4272,9 @@ mod tests {
                                     )?;
                                     &decoded[..]
                                 }
-                                super::super::SpilledRowRepresentation::Values(values) => values,
+                                super::super::SpilledRowRepresentation::Values(
+                                    &crate::storage::SpilledValues { values, .. },
+                                ) => values,
                             };
                             assert_eq!(
                                 (row.rowid, values[0]),
@@ -4509,9 +4514,9 @@ mod tests {
                                         )?;
                                         &decoded[..]
                                     }
-                                    super::super::SpilledRowRepresentation::Values(values) => {
-                                        values
-                                    }
+                                    super::super::SpilledRowRepresentation::Values(
+                                        &crate::storage::SpilledValues { values, .. },
+                                    ) => values,
                                 };
                                 assert_eq!(
                                     (row.rowid, values[0]),
@@ -5082,7 +5087,9 @@ mod tests {
                                 )?;
                                 assert_eq!(values, [expected]);
                             }
-                            super::super::SpilledRowRepresentation::Values(values) => {
+                            super::super::SpilledRowRepresentation::Values(
+                                &crate::storage::SpilledValues { values, .. },
+                            ) => {
                                 assert_eq!(values, [expected])
                             }
                         }
@@ -5859,7 +5866,9 @@ mod tests {
                                         )?;
                                         &decoded[..relation.n_columns]
                                     }
-                                    SpilledRowRepresentation::Values(values) => values,
+                                    SpilledRowRepresentation::Values(
+                                        &crate::storage::SpilledValues { values, .. },
+                                    ) => values,
                                 };
                                 assert_eq!(values, [Datum::Int4(41)]);
                                 count += 1;

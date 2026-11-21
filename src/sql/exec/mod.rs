@@ -16,6 +16,7 @@ use crate::pg::{
 };
 use crate::sql_err;
 use crate::stack_format;
+use crate::storage::StoredForm;
 use crate::storage::rowenc;
 use crate::storage::{
     CHECK_SQL_MAX, ColumnMeta, ColumnSet, IndexDef, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS,
@@ -1123,6 +1124,17 @@ struct ViewCheckContext<'storage, 'arena, 'params, 'sequence> {
 }
 
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         describe::AliasedDefCols {
             definition: self.def,
@@ -1352,6 +1364,17 @@ impl<'v> ReturningLookup<'_, 'v> {
 }
 
 impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn whole_row_field_metadata(
         &self,
         table: &str,
@@ -1529,6 +1552,17 @@ impl<'v> JoinedReturningLookup<'_, '_, 'v> {
 }
 
 impl<'v> ColumnLookup<'v> for JoinedReturningLookup<'_, '_, 'v> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         // The target's `tableoid` is the changed row's table, which the
         // joined row's flattened values do not carry.
@@ -1861,9 +1895,11 @@ use numeric_loops::NumericLoopFrames;
 pub(crate) use projected::{
     PROJECTED_TEXT_TAG, ProjectedValue, compare_projected_key, compare_projected_prefix,
     compare_projected_rows, compare_projected_values, decode_projected_row_into,
-    encode_projected_by_into, encode_projected_into, encode_projected_persistent_pub,
-    pack_projected_rows, projected_row_len, projected_row_len_by, projected_row_width,
-    projected_value_size, try_each_record_field, unpack_projected_rows,
+    encode_projected_by_into, encode_projected_formed, encode_projected_formed_into,
+    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows, projected_row_len,
+    projected_row_len_by, projected_row_len_formed, projected_row_width, projected_stored_form,
+    projected_stored_form_at, projected_stored_forms, projected_value_size, try_each_record_field,
+    unpack_projected_rows,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,
@@ -8954,6 +8990,17 @@ impl<'o, 's, 'e, 'x, 'v, 'd> ColumnLookup<'v> for ExcludedCtx<'o, 's, 'e, 'x, 'v
 where
     's: 'v,
 {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
         self.outer?.column_type_oid(qualifier, name)
     }
@@ -9604,14 +9651,21 @@ where
     if !dml_row_available(storage, txn, conflict.selected, "updated")? {
         return Ok(ConflictOutcome::Skip);
     }
-    let len = rowenc::encoded_len(&new_values[..def.n_columns]);
-    let new_bytes = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "updated row exceeds the arena"
-        )
-    })?;
-    rowenc::encode(&new_values[..def.n_columns], new_bytes);
+    // The updated row keeps the stored datums it passes on.
+    let carried = crate::sql::toast::CarriedForms::of_stored_row(
+        conflict.bytes,
+        schema,
+        &existing[..def.n_columns],
+        true,
+    )?;
+    let new_bytes = encode_table_row(
+        storage,
+        table_index,
+        txn.txid,
+        &new_values[..def.n_columns],
+        &carried,
+        arena,
+    )?;
     crate::sql::query::write_buffers::row_updated(
         storage,
         txn.txid,
@@ -9619,6 +9673,7 @@ where
         rowid,
         &existing[..def.n_columns],
         &new_values[..def.n_columns],
+        &carried,
         arena,
     )?;
     let new_image = storage.heap.append_image(new_bytes)?;
@@ -23676,7 +23731,7 @@ pub(crate) enum InsertSource<'a> {
     /// `None` completes the statement after the last row.
     Produced {
         index: usize,
-        row: Option<&'a [Datum<'a>]>,
+        row: Option<SourceRow<'a>>,
     },
     MaterializedSelect {
         rows: &'a [&'a [u8]],
@@ -24223,6 +24278,17 @@ impl<'d, 's, 'stored, 'value> ColumnLookup<'value> for TriggerTransition<'d, 's,
 where
     'stored: 'value,
 {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn whole_row_field_metadata(
         &self,
         table: &str,
@@ -24524,6 +24590,17 @@ impl<'v> TriggerDmlScope<'_, '_, 'v, '_> {
 }
 
 impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         self.whole_row_owner(table).whole_row_type(table)
     }
@@ -24667,6 +24744,16 @@ where
     'rv: 'value,
     'v: 'value,
 {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, SqlError> {
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if matches!(qualifier, Some("old" | "new"))
             || self.outer.column_type_oid(qualifier, name).is_some()
@@ -25295,7 +25382,7 @@ fn run_atomic_sql_procedure<'a>(
                 inputs,
                 false,
                 Some(&sequences),
-                &mut |values| {
+                &mut |values, _| {
                     if final_output {
                         store_output(values)
                     } else {
@@ -32260,6 +32347,9 @@ struct PlpgsqlVariable<'a> {
     value: Datum<'a>,
     ctype: ColType,
     user_type: Option<crate::storage::UserTypeName>,
+    /// A special variable PL/pgSQL forms (`FOUND`, `TG_*`, `SQLSTATE`,
+    /// `SQLERRM`), never a datum read from a stored row.
+    formed: bool,
 }
 
 impl<'a> PlpgsqlVariable<'a> {
@@ -32318,6 +32408,7 @@ fn plpgsql_variable<'a>(
             }),
             ctype: ColType::Text,
             user_type: None,
+            formed: true,
         });
     }
     if let Some(index) = local {
@@ -32325,6 +32416,7 @@ fn plpgsql_variable<'a>(
             value: values[index],
             ctype: locals[index].ctype,
             user_type: locals[index].user_type,
+            formed: false,
         });
     }
     if let Some(field) = plpgsql_context_field(invocation.program_kind, name) {
@@ -32332,12 +32424,14 @@ fn plpgsql_variable<'a>(
             value: invocation.value(field),
             ctype: field.ctype(),
             user_type: None,
+            formed: true,
         });
     }
     TriggerStatusVariable::parse(name).map(|_| PlpgsqlVariable {
         value: found.map(Datum::Bool).unwrap_or(Datum::Null),
         ctype: ColType::Bool,
         user_type: None,
+        formed: true,
     })
 }
 
@@ -32388,6 +32482,7 @@ fn plpgsql_labeled_variable<'a>(
             value: values[index],
             ctype: locals[index].ctype,
             user_type: locals[index].user_type,
+            formed: false,
         });
     }
     // The routine's label also names FOUND and its context variables.
@@ -32578,6 +32673,23 @@ impl<'t, 'stored, 'value> ColumnLookup<'value> for TriggerLocalScope<'t, 'stored
 where
     'stored: 'value,
 {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        if self
+            .named(qualifier, name)
+            .is_some_and(|variable| variable.formed)
+        {
+            return Ok(None);
+        }
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn procedural_variable(
         &self,
         qualifier: Option<&str>,
@@ -32684,6 +32796,7 @@ where
             value: self.values[index],
             ctype: self.locals[index].ctype,
             user_type: self.locals[index].user_type,
+            formed: false,
         }
         .record_field(name)
         .map(|field| field.type_oid)
@@ -33005,16 +33118,16 @@ where
         execution.params,
         scope,
         Some(&live),
-        &mut |values| {
+        &mut |source, forms| {
             if deferred {
                 // Converted with the calls' results as each row is written.
-                let encoded = encode_projected_persistent_pub(values, result_arena)?;
+                let encoded = encode_projected_persistent_pub(source, forms, result_arena)?;
                 return rows
                     .push(encoded)
                     .map_err(|_| super::query::arena_full_pub());
             }
             let values = coerce_insert_projection(
-                values,
+                source,
                 !statement.values_defaults.is_empty(),
                 &definition,
                 &targets[..count],
@@ -33025,7 +33138,9 @@ where
                 query_arena,
                 Some(&live),
             )?;
-            let encoded = encode_projected_persistent_pub(values, result_arena)?;
+            let kept = crate::sql::toast::converted_forms(source, values, forms);
+            let encoded =
+                encode_projected_persistent_pub(values, &kept[..values.len()], result_arena)?;
             rows.push(encoded)
                 .map_err(|_| super::query::arena_full_pub())?;
             Ok(())
@@ -33091,6 +33206,23 @@ impl<'stored, 'value> ColumnLookup<'value> for TriggerDmlSnapshot<'stored>
 where
     'stored: 'value,
 {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        if self
+            .named(qualifier, name)
+            .is_some_and(|variable| variable.formed)
+        {
+            return Ok(None);
+        }
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
         if matches!(qualifier, Some("old" | "new")) || self.named(qualifier, name).is_some() {
             return None;
@@ -34701,7 +34833,7 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
 fn execute_bound_plpgsql_dynamic_query<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     query: BoundPlpgsqlCommand<'a>,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    emit: &mut crate::sql::query::RowSink<'_>,
 ) -> Result<(), SqlError> {
     // `FOR ... IN EXECUTE 'EXPLAIN ...'` reads the plan's lines.
     if let Stmt::Explain { options, statement } = query.statement {
@@ -34710,7 +34842,7 @@ fn execute_bound_plpgsql_dynamic_query<'a>(
             *options,
             statement,
             query.arguments,
-            &mut |line| emit(&[Datum::Text(line)]),
+            &mut |line| emit(&[Datum::Text(line)], &[StoredForm::Inline]),
         );
     }
     let query = resolve_plpgsql_dynamic_prepared(context, query)?;
@@ -34722,8 +34854,8 @@ fn execute_bound_plpgsql_dynamic_query<'a>(
                fresh_snapshot: bool| {
         execute_procedural_query(context, fresh_snapshot, None, |storage, sequence| {
             let mut rows = ArenaList::new(arena);
-            let mut capture = |values: &[Datum]| {
-                rows.push(encode_projected_pub(values, arena)?)
+            let mut capture = |values: &[Datum], forms: &[StoredForm]| {
+                rows.push(encode_projected_formed(values, forms, arena)?)
                     .map_err(|_| super::query::arena_full_pub())
             };
             let result = match statement {
@@ -34791,7 +34923,11 @@ fn execute_bound_plpgsql_dynamic_query<'a>(
     for row in rows.rows {
         let mut values = [Datum::Null; MAX_PROJ];
         let width = decode_projected_row_into(row, arena, &mut values)?;
-        emit(&values[..width])?;
+        let mut forms = [StoredForm::Inline; MAX_PROJ];
+        for (column, form) in forms.iter_mut().enumerate().take(width) {
+            *form = projected_stored_form(row, column);
+        }
+        emit(&values[..width], &forms[..width])?;
     }
     rows.terminal_error.map_or(Ok(()), Err)
 }
@@ -34937,7 +35073,7 @@ fn execute_nested_write<'a>(
                     arguments,
                     None,
                     Some(sequence),
-                    &mut |_| Ok(()),
+                    &mut |_, _| Ok(()),
                 )
             })?;
             return Ok(0);
@@ -37275,7 +37411,7 @@ fn run_pg_settings_rule<'a>(
             crate::sql::eval::NO_PARAMS,
             Some(scope),
             Some(sequence),
-            &mut |_| Ok(()),
+            &mut |_, _| Ok(()),
         )
     })
 }
@@ -39683,7 +39819,7 @@ where
         params,
         Some(scope),
         Some(sequence),
-        &mut |values| {
+        &mut |values, _| {
             // PostgreSQL assigns the first column; others are left over.
             width = values.len();
             let value = detached_trigger_datum(
@@ -39752,7 +39888,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
             ));
         }
         let mut rows = ArenaList::new(arena);
-        execute_bound_plpgsql_dynamic_query(context, query, &mut |values| {
+        execute_bound_plpgsql_dynamic_query(context, query, &mut |values, _| {
             if values.len() != width {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -40060,7 +40196,7 @@ where
         params,
         Some(scope),
         Some(sequence),
-        &mut |values| {
+        &mut |values, _| {
             if values.len() != width {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -40926,7 +41062,7 @@ fn execute_trigger_step_in<'a>(
                             params,
                             Some(&scope),
                             Some(sequence),
-                            &mut |values| {
+                            &mut |values, _| {
                                 if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
                                     return Err(sql_err!(
                                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -40974,7 +41110,7 @@ fn execute_trigger_step_in<'a>(
                     ),
                 )?;
                 let arena = context.arena;
-                execute_bound_plpgsql_dynamic_query(context, query, &mut |values| {
+                execute_bound_plpgsql_dynamic_query(context, query, &mut |values, _| {
                     if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -42062,7 +42198,7 @@ fn execute_trigger_step_in<'a>(
                                     emit,
                                 )
                             },
-                            &mut |values| {
+                            &mut |values, _| {
                                 if record_target && values.len() != record_width {
                                     return Err(sql_err!(
                                         sqlstate::INTERNAL_ERROR,
@@ -42333,7 +42469,7 @@ fn execute_trigger_step_in<'a>(
                             }
                             Ok(())
                         };
-                    let mut capture = |values: &[Datum]| {
+                    let mut capture = |values: &[Datum], _: &[StoredForm]| {
                         if record_target && record_width != 0 && values.len() != record_width {
                             return Err(sql_err!(
                                 sqlstate::INTERNAL_ERROR,
@@ -42395,7 +42531,7 @@ fn execute_trigger_step_in<'a>(
                                     let line = arena
                                         .alloc_str(line)
                                         .map_err(|_| super::query::arena_full_pub())?;
-                                    capture(&[Datum::Text(line)])
+                                    capture(&[Datum::Text(line)], &[])
                                 },
                             )?;
                         }
@@ -42414,7 +42550,7 @@ fn execute_trigger_step_in<'a>(
                                 .arena
                                 .alloc_str(value.as_str())
                                 .map_err(|_| super::query::arena_full_pub())?;
-                            capture(&[Datum::Text(value)])?;
+                            capture(&[Datum::Text(value)], &[])?;
                         }
                         Stmt::ShowAll => {
                             let PlpgsqlExecHost::Routine { engine, guc, .. } = &context.host else {
@@ -42432,7 +42568,10 @@ fn execute_trigger_step_in<'a>(
                                     .arena
                                     .alloc_str(value)
                                     .map_err(|_| super::query::arena_full_pub())?;
-                                capture(&[Datum::Text(name), Datum::Text(value), Datum::Text("")])
+                                capture(
+                                    &[Datum::Text(name), Datum::Text(value), Datum::Text("")],
+                                    &[],
+                                )
                             })?;
                         }
                         Stmt::FetchCursor {
@@ -42497,7 +42636,7 @@ fn execute_trigger_step_in<'a>(
                                     let cursors = context.host.cursors();
                                     cursors.copy_row(name, row, arena, &mut values)?
                                 };
-                                capture(&values[..width])?;
+                                capture(&values[..width], &[])?;
                             }
                         }
                         Stmt::Select(_) | Stmt::SetQuery(_) => {
@@ -42512,7 +42651,9 @@ fn execute_trigger_step_in<'a>(
                                 |_: &Storage,
                                  _: u32,
                                  _: &dyn crate::sql::eval::SequenceAccess,
-                                 values: &[Datum]| capture(values);
+                                 values: &[Datum]| {
+                                    capture(values, &[])
+                                };
                             let result = execute_procedural_write(
                                 context,
                                 status,
@@ -42581,7 +42722,7 @@ fn execute_trigger_step_in<'a>(
                                     "INTO used with a command that cannot return data"
                                 ));
                             }
-                            capture(&outputs.values[..outputs.count])?;
+                            capture(&outputs.values[..outputs.count], &[])?;
                         }
                         _ => {
                             return Err(sql_err!(
@@ -42636,7 +42777,7 @@ fn execute_trigger_step_in<'a>(
                     let row_count = match query.statement {
                         Stmt::Select(_) | Stmt::SetQuery(_) => {
                             let mut rows = 0u64;
-                            execute_bound_plpgsql_dynamic_query(context, query, &mut |_| {
+                            execute_bound_plpgsql_dynamic_query(context, query, &mut |_, _| {
                                 rows = rows.checked_add(1).ok_or_else(|| {
                                     sql_err!(
                                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -42817,7 +42958,7 @@ fn execute_trigger_step_in<'a>(
                                 params,
                                 Some(&scope),
                                 Some(sequence),
-                                &mut |_| {
+                                &mut |_, _| {
                                     row_count = row_count.checked_add(1).ok_or_else(|| {
                                         sql_err!(
                                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -60049,6 +60190,17 @@ impl RuleConditionColumns<'_> {
 }
 
 impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn suggest_columns(
         &self,
         suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
@@ -62599,8 +62751,8 @@ fn create_table_as_rows<'a>(
         params,
         None,
         Some(&live_sequence),
-        &mut |vals| {
-            let encoded = encode_projected_pub(vals, arena)?;
+        &mut |vals, forms| {
+            let encoded = encode_projected_formed(vals, forms, arena)?;
             rows.push(encoded).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -62938,7 +63090,19 @@ pub fn create_table_as(
                     Err(e) => return sql_fail(e),
                 }
             }
-            if let Err(e) = store_row(storage, txn, write_target, None, &values[..n_cols]) {
+            let carried = match crate::sql::toast::CarriedForms::of_projected(bytes) {
+                Ok(carried) => carried,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(e) = store_row(
+                storage,
+                txn,
+                write_target,
+                None,
+                &values[..n_cols],
+                &carried,
+                arena,
+            ) {
                 return sql_fail(e);
             }
             count += 1;
@@ -63146,8 +63310,8 @@ pub fn refresh_materialized_view(
         params,
         None,
         Some(&live_sequence),
-        &mut |values| {
-            let encoded = encode_projected_pub(values, arena)?;
+        &mut |values, forms| {
+            let encoded = encode_projected_formed(values, forms, arena)?;
             captured.push(encoded).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -63220,7 +63384,19 @@ pub fn refresh_materialized_view(
                 Err(e) => return sql_fail(e),
             }
         }
-        if let Err(e) = store_row(storage, txn, write_target, None, &values[..n_cols]) {
+        let carried = match crate::sql::toast::CarriedForms::of_projected(bytes) {
+            Ok(carried) => carried,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(e) = store_row(
+            storage,
+            txn,
+            write_target,
+            None,
+            &values[..n_cols],
+            &carried,
+            arena,
+        ) {
             return sql_fail(e);
         }
     }
@@ -73519,7 +73695,7 @@ pub(crate) fn analyze_extended_statistics(
             crate::sql::eval::NO_PARAMS,
             None,
             None,
-            &mut |_| {
+            &mut |_, _| {
                 total += 1;
                 Ok(())
             },
@@ -73556,7 +73732,7 @@ pub(crate) fn analyze_extended_statistics(
             crate::sql::eval::NO_PARAMS,
             None,
             None,
-            &mut |values| {
+            &mut |values, _| {
                 let this = position;
                 position += 1;
                 if next < sampled && positions[next] == this {
@@ -75262,7 +75438,9 @@ fn for_each_index_build_row(
                         rowenc::decode(bytes, schema, &mut values)?;
                         visit(spilled.rowid, &values[..schema.len()], bytes.len())?;
                     }
-                    crate::storage::SpilledRowRepresentation::Values(values) => {
+                    crate::storage::SpilledRowRepresentation::Values(
+                        &crate::storage::SpilledValues { values, .. },
+                    ) => {
                         visit(spilled.rowid, values, rowenc::encoded_len(values))?;
                     }
                 }
@@ -75316,11 +75494,12 @@ fn scan_index_rows(
         let mut rows = 0u64;
         let mut row_bytes = 0u64;
         let mut packing = crate::storage::heap_layout::HeapPacking::new();
-        let mut pack = |values: &[Datum]| {
-            packing.add(crate::storage::heap_layout::tuple_length(
-                values,
-                &schema[..definition.n_columns],
-            ));
+        let mut pack = |bytes: &[u8], values: &[Datum]| -> Result<(), SqlError> {
+            let schema = &schema[..definition.n_columns];
+            packing.add(crate::storage::heap_layout::stored_tuple_length(
+                bytes, values, schema,
+            )?);
+            Ok(())
         };
         // A sequential scan's order: saved rows, then resident rows.
         scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
@@ -75331,17 +75510,21 @@ fn scan_index_rows(
                         rowenc::decode(bytes, schema, &mut decoded)?;
                         &decoded[..definition.n_columns]
                     }
-                    crate::storage::SpilledRowRepresentation::Values(values) => values,
+                    crate::storage::SpilledRowRepresentation::Values(
+                        &crate::storage::SpilledValues { values, .. },
+                    ) => values,
                 };
                 validate_values(spilled.rowid, values)?;
-                pack(values);
+                // A PAX row's encoding holds every column of a full scan.
+                let bytes = match spilled.representation {
+                    crate::storage::SpilledRowRepresentation::Encoded(bytes)
+                    | crate::storage::SpilledRowRepresentation::Values(
+                        &crate::storage::SpilledValues { encoded: bytes, .. },
+                    ) => bytes,
+                };
+                pack(bytes, values)?;
                 rows = rows.saturating_add(1);
-                row_bytes = row_bytes.saturating_add(match spilled.representation {
-                    crate::storage::SpilledRowRepresentation::Encoded(bytes) => bytes.len() as u64,
-                    crate::storage::SpilledRowRepresentation::Values(values) => {
-                        rowenc::encoded_len(values) as u64
-                    }
-                });
+                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
             }
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
@@ -75350,7 +75533,7 @@ fn scan_index_rows(
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, schema, &mut values)?;
                 validate_values(rowid, &values[..definition.n_columns])?;
-                pack(&values[..definition.n_columns]);
+                pack(bytes, &values[..definition.n_columns])?;
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(bytes.len() as u64);
                 Ok(())
@@ -81149,12 +81332,15 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                     ));
                 }
             } else {
+                // COPY forms each value from its input.
                 store_row(
                     storage,
                     txn,
                     row_target,
                     row.stored(),
                     &values[..physical.n_columns],
+                    &crate::sql::toast::CarriedForms::NONE,
+                    arena,
                 )?;
             }
             let replication_role = crate::sql::guc::active_session_replication_role()?;
@@ -81355,12 +81541,15 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
                     written: ColumnSet::EMPTY,
                 },
             )?;
+            // A subscription forms each value from the message.
             store_row(
                 storage,
                 txn,
                 row_target,
                 Some(rowid),
                 &values[..definition.n_columns],
+                &crate::sql::toast::CarriedForms::NONE,
+                arena,
             )?;
             fire_partition_row_triggers(
                 storage,
@@ -81978,12 +82167,21 @@ pub(crate) fn apply_replication_update(
         },
     )?;
     row.available(storage, txn, "updated")?;
+    // An unchanged value is the stored datum, kept in place.
+    let carried = crate::sql::toast::CarriedForms::of_stored_row(
+        row.bytes(),
+        &schema[..definition.n_columns],
+        &old_values[..definition.n_columns],
+        true,
+    )?;
     store_row(
         storage,
         txn,
         row_target,
         Some(row.rowid()),
         &new_values[..definition.n_columns],
+        &carried,
+        arena,
     )?;
     if referenced_key_changed(
         storage,
@@ -83434,11 +83632,21 @@ fn copy_out_rows(
     let sel = super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[])?;
     let fmt = &fmt;
     let mut count = 0u64;
-    super::query::select_into_rows(storage, txid, sel, arena, params, None, seq, &mut |vals| {
-        emit_copy_row(storage, txid, fmt, arena, responder, &vals[..n]).map_err(&mut wire)??;
-        count += 1;
-        Ok(())
-    })?;
+    super::query::select_into_rows(
+        storage,
+        txid,
+        sel,
+        arena,
+        params,
+        None,
+        seq,
+        &mut |vals, _| {
+            emit_copy_row(storage, txid, fmt, arena, responder, &vals[..n])
+                .map_err(&mut wire)??;
+            count += 1;
+            Ok(())
+        },
+    )?;
     finish_copy_out(fmt, responder).map_err(&mut wire)?;
     Ok(count)
 }
@@ -84199,9 +84407,29 @@ impl MergeSourceMembers<'_> {
 struct ProceduralMergeScope<'s, 'o, R> {
     row: &'s R,
     outer: Option<&'s dyn ColumnLookup<'o>>,
+    /// The source row's values and the stored forms they keep, when `row`
+    /// reads a source row that keeps them.
+    source_forms: Option<(&'s [Datum<'s>], &'s [StoredForm])>,
 }
 
 impl<'o: 'v, 'v, R: ColumnLookup<'v>> ColumnLookup<'v> for ProceduralMergeScope<'_, 'o, R> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        if let Some(outer) = self.variable(qualifier, name) {
+            return outer.stored_form(qualifier, name);
+        }
+        if let Some((values, forms)) = self.source_forms
+            && let Some(form) =
+                crate::sql::toast::form_among(&self.row.lookup(qualifier, name)?, values, forms)
+        {
+            return Ok(Some(form));
+        }
+        self.row.stored_form(qualifier, name)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         match self.variable(qualifier, name) {
             Some(outer) => outer.lookup(qualifier, name),
@@ -84334,6 +84562,8 @@ struct MergeLookup<'d, 'v> {
     /// PostgreSQL-visible: referring to the source there is a missing
     /// FROM-clause entry, not a NULL-valued row.
     source: Option<&'v [Datum<'v>]>,
+    /// The stored forms of `source`'s values, when its rows keep them.
+    source_forms: Option<&'v [crate::storage::StoredForm]>,
     /// RETURNING is typed against the complete source/target output scope;
     /// the absent half of a target-only candidate is a NULL row there.
     source_namespace_when_absent: bool,
@@ -84345,6 +84575,21 @@ struct MergeLookup<'d, 'v> {
 }
 
 impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A source datum keeps its form; the target's do not here.
+        let value = self.lookup(qualifier, name)?;
+        if let (Some(source), Some(forms)) = (self.source, self.source_forms)
+            && let Some(form) = crate::sql::toast::form_among(&value, source, forms)
+        {
+            return Ok(Some(form));
+        }
+        Ok(crate::sql::toast::unknown_form(&value))
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         match self.table_oid(qualifier, name) {
             Some(MergeTableOid::Target(oid)) => return Ok(oid),
@@ -85714,8 +85959,8 @@ fn merge_source_rows<'a>(
             .as_ref()
             .map(|row| row as &dyn ColumnLookup<'_>),
         Some(&source_sequences),
-        &mut |values| {
-            let encoded = encode_projected_pub(values, arena)?;
+        &mut |values, forms| {
+            let encoded = encode_projected_formed(values, forms, arena)?;
             if n_source == source_capacity {
                 let next_capacity = if source_capacity == 0 {
                     8
@@ -86190,7 +86435,11 @@ fn merge_target<'a>(
                     seq_session,
                     arena,
                     params,
-                    &ProceduralMergeScope { row: &scope, outer },
+                    &ProceduralMergeScope {
+                        row: &scope,
+                        outer,
+                        source_forms: None,
+                    },
                     None,
                 ) {
                     Ok(Datum::Bool(true)) => {
@@ -86466,6 +86715,7 @@ fn merge_target<'a>(
                 source_members,
                 source: None,
                 source_namespace_when_absent: false,
+                source_forms: None,
                 old_name: None,
                 old: None,
                 new_name: None,
@@ -86481,6 +86731,7 @@ fn merge_target<'a>(
                 &ProceduralMergeScope {
                     row: &lookup,
                     outer,
+                    source_forms: None,
                 },
                 None,
             ) {
@@ -86502,6 +86753,7 @@ fn merge_target<'a>(
         selected_rows[accepted] = selected_rows[j];
         target_vals[accepted] = logical;
         target_physical[accepted] = owned;
+        target_bytes[accepted] = bytes;
         accepted += 1;
     }
     n_target = accepted;
@@ -86770,18 +87022,23 @@ fn merge_target<'a>(
             };
             let by_source = source_row.is_none();
             let mut sv = [Datum::Null; MAX_COLUMNS];
+            let mut sf = [StoredForm::Inline; MAX_COLUMNS];
             let n_src_cols = match source_row {
                 None => source_def.n_columns,
                 Some(source_index) => {
                     let sbytes = source_rows[source_index];
                     let width = projected_row_width(sbytes);
-                    for (c, slot) in sv.iter_mut().enumerate().take(width) {
+                    for (c, (slot, form)) in
+                        sv.iter_mut().zip(sf.iter_mut()).enumerate().take(width)
+                    {
                         *slot = decode_projected_pub(sbytes, c);
+                        *form = projected_stored_form(sbytes, c);
                     }
                     width
                 }
             };
             let sv = &sv[..source_def.n_columns.min(n_src_cols)];
+            let sf = &sf[..sv.len()];
             // A source row runs its NOT MATCHED [BY TARGET] stage when it
             // matched nothing, and right after each pair a concurrent change
             // took away, as PostgreSQL's ExecMerge does. A deleted NOT
@@ -86862,6 +87119,7 @@ fn merge_target<'a>(
                                 &ProceduralMergeScope {
                                     row: &source_ctx,
                                     outer,
+                                    source_forms: None,
                                 },
                             ) {
                                 Ok(true) => {}
@@ -86889,6 +87147,7 @@ fn merge_target<'a>(
                                         &ProceduralMergeScope {
                                             row: &source_ctx,
                                             outer,
+                                            source_forms: Some((sv, sf)),
                                         },
                                         &generated,
                                         &defaults,
@@ -87055,6 +87314,7 @@ fn merge_target<'a>(
                     source_members,
                     source: (!by_source).then_some(sv),
                     source_namespace_when_absent: false,
+                    source_forms: None,
                     old_name: None,
                     old: None,
                     new_name: None,
@@ -87075,6 +87335,7 @@ fn merge_target<'a>(
                                 &ProceduralMergeScope {
                                     row: &lookup,
                                     outer,
+                                    source_forms: None,
                                 },
                                 None,
                             )
@@ -87109,6 +87370,7 @@ fn merge_target<'a>(
                 // was deleted.
                 let mut pair_target = target_vals[j];
                 let mut pair_physical = target_physical[j];
+                let mut pair_bytes = target_bytes[j];
                 let mut pair_row = selected_rows[j];
                 let mut by_source_actions = by_source;
                 let mut pair_lost = false;
@@ -87127,6 +87389,7 @@ fn merge_target<'a>(
                         source_members,
                         source: (!by_source).then_some(sv),
                         source_namespace_when_absent: false,
+                        source_forms: None,
                         old_name: None,
                         old: None,
                         new_name: None,
@@ -87142,10 +87405,12 @@ fn merge_target<'a>(
                                 }
                                 Ok(MergeRowLock::Updated {
                                     row,
+                                    bytes,
                                     physical,
                                     target,
                                 }) => {
                                     pair_row = Some(row);
+                                    pair_bytes = bytes;
                                     pair_physical = physical;
                                     pair_target = target;
                                     if !by_source_actions {
@@ -87163,6 +87428,7 @@ fn merge_target<'a>(
                                             &ProceduralMergeScope {
                                                 row: &latest,
                                                 outer,
+                                                source_forms: None,
                                             },
                                             None,
                                         ) {
@@ -87236,6 +87502,7 @@ fn merge_target<'a>(
                             &ProceduralMergeScope {
                                 row: &lookup,
                                 outer,
+                                source_forms: None,
                             },
                         ) {
                             Ok(true) => {}
@@ -87493,6 +87760,7 @@ fn merge_target<'a>(
                                             &ProceduralMergeScope {
                                                 row: &lookup,
                                                 outer,
+                                                source_forms: None,
                                             },
                                             Some((
                                                 &def.columns()[ci],
@@ -87747,14 +88015,33 @@ fn merge_target<'a>(
                                         Err(error) => return sql_fail(error),
                                     }
                                 }
-                                let len =
-                                    rowenc::encoded_len(&persisted[..new_definition.n_columns]);
-                                let out = match arena.alloc_slice_with(len, |_| 0u8) {
-                                    Ok(out) => out,
-                                    Err(_) => return sql_fail(arena_full()),
+                                // The new version keeps the stored datums it
+                                // passes on; a row moving to another
+                                // partition is inserted there.
+                                let in_place = updated_table == target_tables[j];
+                                let mut pair_schema = [ColType::Bool; MAX_COLUMNS];
+                                row_definition.schema(&mut pair_schema);
+                                let carried = match crate::sql::toast::CarriedForms::of_stored_row(
+                                    pair_bytes,
+                                    &pair_schema[..row_definition.n_columns],
+                                    pair_physical,
+                                    in_place,
+                                ) {
+                                    Ok(carried) => carried,
+                                    Err(error) => return sql_fail(error),
                                 };
-                                rowenc::encode(&persisted[..new_definition.n_columns], out);
-                                let counted = if updated_table == target_tables[j] {
+                                let out = match encode_table_row(
+                                    storage,
+                                    updated_table,
+                                    txn.txid,
+                                    &persisted[..new_definition.n_columns],
+                                    &carried,
+                                    arena,
+                                ) {
+                                    Ok(out) => out,
+                                    Err(error) => return sql_fail(error),
+                                };
+                                let counted = if in_place {
                                     crate::sql::query::write_buffers::row_updated(
                                         storage,
                                         txn.txid,
@@ -87762,6 +88049,7 @@ fn merge_target<'a>(
                                         target_ids[j],
                                         pair_physical,
                                         &persisted[..new_definition.n_columns],
+                                        &carried,
                                         arena,
                                     )
                                 } else {
@@ -87770,6 +88058,7 @@ fn merge_target<'a>(
                                         txn.txid,
                                         updated_table,
                                         &persisted[..new_definition.n_columns],
+                                        &carried,
                                         arena,
                                     )
                                 };
@@ -89026,6 +89315,8 @@ enum MergeRowLock<'a> {
     /// its latest version, which the pair's actions are chosen again for.
     Updated {
         row: PhysicalRow,
+        /// The latest version's stored bytes, which `physical` decodes.
+        bytes: &'a [u8],
         physical: &'a [Datum<'a>],
         target: &'a [Datum<'a>],
     },
@@ -89077,6 +89368,7 @@ fn lock_merge_row<'a>(
             layout.project(physical, target);
             Ok(MergeRowLock::Updated {
                 row: PhysicalRow::local(table, rowid, snapshot),
+                bytes,
                 physical,
                 target,
             })
@@ -89153,6 +89445,7 @@ fn merge_insert_values<
     seq_session: &crate::sql::guc::SeqSession,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    carried: &mut crate::sql::toast::CarriedForms,
 ) -> Result<([Datum<'a>; MAX_COLUMNS], [bool; MAX_COLUMNS]), SqlError> {
     // Target columns for the supplied values: the named list, or all columns.
     let mut targets = [0usize; MAX_COLUMNS];
@@ -89211,6 +89504,9 @@ fn merge_insert_values<
                 source_ctx,
                 &hooks,
             )?;
+            // A source column's datum keeps its stored form.
+            let form = crate::sql::toast::passed_form(expression, source_ctx, &row[targets[i]])?;
+            carried.carry(&row[targets[i]], form, None)?;
             explicit[targets[i]] = true;
         }
     }
@@ -89249,6 +89545,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
         table: table_index,
         written,
     };
+    let mut carried = crate::sql::toast::CarriedForms::NONE;
     let (mut row, explicit) = merge_insert_values(
         def,
         columns,
@@ -89262,6 +89559,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
         seq_session,
         arena,
         params,
+        &mut carried,
     )?;
     // Defaults + auto-increment + generated for the unset columns.
     {
@@ -89411,6 +89709,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                 txn.txid,
                 row_target.table(),
                 &row_arr[..def.n_columns],
+                &carried,
                 arena,
             )?;
             store_row(
@@ -89419,6 +89718,8 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                 row_target,
                 row.stored(),
                 &row_arr[..def.n_columns],
+                &carried,
+                arena,
             )?;
             if view.is_some() {
                 let logical_values = partition_insert::logical_insert_values(
@@ -89501,6 +89802,8 @@ fn finish_insert_row<'a, 'outer, 'snapshot, Definition0: crate::storage::Definit
     position: (usize, u64),
     batches: &mut crate::sql::foreign::ForeignInsertBatches<'a>,
     written_columns: ColumnSet,
+    // The stored datums the row passes on, which keep their forms.
+    carried: &crate::sql::toast::CarriedForms,
 ) -> Result<Result<bool, SqlError>, WireFull>
 where
     'snapshot: 'a,
@@ -89838,6 +90141,7 @@ where
                 txn.txid,
                 row_target.table(),
                 &values[..definition.n_columns],
+                carried,
                 arena,
             )
             .and_then(|()| {
@@ -89847,6 +90151,8 @@ where
                     row_target,
                     row.stored(),
                     &values[..definition.n_columns],
+                    carried,
+                    arena,
                 )
             }) {
                 return Ok(Err(error));
@@ -90642,9 +90948,9 @@ pub(crate) fn instead_of_view_dml<'a>(
                         seq_session,
                         txn.txid,
                     )),
-                    &mut |values| {
+                    &mut |source, forms| {
                         let values = coerce_insert_projection(
-                            values,
+                            source,
                             !insert.values_defaults.is_empty(),
                             &def,
                             targets,
@@ -90659,7 +90965,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 coercion_txid,
                             )),
                         )?;
-                        let bytes = encode_projected_pub(values, arena)?;
+                        let kept = crate::sql::toast::converted_forms(source, values, forms);
+                        let bytes = encode_projected_formed(values, &kept[..values.len()], arena)?;
                         rows.push(bytes).map_err(|error| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -91571,7 +91878,7 @@ fn select_view_rows<'a>(
             execution.seq_session,
             txid,
         )),
-        &mut |values| {
+        &mut |values, _| {
             if values.len() != selection.definition.n_columns {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -91795,7 +92102,7 @@ fn next_streamed_row<'a>(
     params: &[Datum<'a>],
     evaluate: bool,
     sequences: &dyn super::eval::SequenceAccess,
-) -> Result<Option<Option<&'a [Datum<'a>]>>, SqlError> {
+) -> Result<Option<Option<SourceRow<'a>>>, SqlError> {
     let _snapshot = storage.dml_expression_snapshot(command);
     let reader = &mut stream.reader;
     loop {
@@ -91825,8 +92132,9 @@ fn next_streamed_row<'a>(
         let values = if evaluate {
             let calls = super::query::active_invocation_position();
             let mut projected = crate::mem::arena::ArenaList::new(arena);
+            let mut forms = crate::mem::arena::ArenaList::new(arena);
             for index in 0..reader.statement_items_len() {
-                let values = super::query::without_routine_invocations(|| {
+                let (values, item_forms) = super::query::without_routine_invocations(|| {
                     reader.evaluate_statement_item(
                         index,
                         storage,
@@ -91838,10 +92146,11 @@ fn next_streamed_row<'a>(
                         arena,
                     )
                 })?;
-                for value in values {
+                for (value, form) in values.iter().zip(item_forms) {
                     projected
                         .push(*value)
                         .map_err(|_| super::eval::arena_full())?;
+                    forms.push(*form).map_err(|_| super::eval::arena_full())?;
                 }
             }
             if super::query::active_invocation_position() != calls {
@@ -91851,13 +92160,24 @@ fn next_streamed_row<'a>(
                     "a streamed INSERT source called a routine"
                 ));
             }
-            Some(projected.as_slice())
+            Some(SourceRow {
+                values: projected.as_slice(),
+                forms: forms.as_slice(),
+            })
         } else {
             None
         };
         reader.finish_statement_row(stream.block, true);
         return Ok(Some(values));
     }
+}
+
+/// A row of an `INSERT` source the engine reads row by row: its values and
+/// the forms of the stored datums it passes on.
+#[derive(Clone, Copy)]
+pub(crate) struct SourceRow<'a> {
+    pub(crate) values: &'a [Datum<'a>],
+    pub(crate) forms: &'a [StoredForm],
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -92397,13 +92717,14 @@ where
             let sel = deferred.as_ref().map_or(sel, |deferred| deferred.select);
             let keep_raw = deferred.is_some();
             let mut rows = crate::mem::arena::ArenaList::new_persistent(arena);
-            let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
+            let mut fill = |vals: &[Datum], forms: &[StoredForm]| -> Result<(), SqlError> {
                 if keep_raw {
                     // Converted with the calls' results as each row is written.
-                    let encoded = encode_projected_persistent_pub(vals, arena)?;
+                    let encoded = encode_projected_persistent_pub(vals, forms, arena)?;
                     rows.push(encoded).map_err(|_| super::eval::arena_full())?;
                     return Ok(());
                 }
+                let source = vals;
                 let vals = coerce_insert_projection(
                     vals,
                     !statement.values_defaults.is_empty(),
@@ -92420,7 +92741,8 @@ where
                         coercion_txid,
                     )),
                 )?;
-                let encoded = encode_projected_persistent_pub(vals, arena)?;
+                let kept = crate::sql::toast::converted_forms(source, vals, forms);
+                let encoded = encode_projected_persistent_pub(vals, &kept[..vals.len()], arena)?;
                 rows.push(encoded).map_err(|_| super::eval::arena_full())?;
                 Ok(())
             };
@@ -92544,7 +92866,7 @@ where
                              index: usize,
                              bytes: &'a [u8],
                              mut stream: Option<&mut StreamedSource<'a>>,
-                             given: Option<&'a [Datum<'a>]>,
+                             given: Option<SourceRow<'a>>,
                              capture: &mut Option<&mut super::ReturningCapture<'_>>,
                              inserted: &mut u64|
          -> Outcome {
@@ -92554,7 +92876,7 @@ where
                     |storage: &Storage,
                      services: &mut TriggerServices<'_>,
                      evaluate: bool|
-                     -> Result<Option<Option<&'a [Datum<'a>]>>, SqlError> {
+                     -> Result<Option<Option<SourceRow<'a>>>, SqlError> {
                         let Some(stream) = stream.as_deref_mut() else {
                             return Ok(None);
                         };
@@ -92673,6 +92995,16 @@ where
                 } else {
                     given
                 };
+                // The stored datums the source row passes on keep their
+                // forms: a streamed row's are listed, a saved row's encoded.
+                let carried = match streamed {
+                    Some(row) => crate::sql::toast::CarriedForms::of_values(row.values, row.forms),
+                    None => crate::sql::toast::CarriedForms::of_projected(bytes),
+                };
+                let carried = match carried {
+                    Ok(carried) => carried,
+                    Err(error) => return sql_fail(error),
+                };
                 // A streamed row converts here, inside its row: an
                 // assignment cast that calls a routine resumes at the row.
                 let converted = match (streamed, &deferred) {
@@ -92690,7 +93022,7 @@ where
                                         params,
                                     )
                                 },
-                                Ok,
+                                |row| Ok(row.values),
                             )
                             .and_then(|row| {
                                 coerce_insert_projection(
@@ -92826,6 +93158,7 @@ where
                     (index, *inserted),
                     &mut batches,
                     written_columns,
+                    &carried,
                 )? {
                     Ok(true) => *inserted += 1,
                     Ok(false) => {}
@@ -93186,6 +93519,7 @@ where
             // waste a `nextval`). The datums borrow `def`, which outlives the row.
             let mut values = [Datum::Null; MAX_COLUMNS];
             let mut explicit = [false; MAX_COLUMNS];
+            let mut carried = crate::sql::toast::CarriedForms::NONE;
             // `ignore[i]` marks a supplied value that OVERRIDING USER VALUE discards
             // in favor of the identity sequence.
             let mut ignore = [false; MAX_COLUMNS];
@@ -93254,7 +93588,14 @@ where
                         params,
                         &value_scope,
                         &hooks,
-                    ) {
+                    )
+                    .and_then(|value| {
+                        // A stored datum the row reads keeps its form.
+                        let form =
+                            crate::sql::toast::passed_form(expression, &value_scope, &value)?;
+                        carried.carry(&value, form, None)?;
+                        Ok(value)
+                    }) {
                         Ok(v) => values[targets[i]] = v,
                         Err(e) => return sql_fail(e),
                     }
@@ -93318,6 +93659,7 @@ where
                 (index, inserted),
                 &mut batches,
                 written_columns,
+                &carried,
             )? {
                 Ok(true) => inserted += 1,
                 Ok(false) => {}
@@ -93791,6 +94133,7 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
         source_members,
         source,
         source_namespace_when_absent: true,
+        source_forms: None,
         old_name: Some(returning.old_name()),
         old,
         new_name: Some(returning.new_name()),
@@ -95787,6 +96130,20 @@ pub(crate) fn update<'a>(
                         Ok(values) => values,
                         Err(error) => return sql_fail(error),
                     };
+                // The new row version keeps the stored datums it passes on
+                // through the trigger's detached copy.
+                let carried = match crate::sql::toast::CarriedForms::of_stored_row(
+                    row_bytes,
+                    row_layout.schema,
+                    &physical_old[..row_definition.n_columns],
+                    true,
+                )
+                .and_then(|carried| {
+                    carried.rebased(&physical_new[..row_definition.n_columns], new_physical)
+                }) {
+                    Ok(carried) => carried,
+                    Err(error) => return sql_fail(error),
+                };
                 if !match fire_partition_row_triggers(
                     storage,
                     txn,
@@ -95992,18 +96349,17 @@ pub(crate) fn update<'a>(
                 ) {
                     return sql_fail(error);
                 }
-                let len = rowenc::encoded_len(persisted);
-                let out = match arena.alloc_slice_with(len, |_| 0u8) {
-                    Ok(o) => o,
-                    Err(_) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "updated rows exceed the statement arena"
-                        ));
-                    }
+                // A row moving to another partition is inserted there.
+                let carried = if target_table == row_table {
+                    carried
+                } else {
+                    carried.moved()
                 };
-                rowenc::encode(persisted, out);
-                &*out
+                match encode_table_row(storage, target_table, txn.txid, persisted, &carried, arena)
+                {
+                    Ok(bytes) => bytes,
+                    Err(error) => return sql_fail(error),
+                }
             };
             if let Some(tuple_id) = remote_tuple {
                 // The remote row in the foreign table's own columns (a child
@@ -105763,18 +106119,37 @@ fn alter_table_relation(
                 ) {
                     return sql_fail(e);
                 }
-                let len = rowenc::encoded_len(values);
-                let buffer = match arena.alloc_slice_with(len, |_| 0u8) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "ALTER rewrite exceeds the statement arena"
-                        ));
+                // A kept column's value is the stored datum, inserted into the
+                // rewritten relation as `ATRewriteTable` does.
+                let mut old_forms = [crate::storage::rowenc::StoredForm::Inline; MAX_COLUMNS];
+                if let Err(error) = rowenc::stored_forms(old_bytes, old_schema, &mut old_forms) {
+                    return sql_fail(error);
+                }
+                let mut carried = crate::sql::toast::CarriedForms::NONE;
+                for (value, column) in values.iter().zip(&source[..new_def.n_columns]) {
+                    if let ColSource::Keep(orig) = *column
+                        && let Err(error) = carried.carry(value, old_forms[orig], None)
+                    {
+                        return sql_fail(error);
                     }
+                }
+                // The rewritten table's columns, not yet installed, decide
+                // the stored forms.
+                let sizing = crate::sql::query::postgres_memory::Sizing {
+                    catalog: Some((&*storage, txn.txid)),
+                    scratch: arena,
                 };
-                rowenc::encode(values, buffer);
-                &*buffer
+                match encode_row_as(
+                    new_def.columns(),
+                    new_def.has_toast,
+                    &sizing,
+                    values,
+                    &carried,
+                    arena,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(error) => return sql_fail(error),
+                }
             };
             match storage.heap.append_image(new_bytes) {
                 Ok(x) => x,
@@ -109750,18 +110125,86 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
     images.finish()
 }
 
+/// Encodes a row of the table in slot `table` in the arena, with the forms
+/// TOAST stores its values in ([`crate::sql::toast::row_forms`]), the
+/// datums in `carried` keeping theirs.
+pub(crate) fn encode_table_row<'a>(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    values: &[Datum<'_>],
+    carried: &crate::sql::toast::CarriedForms,
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let definition = storage.table_def(table, txid);
+    encode_row_as(
+        definition.columns(),
+        definition.has_toast,
+        &crate::sql::query::postgres_memory::Sizing {
+            catalog: Some((storage, txid)),
+            scratch: arena,
+        },
+        values,
+        carried,
+        arena,
+    )
+}
+
+/// [`encode_table_row`] for a table with the columns `metas`, which has a
+/// TOAST relation when `has_toast`.
+fn encode_row_as<'a>(
+    metas: &[crate::storage::ColumnMeta],
+    has_toast: bool,
+    sizing: &crate::sql::query::postgres_memory::Sizing<'_>,
+    values: &[Datum<'_>],
+    carried: &crate::sql::toast::CarriedForms,
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let mut forms = [crate::storage::rowenc::StoredForm::Inline; MAX_COLUMNS];
+    let forms = forms
+        .get_mut(..values.len())
+        .ok_or_else(|| sql_err!(sqlstate::TOO_MANY_COLUMNS, "row has too many columns"))?;
+    crate::sql::toast::row_forms_as(metas, has_toast, sizing, values, carried, forms)?;
+    let len = rowenc::encoded_len_with_forms(values, forms);
+    let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "written row exceeds the statement arena"
+        )
+    })?;
+    rowenc::encode_with_forms(values, forms, out);
+    Ok(out)
+}
+
+/// Inserts `values` as a new row of `target`, the datums in `carried`
+/// keeping their stored forms.
 fn store_row(
     storage: &mut Storage,
     txn: &mut TxnState,
     target: crate::storage::TableDefinitionTarget,
     rowid: Option<u64>,
     values: &[Datum],
+    carried: &crate::sql::toast::CarriedForms,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     let rowid = match rowid {
         Some(rowid) => rowid,
         None => storage.next_rowid()?,
     };
-    let image = storage.heap.append_row_image(values)?;
+    let mut forms = [crate::storage::rowenc::StoredForm::Inline; MAX_COLUMNS];
+    let forms = forms
+        .get_mut(..values.len())
+        .ok_or_else(|| sql_err!(sqlstate::TOO_MANY_COLUMNS, "row has too many columns"))?;
+    crate::sql::toast::row_forms(
+        storage,
+        target.table(),
+        txn.txid,
+        values,
+        carried,
+        forms,
+        arena,
+    )?;
+    let image = storage.heap.append_table_row_image(values, forms)?;
     txn.write_row(
         storage,
         target,

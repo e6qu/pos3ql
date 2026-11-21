@@ -201,6 +201,46 @@ impl PendingRow<'_> {
         self.decode_table(scope, 0, values)
     }
 
+    /// The stored form of each column of this row as scope source `table`
+    /// into `forms`.
+    fn stored_forms(
+        &self,
+        scope: &QueryScope<'_>,
+        table: usize,
+        forms: &mut [crate::storage::StoredForm],
+    ) -> Result<(), SqlError> {
+        let bytes = match &self.row {
+            RetainedRow::Literal(_) | RetainedRow::Singleton | RetainedRow::Null => {
+                forms.fill(crate::storage::StoredForm::Inline);
+                return Ok(());
+            }
+            RetainedRow::Saved { values, .. } => {
+                forms.fill(crate::storage::StoredForm::Inline);
+                crate::sql::exec::projected_stored_forms(values, forms);
+                return Ok(());
+            }
+            RetainedRow::Current { bytes, .. } => *bytes,
+            RetainedRow::Physical(row) => match row.representation() {
+                SpilledRowRepresentation::Encoded(bytes) => bytes,
+                SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                    encoded,
+                    ..
+                }) => encoded,
+            },
+        };
+        let definition = scope
+            .defs
+            .stored(table)
+            .expect("physical source definition");
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        definition.schema(&mut schema);
+        // A PAX row encodes the leading columns its scan reads.
+        let width = rowenc::encoded_column_count(bytes)?.min(definition.n_columns);
+        forms.fill(crate::storage::StoredForm::Inline);
+        rowenc::stored_forms(bytes, &schema[..width], forms)?;
+        Ok(())
+    }
+
     /// Decodes this row as scope source `table` into `values`.
     fn decode_table<'row>(
         &'row self,
@@ -237,7 +277,10 @@ impl PendingRow<'_> {
                 definition.schema(&mut schema);
                 rowenc::decode(bytes, &schema[..definition.n_columns], values)
             }
-            SpilledRowRepresentation::Values(decoded) => {
+            SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                values: decoded,
+                ..
+            }) => {
                 if decoded.len() > definition.n_columns {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -253,7 +296,8 @@ impl PendingRow<'_> {
 
 enum InputBytes<'a> {
     Encoded(&'a [u8]),
-    Values(&'a [Datum<'a>]),
+    /// A stored row's columns and their stored forms.
+    Values(&'a [Datum<'a>], &'a [crate::storage::StoredForm]),
 }
 
 #[derive(Clone, Copy)]
@@ -1539,11 +1583,11 @@ fn literal_rows<'a>(
         params,
         None,
         None,
-        &mut |values| {
+        &mut |values, forms| {
             let row = rows.get_mut(next).ok_or_else(|| {
                 sql_err!(sqlstate::INTERNAL_ERROR, "literal source row count changed")
             })?;
-            *row = crate::sql::exec::encode_projected_pub(values, arena)?;
+            *row = crate::sql::exec::encode_projected_formed(values, forms, arena)?;
             next += 1;
             Ok(())
         },
@@ -1986,6 +2030,7 @@ fn next_appended_row<'a, 'w>(
             continue;
         }
         let mut values = crate::mem::arena::ArenaList::new(work);
+        let mut forms = crate::mem::arena::ArenaList::new(work);
         for index in 0..branch.statement_items_len() {
             let item = branch.evaluate_statement_item(
                 index,
@@ -1997,15 +2042,19 @@ fn next_appended_row<'a, 'w>(
                 None,
                 work,
             )?;
-            for value in item {
+            let (item, item_forms) = item;
+            for (value, form) in item.iter().zip(item_forms) {
                 let target = targets.get(values.len()).ok_or_else(|| {
                     sql_err!(
                         sqlstate::SYNTAX_ERROR,
                         "each UNION query must have the same number of columns"
                     )
                 })?;
-                let value = super::setops::coerce_set_value(*value, *target, work)?;
-                values.push(value).map_err(|_| arena_full())?;
+                let coerced = super::setops::coerce_set_value(*value, *target, work)?;
+                forms
+                    .push(crate::sql::toast::converted_form(value, &coerced, *form))
+                    .map_err(|_| arena_full())?;
+                values.push(coerced).map_err(|_| arena_full())?;
             }
         }
         if values.len() != targets.len() {
@@ -2014,14 +2063,10 @@ fn next_appended_row<'a, 'w>(
                 "each UNION query must have the same number of columns"
             ));
         }
-        let values = values.as_slice();
-        let length = crate::sql::exec::projected_row_len(values)?;
-        let bytes = work
-            .alloc_slice_with(length, |_| 0u8)
-            .map_err(|_| arena_full())?;
-        crate::sql::exec::encode_projected_into(values, bytes)?;
+        let bytes =
+            crate::sql::exec::encode_projected_formed(values.as_slice(), forms.as_slice(), work)?;
         branch.finish_statement_row(state_arena, true);
-        return Ok(Some(&*bytes));
+        return Ok(Some(bytes));
     }
     Ok(None)
 }
@@ -2480,6 +2525,8 @@ impl<'a> RetainedSelect<'a> {
         };
         let mut values = [Datum::Null; MAX_COLUMNS];
         pending.decode(&self.scope, &mut values)?;
+        let mut forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+        pending.stored_forms(&self.scope, 0, &mut forms)?;
         let width = self
             .scope
             .defs
@@ -2489,7 +2536,7 @@ impl<'a> RetainedSelect<'a> {
         each(
             Some(rowid),
             Some(version),
-            InputBytes::Values(&values[..width]),
+            InputBytes::Values(&values[..width], &forms[..width]),
         )
     }
 
@@ -2498,7 +2545,9 @@ impl<'a> RetainedSelect<'a> {
         self.pending_input(|_, _, bytes| {
             let length = match bytes {
                 InputBytes::Encoded(bytes) => bytes.len(),
-                InputBytes::Values(values) => crate::sql::exec::projected_row_len(values)?,
+                InputBytes::Values(values, forms) => {
+                    crate::sql::exec::projected_row_len_formed(values, forms)?
+                }
             };
             Ok(INPUT_HEADER + length)
         })
@@ -2517,8 +2566,8 @@ impl<'a> RetainedSelect<'a> {
             );
             match bytes {
                 InputBytes::Encoded(bytes) => rest.copy_from_slice(bytes),
-                InputBytes::Values(values) => {
-                    crate::sql::exec::encode_projected_into(values, rest)?;
+                InputBytes::Values(values, forms) => {
+                    crate::sql::exec::encode_projected_formed_into(values, forms, rest)?;
                 }
             }
             Ok(())
@@ -4048,7 +4097,7 @@ impl<'a> RetainedSelect<'a> {
         sequence: Option<&dyn SequenceAccess>,
         invocations: Option<&RoutineInvocationState>,
         frame_arena: &'frame Arena,
-    ) -> Result<&'frame [Datum<'frame>], SqlError> {
+    ) -> Result<(&'frame [Datum<'frame>], &'frame [StoredForm]), SqlError> {
         let items = self.plan.items();
         if let Some(sort) = self.plan.sort()
             && sort.has_current()
@@ -4076,14 +4125,20 @@ impl<'a> RetainedSelect<'a> {
                 subs: self.subqueries.as_ref(),
                 ..super::super::eval::NO_HOOKS
             };
-            let value = grouping.with_group(&self.scope, work, &hooks, |row, hooks| {
-                eval_full(expression, work, params, row, hooks)
+            let (value, form) = grouping.with_group(&self.scope, work, &hooks, |row, hooks| {
+                let value = eval_full(expression, work, params, row, hooks)?;
+                // A grouped output reads grouping keys, whose forms the
+                // grouping does not keep.
+                Ok((value, crate::sql::toast::grouped_form(expression, &value)?))
             })?;
             let detached = frame_arena
                 .alloc_slice_with(1, |_| Datum::Null)
                 .map_err(|_| arena_full())?;
             detached[0] = super::super::exec::detach_routine_datum(value, frame_arena)?;
-            return Ok(&*detached);
+            let forms = frame_arena
+                .alloc_slice_copy(&[form])
+                .map_err(|_| arena_full())?;
+            return Ok((&*detached, &*forms));
         }
         let catalog = StorageCatalog {
             storage,
@@ -4100,6 +4155,7 @@ impl<'a> RetainedSelect<'a> {
         };
         self.plan.with_row(&self.scope, work, |row| {
             let mut projected = [Datum::Null; MAX_PROJ];
+            let mut forms = [StoredForm::Inline; MAX_PROJ];
             let width = project_row(
                 &items[index..index + 1],
                 &self.scope,
@@ -4108,6 +4164,7 @@ impl<'a> RetainedSelect<'a> {
                 params,
                 &hooks,
                 &mut projected,
+                &mut forms,
                 None,
             )?;
             let detached = frame_arena
@@ -4116,7 +4173,10 @@ impl<'a> RetainedSelect<'a> {
             for (output, value) in detached.iter_mut().zip(projected[..width].iter()) {
                 *output = super::super::exec::detach_routine_datum(*value, frame_arena)?;
             }
-            Ok(&*detached)
+            let forms = frame_arena
+                .alloc_slice_copy(&forms[..width])
+                .map_err(|_| arena_full())?;
+            Ok((&*detached, &*forms))
         })
     }
 

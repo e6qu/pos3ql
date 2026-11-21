@@ -471,15 +471,18 @@ impl<'a> SortState<'a> {
             ..crate::sql::eval::NO_HOOKS
         };
         let mut values = crate::mem::arena::ArenaList::new(work);
+        let mut forms = crate::mem::arena::ArenaList::new(work);
         for key in self.key_expressions() {
             let value = eval_full(key, work, params, row, &hooks)?;
             values.push(value).map_err(|_| arena_full())?;
+            forms.push(StoredForm::Inline).map_err(|_| arena_full())?;
         }
         for index in 0..self.outputs.len() {
             if self.postponed(index) {
                 continue;
             }
             let mut projected = [Datum::Null; MAX_PROJ];
+            let mut projected_forms = [StoredForm::Inline; MAX_PROJ];
             let width = project_row(
                 &self.outputs[index..index + 1],
                 scope,
@@ -488,6 +491,7 @@ impl<'a> SortState<'a> {
                 params,
                 &hooks,
                 &mut projected,
+                &mut projected_forms,
                 None,
             )?;
             if width != self.saved_width(index) {
@@ -496,8 +500,9 @@ impl<'a> SortState<'a> {
                     "retained sort item width changed"
                 ));
             }
-            for value in &projected[..width] {
+            for (value, form) in projected[..width].iter().zip(&projected_forms[..width]) {
                 values.push(*value).map_err(|_| arena_full())?;
+                forms.push(*form).map_err(|_| arena_full())?;
             }
         }
         if self.keeps_inputs {
@@ -509,27 +514,38 @@ impl<'a> SortState<'a> {
                 {
                     Some(columns) if !columns.is_empty() || width == 0 => {
                         values.push(Datum::Bool(true)).map_err(|_| arena_full())?;
+                        forms.push(StoredForm::Inline).map_err(|_| arena_full())?;
                         for column in 0..width {
                             values
                                 .push(columns.get(column).copied().unwrap_or(Datum::Null))
                                 .map_err(|_| arena_full())?;
+                            let form = if column < columns.len() {
+                                row.column_form(table, column)?
+                                    .unwrap_or(StoredForm::Inline)
+                            } else {
+                                StoredForm::Inline
+                            };
+                            forms.push(form).map_err(|_| arena_full())?;
                         }
                     }
                     _ => {
                         values.push(Datum::Bool(false)).map_err(|_| arena_full())?;
+                        forms.push(StoredForm::Inline).map_err(|_| arena_full())?;
                         for _ in 0..width {
                             values.push(Datum::Null).map_err(|_| arena_full())?;
+                            forms.push(StoredForm::Inline).map_err(|_| arena_full())?;
                         }
                     }
                 }
             }
         }
         let values = values.as_slice();
-        let length = crate::sql::exec::projected_row_len(values)?;
+        let forms = forms.as_slice();
+        let length = crate::sql::exec::projected_row_len_formed(values, forms)?;
         let bytes = work
             .alloc_slice_with(length, |_| 0u8)
             .map_err(|_| arena_full())?;
-        crate::sql::exec::encode_projected_into(values, bytes)?;
+        crate::sql::exec::encode_projected_formed_into(values, forms, bytes)?;
         Ok(&*bytes)
     }
 
@@ -553,7 +569,7 @@ impl<'a> SortState<'a> {
         &self,
         index: usize,
         frame: &'frame Arena,
-    ) -> Result<&'frame [Datum<'frame>], SqlError> {
+    ) -> Result<(&'frame [Datum<'frame>], &'frame [StoredForm]), SqlError> {
         let ItemPlace::Saved { start, width } = self.items[index] else {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -564,13 +580,17 @@ impl<'a> SortState<'a> {
         let values = frame
             .alloc_slice_with(width, |_| Datum::Null)
             .map_err(|_| arena_full())?;
-        for (offset, value) in values.iter_mut().enumerate() {
+        let forms = frame
+            .alloc_slice_with(width, |_| StoredForm::Inline)
+            .map_err(|_| arena_full())?;
+        for (offset, (value, form)) in values.iter_mut().zip(forms.iter_mut()).enumerate() {
             *value = crate::sql::exec::detach_routine_datum(
                 crate::sql::exec::decode_projected_col_record(row, start + offset, frame)?,
                 frame,
             )?;
+            *form = crate::sql::exec::projected_stored_form(row, start + offset);
         }
-        Ok(values)
+        Ok((values, forms))
     }
 
     /// The current row's input columns as a joined row, for postponed items.
@@ -602,11 +622,20 @@ impl<'a> SortState<'a> {
                 let values = work
                     .alloc_slice_with(scope.row_width(table), |_| Datum::Null)
                     .map_err(|_| arena_full())?;
-                for (offset, value) in values[..width].iter_mut().enumerate() {
+                let forms = work
+                    .alloc_slice_with(width, |_| StoredForm::Inline)
+                    .map_err(|_| arena_full())?;
+                for (offset, (value, form)) in
+                    values[..width].iter_mut().zip(forms.iter_mut()).enumerate()
+                {
                     *value =
                         crate::sql::exec::decode_projected_col_record(row, column + offset, work)?;
+                    *form = crate::sql::exec::projected_stored_form(row, column + offset);
                 }
-                *target = Some(scan::BoundRow::Values(values));
+                *target = Some(scan::BoundRow::Values {
+                    values,
+                    forms: scan::RowForms::Listed(forms),
+                });
             }
             column += width;
         }

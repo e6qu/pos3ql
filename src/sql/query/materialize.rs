@@ -16,6 +16,7 @@ use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, SubqueryValues, eval_f
 use crate::sql::exec::{MAX_PROJ, ProjectedValue};
 use crate::sql::types::{ColType, Datum};
 use crate::storage::Storage;
+use crate::storage::StoredForm;
 use crate::{sql_err, stack_format};
 
 use super::{
@@ -37,6 +38,40 @@ struct EncodedRawRow<'s, 'd, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        let flat_of = |t: usize, c: usize| -> usize {
+            (0..t).map(|i| self.scope.stored_width(i)).sum::<usize>() + c
+        };
+        let form_at = |t: usize, c: usize| {
+            let form =
+                crate::sql::exec::projected_stored_form(self.bytes, self.raw_at + flat_of(t, c));
+            (form != crate::storage::StoredForm::Inline).then_some(form)
+        };
+        Ok(match self.scope.find_column_unsuggested(qualifier, name)? {
+            ResolvedColumn::Table(t, c) => form_at(t, c),
+            ResolvedColumn::Merged(m) => {
+                let mut form = None;
+                for &(t, c) in self.scope.merged[m].parts {
+                    let value = crate::sql::exec::decode_projected_col_record(
+                        self.bytes,
+                        self.raw_at + flat_of(t, c),
+                        self.arena,
+                    )?;
+                    if !value.is_null() {
+                        form = form_at(t, c);
+                        break;
+                    }
+                }
+                form
+            }
+            ResolvedColumn::TableOid(_) => None,
+        })
+    }
+
     fn whole_row_field_metadata(
         &self,
         table: &str,
@@ -248,6 +283,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
 /// a row reads only the prefix it wrote.
 pub(super) struct ProjectionBuffers<'a> {
     projected: [Datum<'a>; MAX_PROJ],
+    forms: [StoredForm; MAX_PROJ],
     keys: [Datum<'a>; MAX_PROJ],
 }
 
@@ -255,6 +291,7 @@ impl ProjectionBuffers<'_> {
     pub(super) fn new() -> Self {
         Self {
             projected: [Datum::Null; MAX_PROJ],
+            forms: [StoredForm::Inline; MAX_PROJ],
             keys: [Datum::Null; MAX_PROJ],
         }
     }
@@ -280,7 +317,12 @@ fn for_each_materialized_projection<'a>(
     postponed: Option<&[bool; MAX_PROJ]>,
     has_srf: bool,
     outer: Option<&dyn ColumnLookup<'a>>,
-    consume: &mut impl FnMut(&JoinRow<'_, 'a, '_>, &[Datum<'a>], &[Datum<'a>]) -> Result<(), SqlError>,
+    consume: &mut impl FnMut(
+        &JoinRow<'_, 'a, '_>,
+        &[Datum<'a>],
+        &[StoredForm],
+        &[Datum<'a>],
+    ) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     if !where_correlated.is_empty()
         && !correlated_where_passes(
@@ -323,7 +365,11 @@ fn for_each_materialized_projection<'a>(
         } else {
             row_hooks
         };
-        let ProjectionBuffers { projected, keys } = &mut *buffers;
+        let ProjectionBuffers {
+            projected,
+            forms,
+            keys,
+        } = &mut *buffers;
         let width = project_row_skipping(
             statement.items,
             postponed,
@@ -333,6 +379,7 @@ fn for_each_materialized_projection<'a>(
             params,
             use_hooks,
             projected,
+            forms,
             outer,
         )?;
         let chained_row = Chained { inner: row, outer };
@@ -344,16 +391,20 @@ fn for_each_materialized_projection<'a>(
             )?;
             keys[key] = value;
         }
-        consume(row, &projected[..width], &keys[..n_keys])?;
+        consume(row, &projected[..width], &forms[..width], &keys[..n_keys])?;
     }
     Ok(())
 }
 
 #[expect(clippy::too_many_arguments, reason = "materialized row layout")]
+/// Column `index` of a materialized row and the stored form it keeps: the
+/// outputs `projected` (in `forms`), the sort keys, the source columns as
+/// read, then each source's presence and identity.
 fn materialized_value_at<'a>(
     scope: &QueryScope<'a>,
     row: &JoinRow<'_, 'a, '_>,
     projected: &[Datum<'a>],
+    forms: &[StoredForm],
     keys: &[Datum<'a>],
     width: usize,
     n_keys: usize,
@@ -361,18 +412,21 @@ fn materialized_value_at<'a>(
     raw_columns: Option<&super::scan::PaxReadDemand>,
     source_columns: usize,
     index: usize,
-) -> Datum<'a> {
+) -> Result<(Datum<'a>, StoredForm), SqlError> {
+    let fresh = |value| Ok((value, StoredForm::Inline));
     if index < width {
-        return projected[index];
+        return Ok((projected[index], forms[index]));
     }
     if index < width + n_keys {
-        return keys[index - width];
+        return fresh(keys[index - width]);
     }
     if index >= identities_at {
-        return row.rowids[index - identities_at]
-            .and_then(|rowid| i64::try_from(rowid).ok())
-            .map(Datum::Int8)
-            .unwrap_or(Datum::Null);
+        return fresh(
+            row.rowids[index - identities_at]
+                .and_then(|rowid| i64::try_from(rowid).ok())
+                .map(Datum::Int8)
+                .unwrap_or(Datum::Null),
+        );
     }
     // Each relation's stored columns (`source_columns` in all), then one
     // presence flag per relation.
@@ -381,23 +435,25 @@ fn materialized_value_at<'a>(
         let present = row
             .table_present(raw_index - source_columns)
             .expect("materialized source is joined");
-        return Datum::Bool(present);
+        return fresh(Datum::Bool(present));
     }
     let Some(raw_columns) = raw_columns else {
-        return Datum::Null;
+        return fresh(Datum::Null);
     };
     for table in 0..scope.n {
         let column_count = scope.stored_width(table);
         if raw_index < column_count {
             if !raw_columns.references_column(table, raw_index, column_count) {
-                return Datum::Null;
+                return fresh(Datum::Null);
             }
             let values = row.table_values(table).expect("bound");
-            return if values.is_empty() {
-                Datum::Null
-            } else {
-                values[raw_index]
-            };
+            if values.is_empty() {
+                return fresh(Datum::Null);
+            }
+            let form = row
+                .column_form(table, raw_index)?
+                .unwrap_or(StoredForm::Inline);
+            return Ok((values[raw_index], form));
         }
         raw_index -= column_count;
     }
@@ -465,19 +521,22 @@ fn encode_materialized_row<'a>(
     scope: &QueryScope<'a>,
     row: &JoinRow<'_, 'a, '_>,
     projected: &[Datum<'a>],
+    forms: &[StoredForm],
     keys: &[Datum<'a>],
     layout: &MaterializedLayout<'_>,
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
-    encode_materialized_row_in(scope, row, projected, keys, layout, true, arena)
+    encode_materialized_row_in(scope, row, projected, forms, keys, layout, true, arena)
 }
 
 /// [`encode_materialized_row`] into the persistent tail, or the arena's
 /// front when the caller rewinds it after copying the row out.
+#[expect(clippy::too_many_arguments, reason = "materialized row layout")]
 fn encode_materialized_row_in<'a>(
     scope: &QueryScope<'a>,
     row: &JoinRow<'_, 'a, '_>,
     projected: &[Datum<'a>],
+    forms: &[StoredForm],
     keys: &[Datum<'a>],
     layout: &MaterializedLayout<'_>,
     persistent: bool,
@@ -488,6 +547,7 @@ fn encode_materialized_row_in<'a>(
             scope,
             row,
             projected,
+            forms,
             keys,
             layout.width,
             layout.n_keys,
@@ -925,7 +985,15 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                         arena,
                     )?;
                 }
-                read[table] = Some(BoundRow::Values(values));
+                let forms = arena
+                    .alloc_slice_with(n_columns, |column| {
+                        crate::sql::exec::projected_stored_form(row, column_at + column)
+                    })
+                    .map_err(|_| arena_full())?;
+                read[table] = Some(BoundRow::Values {
+                    values,
+                    forms: super::scan::RowForms::Listed(forms),
+                });
             }
             column_at += n_columns;
             bound[table] = read[table];
@@ -939,7 +1007,11 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                     LateralRecheck::Keep => {}
                     LateralRecheck::RerunJoined(select) => {
                         if let Some(read_row) = read[table] {
-                            let BoundRow::Values(read_values) = read_row else {
+                            let BoundRow::Values {
+                                values: read_values,
+                                ..
+                            } = read_row
+                            else {
                                 unreachable!("a read source is decoded");
                             };
                             let order = arena
@@ -968,7 +1040,10 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                                 self.hooks.sequences,
                             )? {
                                 super::joined_from::LateralRowRecheck::Rerun(values) => {
-                                    bound[table] = Some(BoundRow::Values(values));
+                                    bound[table] = Some(BoundRow::Values {
+                                        values,
+                                        forms: super::scan::RowForms::Unknown,
+                                    });
                                 }
                                 super::joined_from::LateralRowRecheck::Lost => {
                                     bound[table] = None;
@@ -1008,7 +1083,10 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                             &chained,
                             self.hooks,
                         )?;
-                        bound[table] = first.map(BoundRow::Values);
+                        bound[table] = first.map(|values| BoundRow::Values {
+                            values,
+                            forms: super::scan::RowForms::Unknown,
+                        });
                         // An inner or cross join to a source that yields no
                         // row drops the locked row; a left join null-extends.
                         if first.is_none()
@@ -1032,13 +1110,13 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                         "a changed locked row has no identity"
                     )
                 })?;
-                let Some(values) = super::scan::latest_locked_source(
+                let Some(latest) = super::scan::latest_locked_source(
                     storage, txid, scope, table, slot, rowid, arena,
                 )?
                 else {
                     return Ok(None);
                 };
-                bound[table] = Some(BoundRow::Values(values));
+                bound[table] = Some(latest);
             }
         }
         let order = arena
@@ -1053,7 +1131,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
             else {
                 continue;
             };
-            let Some(BoundRow::Values(values)) = bound[table] else {
+            let Some(BoundRow::Values { values, .. }) = bound[table] else {
                 unreachable!("a changed source is bound");
             };
             let context = crate::sql::exec::RowCtx {
@@ -1184,10 +1262,10 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
             },
             self.plan.has_srf,
             self.outer,
-            &mut |row, projected, keys| {
+            &mut |row, projected, forms, keys| {
                 if rebuilt.is_none() {
                     rebuilt = Some(encode_materialized_row(
-                        scope, row, projected, keys, &layout, arena,
+                        scope, row, projected, forms, keys, &layout, arena,
                     )?);
                 }
                 Ok(())
@@ -1205,6 +1283,16 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
 /// and bare ungrouped references remain the same error.
 pub(crate) struct ScopeSchema<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn suggest_columns(
         &self,
         suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
@@ -1362,6 +1450,16 @@ impl ScopePrefix<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for ScopePrefix<'_, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         if self.whole() {
             return ColumnLookup::<'a>::column_type_mod(&ScopeSchema(self.scope), qualifier, name);
@@ -1520,10 +1618,9 @@ pub(crate) fn finalize_projected_row<'a>(
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
     out: &mut [Datum<'a>; MAX_PROJ],
+    forms: &mut [StoredForm; MAX_PROJ],
 ) -> Result<(), SqlError> {
-    for (i, slot) in out.iter_mut().take(width).enumerate() {
-        *slot = crate::sql::exec::decode_projected_col_record(bytes, i, arena)?;
-    }
+    decode_formed_output(bytes, width, arena, out, forms)?;
     let Some(d) = deferred else { return Ok(()) };
     let raw_row = EncodedRawRow {
         scope,
@@ -1550,6 +1647,7 @@ pub(crate) fn finalize_projected_row<'a>(
             SelectItem::Expr { expression, .. } => {
                 if d.postponed[i] {
                     out[slot] = eval_full(expression, arena, params, &row, hooks)?;
+                    forms[slot] = crate::sql::toast::passed_form(expression, &row, &out[slot])?;
                 }
                 slot += 1;
             }
@@ -1562,8 +1660,24 @@ pub(crate) fn finalize_projected_row<'a>(
 /// column at which physical source row identities begin.
 type MaterializedSelect<'a> = (&'a [&'a [u8]], usize, Option<PostponedProjection>, usize);
 
-type ExternalRowEmitter<'a> =
-    dyn for<'row> FnMut(&[Datum<'row>], &[Option<u64>]) -> Result<bool, SqlError> + 'a;
+/// Decodes the first `width` columns of the materialized output row `encoded`
+/// and the stored form each keeps.
+fn decode_formed_output<'a>(
+    encoded: &'a [u8],
+    width: usize,
+    arena: &'a Arena,
+    output: &mut [Datum<'a>; MAX_PROJ],
+    forms: &mut [StoredForm; MAX_PROJ],
+) -> Result<(), SqlError> {
+    for column in 0..width {
+        output[column] = crate::sql::exec::decode_projected_col_record(encoded, column, arena)?;
+        forms[column] = crate::sql::exec::projected_stored_form(encoded, column);
+    }
+    Ok(())
+}
+
+type ExternalRowEmitter<'a> = dyn for<'row> FnMut(&[Datum<'row>], &[StoredForm], &[Option<u64>]) -> Result<bool, SqlError>
+    + 'a;
 
 pub(super) struct MaterializationPlan<'a> {
     n_order: usize,
@@ -2415,7 +2529,7 @@ pub(crate) fn materialized_rows<'a>(
             },
             has_srf,
             outer,
-            &mut |row, projected, keys| {
+            &mut |row, projected, forms, keys| {
                 // The streamed sort compares each row as it arrives, so its
                 // keys must be comparable under their collations first.
                 if streams {
@@ -2446,6 +2560,7 @@ pub(crate) fn materialized_rows<'a>(
                     scope,
                     row,
                     projected,
+                    forms,
                     keys,
                     &MaterializedLayout {
                         width,
@@ -3366,12 +3481,12 @@ pub(crate) fn external_materialized_into<'a>(
                     None,
                     false,
                     outer,
-                    &mut |_row, projected, _keys| {
+                    &mut |_row, projected, forms, _keys| {
                         if logical_index >= offset {
                             // The rows an index returns in order need no
                             // sort: the `Limit` reads them from the scan.
                             stages.limit.row();
-                            keep_emitting = emit(projected, source_rowids)?;
+                            keep_emitting = emit(projected, forms, source_rowids)?;
                             emitted += 1;
                         }
                         logical_index += 1;
@@ -3523,13 +3638,14 @@ pub(crate) fn external_materialized_into<'a>(
             },
             plan.has_srf,
             outer,
-            &mut |row, projected, keys| {
+            &mut |row, projected, forms, keys| {
                 if let Some((recheck, rowids, _)) = lock_pass.as_mut() {
                     // Copied into the external run before the rewind below.
                     let encoded = encode_materialized_row_in(
                         scope,
                         row,
                         projected,
+                        forms,
                         keys,
                         &MaterializedLayout {
                             width: plan.width,
@@ -3557,44 +3673,18 @@ pub(crate) fn external_materialized_into<'a>(
                         .expect("spill-attached block store");
                 }
                 if let Some(hashed) = hashed.as_mut() {
-                    let mut values = [Datum::Null; MAX_PROJ];
-                    for (index, value) in values.iter_mut().enumerate().take(plan.width) {
-                        *value = materialized_value_at(
-                            scope,
-                            row,
-                            projected,
-                            keys,
-                            plan.width,
-                            plan.n_keys,
-                            plan.identities_at,
-                            plan.raw_columns.as_ref(),
-                            source_columns,
-                            index,
-                        );
-                    }
-                    let encoded =
-                        crate::sql::exec::encode_projected_pub(&values[..plan.width], arena)?;
+                    let encoded = crate::sql::exec::encode_projected_formed(
+                        &projected[..plan.width],
+                        &forms[..plan.width],
+                        arena,
+                    )?;
                     return hashed.offer(encoded);
                 }
                 if let Some(distinct_rows) = distinct_rows.as_mut() {
                     // Kept past the rewind below, in the arena's tail.
-                    let mut values = [Datum::Null; MAX_PROJ];
-                    for (index, value) in values.iter_mut().enumerate().take(plan.width) {
-                        *value = materialized_value_at(
-                            scope,
-                            row,
-                            projected,
-                            keys,
-                            plan.width,
-                            plan.n_keys,
-                            plan.identities_at,
-                            plan.raw_columns.as_ref(),
-                            source_columns,
-                            index,
-                        );
-                    }
                     let encoded = crate::sql::exec::encode_projected_persistent_pub(
-                        &values[..plan.width],
+                        &projected[..plan.width],
+                        &forms[..plan.width],
                         arena,
                     )?;
                     distinct_rows.push(encoded).map_err(|_| arena_full())?;
@@ -3610,6 +3700,7 @@ pub(crate) fn external_materialized_into<'a>(
                                     scope,
                                     row,
                                     projected,
+                                    forms,
                                     keys,
                                     plan.width,
                                     plan.n_keys,
@@ -3676,11 +3767,10 @@ pub(crate) fn external_materialized_into<'a>(
             let keep = if logical_index >= offset {
                 stages.limit.row();
                 let mut output = [Datum::Null; MAX_PROJ];
-                for (column, value) in output.iter_mut().enumerate().take(plan.width) {
-                    *value = crate::sql::exec::decode_projected_col_record(encoded, column, arena)?;
-                }
+                let mut forms = [StoredForm::Inline; MAX_PROJ];
+                decode_formed_output(encoded, plan.width, arena, &mut output, &mut forms)?;
                 emitted += 1;
-                emit(&output[..plan.width], source_rowids)?
+                emit(&output[..plan.width], &forms[..plan.width], source_rowids)?
             } else {
                 true
             };
@@ -3847,6 +3937,7 @@ pub(crate) fn external_materialized_into<'a>(
                                 let encoded =
                                     arena.alloc_slice_copy(row).map_err(|_| arena_full())?;
                                 let mut output = [Datum::Null; MAX_PROJ];
+                                let mut forms = [StoredForm::Inline; MAX_PROJ];
                                 finalize_projected_row(
                                     encoded,
                                     plan.width,
@@ -3860,10 +3951,12 @@ pub(crate) fn external_materialized_into<'a>(
                                     hooks,
                                     outer,
                                     &mut output,
+                                    &mut forms,
                                 )?;
                                 if logical_index >= offset && !lookahead {
-                                    crate::sql::exec::encode_projected_into(
+                                    crate::sql::exec::encode_projected_formed_into(
                                         &output[..plan.width],
+                                        &forms[..plan.width],
                                         staged,
                                     )
                                 } else {
@@ -3873,16 +3966,18 @@ pub(crate) fn external_materialized_into<'a>(
                         } else {
                             (|| {
                                 let mut output = [Datum::Null; MAX_PROJ];
-                                for (column, value) in
-                                    output.iter_mut().enumerate().take(plan.width)
-                                {
-                                    *value = crate::sql::exec::decode_projected_col_record(
-                                        row, column, arena,
-                                    )?;
-                                }
+                                let mut forms = [StoredForm::Inline; MAX_PROJ];
+                                decode_formed_output(
+                                    row,
+                                    plan.width,
+                                    arena,
+                                    &mut output,
+                                    &mut forms,
+                                )?;
                                 if logical_index >= offset && !lookahead {
-                                    crate::sql::exec::encode_projected_into(
+                                    crate::sql::exec::encode_projected_formed_into(
                                         &output[..plan.width],
+                                        &forms[..plan.width],
                                         staged,
                                     )
                                 } else {
@@ -3928,10 +4023,9 @@ pub(crate) fn external_materialized_into<'a>(
             // allocations persist for the emitter exactly as any arena
             // allocation it makes itself.
             let mut output = [Datum::Null; MAX_PROJ];
-            for (column, value) in output.iter_mut().enumerate().take(plan.width) {
-                *value = crate::sql::exec::decode_projected_col_record(encoded, column, arena)?;
-            }
-            if !emit(&output[..plan.width], source_rowids)? {
+            let mut forms = [StoredForm::Inline; MAX_PROJ];
+            decode_formed_output(encoded, plan.width, arena, &mut output, &mut forms)?;
+            if !emit(&output[..plan.width], &forms[..plan.width], source_rowids)? {
                 return Ok(emitted);
             }
             emitted += 1;
@@ -4013,7 +4107,9 @@ fn external_materialized_select<'a>(
         None,
         limit,
         offset,
-        &mut |values, _rowids| match super::emit_data_row(storage, txid, arena, responder, values) {
+        &mut |values, _forms, _rowids| match super::emit_data_row(
+            storage, txid, arena, responder, values,
+        ) {
             Ok(Ok(())) => Ok(true),
             Ok(Err(error)) => Err(error),
             Err(_) => {
@@ -4184,7 +4280,7 @@ pub(crate) fn materialized_select<'a>(
         limit,
         offset,
         &stages,
-        &mut |values| match super::emit_data_row(storage, txid, arena, responder, values) {
+        &mut |values, _| match super::emit_data_row(storage, txid, arena, responder, values) {
             Ok(Ok(())) => Ok(true),
             Ok(Err(error)) => Err(error),
             Err(_) => {
@@ -4227,7 +4323,7 @@ pub(crate) fn materialized_rows_into<'a>(
     limit: u64,
     offset: u64,
     stages: &instrument::Stages,
-    emit: &mut dyn FnMut(&[Datum<'a>]) -> Result<bool, SqlError>,
+    emit: &mut super::RowEmitter<'_>,
 ) -> Result<u64, SqlError> {
     let mut order_collations = [Collation::None; MAX_PROJ];
     for (index, order) in statement.order_by.iter().enumerate() {
@@ -4330,9 +4426,10 @@ pub(crate) fn materialized_rows_into<'a>(
             };
             let lookahead = emitted >= limit && !tied(boundary, row)?;
             let mut out = [Datum::Null; MAX_PROJ];
+            let mut forms = [StoredForm::Inline; MAX_PROJ];
             finalize_projected_row(
                 row, width, deferred, statement, scope, storage, txid, arena, params, hooks, outer,
-                &mut out,
+                &mut out, &mut forms,
             )?;
             if lookahead {
                 break;
@@ -4341,7 +4438,7 @@ pub(crate) fn materialized_rows_into<'a>(
                 accepted += 1;
                 continue;
             }
-            let keep_emitting = emit(&out[..width])?;
+            let keep_emitting = emit(&out[..width], &forms[..width])?;
             accepted += 1;
             emitted += 1;
             if !keep_emitting {
@@ -4379,14 +4476,15 @@ pub(crate) fn materialized_rows_into<'a>(
     let below_limit = stages.below_limit();
     for (index, row) in rows.iter().take(projection_window).enumerate() {
         let mut out = [Datum::Null; MAX_PROJ];
+        let mut forms = [StoredForm::Inline; MAX_PROJ];
         finalize_projected_row(
             row, width, deferred, statement, scope, storage, txid, arena, params, hooks, outer,
-            &mut out,
+            &mut out, &mut forms,
         )?;
         below_limit.row();
         if (index as u64) >= offset && index < window {
             stages.limit.row();
-            let keep_emitting = emit(&out[..width])?;
+            let keep_emitting = emit(&out[..width], &forms[..width])?;
             emitted += 1;
             if !keep_emitting {
                 break;

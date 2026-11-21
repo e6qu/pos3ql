@@ -5,6 +5,7 @@ use super::function_execution::FunctionOwner;
 use super::*;
 use crate::mem::lease_pool::SharedSlice;
 use crate::sql::{query, sequence, type_input_plans, type_inputs};
+use crate::storage::StoredForm;
 
 struct StoredSource {
     path: crate::storage::PathContext,
@@ -842,7 +843,7 @@ impl SqlExecution {
                         .as_ref()
                         .map(|saved| (saved.path, saved.view()));
                     let scalar = capture && !self.source.kind.is_set_returning();
-                    let mut emit = |values: &[Datum]| {
+                    let mut emit = |values: &[Datum], _: &[StoredForm]| {
                         if capture {
                             self.result.capture(
                                 &self.source,
@@ -858,20 +859,19 @@ impl SqlExecution {
                             Ok(())
                         }
                     };
-                    let evaluate =
-                        |emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>| {
-                            query::execute_routine_query_under(
-                                query,
-                                storage,
-                                txid,
-                                work,
-                                arguments,
-                                true,
-                                Some(sequences),
-                                stored,
-                                emit,
-                            )
-                        };
+                    let evaluate = |emit: &mut crate::sql::query::RowSink<'_>| {
+                        query::execute_routine_query_under(
+                            query,
+                            storage,
+                            txid,
+                            work,
+                            arguments,
+                            true,
+                            Some(sequences),
+                            stored,
+                            emit,
+                        )
+                    };
                     if scalar {
                         query::consume_query_rows(core::num::NonZeroU64::MIN, evaluate, &mut emit)
                     } else {

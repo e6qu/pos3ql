@@ -793,6 +793,8 @@ impl CursorQuery {
                         invocations,
                         frame,
                     )
+                    // A cursor's rows leave the statement without their forms.
+                    .map(|(values, _)| values)
             })
         })
     }

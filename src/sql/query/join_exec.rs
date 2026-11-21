@@ -18,7 +18,7 @@ use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::Collation;
 use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError};
 use crate::sql::types::Datum;
-use crate::storage::Storage;
+use crate::storage::{Storage, StoredForm};
 
 use super::index_paths::join_query::{ModeledJoin, PlannedJoin};
 use super::index_paths::joins::{
@@ -30,6 +30,10 @@ use super::{QueryScope, arena_full};
 
 /// The plan node numbers of a join's nodes under `EXPLAIN ANALYZE`, past
 /// the numbers the block's own nodes use.
+/// A flat outer row: its values, each table's offset in them and each
+/// value's stored form.
+type OuterValues<'a> = (&'a [Datum<'a>], &'a [usize], &'a [StoredForm]);
+
 pub(crate) fn node_number(path: u32) -> Option<u16> {
     u16::try_from(path).ok()?.checked_add(1000)
 }
@@ -73,6 +77,9 @@ fn take_batch<'a, T: Copy + 'a>(
 #[derive(Clone, Copy)]
 struct BaseRow<'a> {
     values: &'a [Datum<'a>],
+    /// The stored forms of the relation's columns; empty when every one is
+    /// as `heap_form_tuple` forms it.
+    forms: &'a [StoredForm],
     rowid: Option<u64>,
 }
 
@@ -1040,8 +1047,32 @@ struct Runner<'r, 'a> {
     /// another row leaves the join.
     failed: core::cell::Cell<Option<SqlError>>,
     /// The flat row an expression of several relations is evaluated over,
-    /// allocated once.
+    /// allocated once, and its values' stored forms.
     scratch: core::cell::RefCell<&'a mut [Datum<'a>]>,
+    form_scratch: core::cell::RefCell<&'a mut [StoredForm]>,
+}
+
+/// The stored forms of the first `columns` columns of `row`'s only FROM
+/// item, in the arena; empty when every one is as `heap_form_tuple` forms
+/// it.
+fn row_forms<'a>(
+    row: &JoinRow<'_, 'a, '_>,
+    columns: usize,
+    arena: &'a Arena,
+) -> Result<&'a [StoredForm], SqlError> {
+    let mut forms: &mut [StoredForm] = &mut [];
+    for column in 0..columns {
+        let Some(form) = row.column_form(0, column)? else {
+            continue;
+        };
+        if forms.is_empty() {
+            forms = arena
+                .alloc_slice_with(columns, |_| StoredForm::Inline)
+                .map_err(|_| arena_full())?;
+        }
+        forms[column] = form;
+    }
+    Ok(forms)
 }
 
 /// Scans `statement`'s FROM clause: by the plan PostgreSQL's join search
@@ -1154,9 +1185,10 @@ fn run_modeled_sorted<'a>(
             let JoinRowValues::Flat {
                 values,
                 offsets: row_offsets,
+                forms: Some(row_forms),
             } = row.values
             else {
-                unreachable!("a modeled join's rows are flat")
+                unreachable!("a modeled join's rows are flat, with their forms")
             };
             offsets = arena
                 .alloc_slice_copy(row_offsets)
@@ -1179,10 +1211,13 @@ fn run_modeled_sorted<'a>(
                 };
             }
             let values = arena.alloc_slice_copy(values).map_err(|_| arena_full())?;
+            let forms = arena
+                .alloc_slice_copy(row_forms)
+                .map_err(|_| arena_full())?;
             let rowids = arena
                 .alloc_slice_copy(row.rowids)
                 .map_err(|_| arena_full())?;
-            held.push((&*values, &*rowids, &*key_values))
+            held.push((&*values, &*forms, &*rowids, &*key_values))
                 .map_err(|_| arena_full())?;
             Ok(true)
         },
@@ -1190,7 +1225,7 @@ fn run_modeled_sorted<'a>(
     let rows = held.as_slice();
     let compare_key = |at: usize, left: u32, right: u32| {
         let (_, collation, flags) = keys[at];
-        let (left, right) = (&rows[left as usize].2[at], &rows[right as usize].2[at]);
+        let (left, right) = (&rows[left as usize].3[at], &rows[right as usize].3[at]);
         let nulls_first = flags & super::index_paths::joins::KEY_NULLS_FIRST != 0;
         Ok::<_, SqlError>(match (left.is_null(), right.is_null()) {
             (true, true) => Ordering::Equal,
@@ -1252,10 +1287,14 @@ fn run_modeled_sorted<'a>(
         out
     };
     for &at in order {
-        let (values, rowids, _) = rows[at as usize];
+        let (values, forms, rowids, _) = rows[at as usize];
         if !visit(&JoinRow {
             scope,
-            values: JoinRowValues::Flat { values, offsets },
+            values: JoinRowValues::Flat {
+                values,
+                offsets,
+                forms: Some(forms),
+            },
             rowids,
             visible: scope.n,
         })? {
@@ -1313,6 +1352,12 @@ pub(super) fn run_modeled<'a>(
     let widths: &[usize] = widths;
     let values = arena
         .alloc_slice_with(width, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let forms = arena
+        .alloc_slice_with(width, |_| StoredForm::Inline)
+        .map_err(|_| arena_full())?;
+    let written_forms = arena
+        .alloc_slice_with(written_width, |_| StoredForm::Inline)
         .map_err(|_| arena_full())?;
     let rowids = arena
         .alloc_slice_with(n, |_| None::<u64>)
@@ -1374,10 +1419,16 @@ pub(super) fn run_modeled<'a>(
                 .alloc_slice_with(width, |_| Datum::Null)
                 .map_err(|_| arena_full())?,
         ),
+        form_scratch: core::cell::RefCell::new(
+            arena
+                .alloc_slice_with(width, |_| StoredForm::Inline)
+                .map_err(|_| arena_full())?,
+        ),
     };
     let mut bound: Bound<'a> = [None; RELATION_NUMBERS];
     runner.exec(model.plan.top, &mut bound, &mut |bound| {
         runner.check()?;
+        forms.fill(StoredForm::Inline);
         for table in 0..n {
             let start = offsets[table];
             let columns = widths[table];
@@ -1386,6 +1437,7 @@ pub(super) fn run_modeled<'a>(
             if let Some(kept) = model.kept_for[table] {
                 let row = bound[usize::from(kept)].expect("the top join binds every relation");
                 values[start..start + columns].copy_from_slice(&row.values[..columns]);
+                forms[start..start + row.forms.len()].copy_from_slice(row.forms);
                 rowids[table] = row.rowid;
                 continue;
             }
@@ -1397,13 +1449,18 @@ pub(super) fn run_modeled<'a>(
             }
             let row = bound[table].expect("the top join binds every relation");
             values[start..start + columns].copy_from_slice(&row.values[..columns]);
+            forms[start..start + row.forms.len()].copy_from_slice(row.forms);
             rowids[table] = row.rowid;
         }
         let _block = super::instrument::enter_block(block);
         let Some(nested) = model.nested.as_ref() else {
             return visit(&JoinRow {
                 scope,
-                values: JoinRowValues::Flat { values, offsets },
+                values: JoinRowValues::Flat {
+                    values,
+                    offsets,
+                    forms: Some(forms),
+                },
                 rowids,
                 visible: n,
             });
@@ -1422,6 +1479,8 @@ pub(super) fn run_modeled<'a>(
                 let width = widths[members.start];
                 written_values[at..at + width]
                     .copy_from_slice(&values[offsets[members.start]..][..width]);
+                written_forms[at..at + width]
+                    .copy_from_slice(&forms[offsets[members.start]..][..width]);
                 written_rowids[table] = rowids[members.start];
                 continue;
             }
@@ -1431,6 +1490,8 @@ pub(super) fn run_modeled<'a>(
                     let width = widths[member];
                     written_values[at..at + width]
                         .copy_from_slice(&values[offsets[member]..][..width]);
+                    written_forms[at..at + width]
+                        .copy_from_slice(&forms[offsets[member]..][..width]);
                     at += width;
                 }
             }
@@ -1438,6 +1499,7 @@ pub(super) fn run_modeled<'a>(
                 let nulled =
                     bound[member].is_none_or(|row| core::ptr::eq(row.values, nulls[member]));
                 written_values[at] = Datum::Int4(i32::from(nulled));
+                written_forms[at] = StoredForm::Inline;
                 at += 1;
             }
         }
@@ -1446,6 +1508,7 @@ pub(super) fn run_modeled<'a>(
             values: JoinRowValues::Flat {
                 values: written_values,
                 offsets: written_offsets,
+                forms: Some(written_forms),
             },
             rowids: written_rowids,
             visible: written.n,
@@ -3047,16 +3110,9 @@ impl<'r, 'a> Runner<'r, 'a> {
         Ok(true)
     }
 
-    /// Runs path `path` of relation `rel` (search path `id`) as planned: the
-    /// scan's own planning describes that path again, and a parameterized
-    /// path reads the bound outer rows' values.
     /// The bound rows of `relids`, flat by the query's FROM positions: the
     /// outer row a parameterized scan or a `LATERAL` subquery reads.
-    fn outer_values(
-        &self,
-        bound: &Bound<'a>,
-        relids: Relids,
-    ) -> Result<(&'a [Datum<'a>], &'a [usize]), SqlError> {
+    fn outer_values(&self, bound: &Bound<'a>, relids: Relids) -> Result<OuterValues<'a>, SqlError> {
         let n = self.scope.n;
         let offsets = self
             .arena
@@ -3079,7 +3135,31 @@ impl<'r, 'a> Runner<'r, 'a> {
                 values[offsets[table]..offsets[table] + columns.len()].copy_from_slice(columns);
             }
         }
-        Ok((values, offsets))
+        let forms = self
+            .arena
+            .alloc_slice_with(width, |_| StoredForm::Inline)
+            .map_err(|_| arena_full())?;
+        self.flat_forms(bound, Some(relids), forms);
+        Ok((values, offsets, forms))
+    }
+
+    /// The stored forms of the bound rows of `relids` (all when `None`) at
+    /// their places in a flat row, into `forms`; every other entry `Inline`.
+    fn flat_forms(
+        &self,
+        bound: &[Option<BaseRow<'a>>],
+        relids: Option<Relids>,
+        forms: &mut [StoredForm],
+    ) {
+        forms.fill(StoredForm::Inline);
+        for (table, row) in bound.iter().enumerate().take(self.scope.n) {
+            if let Some(row) = row
+                && relids.is_none_or(|relids| relids.contains(table as u32))
+            {
+                let start = self.offsets[table];
+                forms[start..start + row.forms.len()].copy_from_slice(row.forms);
+            }
+        }
     }
 
     /// A `LATERAL` subquery's rows for the bound outer row: its query run
@@ -3092,10 +3172,14 @@ impl<'r, 'a> Runner<'r, 'a> {
         bound: &mut Bound<'a>,
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
-        let (values, offsets) = self.outer_values(bound, lateral.relids)?;
+        let (values, offsets, forms) = self.outer_values(bound, lateral.relids)?;
         let outer_row = JoinRow {
             scope: self.scope,
-            values: JoinRowValues::Flat { values, offsets },
+            values: JoinRowValues::Flat {
+                values,
+                offsets,
+                forms: Some(forms),
+            },
             rowids: &[],
             visible: self.scope.n,
         };
@@ -3110,8 +3194,9 @@ impl<'r, 'a> Runner<'r, 'a> {
                 self.params,
                 Some(&outer_row),
                 self.hooks.sequences,
-                &mut |values| {
-                    let encoded = crate::sql::exec::encode_projected_pub(values, self.arena)?;
+                &mut |values, forms| {
+                    let encoded =
+                        crate::sql::exec::encode_projected_formed(values, forms, self.arena)?;
                     rows.push(encoded).map_err(|_| arena_full())
                 },
             )?;
@@ -3127,8 +3212,15 @@ impl<'r, 'a> Runner<'r, 'a> {
                 *value =
                     crate::sql::exec::decode_projected_col_record(encoded, column, self.arena)?;
             }
+            let forms = self
+                .arena
+                .alloc_slice_with(columns, |column| {
+                    crate::sql::exec::projected_stored_form(encoded, column)
+                })
+                .map_err(|_| arena_full())?;
             bound[rel] = Some(BaseRow {
                 values,
+                forms,
                 rowid: None,
             });
             if !sink(bound)? {
@@ -3146,6 +3238,9 @@ impl<'r, 'a> Runner<'r, 'a> {
         Ok(true)
     }
 
+    /// Runs path `path` of relation `rel` (search path `id`) as planned: the
+    /// scan's own planning describes that path again, and a parameterized
+    /// path reads the bound outer rows' values.
     fn scan(
         &self,
         id: u32,
@@ -3185,6 +3280,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 values: JoinRowValues::Flat {
                     values: outer_values.0,
                     offsets: outer_values.1,
+                    forms: Some(outer_values.2),
                 },
                 rowids: &[],
                 visible: self.scope.n,
@@ -3230,6 +3326,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 }
                 bound[rel] = Some(BaseRow {
                     values,
+                    forms: row_forms(row, columns.len(), self.arena)?,
                     rowid: row.rowids.first().copied().flatten(),
                 });
                 keep = sink(bound)?;
@@ -3383,6 +3480,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             if relids.contains(table as u32) {
                 *slot = Some(BaseRow {
                     values: nulls,
+                    forms: &[],
                     rowid: None,
                 });
             }
@@ -3405,11 +3503,14 @@ impl<'r, 'a> Runner<'r, 'a> {
                 values[start..start + columns.len()].copy_from_slice(columns);
             }
         }
+        let mut forms = self.form_scratch.borrow_mut();
+        self.flat_forms(bound, None, &mut forms);
         let row = JoinRow {
             scope: self.scope,
             values: JoinRowValues::Flat {
                 values,
                 offsets: self.offsets,
+                forms: Some(&forms),
             },
             rowids: &[],
             visible: self.scope.n,
@@ -3435,11 +3536,17 @@ impl<'r, 'a> Runner<'r, 'a> {
                 values[start..start + columns.len()].copy_from_slice(columns);
             }
         }
+        let forms = self
+            .arena
+            .alloc_slice_with(self.width, |_| StoredForm::Inline)
+            .map_err(|_| arena_full())?;
+        self.flat_forms(bound, None, forms);
         let row = JoinRow {
             scope: self.scope,
             values: JoinRowValues::Flat {
                 values,
                 offsets: self.offsets,
+                forms: Some(forms),
             },
             rowids: &[],
             visible: self.scope.n,

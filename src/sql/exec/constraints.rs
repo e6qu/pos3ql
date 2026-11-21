@@ -363,7 +363,9 @@ pub(super) unsafe fn for_each_validation_row(
                         rowenc::decode(bytes, schema, &mut decoded)?;
                         &decoded[..schema.len()]
                     }
-                    crate::storage::SpilledRowRepresentation::Values(values) => values,
+                    crate::storage::SpilledRowRepresentation::Values(
+                        &crate::storage::SpilledValues { values, .. },
+                    ) => values,
                 };
                 validate(row.rowid, values)?;
             }
@@ -398,6 +400,17 @@ struct ValueLookup<'v> {
 }
 
 impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if name.eq_ignore_ascii_case("value") {
             Ok(self.value)

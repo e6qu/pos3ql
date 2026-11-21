@@ -203,12 +203,73 @@ fn count(
     Ok(())
 }
 
-/// The heap tuple length of the row `values` of the table in `slot`.
-fn row_length(storage: &Storage, txid: u32, slot: usize, values: &[Datum<'_>]) -> usize {
+/// The heap tuple length of the row `values` of the table in `slot`, the
+/// datums in `carried` keeping their stored forms. The pages of a TOAST
+/// relation are outside the model, so a row TOAST compresses or moves out of
+/// line is not counted.
+fn row_length(
+    storage: &Storage,
+    txid: u32,
+    slot: usize,
+    values: &[Datum<'_>],
+    carried: &crate::sql::toast::CarriedForms,
+    arena: &Arena,
+) -> Result<usize, SqlError> {
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     let n_columns = storage.table_def(slot, txid).schema(&mut schema);
     let n_columns = n_columns.min(values.len());
-    tuple_length(&values[..n_columns], &schema[..n_columns])
+    let mut forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+    crate::sql::toast::row_forms(
+        storage,
+        slot,
+        txid,
+        &values[..n_columns],
+        carried,
+        &mut forms[..n_columns],
+        arena,
+    )?;
+    inline_row_length(
+        &values[..n_columns],
+        &schema[..n_columns],
+        &forms[..n_columns],
+    )
+}
+
+/// The heap tuple length of the row `values` whose columns TOAST stores in
+/// `forms`.
+fn inline_row_length(
+    values: &[Datum<'_>],
+    schema: &[ColType],
+    forms: &[crate::storage::StoredForm],
+) -> Result<usize, SqlError> {
+    if forms
+        .iter()
+        .any(|form| *form != crate::storage::StoredForm::Inline)
+    {
+        return Err(crate::sql_err!(
+            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN (ANALYZE, BUFFERS) of writing a row TOAST compresses or moves out of line is not supported"
+        ));
+    }
+    Ok(tuple_length(values, schema))
+}
+
+/// [`row_length`] of the stored row `bytes`, which records its forms.
+fn encoded_row_length<'v>(
+    storage: &Storage,
+    txid: u32,
+    slot: usize,
+    bytes: &'v [u8],
+    values: &'v mut [Datum<'v>; MAX_COLUMNS],
+) -> Result<(usize, &'v [Datum<'v>]), SqlError> {
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    let n_columns = storage.table_def(slot, txid).schema(&mut schema);
+    crate::storage::rowenc::decode(bytes, &schema[..n_columns], values)?;
+    let mut forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+    crate::storage::rowenc::stored_forms(bytes, &schema[..n_columns], &mut forms[..n_columns])?;
+    let values = &values[..n_columns];
+    let length = inline_row_length(values, &schema[..n_columns], &forms[..n_columns])?;
+    Ok((length, values))
 }
 
 /// Counts the insertion of the row `values` into the table in `slot`.
@@ -217,12 +278,13 @@ pub(crate) fn row_inserted(
     txid: u32,
     slot: usize,
     values: &[Datum<'_>],
+    carried: &crate::sql::toast::CarriedForms,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     if !instrument::buffers_counted() {
         return Ok(());
     }
-    let length = row_length(storage, txid, slot, values);
+    let length = row_length(storage, txid, slot, values, carried, arena)?;
     count(storage, txid, slot, arena, |held, indexes| {
         Some(append(held, length).plus(indexes.insert(None)))
     })
@@ -238,12 +300,28 @@ pub(crate) fn row_updated(
     rowid: u64,
     old: &[Datum<'_>],
     new: &[Datum<'_>],
+    carried: &crate::sql::toast::CarriedForms,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     if !instrument::buffers_counted() {
         return Ok(());
     }
-    let length = row_length(storage, txid, slot, new);
+    let length = row_length(storage, txid, slot, new, carried, arena)?;
+    updated_to_length(storage, txid, slot, rowid, old, new, length, arena)
+}
+
+/// [`row_updated`] to a new row whose heap tuple takes `length` bytes.
+#[allow(clippy::too_many_arguments)]
+fn updated_to_length(
+    storage: &Storage,
+    txid: u32,
+    slot: usize,
+    rowid: u64,
+    old: &[Datum<'_>],
+    new: &[Datum<'_>],
+    length: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
     let mut kept = 0u64;
     for (column, (old, new)) in old.iter().zip(new).enumerate().take(64) {
         if old == new {
@@ -287,19 +365,6 @@ pub(crate) fn row_deleted(
 }
 
 /// The row `bytes` of the table in `slot` encodes, decoded into `values`.
-fn decoded<'v>(
-    storage: &Storage,
-    txid: u32,
-    slot: usize,
-    bytes: &'v [u8],
-    values: &'v mut [Datum<'v>; MAX_COLUMNS],
-) -> Result<&'v [Datum<'v>], SqlError> {
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
-    let n_columns = storage.table_def(slot, txid).schema(&mut schema);
-    crate::storage::rowenc::decode(bytes, &schema[..n_columns], values)?;
-    Ok(&values[..n_columns])
-}
-
 /// [`row_inserted`] of the row `bytes` encodes.
 pub(crate) fn encoded_row_inserted(
     storage: &Storage,
@@ -312,8 +377,10 @@ pub(crate) fn encoded_row_inserted(
         return Ok(());
     }
     let mut values = [Datum::Null; MAX_COLUMNS];
-    let values = decoded(storage, txid, slot, bytes, &mut values)?;
-    row_inserted(storage, txid, slot, values, arena)
+    let (length, _) = encoded_row_length(storage, txid, slot, bytes, &mut values)?;
+    count(storage, txid, slot, arena, |held, indexes| {
+        Some(append(held, length).plus(indexes.insert(None)))
+    })
 }
 
 /// [`row_updated`] to the row `new` encodes.
@@ -330,8 +397,8 @@ pub(crate) fn encoded_row_updated(
         return Ok(());
     }
     let mut values = [Datum::Null; MAX_COLUMNS];
-    let values = decoded(storage, txid, slot, new, &mut values)?;
-    row_updated(storage, txid, slot, rowid, old, values, arena)
+    let (length, values) = encoded_row_length(storage, txid, slot, new, &mut values)?;
+    updated_to_length(storage, txid, slot, rowid, old, values, length, arena)
 }
 
 /// Counts an `INSERT ... ON CONFLICT`'s check of its arbiter for the

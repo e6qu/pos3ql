@@ -76,6 +76,8 @@ impl<'a> ScanNode<'a> {
         let pending = self.pending.as_ref().expect("prepared statement row");
         let mut values = [Datum::Null; MAX_COLUMNS];
         pending.decode(scope, &mut values)?;
+        let mut forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+        pending.stored_forms(scope, 0, &mut forms)?;
         let rowids = [match &pending.row {
             RetainedRow::Physical(row) => Some(row.rowid),
             RetainedRow::Saved { rowid, .. } => *rowid,
@@ -87,6 +89,7 @@ impl<'a> ScanNode<'a> {
             values: scan::JoinRowValues::Flat {
                 values: &values,
                 offsets: &[0],
+                forms: Some(&forms),
             },
             rowids: &rowids,
             visible: scope.n,

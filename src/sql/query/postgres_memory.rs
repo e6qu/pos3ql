@@ -371,6 +371,41 @@ fn stored_projected_sized(
     at: usize,
     hint: Option<i32>,
 ) -> (Option<Option<Stored>>, usize) {
+    // A value passed on from a stored row is the stored datum: a compressed
+    // varlena with its four-byte header, or an 18-byte TOAST pointer.
+    let size = || crate::sql::exec::projected_value_size(row, tag, at);
+    match crate::sql::exec::projected_stored_form_at(row, at - 1) {
+        crate::storage::rowenc::StoredForm::Inline => {}
+        crate::storage::rowenc::StoredForm::Compressed(compressed) => {
+            return (
+                Some(Some(Stored {
+                    layout: crate::sql::type_layouts::PhysicalLayout {
+                        length: -1,
+                        by_value: false,
+                        alignment: b'i',
+                        storage: b'p',
+                    },
+                    payload: compressed as usize - 4,
+                })),
+                size(),
+            );
+        }
+        crate::storage::rowenc::StoredForm::External { .. } => {
+            return (
+                Some(Some(Stored {
+                    layout: crate::sql::type_layouts::PhysicalLayout {
+                        length: crate::sql::toast::TOAST_POINTER_SIZE as i16,
+                        by_value: false,
+                        alignment: b'c',
+                        storage: b'p',
+                    },
+                    payload: crate::sql::toast::TOAST_POINTER_SIZE,
+                })),
+                size(),
+            );
+        }
+        crate::storage::rowenc::StoredForm::Unmodelled => return (None, size()),
+    }
     if matches!(tag, 19 | 51 | 202 | 204) {
         let size = crate::sql::exec::projected_value_size(row, tag, at);
         let mut fields = [None::<Stored>; crate::sql::exec::MAX_PROJ];

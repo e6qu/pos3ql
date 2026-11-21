@@ -17,6 +17,7 @@ use crate::sql::types::{ColType, Datum, RecordField};
 use crate::sql_err;
 use crate::stack_format;
 use crate::storage::Storage;
+use crate::storage::StoredForm;
 
 use super::{
     AggState, CatalogScopeCols, Chained, QueryScope, SUBQUERY_DEPTH, ScopeCols, ScopeSchema,
@@ -462,7 +463,7 @@ fn external_list_subquery<'a>(
         params,
         outer,
         sequences,
-        &mut |values| {
+        &mut |values, _| {
             if values.len() != projected_columns {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -498,7 +499,13 @@ fn external_list_subquery<'a>(
             }
             storage
                 .with_block_store(|blocks| {
-                    sorter.push_projected_by(storage, blocks, 1, |_| value, &mut compare)
+                    sorter.push_projected_by(
+                        storage,
+                        blocks,
+                        1,
+                        |_| Ok((value, StoredForm::Inline)),
+                        &mut compare,
+                    )
                 })
                 .expect("external subquery run has a block store")
         },
@@ -632,7 +639,7 @@ fn streaming_scalar_subquery<'a>(
         params,
         outer,
         sequences,
-        &mut |values| {
+        &mut |values, _| {
             if values.len() != 1 {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -654,7 +661,13 @@ fn streaming_scalar_subquery<'a>(
             let value = values[0];
             storage
                 .with_block_store(|blocks| {
-                    sorter.push_projected_by(storage, blocks, 1, |_| value, &mut compare)
+                    sorter.push_projected_by(
+                        storage,
+                        blocks,
+                        1,
+                        |_| Ok((value, StoredForm::Inline)),
+                        &mut compare,
+                    )
                 })
                 .expect("external scalar-subquery run has a block store")
         },
@@ -710,7 +723,7 @@ fn streaming_array_subquery<'a>(
         params,
         outer,
         sequences,
-        &mut |values| {
+        &mut |values, _| {
             if values.len() != 1 {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -720,7 +733,13 @@ fn streaming_array_subquery<'a>(
             count += 1;
             storage
                 .with_block_store(|blocks| {
-                    sorter.push_projected_by(storage, blocks, 1, |_| values[0], &mut compare)
+                    sorter.push_projected_by(
+                        storage,
+                        blocks,
+                        1,
+                        |_| Ok((values[0], StoredForm::Inline)),
+                        &mut compare,
+                    )
                 })
                 .expect("external array-subquery run has a block store")
         },
@@ -1226,6 +1245,16 @@ struct SubqueryCollationLookup<'scope, 'definition, 'outer, 'row> {
 }
 
 impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn whole_row_field_metadata(
         &self,
         table: &str,
@@ -2134,7 +2163,7 @@ fn subquery_exists<'a>(
             params,
             outer,
             sequences,
-            &mut |_| {
+            &mut |_, _| {
                 found = true;
                 Ok(())
             },
@@ -4152,7 +4181,7 @@ fn run_scalar_record_subquery<'a>(
         params,
         outer,
         sequences,
-        &mut |row| {
+        &mut |row, _| {
             if row.len() != row_arity {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -4238,7 +4267,7 @@ fn run_record_subquery<'a>(
         params,
         outer,
         sequences,
-        &mut |values| {
+        &mut |values, _| {
             if values.len() != row_arity {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -4420,7 +4449,7 @@ fn run_subquery<'a>(
             params,
             outer,
             sequences,
-            &mut |vals| {
+            &mut |vals, _| {
                 if vals.len() != 1 {
                     return Err(sql_err!(
                         sqlstate::SYNTAX_ERROR,

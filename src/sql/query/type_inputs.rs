@@ -27,6 +27,16 @@ pub(super) struct MetadataOnly<'s, 'v> {
 }
 
 impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         self.columns
             .column_meta(qualifier, name)
@@ -1981,6 +1991,16 @@ impl RemoteCtid<'_> {
 }
 
 impl<'a> ColumnLookup<'a> for RemoteCtid<'_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn lookup(
         &self,
         qualifier: Option<&str>,

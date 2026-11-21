@@ -18,8 +18,8 @@ old prefix's objects as disposable. Application schema changes follow
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v49` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
-| Journal record | Version `34` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v50` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
+| Journal record | Version `35` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process's writer token. |
@@ -522,6 +522,19 @@ Labels follow PostgreSQL's
 | Spill values | Arrays use the eight-byte descriptor; named scalars carry a four-byte stamp |
 | Object-reference default | Full type and target OIDs; at most 130 bytes including a 120-byte cached name; unknown type OIDs fail (set per [PostgreSQL 18](https://www.postgresql.org/docs/18/datatype-oid.html)) |
 | Enum indexes | Key hashes use member identities; label-hashed index generations are retired and replaced |
+
+### Stored row values
+
+A table row is a two-byte column count, a null bitmap, then each non-null
+value. A variable-width value starts with a four-byte length word. When bit 31
+of that word is set, five bytes follow the value: the form PostgreSQL's TOAST
+stores it in (`heap_toast_insert_or_update`) and a four-byte size. Kind `1` is
+compressed in line with that `VARSIZE`, `2` and `3` are saved out of line
+uncompressed or compressed with that many bytes saved, and `4` is a form the
+model does not size (lz4, or a value the writing statement may have passed on
+from another stored row). A value with no record is as `heap_form_tuple` forms
+it. Other kinds are rejected as corrupt. Journal version `35` and manifest
+`pos3ql-manifest-v50` introduced the record; earlier versions are rejected.
 
 ### Saved SQL and values
 

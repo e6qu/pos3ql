@@ -13,7 +13,7 @@ use crate::mem::arena::Arena;
 use crate::sql::ast::{Expr, FromClause};
 use crate::sql::eval::{ColumnLookup, EvalHooks, SequenceAccess, SqlError};
 use crate::sql::types::Datum;
-use crate::storage::Storage;
+use crate::storage::{Storage, StoredForm};
 
 use super::scan::{
     BoundRow, Chained, JoinRow, PaxFullRowReason, PaxReadDemand, pax_column_demand,
@@ -55,33 +55,40 @@ impl<'a> JoinedFromRow<'a> {
             if index >= columns + 2 * scope.n {
                 let table = index - columns - 2 * scope.n;
                 // Checked above: a stored source's oid reads without error.
-                return if scope.stores_rows(table) {
-                    row.table_oid(table).unwrap_or(Datum::Null)
+                let oid = if scope.stores_rows(table) {
+                    row.table_oid(table)?
                 } else {
                     Datum::Null
                 };
+                return Ok((oid, StoredForm::Inline));
             }
             if index >= columns + scope.n {
                 let table = index - columns - scope.n;
-                return row
+                let rowid = row
                     .rowids
                     .get(table)
                     .copied()
                     .flatten()
                     .and_then(|rowid| i64::try_from(rowid).ok())
                     .map_or(Datum::Null, Datum::Int8);
+                return Ok((rowid, StoredForm::Inline));
             }
             if index >= columns {
-                return Datum::Bool(row.table_present(index - columns) == Some(true));
+                let present = row.table_present(index - columns) == Some(true);
+                return Ok((Datum::Bool(present), StoredForm::Inline));
             }
             let mut column = index;
             for table in 0..scope.n {
                 let n_columns = scope.stored_width(table);
                 if column < n_columns {
-                    return row
+                    let value = row
                         .table_values(table)
                         .and_then(|values| values.get(column).copied())
                         .unwrap_or(Datum::Null);
+                    let form = row
+                        .column_form(table, column)?
+                        .unwrap_or(StoredForm::Inline);
+                    return Ok((value, form));
                 }
                 column -= n_columns;
             }
@@ -132,11 +139,19 @@ impl<'a> JoinedFromRow<'a> {
                 })
                 .map_err(|_| arena_full())?;
             let values: &'a [Datum<'a>] = values;
-            *slot = Some(BoundRow::Values(if values[n_columns].is_null() {
-                &values[..n_columns]
-            } else {
-                values
-            }));
+            let forms = arena
+                .alloc_slice_with(n_columns, |index| {
+                    crate::sql::exec::projected_stored_form(self.0, start + index)
+                })
+                .map_err(|_| arena_full())?;
+            *slot = Some(BoundRow::Values {
+                values: if values[n_columns].is_null() {
+                    &values[..n_columns]
+                } else {
+                    values
+                },
+                forms: super::scan::RowForms::Listed(forms),
+            });
         }
         let rowids = arena
             .alloc_slice_with(scope.n, |table| match decoded[columns + scope.n + table] {
@@ -481,15 +496,13 @@ pub(super) fn recheck_lateral_select<'a>(
                     hooks,
                     &mut values,
                 )?;
-                let len = crate::sql::exec::projected_row_len_by(width, |column| values[column])?;
+                // The rerun binds these values without their stored forms.
+                let value = |column: usize| Ok((values[column], StoredForm::Inline));
+                let len = crate::sql::exec::projected_row_len_by(width, value)?;
                 let output = arena
                     .alloc_persistent_slice_with(len, |_| 0u8)
                     .map_err(|_| arena_full())?;
-                let len = crate::sql::exec::encode_projected_by_into(
-                    width,
-                    |column| values[column],
-                    output,
-                )?;
+                let len = crate::sql::exec::encode_projected_by_into(width, value, output)?;
                 Some(&output[..len])
             } else {
                 None

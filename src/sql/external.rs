@@ -412,14 +412,14 @@ impl ExternalSorter {
         Ok(Some(model.space(self.heap_charge)))
     }
 
-    /// Encodes and appends one self-describing projected row without touching
-    /// the statement arena.
+    /// Encodes and appends one self-describing projected row, each value with
+    /// the stored form it carries, without touching the statement arena.
     pub(crate) fn push_projected_by<'a>(
         &mut self,
         storage: &crate::storage::Storage,
         store: &mut dyn BlockStore,
         columns: usize,
-        mut value_at: impl FnMut(usize) -> Datum<'a>,
+        mut value_at: impl FnMut(usize) -> Result<(Datum<'a>, crate::storage::StoredForm), SqlError>,
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
     ) -> Result<(), SqlError> {
         let projected_len = projected_row_len_by(columns, &mut value_at)?;
@@ -980,11 +980,12 @@ mod tests {
                     &mut store,
                     2,
                     |column| {
-                        if column == 0 {
+                        let value = if column == 0 {
                             Datum::Int8(key)
                         } else {
                             Datum::Int8(ordinal)
-                        }
+                        };
+                        Ok((value, crate::storage::StoredForm::Inline))
                     },
                     &mut compare,
                 )
@@ -1019,7 +1020,7 @@ mod tests {
                     &storage,
                     &mut store,
                     1,
-                    |_| Datum::Text(&oversized),
+                    |_| Ok((Datum::Text(&oversized), crate::storage::StoredForm::Inline)),
                     &mut compare,
                 )
                 .is_err(),

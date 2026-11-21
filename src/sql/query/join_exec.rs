@@ -22,8 +22,8 @@ use crate::storage::Storage;
 
 use super::index_paths::join_query::{ModeledJoin, PlannedJoin};
 use super::index_paths::joins::{
-    ClauseList, JoinType, KEY_CLASS, KEY_DESCENDING, KEY_NULLS_FIRST, Keys, MAX_JOIN_RELS, Member,
-    PathKind, Relids,
+    ClauseList, JoinType, KEY_CLASS, KEY_DESCENDING, KEY_NULLS_FIRST, Keys, Member, PathKind,
+    RELATION_NUMBERS, Relids,
 };
 use super::scan::{JoinRow, JoinRowValues, PaxFullRowReason, PaxReadDemand};
 use super::{QueryScope, arena_full};
@@ -44,6 +44,29 @@ fn node(role: impl FnOnce(u16) -> super::instrument::Role, path: u32) -> super::
     node_number(path).map_or(super::instrument::Node::NONE, |number| {
         super::instrument::node(role(number))
     })
+}
+
+/// Moves `files`' entries of `batch` to `out`, replacing its contents, and
+/// keeps the others in place in their order (`BufFile` reads of one batch).
+fn take_batch<'a, T: Copy + 'a>(
+    files: &mut ArenaList<'a, (u32, T)>,
+    batch: u32,
+    out: &mut ArenaList<'a, T>,
+) -> Result<(), SqlError> {
+    out.truncate(0);
+    let entries = files.as_mut_slice().map_err(|_| arena_full())?;
+    let mut kept = 0;
+    for at in 0..entries.len() {
+        let (at_batch, entry) = entries[at];
+        if at_batch == batch {
+            out.push(entry).map_err(|_| arena_full())?;
+        } else {
+            entries[kept] = (at_batch, entry);
+            kept += 1;
+        }
+    }
+    files.truncate(kept);
+    Ok(())
 }
 
 /// One base row: its values and row identity.
@@ -124,7 +147,9 @@ struct BatchTable<'a> {
     memory: ArenaList<'a, MemoryRow<'a>>,
     prepends: u64,
     inner_files: ArenaList<'a, (u32, HashedRow<'a>)>,
-    outer_files: ArenaList<'a, (u32, Bound<'a>)>,
+    /// Saved outer rows by batch: each the query's relations, kept as
+    /// [`Runner::keep`] keeps them.
+    outer_files: ArenaList<'a, (u32, Row<'a>)>,
     /// `memory` ordered by hash, newest prepend first, once loaded.
     index: &'a [u32],
     /// Each row's match flag (`HeapTupleHeaderSetMatch`), in memory and in
@@ -980,7 +1005,7 @@ struct Probe<'k> {
 type KeySides = [((usize, usize), (usize, usize)); super::index_paths::joins::MAX_JOIN_CLAUSES];
 
 /// The rows bound so far, by FROM position.
-type Bound<'a> = [Option<BaseRow<'a>>; MAX_JOIN_RELS];
+type Bound<'a> = [Option<BaseRow<'a>>; RELATION_NUMBERS];
 
 /// A kept row: the query's relations of a [`Bound`], so a store of rows
 /// grows with the relations the query joins, not the most it may.
@@ -1312,7 +1337,7 @@ pub(super) fn run_modeled<'a>(
         .map_err(|_| arena_full())?;
     // A row of NULLs per relation: its columns, then a NULL for each
     // expression member.
-    let mut nulls = [&[][..]; MAX_JOIN_RELS];
+    let mut nulls = [&[][..]; RELATION_NUMBERS];
     for (table, held) in nulls.iter_mut().enumerate().take(n) {
         *held = arena
             .alloc_slice_with(scope.stored_width(table) + model.expressions.len(), |_| {
@@ -1346,7 +1371,7 @@ pub(super) fn run_modeled<'a>(
                 .map_err(|_| arena_full())?,
         ),
     };
-    let mut bound: Bound<'a> = [None; MAX_JOIN_RELS];
+    let mut bound: Bound<'a> = [None; RELATION_NUMBERS];
     runner.exec(model.plan.top, &mut bound, &mut |bound| {
         runner.check()?;
         for table in 0..n {
@@ -2658,9 +2683,10 @@ impl<'r, 'a> Runner<'r, 'a> {
             let skew = table.skew_bucket(value);
             if skew.is_none() && table.batch_of(value) != 0 {
                 let batch = table.batch_of(value);
+                let saved = self.keep(bound)?;
                 table
                     .outer_files
-                    .push((batch, *bound))
+                    .push((batch, saved))
                     .map_err(|_| arena_full())?;
                 return Ok(true);
             }
@@ -2695,13 +2721,16 @@ impl<'r, 'a> Runner<'r, 'a> {
         table.skew_enabled = false;
         let outer_start = table.batches;
         let mut current = 0u32;
+        // The current batch's saved rows, read in the order they were saved.
+        let mut loaded = ArenaList::new(self.arena);
+        let mut probes = ArenaList::new(self.arena);
         loop {
             current += 1;
             let has = |files: &[(u32, HashedRow<'a>)], batch: u32| {
                 files.iter().any(|(at, _)| *at == batch)
             };
             let has_outer =
-                |files: &[(u32, Bound<'a>)], batch: u32| files.iter().any(|(at, _)| *at == batch);
+                |files: &[(u32, Row<'a>)], batch: u32| files.iter().any(|(at, _)| *at == batch);
             // A batch lacking outer or inner rows is skipped unless the join
             // returns the unmatched rows it has, or batches grew since.
             while current < table.batches
@@ -2730,41 +2759,23 @@ impl<'r, 'a> Runner<'r, 'a> {
             }
             table.current = current;
             table.reset();
-            let files = table.inner_files.as_slice();
-            let mut rest = ArenaList::new(self.arena);
-            let mut loaded = ArenaList::new(self.arena);
-            for &(batch, hashed) in files {
-                if batch == current {
-                    loaded.push(hashed).map_err(|_| arena_full())?;
-                } else {
-                    rest.push((batch, hashed)).map_err(|_| arena_full())?;
-                }
+            take_batch(&mut table.inner_files, current, &mut loaded)?;
+            for at in 0..loaded.len() {
+                table.insert(loaded.borrowed_slice()[at], self.arena)?;
             }
-            table.inner_files = rest;
-            for &hashed in loaded.as_slice() {
-                table.insert(hashed, self.arena)?;
-            }
-            let files = table.outer_files.as_slice();
-            let mut rest = ArenaList::new(self.arena);
-            let mut probes = ArenaList::new(self.arena);
-            for &(batch, row) in files {
-                if batch == current {
-                    probes.push(row).map_err(|_| arena_full())?;
-                } else {
-                    rest.push((batch, row)).map_err(|_| arena_full())?;
-                }
-            }
-            table.outer_files = rest;
+            take_batch(&mut table.outer_files, current, &mut probes)?;
             table.ready(self, keys)?;
-            for outer_row in probes.as_slice() {
-                let mut row = *outer_row;
+            for at in 0..probes.len() {
+                let saved = probes.borrowed_slice()[at];
+                let mut row = *bound;
+                row[..saved.len()].copy_from_slice(saved);
                 let hash = self.key_hash(&row, keys, true, fill_outer)?;
                 let value = hash.expect("saved rows have hash values");
                 let batch = table.batch_of(value);
                 if batch != table.current {
                     table
                         .outer_files
-                        .push((batch, row))
+                        .push((batch, saved))
                         .map_err(|_| arena_full())?;
                     continue;
                 }
@@ -3045,6 +3056,102 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// Runs path `path` of relation `rel` (search path `id`) as planned: the
     /// scan's own planning describes that path again, and a parameterized
     /// path reads the bound outer rows' values.
+    /// The bound rows of `relids`, flat by the query's FROM positions: the
+    /// outer row a parameterized scan or a `LATERAL` subquery reads.
+    fn outer_values(
+        &self,
+        bound: &Bound<'a>,
+        relids: Relids,
+    ) -> Result<(&'a [Datum<'a>], &'a [usize]), SqlError> {
+        let n = self.scope.n;
+        let offsets = self
+            .arena
+            .alloc_slice_with(n, |_| 0usize)
+            .map_err(|_| arena_full())?;
+        let mut width = 0;
+        for (table, offset) in offsets.iter_mut().enumerate() {
+            *offset = width;
+            width += self.scope.stored_width(table);
+        }
+        let values = self
+            .arena
+            .alloc_slice_with(width, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for table in 0..n {
+            if let Some(row) = bound[table]
+                && relids.contains(table as u32)
+            {
+                let columns = self.columns_of(row.values);
+                values[offsets[table]..offsets[table] + columns.len()].copy_from_slice(columns);
+            }
+        }
+        Ok((values, offsets))
+    }
+
+    /// A `LATERAL` subquery's rows for the bound outer row: its query run
+    /// with the outer columns it reads bound, its nodes counted in the
+    /// relation's block as `EXPLAIN` plans them.
+    fn lateral_scan(
+        &self,
+        rel: usize,
+        lateral: &super::index_paths::join_query::LateralRel<'a>,
+        bound: &mut Bound<'a>,
+        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
+    ) -> Result<bool, SqlError> {
+        let (values, offsets) = self.outer_values(bound, lateral.relids)?;
+        let outer_row = JoinRow {
+            scope: self.scope,
+            values: JoinRowValues::Flat { values, offsets },
+            rowids: &[],
+            visible: self.scope.n,
+        };
+        let mut rows = ArenaList::new(self.arena);
+        {
+            let _block = super::instrument::enter_block(self.block.child(scan_segment(rel)));
+            super::select_into_rows(
+                self.storage,
+                self.txid,
+                lateral.select,
+                self.arena,
+                self.params,
+                Some(&outer_row),
+                self.hooks.sequences,
+                &mut |values| {
+                    let encoded = crate::sql::exec::encode_projected_pub(values, self.arena)?;
+                    rows.push(encoded).map_err(|_| arena_full())
+                },
+            )?;
+        }
+        let columns = lateral.widths.len();
+        let rows = rows.into_mut_slice().map_err(|_| arena_full())?;
+        for (at, encoded) in rows.iter().enumerate() {
+            let values = self
+                .arena
+                .alloc_slice_with(columns + self.model.expressions.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (column, value) in values.iter_mut().take(columns).enumerate() {
+                *value =
+                    crate::sql::exec::decode_projected_col_record(encoded, column, self.arena)?;
+            }
+            bound[rel] = Some(BaseRow {
+                values,
+                rowid: None,
+            });
+            if !sink(bound)? {
+                // The subquery ran to its end: its nodes' counts would
+                // exceed PostgreSQL's, which stops reading it here.
+                if at + 1 < rows.len() && super::instrument::active() {
+                    return Err(crate::sql_err!(
+                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN ANALYZE of a LATERAL subquery its join stops reading is not supported"
+                    ));
+                }
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn scan(
         &self,
         id: u32,
@@ -3054,6 +3161,9 @@ impl<'r, 'a> Runner<'r, 'a> {
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         let modeled = self.model.rels[rel];
+        if let Some(lateral) = modeled.lateral.as_ref() {
+            return self.lateral_scan(rel, lateral, bound, sink);
+        }
         let scan = match self.scans[id as usize].get() {
             Some(scan) => scan,
             None => {
@@ -3075,29 +3185,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         let outer_values;
         let outer_row;
         let outer: Option<&dyn ColumnLookup<'a>> = if scan.param != Relids::EMPTY {
-            let n = self.scope.n;
-            let offsets = self
-                .arena
-                .alloc_slice_with(n, |_| 0usize)
-                .map_err(|_| arena_full())?;
-            let mut width = 0;
-            for (table, offset) in offsets.iter_mut().enumerate() {
-                *offset = width;
-                width += self.scope.stored_width(table);
-            }
-            let values = self
-                .arena
-                .alloc_slice_with(width, |_| Datum::Null)
-                .map_err(|_| arena_full())?;
-            for table in 0..n {
-                if let Some(row) = bound[table]
-                    && scan.param.contains(table as u32)
-                {
-                    let columns = self.columns_of(row.values);
-                    values[offsets[table]..offsets[table] + columns.len()].copy_from_slice(columns);
-                }
-            }
-            outer_values = (&*values, &*offsets);
+            outer_values = self.outer_values(bound, scan.param)?;
             outer_row = JoinRow {
                 scope: self.scope,
                 values: JoinRowValues::Flat {
@@ -3105,19 +3193,12 @@ impl<'r, 'a> Runner<'r, 'a> {
                     offsets: outer_values.1,
                 },
                 rowids: &[],
-                visible: n,
+                visible: self.scope.n,
             };
             Some(&outer_row)
         } else {
             None
         };
-        let slot = self.scope.slots[rel];
-        let _context = super::index_paths::enter_query(
-            slot,
-            scan.condition,
-            Some(crate::storage::ColumnSet::from_low_word(scan.read)),
-            Some(scan.shape),
-        );
         let mut keep = true;
         let _block = super::instrument::enter_block(self.block.child(scan_segment(rel)));
         super::scan::scan_described_path(

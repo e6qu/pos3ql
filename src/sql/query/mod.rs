@@ -62,6 +62,7 @@ pub(crate) use joined_from::{
     TargetHashPlan, joined_from_match, joined_write_join, joined_write_pairs, merge_join_plan,
     recheck_joined_from_match, target_hash_plan, with_joined_from_row,
 };
+mod bounded_sort;
 mod materialize;
 mod minmax;
 pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
@@ -153,6 +154,7 @@ mod outer_joins;
 pub(crate) mod postgres_memory;
 pub(crate) mod postgres_values;
 mod pullup;
+pub(crate) mod transition_memory;
 pub(crate) mod write_buffers;
 pub(crate) use cte::expand_dml_ctes_schema;
 use cte::expand_set_tree_exec;

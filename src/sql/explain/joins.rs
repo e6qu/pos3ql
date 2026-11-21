@@ -32,7 +32,17 @@ pub(super) fn join_plan<'a>(
 ) -> Result<Plan<'a>, SqlError> {
     // Each path of the chosen plan prints as at most three nodes (a join
     // with its `Hash` or a `Sort` of each input).
-    let mut plan = Plan::new(arena, plan_paths(&model.plan, model.plan.top) * 3 + 6)?;
+    // A `LATERAL` subquery's scan prints its query's plan.
+    let lateral_nodes = MAX_LATERAL_NODES
+        * model
+            .rels
+            .iter()
+            .filter(|rel| rel.lateral.is_some())
+            .count();
+    let mut plan = Plan::new(
+        arena,
+        plan_paths(&model.plan, model.plan.top) * 3 + 6 + lateral_nodes,
+    )?;
     let mut writer = Writer {
         storage,
         txid,
@@ -138,6 +148,11 @@ type SortLists = (Option<Output>, Option<Output>);
 /// A node that does not project (`Hash`, `Sort`, `Materialize`,
 /// `Memoize`) returns its input's target list: the node at `at` takes the
 /// list of the node pushed after it.
+/// The most nodes the plan of one `LATERAL` subquery the search plans
+/// holds: a scan of one table (a bitmap tree's leaves included) under its
+/// sort, aggregate and limit.
+const MAX_LATERAL_NODES: usize = 72;
+
 fn pass_through(plan: &mut Plan<'_>, at: usize) {
     let input = plan.nodes[at + 1];
     plan.nodes[at].output = input.output;
@@ -724,6 +739,9 @@ impl Writer<'_, '_, '_, '_> {
         demand: Demand,
     ) -> Result<(), SqlError> {
         let modeled = self.model.rels[rel];
+        if let Some(lateral) = modeled.lateral {
+            return self.lateral_scan(plan, rel, &lateral, depth);
+        }
         let scan = modeled.scan(self.storage, self.txid, path, &[], self.arena)?;
         let single =
             QueryScope::resolve_schema(self.storage, modeled.from, self.txid, self.arena, None)?;
@@ -815,6 +833,44 @@ impl Writer<'_, '_, '_, '_> {
             );
         }
         super::push_scan(plan, node)
+    }
+
+    /// A `LATERAL` subquery's scan: the trivial `SubqueryScan` that
+    /// `setrefs.c` removes leaves its query's plan, its outer columns
+    /// printed as the parameters they are, its nodes counted in the
+    /// relation's block.
+    fn lateral_scan(
+        &mut self,
+        plan: &mut Plan<'_>,
+        rel: usize,
+        lateral: &query::index_paths::join_query::LateralRel<'_>,
+        depth: u8,
+    ) -> Result<(), SqlError> {
+        let block = self.block.child(query::join_exec_scan_segment(rel));
+        let Some(planned) = super::lateral_subquery_plan(
+            self.storage,
+            self.txid,
+            self.scope,
+            lateral.select,
+            lateral.relids,
+            block,
+            self.arena,
+        )?
+        else {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN of this LATERAL subquery is not supported"
+            ));
+        };
+        for node in &planned.nodes[..planned.count] {
+            plan.push(PlanNode {
+                depth: node.depth + depth,
+                // Its target list reads the subquery's own expressions.
+                output_unprintable: true,
+                ..*node
+            })?;
+        }
+        Ok(())
     }
 
     /// The target list of a unique-ified relation's input
@@ -956,6 +1012,17 @@ impl Writer<'_, '_, '_, '_> {
             };
             let _ = write!(text, "{}", printed.as_str());
             return Ok(());
+        }
+        if self
+            .model
+            .rels
+            .get(table)
+            .is_some_and(|rel| rel.lateral.is_some())
+        {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN VERBOSE of a LATERAL subquery's columns is not supported"
+            ));
         }
         let definition = self.scope.defs.stored(table).expect("a plain table");
         // A plan scanning nothing names every relation (`set_rtable_names`

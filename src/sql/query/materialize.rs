@@ -2295,6 +2295,68 @@ pub(crate) fn materialized_rows<'a>(
             && !any_postponed
             && !statement.distinct
     });
+    // A sort under a limit that its input reaches unsorted keeps only the
+    // rows the limit returns once it forms its heap.
+    let streamed_bound = rank_window.filter(|&bound| {
+        bound > 0
+            && sort_bounded
+            && n_order > 0
+            && n_on == 0
+            && !statement.distinct
+            && ordered_candidates.is_none()
+            && !join_presorted
+            && join_sort
+                .flatten()
+                .is_none_or(|(_, _, presorted)| presorted == 0)
+            && lock_pass.is_none()
+    });
+    let mut sort_columns = [0usize; MAX_PROJ];
+    let sort_column_count = super::postgres_sort_columns(
+        width,
+        statement.items,
+        &order_exprs[..n_keys],
+        &mut sort_columns,
+    );
+    let streamed_tuples = match streamed_bound {
+        Some(_) => Some(
+            instrument::SortTuples::new(
+                Some(&sort_columns[..sort_column_count]),
+                n_identities,
+                true,
+            )
+            .ok_or_else(instrument::unsized_value)?
+            .computed(super::sole_item_computed(statement.items)),
+        ),
+        None => None,
+    };
+    let mut streamed = streamed_tuples
+        .as_ref()
+        .zip(streamed_bound)
+        .map(|(tuples, bound)| {
+            super::bounded_sort::BoundedSort::new(
+                tuples,
+                super::postgres_memory::SizeSource { storage, txid },
+                bound,
+                arena,
+            )
+        });
+    let mut streamed_compare = |a: &[u8], b: &[u8]| {
+        compare_materialized_rows(
+            storage,
+            txid,
+            &key_collations,
+            statement,
+            width,
+            n_order,
+            n_on,
+            false,
+            a,
+            b,
+        )
+    };
+    // Whether rows encode into the arena's front, which the streamed sort
+    // rewinds after taking each row.
+    let front = core::cell::Cell::new(false);
     // Evaluate each projection once, in scan order. Encoded rows and their
     // references survive the scan's per-row scratch rewinds in the arena tail.
     let mut encode_into = |row: &JoinRow<'_, 'a, '_>,
@@ -2321,7 +2383,7 @@ pub(crate) fn materialized_rows<'a>(
             has_srf,
             outer,
             &mut |row, projected, keys| {
-                let output = encode_materialized_row(
+                let output = encode_materialized_row_in(
                     scope,
                     row,
                     projected,
@@ -2333,6 +2395,7 @@ pub(crate) fn materialized_rows<'a>(
                         stored_width,
                         raw_columns: raw_columns.as_ref(),
                     },
+                    !front.get(),
                     arena,
                 )?;
                 let output = match lock_pass.as_mut() {
@@ -2428,7 +2491,32 @@ pub(crate) fn materialized_rows<'a>(
         }
         _ => scan_window,
     };
-    let mut encode = |row: &JoinRow<'_, 'a, '_>| encode_into(row, &mut rows, scan_window);
+    let mut pending = ArenaList::new_persistent(arena);
+    let mut encode = |row: &JoinRow<'_, 'a, '_>| {
+        let Some(sort) = streamed.as_mut() else {
+            return encode_into(row, &mut rows, scan_window);
+        };
+        // The row's projection scratch, and its encoding once the heap
+        // copies the rows it keeps, are rewound after the sort takes it.
+        let mark = arena.mark();
+        front.set(sort.heap_formed());
+        let more = encode_into(row, &mut pending, None)?;
+        for at in 0..pending.len() {
+            let output: &'a [u8] = pending.borrowed_slice()[at];
+            for (key, &collation) in key_collations.iter().enumerate().take(n_keys) {
+                storage.validate_text_collation(
+                    collation,
+                    &crate::sql::exec::decode_projected_pub(output, width + key),
+                )?;
+            }
+            sort.push(output, &mut streamed_compare)?;
+        }
+        pending.truncate(0);
+        // SAFETY: the sort copied each row it keeps past its heap's
+        // forming, and earlier rows are in the arena's tail.
+        unsafe { arena.rewind_to(mark) };
+        Ok(more)
+    };
     if let Some(model) = modeled.as_ref() {
         super::join_exec::run_modeled(
             storage,
@@ -2470,7 +2558,13 @@ pub(crate) fn materialized_rows<'a>(
             &mut encode,
         )?;
     }
-    let rows = rows.into_mut_slice().map_err(|_| arena_full())?;
+    let (rows, streamed_space) = match streamed {
+        Some(sort) => {
+            let (rows, space) = sort.finish(&mut streamed_compare)?;
+            (rows, Some(space))
+        }
+        None => (rows.into_mut_slice().map_err(|_| arena_full())?, None),
+    };
 
     // Plain DISTINCT dedups on the visible prefix before the ORDER BY sort.
     // DISTINCT ON dedups on its keys *after* the sort (below), so the first
@@ -2534,7 +2628,9 @@ pub(crate) fn materialized_rows<'a>(
     // ascending as a tiebreak — a no-op when ORDER BY already begins with them
     // (as PostgreSQL requires), but it groups equal keys when ORDER BY is
     // absent so the run dedup below works.
-    if (n_order > 0 && ordered_candidates.is_none() && !join_presorted) || n_on > 0 {
+    if let Some(space) = streamed_space {
+        stages.sort.sorted(space);
+    } else if (n_order > 0 && ordered_candidates.is_none() && !join_presorted) || n_on > 0 {
         for row in rows.iter() {
             for (key, &collation) in key_collations.iter().enumerate().take(n_keys) {
                 storage.validate_text_collation(

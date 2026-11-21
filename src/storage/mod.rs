@@ -18587,6 +18587,8 @@ pub struct Storage {
     /// Client result output queued behind slow readers.
     result_spool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     plan_build: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    /// The join search's startup reservation (`max_join_relations`).
+    join_search: crate::sql::query::index_paths::joins::JoinSearchPool,
     row_overlay: std::sync::Arc<RowOverlayPool>,
     row_walks: RowWalkPool,
     snapshot_reclamation: SnapshotReclamation,
@@ -24196,6 +24198,9 @@ impl Storage {
                 .saturating_mul(table_slot_capacity(config))
                 .saturating_mul(size_of::<(u32, u32, u64, bool)>()),
             ValueIndexPool::budget_bytes(config.max_value_indexes, config.value_index_rows),
+            crate::sql::query::index_paths::joins::JoinSearchPool::budget_bytes(
+                config.max_join_relations,
+            ),
         ]
         .into_iter()
         .fold(0usize, usize::saturating_add)
@@ -24270,6 +24275,10 @@ impl Storage {
             crate::mem::lease_pool::Purpose::PLAN_BUILD,
             config.plan_build_bytes,
             config.plan_build_leases,
+        )?;
+        let join_search = crate::sql::query::index_paths::joins::JoinSearchPool::new(
+            budget,
+            config.max_join_relations,
         )?;
         // Long error text raised on this thread, the one running SQL.
         crate::sql::error_text::install(crate::mem::lease_pool::LeasePool::new(
@@ -25078,6 +25087,7 @@ impl Storage {
             statistics_pool,
             result_spool,
             plan_build,
+            join_search,
             row_overlay,
             row_walks,
             snapshot_reclamation,
@@ -57503,6 +57513,11 @@ impl Storage {
     }
 
     /// The shared pool holding retained plan nodes' build sides.
+    /// The join search's startup reservation.
+    pub(crate) fn join_search(&self) -> &crate::sql::query::index_paths::joins::JoinSearchPool {
+        &self.join_search
+    }
+
     pub(crate) fn plan_build(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
         &self.plan_build
     }

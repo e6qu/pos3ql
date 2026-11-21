@@ -1523,11 +1523,22 @@ fn pax_column_demand_bounded(
         });
         complete
     }
-    if !collect_table_function_arguments(&from.base, scope, &mut columns)
+    // A `LATERAL` item's body runs per row of the items to its left, so the
+    // columns it reads of them are this scan's demand, as a function item's
+    // arguments are.
+    let item_demand = |table: usize, item: &TableRef, columns: &mut PaxColumnDemand| {
+        if scope.lateral[table] {
+            collect_table(item, scope, columns)
+        } else {
+            collect_table_function_arguments(item, scope, columns)
+        }
+    };
+    if !item_demand(0, &from.base, &mut columns)
         || from
             .joins
             .iter()
-            .any(|join| !collect_table_function_arguments(&join.table, scope, &mut columns))
+            .enumerate()
+            .any(|(index, join)| !item_demand(index + 1, &join.table, &mut columns))
     {
         return None;
     }
@@ -8332,13 +8343,21 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
     }
 
     /// The member `chosen` describes, its rows in its scan's order.
+    /// The member's scan, and the index whose statistics its rows count
+    /// when the scan seeks one.
     fn member(
         &self,
         chosen: &super::index_paths::MemberPath<'a>,
         physical: &crate::storage::TableDef,
         table: u16,
         tree: &super::index_paths::TreePath<'a>,
-    ) -> Result<TreeMember<'a>, SqlError> {
+    ) -> Result<
+        (
+            TreeMember<'a>,
+            Option<crate::storage::IndexStatisticsCapture<'a>>,
+        ),
+        SqlError,
+    > {
         let storage = self.storage;
         let arena = self.arena;
         let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -8361,16 +8380,10 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
         } else {
             None
         };
+        let (rows, seek) = self.member_rows(chosen)?;
         let mut member = TreeMember {
             leaf: chosen.leaf,
-            rows: member_rows_in_order(
-                storage,
-                self.txid,
-                chosen.leaf,
-                &chosen.path,
-                self.scope.names[0],
-                arena,
-            )?,
+            rows,
             keys: &[],
             schema,
             mapping: crate::storage::RelationColumnMap::new(self.logical, physical, arena)?,
@@ -8391,7 +8404,69 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
         if tree.kind == super::index_paths::AppendKind::Merge && !member.sort {
             member.keys = self.keys_of(&member, member.rows)?;
         }
-        Ok(member)
+        Ok((member, seek))
+    }
+
+    /// The member's rows in its scan's order. A member whose path reads an
+    /// index seeks it with the query's conditions and reads only the rows it
+    /// reaches, counted as that index's scan; a sequential member reads
+    /// every row. A path that reads an index only for its order reads every
+    /// row too.
+    fn member_rows(
+        &self,
+        chosen: &super::index_paths::MemberPath<'a>,
+    ) -> Result<
+        (
+            &'a [u64],
+            Option<crate::storage::IndexStatisticsCapture<'a>>,
+        ),
+        SqlError,
+    > {
+        use super::index_paths::ScanKind;
+        let (storage, txid, arena, leaf) = (self.storage, self.txid, self.arena, chosen.leaf);
+        let path = &chosen.path;
+        let observed_at = crate::sql::datetime::now_micros();
+        if path.kind != ScanKind::Seq {
+            let member_scope =
+                super::index_paths::member_scope(storage, txid, leaf, self.scope.names[0], arena)?;
+            if let Some(access) = indexed_candidates(
+                storage,
+                &member_scope,
+                txid,
+                self.where_clause,
+                arena,
+                self.params,
+                self.hooks,
+                self.outer,
+            )? {
+                if access.scan_executed {
+                    storage.record_relation_scan(
+                        txid,
+                        leaf,
+                        Some(access.statistics()),
+                        access.index_entries,
+                        observed_at,
+                    )?;
+                }
+                let rows = member_rows_in_order(
+                    storage,
+                    txid,
+                    leaf,
+                    path,
+                    Some(access.rowids),
+                    &member_scope,
+                    arena,
+                )?;
+                return Ok((rows, Some(access.statistics)));
+            }
+            let rows = member_rows_in_order(storage, txid, leaf, path, None, &member_scope, arena)?;
+            return Ok((rows, None));
+        }
+        storage.record_relation_scan(txid, leaf, None, 0, observed_at)?;
+        let member_scope =
+            super::index_paths::member_scope(storage, txid, leaf, self.scope.names[0], arena)?;
+        let rows = member_rows_in_order(storage, txid, leaf, path, None, &member_scope, arena)?;
+        Ok((rows, None))
     }
 
     /// The tree's sort key values of each of `rows` of `member`.
@@ -8704,41 +8779,64 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
 
 /// The visible rows of `leaf` in the order its scan `path` reads them: heap
 /// order, or an index scan's key order.
+/// The visible rows of member `leaf` among `candidates` (every row when
+/// `None`), in the order its chosen `path` returns them.
 fn member_rows_in_order<'a>(
     storage: &Storage,
     txid: u32,
     leaf: usize,
     path: &super::index_paths::ScanPath<'a>,
-    exposed: &'a str,
+    candidates: Option<&[u64]>,
+    member_scope: &QueryScope<'a>,
     arena: &'a Arena,
 ) -> Result<&'a [u64], SqlError> {
-    let count = storage.visible_row_count(leaf, txid)?;
     let snapshot = storage.table_row_snapshot(leaf, Some(arena))?;
-    let ordered = arena
-        .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
-        .map_err(|_| arena_full())?;
     let mut fill = 0usize;
-    storage.for_each_row_state(leaf, &mut |rowid, state| {
-        if let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? {
-            if fill == ordered.len() {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "member rows changed during the scan"
-                ));
+    let ordered = match candidates {
+        Some(candidates) => {
+            let ordered = arena
+                .alloc_slice_with(candidates.len(), |_| {
+                    None::<crate::storage::OrderedRowSnapshot>
+                })
+                .map_err(|_| arena_full())?;
+            for &rowid in candidates {
+                let Some(state) = storage.row_state(leaf, rowid)? else {
+                    continue;
+                };
+                if let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? {
+                    ordered[fill] = Some(snapshot.retain(rowid, &home)?);
+                    fill += 1;
+                }
             }
-            ordered[fill] = Some(snapshot.retain(rowid, &home)?);
-            fill += 1;
+            ordered
         }
-        Ok(core::ops::ControlFlow::Continue(()))
-    })?;
+        None => {
+            let count = storage.visible_row_count(leaf, txid)?;
+            let ordered = arena
+                .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
+                .map_err(|_| arena_full())?;
+            storage.for_each_row_state(leaf, &mut |rowid, state| {
+                if let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? {
+                    if fill == ordered.len() {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "member rows changed during the scan"
+                        ));
+                    }
+                    ordered[fill] = Some(snapshot.retain(rowid, &home)?);
+                    fill += 1;
+                }
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
+            ordered
+        }
+    };
     let ordered = &mut ordered[..fill];
     use super::index_paths::ScanKind;
     match path.kind {
         ScanKind::Index | ScanKind::IndexOnly => {
             ordered.sort_unstable_by_key(|row| row.expect("row snapshots are initialized").rowid());
-            let member_scope =
-                super::index_paths::member_scope(storage, txid, leaf, exposed, arena)?;
-            sort_by_index_key(storage, &member_scope, txid, path, ordered, arena)?;
+            sort_by_index_key(storage, member_scope, txid, path, ordered, arena)?;
         }
         ScanKind::Seq | ScanKind::Bitmap => {
             ordered
@@ -11219,6 +11317,10 @@ fn scan_source_mode<'a>(
                         )?;
                         let table_role = u16::try_from(table).unwrap_or(u16::MAX);
                         let mut members = [None::<TreeMember<'a>>; 256];
+                        // The index each member's seek reads, whose statistics
+                        // its rows count.
+                        let mut seeks: [Option<crate::storage::IndexStatisticsCapture<'a>>; 256] =
+                            core::array::from_fn(|_| None);
                         let mut count = 0usize;
                         for chosen in tree.members {
                             if !leaves.contains(&chosen.leaf) {
@@ -11231,8 +11333,10 @@ fn scan_source_mode<'a>(
                                 ));
                             }
                             let physical = definitions.definition(storage, chosen.leaf, txid)?;
-                            members[count] =
-                                Some(scan.member(chosen, physical, table_role, &tree)?);
+                            let (member, seek) =
+                                scan.member(chosen, physical, table_role, &tree)?;
+                            members[count] = Some(member);
+                            seeks[count] = seek;
                             count += 1;
                         }
                         let members = &mut members[..count];
@@ -11247,7 +11351,11 @@ fn scan_source_mode<'a>(
                                 let member = members[$at].expect("dense members");
                                 let rowid = member.rows[$position];
                                 check_timeout()?;
-                                storage.record_relation_tuple_read(txid, member.leaf, None)?;
+                                storage.record_relation_tuple_read(
+                                    txid,
+                                    member.leaf,
+                                    seeks[$at].as_ref(),
+                                )?;
                                 let sorted = member.sort;
                                 let _member_counts = MemberCounts::new(
                                     append,

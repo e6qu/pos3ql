@@ -78,7 +78,10 @@ The model covers:
   index-ordered groupings with keys reordered to the index
   (`get_useful_group_keys_orderings`, `905`), `HAVING` costs and default
   selectivities, and `LIMIT`/`OFFSET` via `adjust_limit_rows_costs` (`821`).
-  A grouping whose keys all conditions fix is refused.
+  A `GroupAggregate`'s input sort holds the keys and the columns its
+  aggregates read (`make_group_input_target`) and spills under `work_mem`
+  as `tuplesort` does; a limit over an `ORDER BY` of its keys stops it early
+  (`965`). A grouping whose keys all conditions fix is refused.
 - Grouping sets arranged as PostgreSQL does (`extract_rollup_sets`,
   `reorder_grouping_sets`, `DiscreteKnapsack`, `MixedAggregate`), with
   PostgreSQL's costs over one table (`802`).

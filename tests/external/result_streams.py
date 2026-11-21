@@ -125,9 +125,11 @@ QUERIES = (
         ALL_PROTOCOLS,
         BOTH,
     ),
-    # Plain DISTINCT groups by its output list the same way.
+    # Plain DISTINCT groups by its output list the same way. Its ORDER BY
+    # names every column: PostgreSQL hashes this DISTINCT, so rows tied on
+    # a shorter ORDER BY would come in its hash table's order.
     (
-        "SELECT DISTINCT id, payload FROM result_stream_rows ORDER BY id",
+        "SELECT DISTINCT id, payload FROM result_stream_rows ORDER BY id, payload",
         TABLE_ROWS,
         ALL_PROTOCOLS,
         BOTH,

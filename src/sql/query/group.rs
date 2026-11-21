@@ -1917,10 +1917,10 @@ pub(super) fn hash_row_keys(
 /// returns them when it hashes: `None` when it sorts them (their order
 /// then), or when the grouping is outside the planner model.
 /// Whether the general executor returns the groups of `statement` in key
-/// order: no grouping, an order PostgreSQL's plan does not show, one FROM
-/// item that is not a plain table, or one table whose grouping PostgreSQL's
-/// planner sorts. A reader that forms the groups in key order itself leaves
-/// any other grouping to the general executor, which follows a hashed
+/// order: unless they come from a join or from one table whose grouping
+/// PostgreSQL's planner hashes with a ported hash function, in an order
+/// the plan shows. A reader that forms the groups in key order itself
+/// leaves the others to the general executor, which follows a hashed
 /// grouping's order and a modelled join's.
 ///
 /// `statement` groups by its keys; `source` is the statement as written,
@@ -1948,7 +1948,19 @@ pub(super) fn groups_in_key_order<'a>(
     if !one_plain_table(storage, scope, txid) {
         return Ok(true);
     }
-    let planned = planner_statement(source, scope, storage, txid, arena)?;
+    // As the general executor plans a `DISTINCT` or a grouping.
+    let (planned, distinct) = if distinct {
+        let Some(grouping) = crate::sql::explain::distinct_as_grouping(source, scope, arena)?
+        else {
+            return Ok(true);
+        };
+        (grouping, true)
+    } else {
+        (
+            planner_statement(source, scope, storage, txid, arena)?,
+            false,
+        )
+    };
     let columns = super::CatalogScopeCols {
         scope,
         outer: None,
@@ -1956,12 +1968,15 @@ pub(super) fn groups_in_key_order<'a>(
         txid,
         arena,
     };
-    Ok(matches!(
-        crate::sql::explain::grouping_strategy(
-            storage, txid, planned, distinct, scope, from, &columns, arena,
-        )?,
-        crate::sql::explain::GroupingStrategy::Sorted
-    ))
+    match crate::sql::explain::grouping_strategy(
+        storage, txid, planned, distinct, scope, from, &columns, arena,
+    )? {
+        crate::sql::explain::GroupingStrategy::Hashed(hashed) => Ok(!matches!(
+            hash_order_supported(&hashed, storage, txid),
+            Ok(true)
+        )),
+        _ => Ok(true),
+    }
 }
 
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]

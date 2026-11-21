@@ -19,6 +19,8 @@ const HEAP_TUPLE_HEADER: usize = 23;
 const TOAST_TUPLE_TARGET: usize = 2032;
 /// `TOAST_TUPLE_TARGET_MAIN`.
 const TOAST_TUPLE_TARGET_MAIN: usize = 8160;
+/// `MaxHeapTupleSize` with 8 kB blocks.
+pub(crate) const MAX_HEAP_TUPLE_SIZE: usize = 8160;
 /// `TOAST_POINTER_SIZE`: a one-byte header and `varatt_external`.
 pub(crate) const TOAST_POINTER_SIZE: usize = 18;
 /// `VARHDRSZ_COMPRESSED`.
@@ -129,12 +131,13 @@ fn data_size(columns: &[ToastColumn<'_>], forms: &[ToastedForm]) -> usize {
 
 /// `heap_toast_insert_or_update` of a new row of `columns` into a table
 /// with (`has_toast`) or without a TOAST relation: writes each value's form
-/// to `forms`.
+/// to `forms` and returns the stored tuple's `MAXALIGN`ed length, which
+/// `RelationGetBufferForTuple` checks against [`MAX_HEAP_TUPLE_SIZE`].
 pub(crate) fn toast_row(
     columns: &[ToastColumn<'_>],
     has_toast: bool,
     forms: &mut [ToastedForm],
-) -> Result<(), Unmodelled> {
+) -> Result<usize, Unmodelled> {
     use crate::storage::rowenc::StoredForm;
     let forms = &mut forms[..columns.len()];
     for (form, column) in forms.iter_mut().zip(columns) {
@@ -155,9 +158,10 @@ pub(crate) fn toast_row(
         0
     };
     let header = (HEAP_TUPLE_HEADER + bitmap).div_ceil(8) * 8;
+    let length = |forms: &[ToastedForm]| (header + data_size(columns, forms)).div_ceil(8) * 8;
     // `heap_insert` toasts only a tuple past the threshold.
     if header + data_size(columns, forms) <= TOAST_TUPLE_TARGET {
-        return Ok(());
+        return Ok(length(forms));
     }
     let mut attributes = [Attribute {
         size: 0,
@@ -222,7 +226,7 @@ pub(crate) fn toast_row(
         };
         state.externalize(biggest);
     }
-    Ok(())
+    Ok(length(state.forms))
 }
 
 /// Whether TOAST could hold `value` other than as `heap_form_tuple` forms
@@ -251,7 +255,6 @@ fn datum_identity(value: &crate::sql::types::Datum<'_>) -> Option<(usize, usize)
         | Datum::Geometry { text, .. }
         | Datum::Bit { bits: text, .. } => text.as_bytes(),
         Datum::TsVector(vector) => vector.as_str().as_bytes(),
-        Datum::TsQuery(query) => query.as_str().as_bytes(),
         Datum::Array { raw, .. } | Datum::Bytea(raw) => raw,
         _ => return None,
     };
@@ -925,9 +928,7 @@ fn may_compress(bytes: &[u8]) -> bool {
 
 /// The bytes pglz reads of `value` as PostgreSQL stores it: the data of the
 /// types pos3ql holds byte for byte, or formed into `scratch` for a tsvector,
-/// path or polygon. `None` for a type whose stored data its value does not
-/// determine (a tsquery's operand order depends on the function forming it)
-/// or is not modelled.
+/// path or polygon. `None` for a type whose stored data is not modelled.
 fn pglz_input<'v>(
     value: &crate::sql::types::Datum<'v>,
     scratch: &'v crate::mem::arena::Arena,
@@ -1066,9 +1067,19 @@ pub(crate) fn row_forms_as(
     } else {
         Err(Unmodelled)
     };
+    if let Ok(length) = result
+        && length > MAX_HEAP_TUPLE_SIZE
+    {
+        return Err(crate::sql_err!(
+            crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "row is too big: size {}, maximum size {}",
+            length,
+            MAX_HEAP_TUPLE_SIZE
+        ));
+    }
     for (at, (form, value)) in forms.iter_mut().zip(values).enumerate() {
         let toasted = match result {
-            Ok(()) => StoredForm::from(toasted[at]),
+            Ok(_) => StoredForm::from(toasted[at]),
             // An unsized row's forms are unknown, save that a value too
             // short to compress or move out of line stays in line.
             Err(Unmodelled) if may_be_toasted(value) => StoredForm::Unmodelled,

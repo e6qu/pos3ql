@@ -11154,7 +11154,9 @@ fn wide_full_text_values_survive_indexes_checkpoint_and_object_cold_recovery() {
         }
         write!(vector, "word{index:04}:1,2,3,4").unwrap();
     }
-    let mut query_terms = (0..300)
+    // A tsquery has plain storage: 300 terms would make the row too big
+    // for a heap page, as in PostgreSQL.
+    let mut query_terms = (0..100)
         .map(|index| format!("word{index:04}"))
         .collect::<Vec<_>>();
     while query_terms.len() > 1 {
@@ -11207,7 +11209,7 @@ fn wide_full_text_values_survive_indexes_checkpoint_and_object_cold_recovery() {
     );
     assert_eq!(
         data_rows(&output),
-        ["1|600|599|t"],
+        ["1|600|199|t"],
         "{}",
         String::from_utf8_lossy(&output)
     );

@@ -144,7 +144,8 @@ fn varlena_length(word: &[u8]) -> (usize, usize) {
 
 /// Whether `value`'s encoding begins with the length word a form record
 /// hangs off: the types PostgreSQL stores as varlenas that TOAST can
-/// compress or move out of line.
+/// compress or move out of line. A `tsquery` (`typstorage` plain) is
+/// always stored as `heap_form_tuple` forms it.
 pub(crate) const fn carries_stored_form(value: &Datum<'_>) -> bool {
     matches!(
         value,
@@ -157,7 +158,6 @@ pub(crate) const fn carries_stored_form(value: &Datum<'_>) -> bool {
             | Datum::Multirange { .. }
             | Datum::Geometry { .. }
             | Datum::TsVector(_)
-            | Datum::TsQuery(_)
             | Datum::Bit { .. }
             | Datum::Array { .. }
             | Datum::Bytea(_)
@@ -177,7 +177,6 @@ pub(crate) const fn column_carries_stored_form(column: ColType) -> bool {
             | ColType::Xml
             | ColType::Jsonpath
             | ColType::TsVector
-            | ColType::TsQuery
             | ColType::Range(_)
             | ColType::Multirange(_)
             | ColType::Geometry(_)

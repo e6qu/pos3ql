@@ -4395,6 +4395,26 @@ pub(crate) fn execute_index_comparison<'a>(
     Ok(comparison.cmp(&0))
 }
 
+/// The result of operator call `schema.name` over `arguments` a built-in
+/// operator gives: one of `pg_catalog`'s geometric or prefix operators by
+/// any search path, or another `pg_catalog` operator named so.
+pub(crate) fn builtin_operator_call_result(
+    schema: Option<&str>,
+    name: &str,
+    arguments: &[i32],
+) -> Option<ColType> {
+    let catalog = schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"));
+    if catalog && let Some(ctype) = super::eval::funcs::geometry::operator_result(name, arguments) {
+        return Some(ctype);
+    }
+    if (arguments.len() == 1 && catalog)
+        || schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+    {
+        return builtin_operator_result(name, arguments);
+    }
+    None
+}
+
 pub(crate) fn builtin_operator_result(name: &str, arguments: &[i32]) -> Option<ColType> {
     if let Some(result) = super::eval::funcs::geometry::operator_result(name, arguments) {
         return Some(result);
@@ -4404,6 +4424,16 @@ pub(crate) fn builtin_operator_result(name: &str, arguments: &[i32]) -> Option<C
         .any(|oid| matches!(ColType::from_oid(*oid), Some(ColType::Geometry(_))))
     {
         return None;
+    }
+    if let [operand] = *arguments {
+        // `!!` is the one built-in prefix operator the parser leaves as an
+        // operator call: `tsquery_not`.
+        return (name == "!!"
+            && matches!(
+                operand,
+                crate::sql::types::oid::TSQUERY | crate::sql::types::oid::UNKNOWN
+            ))
+        .then_some(ColType::TsQuery);
     }
     if arguments.len() != 2 {
         return None;
@@ -7460,16 +7490,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             if !(1..=2).contains(&argument_type_oids.len()) {
                 return None;
             }
-            if schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-                && let Some(ctype) =
-                    super::eval::funcs::geometry::operator_result(operator, argument_type_oids)
+            if let Some(ctype) = builtin_operator_call_result(schema, operator, argument_type_oids)
             {
                 return Some(ctype.oid());
-            }
-            if argument_type_oids.len() == 2
-                && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-            {
-                return builtin_operator_result(operator, argument_type_oids).map(ColType::oid);
             }
             let (left_oid, right_oid) = if argument_type_oids.len() == 1 {
                 (None, Some(argument_type_oids[0]))
@@ -19536,21 +19559,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
             if !(1..=2).contains(&arguments.len()) {
                 return None;
             }
-            if schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-                && let Some(ctype) =
-                    super::eval::funcs::geometry::operator_result(operator, arguments)
-            {
-                return Some(super::exec::StaticTypeMeta {
-                    type_oid: ctype.oid(),
-                    ctype,
-                    type_mod: -1,
-                    collation: super::ast::Collation::None,
-                });
-            }
-            if arguments.len() == 2
-                && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-            {
-                let ctype = builtin_operator_result(operator, arguments)?;
+            if let Some(ctype) = builtin_operator_call_result(schema, operator, arguments) {
                 return Some(super::exec::StaticTypeMeta {
                     type_oid: ctype.oid(),
                     ctype,

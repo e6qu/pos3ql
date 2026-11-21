@@ -454,23 +454,41 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   binary form; a PL/pgSQL special variable such as `TG_TABLE_NAME` and a
   scalar subquery forming its value are values formed anew, and a datum of
   unknown form that neither pglz nor lz4 could compress is stored as one
-  formed anew (`981`, `239`).
+  formed anew (`981`, `239`). A `tsquery` has plain storage, so TOAST
+  keeps it as formed, and a row too wide for a heap page after toasting
+  fails with `row is too big` (`986`).
 - [ ] *In progress:* TOAST forms the executor does not carry yet: the input
   datum `min`, `max`, `any_value`, `mode`, `percentile_disc` and window
   value functions return, grouping keys, scalar subqueries, window rows,
   index-only scans, PL/pgSQL variables, trigger and `RETURNING` rows, a
   passed value's `varchar(n)` or `char(n)` length coercion, `lz4` and
   compression of types other than text, `bytea`, `json`, `xml`, `tsvector`,
-  `path` and `polygon`. A `tsquery`'s stored bytes depend on the function
-  that formed it (`to_tsquery` reorders its operand strings), so its
-  compression is not modelled. Such a value's form is
-  not modelled: `pg_column_size` of it, and `relpages`, `ANALYZE` or
+  `path` and `polygon`. Such a value's form is not modelled: `pg_column_size` of it, and `relpages`, `ANALYZE` or
   `CREATE INDEX` over a table storing it, are `0A000`; so is
   `EXPLAIN (ANALYZE, BUFFERS)` of writing a row TOAST compresses, and
   `pg_column_size` of a short value an aggregate, window function or
   subquery passes on (PostgreSQL keeps its one-byte header). The result of
   a user-defined function is taken as formed anew, though PostgreSQL may
   return a stored datum it read.
+- [ ] PL/pgSQL forms as PostgreSQL 18.6 keeps them: a variable or record
+  field filled by `SELECT INTO`, `FOR` or `FETCH` holds its value formed
+  anew (detoasted, four-byte header: `pg_column_size` of a stored `'short'`
+  is 9, pos3ql reports 6 today), while the record as a whole keeps the
+  stored tuple; `v := NEW.t` keeps `NEW.t`'s form; `NEW` and `OLD` fields
+  hold the stored forms (`NEW` of a `BEFORE` trigger the forms the new row
+  passes on). pos3ql refuses such a variable's `pg_column_size` once it may
+  be toasted (`0A000`). The forms must survive a suspended routine's saved
+  values.
+- [ ] A whole-row reference or `ROW(...)` over a stored row keeps its
+  compressed values compressed (`toast_build_flattened_tuple`); its
+  `pg_column_size` counts them uncompressed today. `ANALYZE`'s `avg_width`
+  of a compressed or out-of-line column counts the formed width.
+- [ ] A `tsquery` nested more than 64 operators deep (`to_tsquery` of 65
+  `&`-joined words) fails with `54000`; PostgreSQL bounds it only by
+  `max_stack_depth`.
+- [ ] A btree index entry wider than 2704 bytes after `index_form_tuple`
+  compresses it fails with `index row size ... exceeds btree version 4
+  maximum` in PostgreSQL; pos3ql indexes it.
 - [ ] Hash aggregates inherit `aset.c`'s recycled executor and transition
   contexts after a session's hash aggregate under `work_mem` below 1MB
   (`0A000` from the next statement on while the bucket array is within 8 kB

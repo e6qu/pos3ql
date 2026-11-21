@@ -9127,6 +9127,8 @@ fn eval_full_inner<'a>(
             if kind == super::ast::CallKind::SqlSyntax
                 && let Some((Some(schema), symbol)) = crate::sql::ast::catalog_operator_call(name)
                 && schema.eq_ignore_ascii_case("pg_catalog")
+                // A prefix operator is called as its unqualified spelling is.
+                && args.len() != 1
             {
                 if args.len() != 2 || star || !argument_names.is_empty() || variadic {
                     return Err(sql_err!(

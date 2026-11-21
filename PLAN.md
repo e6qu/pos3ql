@@ -247,8 +247,18 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   `LIMIT` stop, and resumes a storage wait without counting twice; the
   nested-loop, `Materialize`, hash, merge, `Memoize` and `Unique` nodes
   above it still push rows in `join_exec.rs`, whose statement starts again
-  after a wait. A `LATERAL` subquery's rows become a subtree of the same
-  plan.
+  after a wait. Their condition and row helpers (`JoinContext`) and the
+  output row a plan returns (`OutputRow`) are already shared plan-level
+  state, and a scan node reads through the caller's cursor scratch (a
+  reader's buffers or the statement's). Running a modeled join as a
+  retained reader still needs: the join search to plan in less than a
+  stream's `result_stream_bytes` (planning an analyzed two-column table
+  joined with itself takes 235,888 bytes of the reader's arena today, most
+  of the default 256 KiB stream), the scan
+  node to take its `Storage` per call and capture index statistics per read
+  (a retained reader holds no `Storage` or `Arena` reference across calls),
+  and a `Materialize` store in `plan_build_bytes` leases. A `LATERAL`
+  subquery's rows become a subtree of the same plan.
 - [x] `LATERAL` subqueries of one table planned by the search, with `Memoize`
   and exact `EXPLAIN ANALYZE` counters (`977`). A scan reading spilled rows
   decodes the columns a `LATERAL` body reads of it, so an aggregate over

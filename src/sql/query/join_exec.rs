@@ -1012,6 +1012,7 @@ type Bound<'a> = [Option<BaseRow<'a>>; RELATION_NUMBERS];
 type Row<'a> = &'a [Option<BaseRow<'a>>];
 
 struct Runner<'r, 'a> {
+    cx: JoinContext<'r, 'a>,
     /// Each path's kept hash table or store, which a rescan reads again
     /// (`ExecReScanHashJoin`, `ExecReScanMaterial`).
     built: &'a [core::cell::Cell<Option<Built<'a>>>],
@@ -1024,13 +1025,19 @@ struct Runner<'r, 'a> {
     memos: &'r [core::cell::Cell<Option<MemoCache<'a>>>],
     /// The block the join's nodes count in.
     block: super::instrument::BlockId,
-    storage: &'a Storage,
-    scope: &'r QueryScope<'a>,
-    txid: u32,
-    model: &'r ModeledJoin<'a>,
-    arena: &'a Arena,
-    params: &'r [Datum<'a>],
-    hooks: &'r EvalHooks<'r, 'a>,
+}
+
+impl<'r, 'a> core::ops::Deref for Runner<'r, 'a> {
+    type Target = JoinContext<'r, 'a>;
+
+    fn deref(&self) -> &JoinContext<'r, 'a> {
+        &self.cx
+    }
+}
+
+/// The flat row layout of a join's relations, which every node of its plan
+/// evaluates conditions over, made once per plan.
+pub(super) struct JoinLayout<'a> {
     /// Each relation's values' start in a flat row, and a row of NULLs per
     /// relation, which an outer join binds to the side it null-extends.
     offsets: &'a [usize],
@@ -1043,6 +1050,355 @@ struct Runner<'r, 'a> {
     /// The flat row an expression of several relations is evaluated over,
     /// allocated once.
     scratch: core::cell::RefCell<&'a mut [Datum<'a>]>,
+}
+
+impl<'a> JoinLayout<'a> {
+    /// The layout of `model`'s relations, resolved in `scope`.
+    pub(super) fn new(
+        model: &ModeledJoin<'a>,
+        scope: &QueryScope<'a>,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let n = scope.n;
+        let offsets = arena
+            .alloc_slice_with(n, |_| 0usize)
+            .map_err(|_| arena_full())?;
+        let mut width = 0;
+        for (table, offset) in offsets.iter_mut().enumerate() {
+            *offset = width;
+            width += scope.stored_width(table);
+        }
+        // A row of NULLs per relation: its columns, then a NULL for each
+        // expression member.
+        let mut nulls = [&[][..]; RELATION_NUMBERS];
+        for (table, held) in nulls.iter_mut().enumerate().take(n) {
+            *held = arena
+                .alloc_slice_with(scope.stored_width(table) + model.expressions.len(), |_| {
+                    Datum::Null
+                })
+                .map_err(|_| arena_full())?;
+        }
+        Ok(Self {
+            offsets,
+            width,
+            nulls: arena
+                .alloc_slice_copy(&nulls[..n])
+                .map_err(|_| arena_full())?,
+            failed: core::cell::Cell::new(None),
+            scratch: core::cell::RefCell::new(
+                arena
+                    .alloc_slice_with(width, |_| Datum::Null)
+                    .map_err(|_| arena_full())?,
+            ),
+        })
+    }
+}
+
+/// What every node of a join's plan reads to compare and bind rows: the
+/// plan, its relations' layout and the statement's evaluation context.
+#[derive(Clone, Copy)]
+pub(super) struct JoinContext<'r, 'a> {
+    storage: &'a Storage,
+    scope: &'r QueryScope<'a>,
+    txid: u32,
+    model: &'r ModeledJoin<'a>,
+    arena: &'a Arena,
+    params: &'r [Datum<'a>],
+    hooks: &'r EvalHooks<'r, 'a>,
+    offsets: &'a [usize],
+    width: usize,
+    nulls: &'a [&'a [Datum<'a>]],
+    failed: &'r core::cell::Cell<Option<SqlError>>,
+    scratch: &'r core::cell::RefCell<&'a mut [Datum<'a>]>,
+}
+
+impl<'r, 'a> JoinContext<'r, 'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        storage: &'a Storage,
+        scope: &'r QueryScope<'a>,
+        txid: u32,
+        model: &'r ModeledJoin<'a>,
+        arena: &'a Arena,
+        params: &'r [Datum<'a>],
+        hooks: &'r EvalHooks<'r, 'a>,
+        layout: &'r JoinLayout<'a>,
+    ) -> Self {
+        Self {
+            storage,
+            scope,
+            txid,
+            model,
+            arena,
+            params,
+            hooks,
+            offsets: layout.offsets,
+            width: layout.width,
+            nulls: layout.nulls,
+            failed: &layout.failed,
+            scratch: &layout.scratch,
+        }
+    }
+
+    /// `bound`'s relations of the query, kept in the arena.
+    fn keep(&self, bound: &Bound<'a>) -> Result<Row<'a>, SqlError> {
+        let row = self
+            .arena
+            .alloc_slice_with(self.scope.n, |table| bound[table])
+            .map_err(|_| arena_full())?;
+        Ok(row)
+    }
+
+    fn bind(&self, bound: &mut [Option<BaseRow<'a>>], row: &[Option<BaseRow<'a>>], relids: Relids) {
+        for table in 0..self.scope.n {
+            if relids.contains(table as u32) {
+                bound[table] = row[table];
+            }
+        }
+    }
+
+    /// Fails with the first error an expression of several relations
+    /// raised.
+    fn check(&self) -> Result<(), SqlError> {
+        match self.failed.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// A member's value in the bound row: a column, an expression member
+    /// its scan computed after the columns, or an expression of several
+    /// relations evaluated over their bound rows.
+    fn value(&self, row: &[Option<BaseRow<'a>>], (table, column): (usize, usize)) -> Datum<'a> {
+        if let Some(id) = Member::plain(0, column as u16).expression_id()
+            && self.model.expressions[id].reads != Relids::EMPTY
+        {
+            return match self.evaluate(row, self.model.expressions[id].expression) {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some(first) = self.failed.take() {
+                        self.failed.set(Some(first));
+                    } else {
+                        self.failed.set(Some(error));
+                    }
+                    Datum::Null
+                }
+            };
+        }
+        row[table].map_or(Datum::Null, |row| {
+            row.values[self.value_index(row.values.len(), column)]
+        })
+    }
+
+    /// Where a member's value sits in a base row of `len` values.
+    fn value_index(&self, len: usize, column: usize) -> usize {
+        match Member::plain(0, column as u16).expression_id() {
+            Some(id) => len - self.model.expressions.len() + id,
+            None => column,
+        }
+    }
+
+    /// The columns of a base row, without its expression members' values.
+    fn columns_of<'v>(&self, values: &'v [Datum<'a>]) -> &'v [Datum<'a>] {
+        &values[..values.len() - self.model.expressions.len()]
+    }
+
+    fn collation(&self, (table, column): (usize, usize)) -> Collation {
+        if let Some(id) = Member::plain(0, column as u16).expression_id() {
+            return self.model.expressions[id].collation;
+        }
+        self.scope
+            .defs
+            .stored(table)
+            .expect("a plain table")
+            .columns()[column]
+            .collation
+    }
+
+    fn column_type(&self, (table, column): (usize, usize)) -> crate::sql::types::ColType {
+        if let Some(id) = Member::plain(0, column as u16).expression_id() {
+            return self.model.expressions[id].ctype;
+        }
+        self.scope
+            .defs
+            .stored(table)
+            .expect("a plain table")
+            .columns()[column]
+            .ctype
+    }
+
+    /// Each clause's (outer, inner) columns.
+    fn sides(&self, clauses: &ClauseList, outer: Relids) -> KeySides {
+        let mut sides =
+            [((usize::MAX, 0), (usize::MAX, 0)); super::index_paths::joins::MAX_JOIN_CLAUSES];
+        for (at, &id) in clauses.as_slice().iter().enumerate() {
+            let (left, right) = self
+                .model
+                .clause_columns(&self.model.plan.clauses[usize::from(id)])
+                .expect("a hash or merge clause equates columns");
+            sides[at] = if outer.contains(left.0 as u32) {
+                (left, right)
+            } else {
+                (right, left)
+            };
+        }
+        sides
+    }
+
+    /// A join's clauses as its plan evaluates them
+    /// (`extract_actual_join_clauses`, `order_qual_clauses`): an outer
+    /// join's matching conditions apart from the filters pushed down to it,
+    /// each list cheapest first, without the clauses its hash or merge keys
+    /// apply.
+    fn split(
+        &self,
+        clauses: &ClauseList,
+        relids: Relids,
+        jointype: JoinType,
+        keyed: &ClauseList,
+    ) -> (ClauseList, ClauseList) {
+        crate::sql::query::index_paths::joins::split_join_clauses(
+            self.model.plan.clauses,
+            clauses,
+            relids,
+            jointype,
+            keyed,
+        )
+    }
+
+    /// Binds a row of NULLs to the relations of `relids`.
+    fn null_extend(&self, bound: &mut [Option<BaseRow<'a>>], relids: Relids) {
+        for (table, (slot, nulls)) in bound.iter_mut().zip(self.nulls).enumerate() {
+            if relids.contains(table as u32) {
+                *slot = Some(BaseRow {
+                    values: nulls,
+                    rowid: None,
+                });
+            }
+        }
+    }
+
+    /// `expression` over the bound rows, its value kept in the arena.
+    fn evaluate(
+        &self,
+        bound: &[Option<BaseRow<'a>>],
+        expression: &crate::sql::ast::Expr<'a>,
+    ) -> Result<Datum<'a>, SqlError> {
+        let mut scratch = self.scratch.borrow_mut();
+        let values: &mut [Datum<'a>] = &mut scratch;
+        values.fill(Datum::Null);
+        for (table, row) in bound.iter().enumerate().take(self.scope.n) {
+            if let Some(row) = row {
+                let start = self.offsets[table];
+                let columns = self.columns_of(row.values);
+                values[start..start + columns.len()].copy_from_slice(columns);
+            }
+        }
+        let row = JoinRow {
+            scope: self.scope,
+            values: JoinRowValues::Flat {
+                values,
+                offsets: self.offsets,
+            },
+            rowids: &[],
+            visible: self.scope.n,
+        };
+        crate::sql::eval::eval_full(expression, self.arena, self.params, &row, self.hooks)
+    }
+
+    /// Whether a condition no equality models holds for the bound rows.
+    fn condition(
+        &self,
+        bound: &[Option<BaseRow<'a>>],
+        expression: &crate::sql::ast::Expr<'a>,
+    ) -> Result<bool, SqlError> {
+        let mark = self.arena.mark();
+        let values = self
+            .arena
+            .alloc_slice_with(self.width, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (table, row) in bound.iter().enumerate().take(self.scope.n) {
+            if let Some(row) = row {
+                let start = self.offsets[table];
+                let columns = self.columns_of(row.values);
+                values[start..start + columns.len()].copy_from_slice(columns);
+            }
+        }
+        let row = JoinRow {
+            scope: self.scope,
+            values: JoinRowValues::Flat {
+                values,
+                offsets: self.offsets,
+            },
+            rowids: &[],
+            visible: self.scope.n,
+        };
+        let value =
+            crate::sql::eval::eval_full(expression, self.arena, self.params, &row, self.hooks)?;
+        let holds = matches!(value, Datum::Bool(true));
+        // SAFETY: nothing the evaluation allocated outlives it: the result
+        // was read as a flag.
+        unsafe { self.arena.rewind_to(mark) };
+        Ok(holds)
+    }
+
+    fn keys(keys: &KeySides) -> impl Iterator<Item = &((usize, usize), (usize, usize))> {
+        keys.iter().take_while(|key| key.0.0 != usize::MAX)
+    }
+
+    /// Whether every clause of `clauses` holds for the bound rows.
+    fn equal(&self, bound: &[Option<BaseRow<'a>>], clauses: &ClauseList) -> Result<bool, SqlError> {
+        for &id in clauses.as_slice() {
+            let clause = &self.model.plan.clauses[usize::from(id)];
+            let Some((left, right)) = self.model.clause_columns(clause) else {
+                let expression = self.model.condition(clause).expect("a written condition");
+                if !self.condition(bound, expression)? {
+                    return Ok(false);
+                }
+                continue;
+            };
+            let (one, two) = (self.value(bound, left), self.value(bound, right));
+            if one.is_null()
+                || two.is_null()
+                || crate::sql::eval::compare_datums_collated(
+                    self.storage,
+                    self.txid,
+                    self.collation(left),
+                    &one,
+                    &two,
+                )? != Ordering::Equal
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn has_null(&self, row: &[Option<BaseRow<'a>>], keys: &KeySides, outer: bool) -> bool {
+        Self::keys(keys).any(|(o, i)| self.value(row, if outer { *o } else { *i }).is_null())
+    }
+
+    /// The bound outer row's keys against `inner`'s keys.
+    fn compare_sides(
+        &self,
+        bound: &[Option<BaseRow<'a>>],
+        inner: &[Option<BaseRow<'a>>],
+        keys: &KeySides,
+    ) -> Result<Ordering, SqlError> {
+        for &(o, i) in Self::keys(keys) {
+            let order = crate::sql::eval::compare_datums_collated(
+                self.storage,
+                self.txid,
+                self.collation(o),
+                &self.value(bound, o),
+                &self.value(inner, i),
+            )?;
+            if order != Ordering::Equal {
+                return Ok(order);
+            }
+        }
+        Ok(Ordering::Equal)
+    }
 }
 
 /// Scans `statement`'s FROM clause: by the plan PostgreSQL's join search
@@ -1279,45 +1635,9 @@ pub(super) fn run_modeled<'a>(
     hooks: &EvalHooks<'_, 'a>,
     visit: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
-    // The plan's relations; a parenthesized join's members fill its
-    // written entry's columns in order, so one flat row serves both.
     let written = scope;
     let scope = model.scope(written);
-    let n = scope.n;
-    let written_offsets = arena
-        .alloc_slice_with(written.n, |_| 0usize)
-        .map_err(|_| arena_full())?;
-    let mut written_width = 0;
-    for (table, offset) in written_offsets.iter_mut().enumerate() {
-        *offset = written_width;
-        written_width += written.stored_width(table);
-    }
-    let written_offsets: &[usize] = written_offsets;
-    let written_rowids = arena
-        .alloc_slice_with(written.n, |_| None::<u64>)
-        .map_err(|_| arena_full())?;
-    let written_values = arena
-        .alloc_slice_with(written_width, |_| Datum::Null)
-        .map_err(|_| arena_full())?;
-    let offsets = arena
-        .alloc_slice_with(n, |_| 0usize)
-        .map_err(|_| arena_full())?;
-    let mut width = 0;
-    for (table, offset) in offsets.iter_mut().enumerate() {
-        *offset = width;
-        width += scope.stored_width(table);
-    }
-    let offsets: &[usize] = offsets;
-    let widths = arena
-        .alloc_slice_with(n, |table| scope.stored_width(table))
-        .map_err(|_| arena_full())?;
-    let widths: &[usize] = widths;
-    let values = arena
-        .alloc_slice_with(width, |_| Datum::Null)
-        .map_err(|_| arena_full())?;
-    let rowids = arena
-        .alloc_slice_with(n, |_| None::<u64>)
-        .map_err(|_| arena_full())?;
+    let mut output = OutputRow::new(model, written, arena)?;
     let block = super::instrument::current_block();
     let built = core::cell::Cell::from_mut(
         arena
@@ -1344,45 +1664,106 @@ pub(super) fn run_modeled<'a>(
     let memos = arena
         .alloc_owned_slice_with(model.plan.paths.len(), |_| core::cell::Cell::new(None))
         .map_err(|_| arena_full())?;
-    // A row of NULLs per relation: its columns, then a NULL for each
-    // expression member.
-    let mut nulls = [&[][..]; RELATION_NUMBERS];
-    for (table, held) in nulls.iter_mut().enumerate().take(n) {
-        *held = arena
-            .alloc_slice_with(scope.stored_width(table) + model.expressions.len(), |_| {
-                Datum::Null
-            })
-            .map_err(|_| arena_full())?;
-    }
-    let nulls = arena
-        .alloc_slice_copy(&nulls[..n])
-        .map_err(|_| arena_full())?;
+    let layout = JoinLayout::new(model, scope, arena)?;
     let runner = Runner {
+        cx: JoinContext::new(storage, scope, txid, model, arena, params, hooks, &layout),
         built,
         frozen,
         scan_nodes: &scan_nodes,
         memos: &memos,
         block,
-        storage,
-        scope,
-        txid,
-        model,
-        arena,
-        params,
-        hooks,
-        offsets,
-        width,
-        nulls,
-        failed: core::cell::Cell::new(None),
-        scratch: core::cell::RefCell::new(
-            arena
-                .alloc_slice_with(width, |_| Datum::Null)
-                .map_err(|_| arena_full())?,
-        ),
     };
     let mut bound: Bound<'a> = [None; RELATION_NUMBERS];
     runner.exec(model.plan.top, &mut bound, &mut |bound| {
         runner.check()?;
+        output.fill(model, written, layout.nulls, bound);
+        let _block = super::instrument::enter_block(block);
+        visit(&output.row(model, written))
+    })?;
+    runner.check()
+}
+
+/// The joined row a plan returns, as the query reads it: each relation's
+/// bound row, a removed self-join's relation reading the row of the scan
+/// kept in its place and a removed join's relation reading NULLs; with
+/// parenthesized joins, each written entry's row built from its members'.
+/// Its buffers are allocated once and refilled for each row.
+pub(super) struct OutputRow<'a> {
+    offsets: &'a [usize],
+    widths: &'a [usize],
+    values: &'a mut [Datum<'a>],
+    rowids: &'a mut [Option<u64>],
+    written_offsets: &'a [usize],
+    written_values: &'a mut [Datum<'a>],
+    written_rowids: &'a mut [Option<u64>],
+}
+
+impl<'a> OutputRow<'a> {
+    /// The buffers of `model`'s rows over the query's `written` scope.
+    pub(super) fn new(
+        model: &ModeledJoin<'a>,
+        written: &QueryScope<'a>,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        // The plan's relations; a parenthesized join's members fill its
+        // written entry's columns in order, so one flat row serves both.
+        let scope = model.scope(written);
+        let n = scope.n;
+        let written_offsets = arena
+            .alloc_slice_with(written.n, |_| 0usize)
+            .map_err(|_| arena_full())?;
+        let mut written_width = 0;
+        for (table, offset) in written_offsets.iter_mut().enumerate() {
+            *offset = written_width;
+            written_width += written.stored_width(table);
+        }
+        let offsets = arena
+            .alloc_slice_with(n, |_| 0usize)
+            .map_err(|_| arena_full())?;
+        let mut width = 0;
+        for (table, offset) in offsets.iter_mut().enumerate() {
+            *offset = width;
+            width += scope.stored_width(table);
+        }
+        Ok(Self {
+            offsets,
+            widths: arena
+                .alloc_slice_with(n, |table| scope.stored_width(table))
+                .map_err(|_| arena_full())?,
+            values: arena
+                .alloc_slice_with(width, |_| Datum::Null)
+                .map_err(|_| arena_full())?,
+            rowids: arena
+                .alloc_slice_with(n, |_| None::<u64>)
+                .map_err(|_| arena_full())?,
+            written_offsets,
+            written_values: arena
+                .alloc_slice_with(written_width, |_| Datum::Null)
+                .map_err(|_| arena_full())?,
+            written_rowids: arena
+                .alloc_slice_with(written.n, |_| None::<u64>)
+                .map_err(|_| arena_full())?,
+        })
+    }
+
+    /// Copies the top join's bound rows in.
+    fn fill(
+        &mut self,
+        model: &ModeledJoin<'a>,
+        written: &QueryScope<'a>,
+        nulls: &[&'a [Datum<'a>]],
+        bound: &[Option<BaseRow<'a>>],
+    ) {
+        let Self {
+            offsets,
+            widths,
+            values,
+            rowids,
+            written_offsets,
+            written_values,
+            written_rowids,
+        } = self;
+        let n = offsets.len();
         for table in 0..n {
             let start = offsets[table];
             let columns = widths[table];
@@ -1404,14 +1785,8 @@ pub(super) fn run_modeled<'a>(
             values[start..start + columns].copy_from_slice(&row.values[..columns]);
             rowids[table] = row.rowid;
         }
-        let _block = super::instrument::enter_block(block);
         let Some(nested) = model.nested.as_ref() else {
-            return visit(&JoinRow {
-                scope,
-                values: JoinRowValues::Flat { values, offsets },
-                rowids,
-                visible: n,
-            });
+            return;
         };
         // Each written entry's row from its members' rows; a parenthesized
         // join's is a joined row of no one row.
@@ -1446,17 +1821,36 @@ pub(super) fn run_modeled<'a>(
                 at += 1;
             }
         }
-        visit(&JoinRow {
-            scope: written,
-            values: JoinRowValues::Flat {
-                values: written_values,
-                offsets: written_offsets,
+    }
+
+    /// The row last filled, over the plan's relations or, with
+    /// parenthesized joins, over `written`.
+    pub(super) fn row<'s>(
+        &'s self,
+        model: &'s ModeledJoin<'a>,
+        written: &'s QueryScope<'a>,
+    ) -> JoinRow<'s, 'a, 'a> {
+        match model.nested.as_ref() {
+            None => JoinRow {
+                scope: written,
+                values: JoinRowValues::Flat {
+                    values: self.values,
+                    offsets: self.offsets,
+                },
+                rowids: self.rowids,
+                visible: written.n,
             },
-            rowids: written_rowids,
-            visible: written.n,
-        })
-    })?;
-    runner.check()
+            Some(_) => JoinRow {
+                scope: written,
+                values: JoinRowValues::Flat {
+                    values: self.written_values,
+                    offsets: self.written_offsets,
+                },
+                rowids: self.written_rowids,
+                visible: written.n,
+            },
+        }
+    }
 }
 
 /// A base relation's scan node and the outer row its condition reads.
@@ -1906,7 +2300,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         let eval = |row: &[Option<BaseRow<'a>>], outer_side: bool| -> MergeEval {
             let fills = if outer_side { fill_outer } else { fill_inner };
             let mut result = MergeEval::Matchable;
-            for (at, &(o, i)) in Self::keys(&keys).enumerate() {
+            for (at, &(o, i)) in JoinContext::keys(&keys).enumerate() {
                 if self.value(row, if outer_side { o } else { i }).is_null() {
                     if at == 0 && nulls_first & 1 == 0 && !fills {
                         return MergeEval::EndOfJoin;
@@ -2018,7 +2412,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                        inner_row: &[Option<BaseRow<'a>>]|
          -> Result<Ordering, SqlError> {
             let mut null_equals_null = false;
-            for (at, &(o, i)) in Self::keys(&keys).enumerate() {
+            for (at, &(o, i)) in JoinContext::keys(&keys).enumerate() {
                 let (one, two) = (self.value(outer_row, o), self.value(inner_row, i));
                 let first = nulls_first >> at & 1 != 0;
                 let order = match (one.is_null(), two.is_null()) {
@@ -2593,7 +2987,7 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// `create_hashjoin_plan`'s skew table: the join hashes one key whose
     /// outer side is a column.
     fn skewed(&self, keys: &KeySides) -> bool {
-        Self::keys(keys).count() == 1
+        JoinContext::keys(keys).count() == 1
             && Member::plain(0, keys[0].0.1 as u16)
                 .expression_id()
                 .is_none()
@@ -2601,7 +2995,7 @@ impl<'r, 'a> Runner<'r, 'a> {
 
     /// Whether every key's type has a hash function here.
     fn hashable(&self, keys: &KeySides) -> bool {
-        Self::keys(keys).all(|&(outer, inner)| {
+        JoinContext::keys(keys).all(|&(outer, inner)| {
             [outer, inner]
                 .into_iter()
                 .all(|member| datum_type_hashable(self.column_type(member)))
@@ -2847,7 +3241,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         keep_nulls: bool,
     ) -> Result<Option<u32>, SqlError> {
         let mut hash = 0u32;
-        for (at, &(o, i)) in Self::keys(keys).enumerate() {
+        for (at, &(o, i)) in JoinContext::keys(keys).enumerate() {
             let value = self.value(row, if outer { o } else { i });
             if value.is_null() {
                 // A join returning the side's unmatched rows hashes a NULL
@@ -3249,7 +3643,13 @@ impl<'r, 'a> Runner<'r, 'a> {
             None
         };
         node.rescan();
-        while node.next(self.arena, self.params, self.hooks, outer)? {
+        while node.next(
+            crate::storage::CursorScratch::Statement,
+            self.arena,
+            self.params,
+            self.hooks,
+            outer,
+        )? {
             let columns = node.values();
             let values = self
                 .arena
@@ -3293,266 +3693,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         })?;
         *bound = saved;
         Ok(Held { rows })
-    }
-
-    /// `bound`'s relations of the query, kept in the arena.
-    fn keep(&self, bound: &Bound<'a>) -> Result<Row<'a>, SqlError> {
-        let row = self
-            .arena
-            .alloc_slice_with(self.scope.n, |table| bound[table])
-            .map_err(|_| arena_full())?;
-        Ok(row)
-    }
-
-    fn bind(&self, bound: &mut Bound<'a>, row: &[Option<BaseRow<'a>>], relids: Relids) {
-        for table in 0..self.scope.n {
-            if relids.contains(table as u32) {
-                bound[table] = row[table];
-            }
-        }
-    }
-
-    /// Fails with the first error an expression of several relations
-    /// raised.
-    fn check(&self) -> Result<(), SqlError> {
-        match self.failed.take() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    /// A member's value in the bound row: a column, an expression member
-    /// its scan computed after the columns, or an expression of several
-    /// relations evaluated over their bound rows.
-    fn value(&self, row: &[Option<BaseRow<'a>>], (table, column): (usize, usize)) -> Datum<'a> {
-        if let Some(id) = Member::plain(0, column as u16).expression_id()
-            && self.model.expressions[id].reads != Relids::EMPTY
-        {
-            return match self.evaluate(row, self.model.expressions[id].expression) {
-                Ok(value) => value,
-                Err(error) => {
-                    if let Some(first) = self.failed.take() {
-                        self.failed.set(Some(first));
-                    } else {
-                        self.failed.set(Some(error));
-                    }
-                    Datum::Null
-                }
-            };
-        }
-        row[table].map_or(Datum::Null, |row| {
-            row.values[self.value_index(row.values.len(), column)]
-        })
-    }
-
-    /// Where a member's value sits in a base row of `len` values.
-    fn value_index(&self, len: usize, column: usize) -> usize {
-        match Member::plain(0, column as u16).expression_id() {
-            Some(id) => len - self.model.expressions.len() + id,
-            None => column,
-        }
-    }
-
-    /// The columns of a base row, without its expression members' values.
-    fn columns_of<'v>(&self, values: &'v [Datum<'a>]) -> &'v [Datum<'a>] {
-        &values[..values.len() - self.model.expressions.len()]
-    }
-
-    fn collation(&self, (table, column): (usize, usize)) -> Collation {
-        if let Some(id) = Member::plain(0, column as u16).expression_id() {
-            return self.model.expressions[id].collation;
-        }
-        self.scope
-            .defs
-            .stored(table)
-            .expect("a plain table")
-            .columns()[column]
-            .collation
-    }
-
-    fn column_type(&self, (table, column): (usize, usize)) -> crate::sql::types::ColType {
-        if let Some(id) = Member::plain(0, column as u16).expression_id() {
-            return self.model.expressions[id].ctype;
-        }
-        self.scope
-            .defs
-            .stored(table)
-            .expect("a plain table")
-            .columns()[column]
-            .ctype
-    }
-
-    /// Each clause's (outer, inner) columns.
-    fn sides(&self, clauses: &ClauseList, outer: Relids) -> KeySides {
-        let mut sides =
-            [((usize::MAX, 0), (usize::MAX, 0)); super::index_paths::joins::MAX_JOIN_CLAUSES];
-        for (at, &id) in clauses.as_slice().iter().enumerate() {
-            let (left, right) = self
-                .model
-                .clause_columns(&self.model.plan.clauses[usize::from(id)])
-                .expect("a hash or merge clause equates columns");
-            sides[at] = if outer.contains(left.0 as u32) {
-                (left, right)
-            } else {
-                (right, left)
-            };
-        }
-        sides
-    }
-
-    /// A join's clauses as its plan evaluates them
-    /// (`extract_actual_join_clauses`, `order_qual_clauses`): an outer
-    /// join's matching conditions apart from the filters pushed down to it,
-    /// each list cheapest first, without the clauses its hash or merge keys
-    /// apply.
-    fn split(
-        &self,
-        clauses: &ClauseList,
-        relids: Relids,
-        jointype: JoinType,
-        keyed: &ClauseList,
-    ) -> (ClauseList, ClauseList) {
-        crate::sql::query::index_paths::joins::split_join_clauses(
-            self.model.plan.clauses,
-            clauses,
-            relids,
-            jointype,
-            keyed,
-        )
-    }
-
-    /// Binds a row of NULLs to the relations of `relids`.
-    fn null_extend(&self, bound: &mut Bound<'a>, relids: Relids) {
-        for (table, (slot, nulls)) in bound.iter_mut().zip(self.nulls).enumerate() {
-            if relids.contains(table as u32) {
-                *slot = Some(BaseRow {
-                    values: nulls,
-                    rowid: None,
-                });
-            }
-        }
-    }
-
-    /// `expression` over the bound rows, its value kept in the arena.
-    fn evaluate(
-        &self,
-        bound: &[Option<BaseRow<'a>>],
-        expression: &crate::sql::ast::Expr<'a>,
-    ) -> Result<Datum<'a>, SqlError> {
-        let mut scratch = self.scratch.borrow_mut();
-        let values: &mut [Datum<'a>] = &mut scratch;
-        values.fill(Datum::Null);
-        for (table, row) in bound.iter().enumerate().take(self.scope.n) {
-            if let Some(row) = row {
-                let start = self.offsets[table];
-                let columns = self.columns_of(row.values);
-                values[start..start + columns.len()].copy_from_slice(columns);
-            }
-        }
-        let row = JoinRow {
-            scope: self.scope,
-            values: JoinRowValues::Flat {
-                values,
-                offsets: self.offsets,
-            },
-            rowids: &[],
-            visible: self.scope.n,
-        };
-        crate::sql::eval::eval_full(expression, self.arena, self.params, &row, self.hooks)
-    }
-
-    /// Whether a condition no equality models holds for the bound rows.
-    fn condition(
-        &self,
-        bound: &[Option<BaseRow<'a>>],
-        expression: &crate::sql::ast::Expr<'a>,
-    ) -> Result<bool, SqlError> {
-        let mark = self.arena.mark();
-        let values = self
-            .arena
-            .alloc_slice_with(self.width, |_| Datum::Null)
-            .map_err(|_| arena_full())?;
-        for (table, row) in bound.iter().enumerate().take(self.scope.n) {
-            if let Some(row) = row {
-                let start = self.offsets[table];
-                let columns = self.columns_of(row.values);
-                values[start..start + columns.len()].copy_from_slice(columns);
-            }
-        }
-        let row = JoinRow {
-            scope: self.scope,
-            values: JoinRowValues::Flat {
-                values,
-                offsets: self.offsets,
-            },
-            rowids: &[],
-            visible: self.scope.n,
-        };
-        let value =
-            crate::sql::eval::eval_full(expression, self.arena, self.params, &row, self.hooks)?;
-        let holds = matches!(value, Datum::Bool(true));
-        // SAFETY: nothing the evaluation allocated outlives it: the result
-        // was read as a flag.
-        unsafe { self.arena.rewind_to(mark) };
-        Ok(holds)
-    }
-
-    fn keys(keys: &KeySides) -> impl Iterator<Item = &((usize, usize), (usize, usize))> {
-        keys.iter().take_while(|key| key.0.0 != usize::MAX)
-    }
-
-    /// Whether every clause of `clauses` holds for the bound rows.
-    fn equal(&self, bound: &[Option<BaseRow<'a>>], clauses: &ClauseList) -> Result<bool, SqlError> {
-        for &id in clauses.as_slice() {
-            let clause = &self.model.plan.clauses[usize::from(id)];
-            let Some((left, right)) = self.model.clause_columns(clause) else {
-                let expression = self.model.condition(clause).expect("a written condition");
-                if !self.condition(bound, expression)? {
-                    return Ok(false);
-                }
-                continue;
-            };
-            let (one, two) = (self.value(bound, left), self.value(bound, right));
-            if one.is_null()
-                || two.is_null()
-                || crate::sql::eval::compare_datums_collated(
-                    self.storage,
-                    self.txid,
-                    self.collation(left),
-                    &one,
-                    &two,
-                )? != Ordering::Equal
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    fn has_null(&self, row: &[Option<BaseRow<'a>>], keys: &KeySides, outer: bool) -> bool {
-        Self::keys(keys).any(|(o, i)| self.value(row, if outer { *o } else { *i }).is_null())
-    }
-
-    /// The bound outer row's keys against `inner`'s keys.
-    fn compare_sides(
-        &self,
-        bound: &[Option<BaseRow<'a>>],
-        inner: &[Option<BaseRow<'a>>],
-        keys: &KeySides,
-    ) -> Result<Ordering, SqlError> {
-        for &(o, i) in Self::keys(keys) {
-            let order = crate::sql::eval::compare_datums_collated(
-                self.storage,
-                self.txid,
-                self.collation(o),
-                &self.value(bound, o),
-                &self.value(inner, i),
-            )?;
-            if order != Ordering::Equal {
-                return Ok(order);
-            }
-        }
-        Ok(Ordering::Equal)
     }
 
     /// The `t_len` of the minimal tuple of path `id`'s target list for
@@ -3733,7 +3873,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             self.arena,
             index,
             |&a, &b| {
-                for &(o, i) in Self::keys(keys) {
+                for &(o, i) in JoinContext::keys(keys) {
                     let order = crate::sql::eval::compare_datums_collated(
                         self.storage,
                         self.txid,

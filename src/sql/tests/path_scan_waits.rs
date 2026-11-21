@@ -170,7 +170,13 @@ fn run(engine: &mut Engine, kind: ScanKind, bounds: &[i32]) -> (Vec<Vec<i32>>, u
             let result = {
                 let _snapshot = storage.nested_statement_snapshot(storage.lsn());
                 crate::mem::guard::forbid_alloc(|| {
-                    node.next(&arena, &params, &crate::sql::eval::NO_HOOKS, None)
+                    node.next(
+                        crate::storage::CursorScratch::Statement,
+                        &arena,
+                        &params,
+                        &crate::sql::eval::NO_HOOKS,
+                        None,
+                    )
                 })
             };
             checkpointer.set_read_owner(prior_owner);

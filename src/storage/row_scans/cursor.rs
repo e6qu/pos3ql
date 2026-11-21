@@ -80,6 +80,16 @@ pub(crate) enum CursorScratch<'b> {
     Statement,
 }
 
+impl CursorScratch<'_> {
+    /// The same scratch, lent to one call.
+    pub(crate) fn reborrow(&mut self) -> CursorScratch<'_> {
+        match self {
+            Self::Reader(buffers) => CursorScratch::Reader(buffers),
+            Self::Statement => CursorScratch::Statement,
+        }
+    }
+}
+
 pub(crate) struct RowCursorBuffers {
     scan: crate::mem::mutex::Mutex<crate::storage::ScanContext>,
     row: RowReadBuffers,

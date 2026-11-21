@@ -252,6 +252,7 @@ impl<'a> PathScan<'a> {
     /// execution's position: the same call resumes it.
     pub(crate) fn next(
         &mut self,
+        mut scratch: CursorScratch<'_>,
         arena: &'a Arena,
         params: &[Datum<'a>],
         hooks: &EvalHooks<'_, 'a>,
@@ -267,7 +268,7 @@ impl<'a> PathScan<'a> {
             }
             // A row the condition rejects releases its bytes.
             let mark = arena.mark();
-            let read = self.read_row(arena);
+            let read = self.read_row(&mut scratch, arena);
             let passed = match read.and_then(|found| {
                 if !found {
                     return Ok(None);
@@ -508,7 +509,11 @@ impl<'a> PathScan<'a> {
 
     /// Reads the execution's next row into the node's values; `Ok(false)`
     /// once none is left.
-    fn read_row(&mut self, arena: &'a Arena) -> Result<bool, SqlError> {
+    fn read_row(
+        &mut self,
+        scratch: &mut CursorScratch<'_>,
+        arena: &'a Arena,
+    ) -> Result<bool, SqlError> {
         let (storage, txid, slot) = (self.storage, self.txid, self.slot);
         let (rowid, statistics, representation) = match self.rows {
             Rows::Sequential => {
@@ -516,7 +521,7 @@ impl<'a> PathScan<'a> {
                     .sequential
                     .as_mut()
                     .expect("a sequential execution opened its cursor");
-                let Some(row) = cursor.next(CursorScratch::Statement, arena, arena, None)? else {
+                let Some(row) = cursor.next(scratch.reborrow(), arena, arena, None)? else {
                     return Ok(false);
                 };
                 let rowid = row.rowid;

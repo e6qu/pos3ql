@@ -2,19 +2,26 @@
 //! execution's candidates and while it reads a row. Every row passing the
 //! scan's condition is returned once, in the path's order, for each
 //! execution, whether the table's rows are resident or saved in object
-//! storage. A retried open finds the blocks the interrupted one fetched in
-//! the block cache, as a server's does, so it gets further each time.
+//! storage, and without a block cache.
+//!
+//! The test drives the node as a statement does: each call after a wait is
+//! a restarted attempt of the statement's reads and each returned row is
+//! progress, so a retried open that would download a block a third time
+//! reads the rest synchronously and finishes. An object store answers every
+//! GET on its own thread, as a real one does.
 
-use super::object_reads::{advance, read_request, replace_blocks, replace_uncached_blocks, reply};
+use super::object_reads::{replace_uncached_blocks, reply};
 use super::*;
 use crate::sql::query::PathScan;
 use crate::sql::query::index_paths::{IndexPages, ScanKind, ScanPath, SortKind};
 use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-const ROWS: i32 = 240;
-/// Room for every block the table's saved rows span.
-const CACHE_BYTES: usize = 4 << 20;
+/// Rows of about 3 KB, so the saved rows span two 256 KiB blocks and a
+/// sequential scan waits again after its first rows.
+const ROWS: i32 = 100;
 
 /// The path `kind` with nothing else known about it, as a join's plan
 /// describes a sequential or bitmap heap scan to its node.
@@ -46,30 +53,80 @@ fn path(kind: ScanKind) -> ScanPath<'static> {
     }
 }
 
+/// Moves the checkpointer's pending block reads on.
+fn advance_block_reads(checkpointer: &mut crate::checkpoint::Checkpointer) {
+    checkpointer.advance_background_io(Instant::now());
+    for slot in 0..checkpointer.block_read_slots() {
+        if checkpointer.pending_block_read_fd(slot).is_some() {
+            crate::mem::guard::forbid_alloc(|| checkpointer.advance_pending_block_read(slot))
+                .unwrap();
+        }
+    }
+}
+
+/// Answers every object GET on `listener` from `namespace` until `stop`,
+/// each connection on its own thread: a client may connect before it sends
+/// its request.
+fn serve(
+    listener: TcpListener,
+    prefix: String,
+    namespace: crate::object_store::sim::SimNamespaceHandle,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut connections = Vec::new();
+        while !stop.load(Ordering::Acquire) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => panic!("object GET accept: {error}"),
+            };
+            let (prefix, namespace, stop) = (prefix.clone(), namespace.clone(), Arc::clone(&stop));
+            connections.push(std::thread::spawn(move || {
+                let mut head = [0; 8192];
+                let Some((_, len)) =
+                    crate::test_wait::read_request_head(&mut stream, &mut head, &stop)
+                else {
+                    return;
+                };
+                let request = core::str::from_utf8(&head[..len]).unwrap().to_owned();
+                let key = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .strip_prefix(prefix.as_str())
+                    .unwrap()
+                    .to_owned();
+                let body = namespace.borrow().object_bytes(&key).unwrap().to_vec();
+                reply(&mut stream, &request, &body);
+            }));
+        }
+        for connection in connections {
+            connection.join().unwrap();
+        }
+    })
+}
+
 /// The ids every execution of the node returns, one execution per bound
-/// in `bounds`, serving each object GET by hand; and the waits after an
-/// execution's first row.
-fn run(
-    engine: &mut Engine,
-    kind: ScanKind,
-    bounds: &[i32],
-    object: Option<(
-        &TcpListener,
-        &str,
-        &crate::object_store::sim::SimNamespaceHandle,
-    )>,
-) -> (Vec<Vec<i32>>, usize) {
-    let mut budget = Budget::new(16 << 20);
-    let arena = Arena::new(&mut budget, "path scan rows", 16 << 20).unwrap();
+/// in `bounds`, and the waits after an execution's first row.
+fn run(engine: &mut Engine, kind: ScanKind, bounds: &[i32]) -> (Vec<Vec<i32>>, usize) {
+    let mut budget = Budget::new(4 << 20);
+    let arena = Arena::new(&mut budget, "path scan rows", 4 << 20).unwrap();
     let select =
         crate::sql::parser::parse_query("SELECT * FROM candidates WHERE id <= $1", &arena).unwrap();
     let from = select.from.as_ref().unwrap();
     let owner = ExecutionIdentity::new(41, engine.execution_identity().database_oid).read_owner();
-    // The node borrows the storage for the statement, as a plan does while
-    // the session that owns the engine serves its reads between calls.
-    // SAFETY: the engine is neither moved nor dropped, and its storage is
-    // not replaced, while the node lives.
-    let storage: &crate::storage::Storage = unsafe { &*core::ptr::from_ref(&engine.storage) };
+    let prior_owner = engine.read_owner;
+    // The node borrows the storage for the statement while the checkpointer
+    // serves its reads between calls, as a session's engine does.
+    let storage = &engine.storage;
+    let checkpointer = engine.ckpt.as_mut().unwrap();
     let params = [Datum::Int4(bounds[0])];
     let mut node = {
         let _snapshot = storage.nested_statement_snapshot(storage.lsn());
@@ -87,6 +144,12 @@ fn run(
     };
     let mut executions = Vec::new();
     let mut waits = 0;
+    // Rows returned so far: the statement's progress across waits.
+    let mut progress = 0;
+    let mut restarted = false;
+    checkpointer
+        .begin_statement_reads(owner, false, progress)
+        .unwrap();
     for &bound in bounds {
         let params = [Datum::Int4(bound)];
         node.rescan();
@@ -97,19 +160,27 @@ fn run(
         let mut waited_at = None;
         let mut opened = false;
         loop {
-            advance(engine);
-            let prior = engine.replace_read_owner(Some(owner));
+            advance_block_reads(checkpointer);
+            if restarted {
+                checkpointer
+                    .begin_statement_reads(owner, true, progress)
+                    .unwrap();
+            }
+            checkpointer.set_read_owner(Some(owner));
             let result = {
                 let _snapshot = storage.nested_statement_snapshot(storage.lsn());
                 crate::mem::guard::forbid_alloc(|| {
                     node.next(&arena, &params, &crate::sql::eval::NO_HOOKS, None)
                 })
             };
-            let _ = engine.replace_read_owner(prior);
+            checkpointer.set_read_owner(prior_owner);
+            restarted = result.is_err();
             match result {
                 Ok(true) => {
                     waited_at = None;
                     opened = true;
+                    progress += 1;
+                    checkpointer.statement_progressed(owner);
                     match node.values()[0] {
                         Datum::Int4(id) => ids.push(id),
                         other => panic!("id column: {other:?}"),
@@ -136,36 +207,16 @@ fn run(
                     }
                     waited_at = Some(used);
                     waits += usize::from(!ids.is_empty());
-                    let (listener, prefix, namespace) = object.expect("resident rows never wait");
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let request = read_request(engine, &mut stream);
-                            let key = request
-                                .lines()
-                                .next()
-                                .unwrap()
-                                .split_whitespace()
-                                .nth(1)
-                                .unwrap()
-                                .strip_prefix(prefix)
-                                .unwrap()
-                                .to_owned();
-                            let body = namespace.borrow().object_bytes(&key).unwrap().to_vec();
-                            reply(&mut stream, &request, &body);
-                            deadline = crate::test_wait::deadline();
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(Instant::now() < deadline, "the scan did not advance");
-                            std::thread::yield_now();
-                        }
-                        Err(error) => panic!("path scan accept: {error}"),
-                    }
+                    assert!(Instant::now() < deadline, "the scan did not advance");
+                    std::thread::yield_now();
                 }
             }
         }
         executions.push(ids);
     }
-    engine.ckpt.as_mut().unwrap().cancel_read_owner(owner);
+    drop(node);
+    checkpointer.forget_statement_reads(owner);
+    checkpointer.cancel_read_owner(owner);
     (executions, waits)
 }
 
@@ -196,29 +247,31 @@ fn path_scan_resumes_waits_across_rescans() {
         &format!(
             "CREATE TABLE candidates(id integer, pad text); \
              CREATE INDEX candidates_id ON candidates(id); \
-             INSERT INTO candidates SELECT g, (SELECT string_agg(md5(g::text || i::text), '') FROM generate_series(1, 96) i) \
+             INSERT INTO candidates SELECT g, \
+             (SELECT string_agg(md5(g::text || i::text), '') FROM generate_series(1, 96) i) \
              FROM generate_series(1, {ROWS}) g; \
              DELETE FROM candidates WHERE id % 7 = 0"
         ),
         false,
     );
-    // Each execution's bound, a rescan with a smaller, larger and equal one.
-    let bounds = [200, 90, ROWS, 90];
+    // A smaller, then a larger rescan: the larger one outgrows the node's
+    // candidate storage.
+    let bounds = [70, ROWS, 30];
     let expected: Vec<Vec<i32>> = bounds
         .iter()
         .map(|&bound| (1..=bound).filter(|id| id % 7 != 0).collect())
         .collect();
     for kind in [ScanKind::Seq, ScanKind::Bitmap] {
-        let (resident, _) = run(&mut engine, kind, &bounds, None);
+        let (resident, waits) = run(&mut engine, kind, &bounds);
+        assert_eq!(waits, 0, "resident rows never wait");
         assert_eq!(resident, expected);
     }
     assert!(engine.checkpoint().unwrap());
     drop((session, engine));
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
-    // Saved rows, each block read from object storage with a wait and kept
-    // in a RAM cache. The rows span several blocks, so a sequential scan
-    // waits again after its first rows.
+    // Saved rows, each block read from object storage with a wait, with no
+    // block cache to keep them: a retried open downloads its blocks again.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut network = config.clone();
@@ -226,17 +279,18 @@ fn path_scan_resumes_waits_across_rescans() {
     network.object_store_endpoint = listener.local_addr().unwrap().to_string();
     network.object_store_access_key = "test-access".to_owned();
     network.object_store_secret_key = "test-secret".to_owned();
-    let prefix = format!("/{}/", config.object_store_bucket);
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = serve(
+        listener,
+        format!("/{}/", config.object_store_bucket),
+        namespace.clone(),
+        Arc::clone(&stop),
+    );
     for kind in [ScanKind::Seq, ScanKind::Bitmap] {
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
-        replace_blocks(&mut engine, &network, CACHE_BYTES);
-        let (saved, waits) = run(
-            &mut engine,
-            kind,
-            &bounds,
-            Some((&listener, &prefix, &namespace)),
-        );
+        replace_uncached_blocks(&mut engine, &network);
+        let (saved, waits) = run(&mut engine, kind, &bounds);
         assert_eq!(saved, expected);
         // A sequential scan reads each block as it reaches it.
         assert!(
@@ -248,5 +302,7 @@ fn path_scan_resumes_waits_across_rescans() {
         drop(engine);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
     }
+    stop.store(true, Ordering::Release);
+    server.join().unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }

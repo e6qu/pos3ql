@@ -273,6 +273,9 @@ pub(crate) struct AggState<'a> {
     ord: *mut &'a [u8],
     ord_len: usize,
     ord_cap: usize,
+    /// What the latest `update` handed the transition, which a hash
+    /// aggregate's memory model replays.
+    observed: super::transition_memory::Observed<'a>,
 }
 
 // Built-in groups must not reserve maximum-width custom routine state.
@@ -789,6 +792,7 @@ impl Default for AggState<'_> {
             ord: core::ptr::null_mut(),
             ord_len: 0,
             ord_cap: 0,
+            observed: super::transition_memory::Observed::NotCalled,
         }
     }
 }
@@ -2015,6 +2019,20 @@ impl<'a> AggState<'a> {
         Ok(true)
     }
 
+    /// Notes the values the latest update handed the transition.
+    fn observe(&mut self, value: Datum<'a>, extra: Datum<'a>) {
+        self.observed = super::transition_memory::Observed::Called {
+            value,
+            extra,
+            ordering: None,
+        };
+    }
+
+    /// What the latest update handed the transition.
+    pub(crate) fn observed(&self) -> super::transition_memory::Observed<'a> {
+        self.observed
+    }
+
     pub(crate) fn update(
         &mut self,
         node: &Expr<'a>,
@@ -2026,6 +2044,7 @@ impl<'a> AggState<'a> {
         let Expr::Call { args, filter, .. } = node else {
             unreachable!("validated in init");
         };
+        self.observed = super::transition_memory::Observed::NotCalled;
         // `FILTER (WHERE cond)` excludes rows where the condition is not true.
         if let Some(cond) = filter
             && !matches!(
@@ -2035,6 +2054,7 @@ impl<'a> AggState<'a> {
         {
             return Ok(());
         }
+        self.observe(Datum::Null, Datum::Null);
         if self.custom.is_some() {
             return self.update_custom(node, arena, params, row, hooks);
         }
@@ -2116,6 +2136,7 @@ impl<'a> AggState<'a> {
             }
             // array_agg/json_agg keep NULL elements, unlike string_agg.
             let value = eval_full(args[0], arena, params, row, hooks)?;
+            self.observe(value, Datum::Null);
             if matches!(self.kind, AggKind::JsonAgg { absent: true, .. }) && value.is_null() {
                 return Ok(());
             }
@@ -2208,6 +2229,7 @@ impl<'a> AggState<'a> {
         };
         self.collation = resolved_expression_collation(arg, row, hooks.catalog)?;
         let v = eval_full(arg, arena, params, row, hooks)?;
+        self.observe(v, Datum::Null);
         if v.is_null() {
             return Ok(());
         }
@@ -2456,6 +2478,11 @@ impl<'a> AggState<'a> {
                     None => true,
                     Some(b) => {
                         let ord = compare_datums_with_catalog(self.collation, catalog, &v, b)?;
+                        if let super::transition_memory::Observed::Called { ordering, .. } =
+                            &mut self.observed
+                        {
+                            *ordering = Some(ord);
+                        }
                         (self.kind == AggKind::Min && !ord.is_gt())
                             || (self.kind == AggKind::Max && !ord.is_lt())
                     }
@@ -2790,6 +2817,7 @@ impl<'a> AggState<'a> {
                 }
             }
         };
+        self.observe(value, separator);
         let sep_bytes = match separator {
             Datum::Bytea(bytes) => bytes,
             Datum::Text(text) => text.as_bytes(),

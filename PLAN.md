@@ -231,6 +231,10 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 
 - [x] Full join merged keys: a `COALESCE` of a full join's compared columns
   equated with a constant (PR #779, `975`).
+- [x] A hash join PostgreSQL splits into batches under a small `work_mem`
+  saves each later batch's outer rows as the query's relations only, not a
+  row slot per possible relation, and reads a batch's saved rows in place
+  (`979`).
 - [x] Self-join removal (`remove_useless_self_joins`, `976`).
 - [ ] *In progress:* plan joins of never-analyzed tables by PostgreSQL's
   search (they keep pos3ql's join order today). Needs the retained pull-based
@@ -238,16 +242,30 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 - [ ] *In progress:* a retained pull-based executor whose merge join, sort,
   hash and hash aggregate nodes keep their state between rows, as the retained
   nested-loop and hash levels do.
-- [ ] *In progress:* `LATERAL` subqueries planned by the search, with
-  `Memoize` and exact `EXPLAIN ANALYZE` counters (`EXPLAIN` fails with
-  `0A000` while `enable_memoize` is on today).
-- [ ] *In progress:* relation sets sized at startup, so queries of more than
-  128 relations are searched (they run pos3ql's join order today), and an
-  indexed relation equated with more than 16 others no longer fails with
-  `54000`.
-- [ ] *In progress:* `ORDER BY` over a large join streams the joined rows into
-  the retained, spilling sort (seven 8-row tables cross joined with `ORDER BY
-  1 LIMIT 1` fails with `54000` today).
+- [x] `LATERAL` subqueries of one table planned by the search, with `Memoize`
+  and exact `EXPLAIN ANALYZE` counters (`977`). A scan reading spilled rows
+  decodes the columns a `LATERAL` body reads of it, so an aggregate over
+  such a join no longer sees them as NULL.
+- [ ] Other `LATERAL` subqueries in the search: joins, grouping or volatile
+  calls inside them, outer columns read outside their `WHERE`, a target list
+  other than all their columns in order (a kept `Subquery Scan`), `LEFT JOIN
+  LATERAL`, and queries filtering, grouping or ordering by their columns
+  (`EXPLAIN` of them fails with `0A000` while `enable_memoize` is on).
+- [x] Relation capacity set at startup (`max_join_relations`, up to 255,
+  `978`): the search's per-relation, per-node, per-condition and
+  per-parameter state is sized by the query in the statement arena, and an
+  indexed relation's join parameters are unbounded.
+- [ ] GEQO reclaims each tour's arena memory, as PostgreSQL frees a tour's
+  memory context, so joins up to `max_join_relations` plan in the default
+  statement arena (a 150-relation `USING` chain exhausts 32 MiB today), and
+  equivalence classes past 64 (a chain of more than 64 left joins) fit.
+- [x] `ORDER BY ... LIMIT` over a large join keeps only the limit's rows once
+  its sort forms its bounded heap (seven 8-row tables cross joined, `980`).
+- [ ] *In progress:* `ORDER BY` without a limit over a join larger than the
+  statement arena sorts in runs over `plan_build_bytes` leases (it fails with
+  `54000` today). The pull executor's scan node first needs index, bitmap,
+  function and `LATERAL` scans that resume mid-scan (only sequential heap
+  scans do, through `RowCursor`).
 - [ ] `GROUP BY` of an expression other than a full join's merged column
   (`0A000` when costs print).
 - [ ] Conditions comparing expressions of several relations other than by a
@@ -393,9 +411,9 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 #### Sorting, hashing and grouping state
 
 - [ ] *In progress:* aggregate transition states without a PostgreSQL size:
-  size them, so a join's hashed `GROUP BY` that spills and `EXPLAIN ANALYZE`
-  of hash aggregates with `numeric` sums, text `min`/`max`, collecting
-  aggregates or more than seven grouping columns stop failing with `0A000`.
+  hash aggregates over more than seven grouping columns, and the states of
+  `json_agg`, `range_agg`, ordered-set aggregates, `array_agg` of arrays and
+  `min`/`max` of arrays, records and bit strings (`0A000`).
 - [ ] *In progress:* `GROUP BY` state streams instead of materializing.
 - [ ] *In progress:* route every sort through the `tuplesort` model: the
   modeled-join grouping sort and incremental sort batches are charged against
@@ -404,14 +422,13 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   sorter's first 256 KiB chunk sort ties in PostgreSQL's order (needs
   `work_mem`-sized run buffers and a streaming merge over up to 500 tapes); a
   bounded sort outgrowing its heap under `EXPLAIN ANALYZE` (`0A000`).
-- [ ] *In progress:* partition seek: a partition member is read through its
-  own index as PostgreSQL's costs choose.
 - [ ] *In progress:* pglz compression and TOAST sizes, so hash, sort and
   statistics figures match for values PostgreSQL compresses or stores out of
   line (rows over about 2 kB).
-- [ ] Hash aggregates inherit `aset.c`'s recycled executor context after a
-  session's hash aggregate under `work_mem` below 1MB (`0A000` from the next
-  statement on while the bucket array is within 8 kB).
+- [ ] Hash aggregates inherit `aset.c`'s recycled executor and transition
+  contexts after a session's hash aggregate under `work_mem` below 1MB
+  (`0A000` from the next statement on while the bucket array is within 8 kB
+  or a transition value takes more than 1 kB).
 - [ ] `EXPLAIN ANALYZE` of a hash aggregate that spills rows holding columns
   besides its keys, or whose group estimate lies outside the cost model
   (`0A000`).
@@ -424,6 +441,13 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 
 #### Statistics
 
+- [ ] Index layouts and counters: a btree grown by inserts has the pages
+  PostgreSQL's page splits and deduplication leave (an index created before
+  6,000 inserts is costed as built, 8.00 below PostgreSQL's full scan);
+  an index's `pg_class.relpages` and `reltuples` (0 today); cumulative
+  counters for `CREATE INDEX`'s heap scan, the heap fetches of bitmap and
+  index-only scans (`idx_tup_fetch`), and partition index scans read only
+  for their order.
 - [ ] Range and multirange histograms; `compute_distinct_stats` for types
   without an ordering; widths of compressed values; the binary form of a
   composite value inside a statistics array (sent as text today).
@@ -605,6 +629,13 @@ lists the shared pools today.
 
 **Remaining:**
 
+- [ ] A transaction writes more rows than `row_overlay_slots`, `txn_rows` or
+  `table_metadata_leases` hold: its uncommitted rows and prepared index keys
+  move out of memory (a 10,000-row `INSERT` fails with `54000` under the
+  8,192 defaults today, as no checkpoint can free its own rows).
+- [ ] Local mode (`object_store = off`) saves checkpointed rows outside
+  memory, so its tables together can hold more rows than
+  `row_overlay_slots`.
 - [ ] A write that cannot pause (`COPY FROM`, a statement after its first
   unreplayable effect) waits for a checkpoint when `row_overlay_slots` or
   `row_history_slots` are exhausted, without a restart (`54000` today).

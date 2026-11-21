@@ -13,17 +13,17 @@ use crate::sql::ast::{
 };
 use crate::sql::eval::SqlError;
 use crate::sql::types::{ColType, Datum};
-use crate::storage::{ColumnSet, Storage, TableStatistics};
+use crate::storage::{ColumnSet, Storage};
 
-use super::join_tree::{self, Placed, Qual, Shape, Tree, TreeJoin, TreeNode, VarList};
+use super::join_tree::{self, NodeId, Placed, Qual, Shape, Tree, TreeJoin, TreeNode, VarList};
 use super::joins::{
     BASE_RELIDS, BasePath, BaseRel, Clause, ClauseForm, ClauseId, ClauseList, EquivalenceClass,
     ForeignKeyJoin, JoinPlan, JoinProblem, JoinSettings, JoinStatistics, KEY_CLASS, Keys,
-    MAX_CLAUSES, MAX_JOIN_EXPRESSIONS, MAX_JOIN_RELS, Member, NO_KEY_CLASS, NeededColumn, Relids,
+    MAX_CLAUSES, MAX_JOIN_EXPRESSIONS, Member, NO_KEY_CLASS, NeededColumn, Relids,
 };
 use super::paths::JoinCandidate;
 use super::{
-    Comparison, Costs, JoinScan, MAX_JOIN_PARAMS, NO_CLASS, Planned, Planner, QueryShape, ScanPath,
+    Comparison, Costs, JoinScan, NO_CLASS, Planned, Planner, QueryShape, ScanPath,
     clamp_probability,
 };
 use crate::sql::query::scope::{QueryScope, ResolvedColumn};
@@ -38,23 +38,23 @@ pub(crate) struct ModeledRel<'a> {
     /// Its column equated with each other relation's column, as
     /// [`JoinScan::params`] lists them.
     pub(crate) joins: &'a [&'a Expr<'a>],
-    pub(crate) scan: JoinScan,
+    pub(crate) scan: JoinScan<'a>,
     /// The columns its scan reads, and those above it.
     pub(crate) read: u64,
     pub(crate) output: u64,
     /// Its paths, by the search's [`super::joins::PathKind::Scan`] number.
     pub(crate) paths: &'a [JoinCandidate],
+    /// A `LATERAL` subquery's query, which its one path runs instead.
+    pub(crate) lateral: Option<LateralRel<'a>>,
 }
 
-/// The scan of one path of a modeled join's base relation: the path, the
-/// condition it runs under (its restrictions and the join clauses it moves
-/// in) and the shape that plans it again when it runs.
+/// The scan of one path of a modeled join's base relation: the path and
+/// the condition it runs under (its restrictions and the join clauses it
+/// moves in).
 #[derive(Clone, Copy)]
 pub(crate) struct RelScan<'a> {
     pub(crate) path: ScanPath<'a>,
     pub(crate) condition: Option<&'a Expr<'a>>,
-    pub(crate) shape: QueryShape,
-    pub(crate) read: u64,
     /// The relations whose values the condition reads, and the outer
     /// joins that null them.
     pub(crate) param: Relids,
@@ -73,32 +73,33 @@ impl<'a> ModeledRel<'a> {
         arena: &'a Arena,
     ) -> Result<RelScan<'a>, SqlError> {
         let candidate = self.paths[usize::from(path)];
-        let mut scan = JoinScan {
-            param_count: 0,
-            clause_params: 0,
+        let kept = |at: usize| {
+            (Relids::of(self.scan.params[at].1) | self.scan.param_others[at]) & !candidate.param
+                == Relids::EMPTY
+        };
+        let count = (0..self.scan.params.len()).filter(|&at| kept(at)).count();
+        let mut chosen = (0..self.scan.params.len()).filter(|&at| kept(at));
+        let chosen = arena
+            .alloc_slice_with(count, |_| chosen.next().expect("a kept parameter"))
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let full = |_| crate::sql::eval::arena_full();
+        let scan = JoinScan {
+            params: arena
+                .alloc_slice_with(count, |at| self.scan.params[chosen[at]])
+                .map_err(full)?,
+            clause_params: arena
+                .alloc_slice_with(count, |at| self.scan.clause_params[chosen[at]])
+                .map_err(full)?,
+            param_others: arena
+                .alloc_slice_with(count, |at| self.scan.param_others[chosen[at]])
+                .map_err(full)?,
             describe: Some(candidate.describe),
             ..self.scan
         };
-        let mut joins = [&Expr::Null; MAX_JOIN_PARAMS];
-        for (at, &(class, rel)) in self.scan.params[..usize::from(self.scan.param_count)]
-            .iter()
-            .enumerate()
-        {
-            if (Relids::of(rel) | self.scan.param_others[at]) & !candidate.param == Relids::EMPTY {
-                if self.scan.clause_params & 1 << at != 0 {
-                    scan.clause_params |= 1 << scan.param_count;
-                }
-                scan.param_others[usize::from(scan.param_count)] = self.scan.param_others[at];
-                scan.params[usize::from(scan.param_count)] = (class, rel);
-                joins[usize::from(scan.param_count)] = self.joins[at];
-                scan.param_count += 1;
-            }
-        }
-        let condition = joined_condition(
-            self.restriction,
-            &joins[..usize::from(scan.param_count)],
-            arena,
-        )?;
+        let joins = arena
+            .alloc_slice_with(count, |at| self.joins[chosen[at]])
+            .map_err(full)?;
+        let condition = joined_condition(self.restriction, joins, arena)?;
         let single = QueryScope::resolve_schema(storage, self.from, txid, arena, None)?;
         let shape = QueryShape {
             output: Some(ColumnSet::from_low_word(self.output)),
@@ -124,8 +125,6 @@ impl<'a> ModeledRel<'a> {
         Ok(RelScan {
             path,
             condition,
-            shape,
-            read: self.read,
             param: candidate.param,
         })
     }
@@ -352,7 +351,7 @@ pub(crate) struct ModeledJoin<'a> {
     /// one scan, and which the search does not remove.
     pub(crate) self_join: bool,
     /// The scan read in each removed self-join relation's place.
-    pub(crate) kept_for: KeptFor,
+    pub(crate) kept_for: KeptFor<'a>,
 }
 
 /// The base relations of a FROM clause holding parenthesized joins
@@ -362,7 +361,7 @@ pub(crate) struct NestedMembers<'a> {
     /// The members, resolved in written order.
     pub(crate) scope: QueryScope<'a>,
     /// Each member's written FROM entry.
-    pub(crate) entries: [u8; MAX_JOIN_RELS],
+    pub(crate) entries: &'a [u8],
     /// The written entries that are parenthesized joins, by bit: each
     /// one's row holds its members' columns in order, each member's again
     /// (`member.*`), then each member's `num_nulls` of its whole row.
@@ -393,10 +392,6 @@ pub(crate) struct ModeledGroup<'a> {
     /// What sizes a grouping `HashAggregate`'s memory, when the model
     /// covers it.
     pub(crate) hash_agg: Option<crate::sql::query::postgres_memory::HashAggSizing>,
-    /// [`Self::hash_agg`] without the transition states the model does not
-    /// size: a lower bound on the table's memory, which orders the groups
-    /// when even it does not spill.
-    pub(crate) order_sizing: Option<crate::sql::query::postgres_memory::HashAggSizing>,
     /// A `DISTINCT`'s `Unique` or `HashAggregate`, whose keys are select
     /// list positions.
     pub(crate) distinct: bool,
@@ -448,20 +443,10 @@ fn extract_or_clause<'a>(
     table: usize,
     arena: &'a Arena,
 ) -> Result<Option<&'a Expr<'a>>, SqlError> {
-    let mut arms = [&Expr::Null; super::super::plan::MAX_CONJUNCTS];
-    let mut arm_count = 0;
-    if !or_arms(expression, &mut arms, &mut arm_count) {
-        return Ok(None);
-    }
     let mut result: Option<&'a Expr<'a>> = None;
-    for &arm in &arms[..arm_count] {
-        let mut conjuncts = [&Expr::Null; super::super::plan::MAX_CONJUNCTS];
-        let mut count = 0;
-        if !super::super::plan::flatten_and(arm, &mut conjuncts, &mut count) {
-            return Ok(None);
-        }
+    for &arm in or_arms(expression, arena)? {
         let mut subclauses: Option<&'a Expr<'a>> = None;
-        for &conjunct in &conjuncts[..count] {
+        for &conjunct in conjuncts_of(arm, arena)? {
             let sub = if matches!(
                 conjunct,
                 Expr::Binary {
@@ -495,12 +480,7 @@ fn extract_or_clause<'a>(
             return Ok(None);
         };
         // A nested `OR`'s arms join the list.
-        let mut parts = [&Expr::Null; super::super::plan::MAX_CONJUNCTS];
-        let mut part_count = 0;
-        if !or_arms(sub, &mut parts, &mut part_count) {
-            return Ok(None);
-        }
-        for &part in &parts[..part_count] {
+        for &part in or_arms(sub, arena)? {
             result = Some(match result {
                 None => part,
                 Some(held) => arena
@@ -517,47 +497,75 @@ fn extract_or_clause<'a>(
     Ok(result)
 }
 
-/// The arms of a (nested) `OR`, in order; false past the list's capacity.
-fn or_arms<'a>(expression: &'a Expr<'a>, arms: &mut [&'a Expr<'a>], count: &mut usize) -> bool {
+/// Each operand of a (nested) `operator` tree, in order, while `each`
+/// returns true; whether it always did.
+fn all_operands<'a>(
+    expression: &'a Expr<'a>,
+    operator: BinaryOp,
+    each: &mut dyn FnMut(&'a Expr<'a>) -> bool,
+) -> bool {
     match expression {
         Expr::Binary {
-            operator: BinaryOp::Or,
+            operator: found,
             left,
             right,
             ..
-        } => or_arms(left, arms, count) && or_arms(right, arms, count),
-        _ => {
-            let Some(slot) = arms.get_mut(*count) else {
-                return false;
-            };
-            *slot = expression;
-            *count += 1;
-            true
+        } if *found == operator => {
+            all_operands(left, operator, each) && all_operands(right, operator, each)
         }
+        _ => each(expression),
     }
+}
+
+/// The operands of a (nested) `operator` tree, in order, in `arena`.
+fn operands<'a>(
+    expression: &'a Expr<'a>,
+    operator: BinaryOp,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    let mut count = 0;
+    all_operands(expression, operator, &mut |_| {
+        count += 1;
+        true
+    });
+    let list = arena
+        .alloc_slice_with(count, |_| &Expr::Null)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut at = 0;
+    all_operands(expression, operator, &mut |operand| {
+        list[at] = operand;
+        at += 1;
+        true
+    });
+    Ok(list)
+}
+
+/// The arms of a (nested) `OR`, in order.
+fn or_arms<'a>(expression: &'a Expr<'a>, arena: &'a Arena) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    operands(expression, BinaryOp::Or, arena)
+}
+
+/// The conditions of a (nested) `AND`, in order.
+fn conjuncts_of<'a>(
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    operands(expression, BinaryOp::And, arena)
 }
 
 /// Whether each arm of the `OR` `expression`, and each condition of an arm
 /// that is an `AND`, reads a single relation.
 fn or_reads_one_relation_each(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
-    let mut arms = [&Expr::Null; super::super::plan::MAX_CONJUNCTS];
-    let mut count = 0;
-    if !or_arms(expression, &mut arms, &mut count) {
-        return false;
-    }
-    arms[..count].iter().all(|arm| {
-        let mut conjuncts = [&Expr::Null; super::super::plan::MAX_CONJUNCTS];
-        let mut conjunct_count = 0;
-        super::super::plan::flatten_and(arm, &mut conjuncts, &mut conjunct_count)
-            && conjuncts[..conjunct_count].iter().all(|conjunct| {
-                qual_vars(scope, conjunct).is_some_and(|vars| {
-                    vars.as_slice()
-                        .iter()
-                        .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel))
-                        .count_ones()
-                        == 1
-                })
+    all_operands(expression, BinaryOp::Or, &mut |arm| {
+        all_operands(arm, BinaryOp::And, &mut |conjunct| {
+            qual_vars(scope, conjunct).is_some_and(|vars| {
+                vars.as_slice()
+                    .iter()
+                    .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel))
+                    .count_ones()
+                    == 1
             })
+        })
     })
 }
 
@@ -575,13 +583,18 @@ fn joinable(ctype: ColType) -> bool {
     crate::sql::query::join_exec::datum_type_hashable(ctype)
 }
 
-/// The conditions one query holds.
-const MAX_QUALS: usize = join_tree::MAX_QUALS;
+/// An array of one entry per relation of a query of `n`, or per qual, in
+/// the statement arena.
+fn per_relation<T: Copy>(arena: &Arena, n: usize, fill: T) -> Result<&mut [T], SqlError> {
+    arena
+        .alloc_slice_with(n, |_| fill)
+        .map_err(|_| crate::sql::eval::arena_full())
+}
 
 /// The constants equated with columns, each once by value and type
-/// (`em_is_const` members compare by `equal`).
+/// (`em_is_const` members compare by `equal`), at most one per qual.
 struct Constants<'a> {
-    held: [(&'a Expr<'a>, ColType); MAX_QUALS + 1],
+    held: &'a mut [(&'a Expr<'a>, ColType)],
     count: usize,
 }
 
@@ -1279,8 +1292,6 @@ fn join_condition(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
             }
             // An `AND` arm: each condition one relation's or a join
             // condition.
-            let mut conjuncts = [&Expr::Null; super::super::plan::MAX_CONJUNCTS];
-            let mut count = 0;
             if matches!(
                 arm,
                 Expr::Binary {
@@ -1288,16 +1299,15 @@ fn join_condition(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
                     ..
                 }
             ) {
-                return super::super::plan::flatten_and(arm, &mut conjuncts, &mut count)
-                    && conjuncts[..count].iter().all(|conjunct| {
-                        qual_vars(scope, conjunct).is_some_and(|vars| {
-                            vars.as_slice()
-                                .iter()
-                                .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel))
-                                .count_ones()
-                                <= 1
-                        }) || join_condition(scope, conjunct)
-                    });
+                return all_operands(arm, BinaryOp::And, &mut |conjunct| {
+                    qual_vars(scope, conjunct).is_some_and(|vars| {
+                        vars.as_slice()
+                            .iter()
+                            .fold(Relids::EMPTY, |relids, &(rel, _)| relids | Relids::of(rel))
+                            .count_ones()
+                            <= 1
+                    }) || join_condition(scope, conjunct)
+                });
             }
             join_condition(scope, arm)
         }),
@@ -1364,13 +1374,12 @@ fn and_estimate<'a>(
     costs: Costs,
     arena: &'a Arena,
 ) -> Result<Option<(f64, f64)>, SqlError> {
-    let mut conjuncts = [&Expr::Null; super::super::plan::MAX_CONJUNCTS];
-    let mut count = 0;
-    if !super::super::plan::flatten_and(expression, &mut conjuncts, &mut count) {
-        return Ok(None);
-    }
+    let conjuncts = conjuncts_of(expression, arena)?;
+    let count = conjuncts.len();
     let (mut selectivity, mut cost) = (1.0, 0.0);
-    let mut done = [false; super::super::plan::MAX_CONJUNCTS];
+    let done = arena
+        .alloc_slice_with(count, |_| false)
+        .map_err(|_| crate::sql::eval::arena_full())?;
     for at in 0..count {
         if done[at] {
             continue;
@@ -1618,16 +1627,18 @@ fn join_comparison(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
 /// entry after those of the joins inside it, as parse analysis numbers
 /// them.
 struct ChainBuilder<'t, 'a> {
-    tree: &'t mut Tree,
+    tree: &'t mut Tree<'a>,
     next: u8,
     rtindex: u8,
-    /// Each join's node and condition, inner joins' first.
-    sources: [(u8, &'a Expr<'a>); MAX_JOIN_RELS],
+    /// Each join's node and condition, inner joins' first; one per
+    /// written join.
+    sources: &'a mut [(NodeId, &'a Expr<'a>)],
     source_count: usize,
+    arena: &'a Arena,
 }
 
 impl<'a> ChainBuilder<'_, 'a> {
-    fn source(&mut self, node: u8, on: &'a Expr<'a>) -> Option<()> {
+    fn source(&mut self, node: NodeId, on: &'a Expr<'a>) -> Option<()> {
         *self.sources.get_mut(self.source_count)? = (node, on);
         self.source_count += 1;
         Some(())
@@ -1635,13 +1646,12 @@ impl<'a> ChainBuilder<'_, 'a> {
 
     /// The node of FROM item `table`: a base relation, or a parenthesized
     /// join's subtree.
-    fn item(&mut self, table: &'a TableRef<'a>) -> Option<u8> {
+    fn item(&mut self, table: &'a TableRef<'a>) -> Option<NodeId> {
         match parenthesized_join(table) {
             Some(inner) => {
-                let mut items = [0u8; MAX_JOIN_RELS];
-                let mut count = 0;
-                self.chain(&inner.base, inner.joins, |_| None, &mut items, &mut count)?;
-                (count == 1).then_some(items[0])
+                let mut items = crate::mem::arena::ArenaList::new(self.arena);
+                self.chain(&inner.base, inner.joins, |_| None, &mut items)?;
+                (items.len() == 1).then(|| items.borrowed_slice()[0])
             }
             None => {
                 let rel = self.next;
@@ -1659,16 +1669,14 @@ impl<'a> ChainBuilder<'_, 'a> {
         base: &'a TableRef<'a>,
         joins: &'a [crate::sql::ast::Join<'a>],
         implied: impl Fn(usize) -> Option<&'a Expr<'a>>,
-        items: &mut [u8; MAX_JOIN_RELS],
-        count: &mut usize,
+        items: &mut crate::mem::arena::ArenaList<'a, NodeId>,
     ) -> Option<()> {
         let mut current = self.item(base)?;
         for (index, join) in joins.iter().enumerate() {
             let right = self.item(&join.table)?;
             let (kind, numbered) = match join.kind {
                 JoinKind::Comma => {
-                    *items.get_mut(*count)? = current;
-                    *count += 1;
+                    items.push(current).ok()?;
                     current = right;
                     continue;
                 }
@@ -1692,8 +1700,7 @@ impl<'a> ChainBuilder<'_, 'a> {
             }
             current = node;
         }
-        *items.get_mut(*count)? = current;
-        *count += 1;
+        items.push(current).ok()?;
         Some(())
     }
 }
@@ -1869,7 +1876,7 @@ fn modeled_join_written<'a>(
         return Ok(None);
     }
     let members = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
-    let mut entries = [0u8; MAX_JOIN_RELS];
+    let entries = per_relation(arena, members.n, 0u8)?;
     let mut joined = Relids::EMPTY;
     let mut leaf = 0;
     for (table, item) in core::iter::once(&written.base)
@@ -2062,7 +2069,7 @@ fn modeled_join_over<'a>(
                 if *distinct || !order_by.is_empty());
         });
     }
-    if !(if windowed || presorting { 1 } else { 2 }..=MAX_JOIN_RELS).contains(&n)
+    if n < if windowed || presorting { 1 } else { 2 }
         || n != from.joins.len() + 1
         || statement.set_body.is_some()
         || !statement.with.is_empty()
@@ -2075,6 +2082,10 @@ fn modeled_join_over<'a>(
                 || (n == 1 && (!statement.group_by.is_empty() || statement.having.is_some()))))
     {
         return Ok(None);
+    }
+    let max_relations = storage.join_search().max_relations();
+    if n > max_relations {
+        return Err(super::joins::too_many_relations(n, max_relations));
     }
     let Some(limit) = super::constant_limit(statement.limit, statement.offset, arena)? else {
         return Ok(None);
@@ -2097,19 +2108,66 @@ fn modeled_join_over<'a>(
             return Ok(None);
         }
     }
+    let laterals = per_relation(arena, n, None::<LateralRel<'a>>)?;
     for table in 0..n {
         let tref = source(from, table);
-        if !plain_table(storage, txid, scope, table, tref) {
+        if plain_table(storage, txid, scope, table, tref) {
+            continue;
+        }
+        match lateral_rel(storage, txid, from, scope, table, laterals, arena)? {
+            Some(lateral) => laterals[table] = Some(lateral),
+            None => return Ok(None),
+        }
+    }
+    let lateral_relids = (0..n)
+        .filter(|&table| laterals[table].is_some())
+        .fold(Relids::EMPTY, |relids, table| relids | Relids::of(table));
+    // A `LATERAL` subquery's columns are read by the select list alone, as
+    // plain columns, in a query without grouping or windows.
+    if lateral_relids != Relids::EMPTY {
+        let reads_lateral = |expression: &Expr<'_>| {
+            let mut reads = false;
+            expression.for_each_column_reference(&mut |qualifier, name| {
+                reads |= matches!(scope.probe_column(qualifier, name),
+                    Some(ResolvedColumn::Table(table, _)) if laterals[table].is_some());
+            });
+            reads
+        };
+        if windowed
+            || presorting
+            || statement.distinct
+            || !statement.group_by.is_empty()
+            || statement.having.is_some()
+            || statement.where_clause.is_some_and(reads_lateral)
+            || from
+                .joins
+                .iter()
+                .filter_map(|join| join.on)
+                .any(reads_lateral)
+            || statement
+                .order_by
+                .iter()
+                .any(|order| reads_lateral(order.expression))
+            || statement.items.iter().any(|item| match item {
+                SelectItem::Expr { expression, .. } => {
+                    !matches!(expression, Expr::Column { .. }) && reads_lateral(expression)
+                }
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
+                SelectItem::RecordStar(_) => true,
+            })
+        {
             return Ok(None);
         }
     }
     // The output: plain columns and wildcards.
-    let mut output = [0u64; MAX_JOIN_RELS];
+    let output = per_relation(arena, n, 0u64)?;
     // Each relation's columns in the order its target list takes them:
     // the output's first, then those the joins need
     // (`build_base_rel_tlists`, then `add_vars_to_targetlist`).
-    let appearance =
-        core::cell::RefCell::new(([[0u8; 64]; MAX_JOIN_RELS], [0usize; MAX_JOIN_RELS]));
+    let appearance = core::cell::RefCell::new((
+        per_relation(arena, n, [0u8; 64])?,
+        per_relation(arena, n, 0usize)?,
+    ));
     let note = |table: usize, column: usize| {
         let (appearance, appeared) = &mut *appearance.borrow_mut();
         if column < 64 && !appearance[table][..appeared[table]].contains(&(column as u8)) {
@@ -2117,11 +2175,12 @@ fn modeled_join_over<'a>(
             appeared[table] += 1;
         }
     };
-    let width = |table: usize| {
-        scope
+    let width = |table: usize| match laterals[table] {
+        Some(lateral) => lateral.widths.len().min(64),
+        None => scope
             .defs
             .stored(table)
-            .map_or(0, |def| def.columns().len().min(64))
+            .map_or(0, |def| def.columns().len().min(64)),
     };
     // The select list's expressions' widths and their cost per row; an
     // aggregating query's per group (`create_agg_path`'s target cost).
@@ -2245,6 +2304,9 @@ fn modeled_join_over<'a>(
     }
     // The `GROUP BY` columns, once each, which the joined rows return.
     let grouped = !statement.group_by.is_empty();
+    if lateral_relids != Relids::EMPTY && aggregated {
+        return Ok(None);
+    }
     // Windows over one relation's groups are not planned here.
     if windowed && n == 1 && aggregated {
         return Ok(None);
@@ -2527,7 +2589,9 @@ fn modeled_join_over<'a>(
     // The join tree as written: each comma-separated item a chain of joins
     // (each join's range table entry numbered in written order), then the
     // `FROM` list holding the `WHERE` conditions.
-    let mut tree = Tree::new(n);
+    let Some(mut tree) = Tree::new(n, max_relations, arena) else {
+        return Err(crate::sql::eval::arena_full());
+    };
     tree.enable_hashagg = value("enable_hashagg") != 0.0;
     tree.from_collapse_limit = value("from_collapse_limit") as i64;
     tree.join_collapse_limit = value("join_collapse_limit") as i64;
@@ -2552,22 +2616,21 @@ fn modeled_join_over<'a>(
         tree: &mut tree,
         next: 0,
         rtindex: 0,
-        sources: [(0, &Expr::Null); MAX_JOIN_RELS],
+        sources: per_relation(arena, n, (0, &Expr::Null))?,
         source_count: 0,
+        arena,
     };
-    let mut items = [0u8; MAX_JOIN_RELS];
-    let mut item_count = 0;
+    let mut items = crate::mem::arena::ArenaList::new(arena);
     let built = chain.chain(
         &written.base,
         &written.joins[..semi_start],
         |index| scope.join_on.get(index).copied().flatten(),
         &mut items,
-        &mut item_count,
     );
     let Some(()) = built else {
         return Ok(None);
     };
-    let Some(inner_root) = chain.tree.list_of(&items[..item_count]) else {
+    let Some(inner_root) = chain.tree.list_of(items.borrowed_slice()) else {
         return Ok(None);
     };
     let mut current = inner_root;
@@ -2612,15 +2675,16 @@ fn modeled_join_over<'a>(
         .map_err(|_| crate::sql::eval::arena_full())?;
     tree.root = root;
     // The conditions: each join's `ON`, then `WHERE`.
-    let mut quals = [&Expr::Null; MAX_QUALS + 1];
+    let qual_capacity = tree.quals.len();
+    let quals = per_relation(arena, qual_capacity + 1, &Expr::Null)?;
     let mut constants = Constants {
-        held: [(&Expr::Null, ColType::Int4); MAX_QUALS + 1],
+        held: per_relation(arena, qual_capacity + 1, (&Expr::Null, ColType::Int4))?,
         count: 0,
     };
     let mut expressions = Expressions::new(storage, txid, arena);
     // The written left and right operands of each full join's equality
     // clause, in pairs, which a `COALESCE` above it must name in order.
-    let mut full_clauses = [(0u8, 0u16); 2 * (MAX_QUALS + 1)];
+    let full_clauses = per_relation(arena, 2 * (qual_capacity + 1), (0u8, 0u16))?;
     let mut full_clause_count = 0;
     let sources = joined.iter().map(|&(node, on)| (Some(node), on)).chain(
         statement
@@ -2631,12 +2695,7 @@ fn modeled_join_over<'a>(
         let Some(node) = node else {
             return Ok(None);
         };
-        let mut conjuncts = [&Expr::Null; super::super::plan::MAX_CONJUNCTS];
-        let mut count = 0;
-        if !super::super::plan::flatten_and(condition, &mut conjuncts, &mut count) {
-            return Err(preparation_full());
-        }
-        for &conjunct in &conjuncts[..count] {
+        for &conjunct in conjuncts_of(condition, arena)? {
             let conjunct = flatten_merged(scope, conjunct, arena)?;
             let Some(qual) = analyze_qual(
                 scope,
@@ -2726,9 +2785,15 @@ fn modeled_join_over<'a>(
     // `remove_useless_self_joins`, unless a subquery reads the scans.
     let self_joins = if reads_subquery(statement, from) {
         SelfJoins {
-            kept_for: [None; MAX_JOIN_RELS],
+            kept_for: per_relation(arena, n, None)?,
             removed: Relids::EMPTY,
-            declined: removable_self_join(storage, txid, scope, &prepared, removed),
+            declined: removable_self_join(
+                storage,
+                txid,
+                scope,
+                &prepared,
+                removed | lateral_relids,
+            ),
         }
     } else {
         remove_self_joins(
@@ -2738,7 +2803,8 @@ fn modeled_join_over<'a>(
             &mut prepared,
             &mut quals[..=tree.qual_count],
             &expressions,
-            removed,
+            // A `LATERAL` subquery is no table scan to merge.
+            removed | lateral_relids,
             arena,
         )?
     };
@@ -2748,7 +2814,7 @@ fn modeled_join_over<'a>(
     let kept_for = self_joins.kept_for;
     // The query reads each removed scan's columns from the kept one.
     let kept = |table: usize| kept_for[table].map_or(table, usize::from);
-    let statement = rename_self_joined(scope, &kept_for, statement, arena)?;
+    let statement = rename_self_joined(scope, &&*kept_for, statement, arena)?;
     let rename_target = |target: SortTarget<'a>| -> Result<SortTarget<'a>, SqlError> {
         Ok(match target {
             SortTarget::Column(table, column) => SortTarget::Column(kept(table), column),
@@ -2814,7 +2880,7 @@ fn modeled_join_over<'a>(
     };
     // Each relation's restrictions in the order they reach it
     // (`baserestrictinfo`).
-    let mut restrictions = [None::<&'a Expr<'a>>; MAX_JOIN_RELS];
+    let restrictions = per_relation(arena, n, None::<&'a Expr<'a>>)?;
     for placed in prepared.placed() {
         let (table, restriction) = match *placed {
             Placed::Restriction { rel, qual } => (usize::from(rel), quals[usize::from(qual)]),
@@ -2930,7 +2996,7 @@ fn modeled_join_over<'a>(
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
     // The outer joins that can null each relation (`nulling_relids`).
-    let mut nulling_relids = [Relids::EMPTY as Relids; MAX_JOIN_RELS];
+    let nulling_relids = per_relation(arena, n, Relids::EMPTY)?;
     for special in &prepared.specials[..prepared.special_count] {
         let nullable = match special.kind {
             super::joins::SpecialKind::Left | super::joins::SpecialKind::Anti => special.syn_right,
@@ -3418,7 +3484,7 @@ fn modeled_join_over<'a>(
     // The expression members the window clauses sort by, and the columns
     // only they read, which the windows' input does not carry.
     let mut window_expressions = 0u32;
-    let mut key_only_columns = [0u64; MAX_JOIN_RELS];
+    let key_only_columns = per_relation(arena, n, 0u64)?;
     if windowed {
         let columns = crate::sql::query::CatalogScopeCols {
             scope,
@@ -3753,23 +3819,26 @@ fn modeled_join_over<'a>(
     // clauses movable into it (`join_clause_is_movable_to`), and its
     // column of each class equated with every other member
     // (`generate_implied_equalities_for_column`).
-    let mut scans = [JoinScan {
-        params: [(0, 0); MAX_JOIN_PARAMS],
-        param_count: 0,
-        clause_params: 0,
-        param_others: [Relids::EMPTY; MAX_JOIN_PARAMS],
-        classes: [NO_CLASS; 64],
-        merging: 0,
-        order: Keys::NONE,
-        rel_rows: [0.0; MAX_JOIN_RELS],
-        total_table_pages: 0.0,
-        describe: None,
-    }; MAX_JOIN_RELS];
-    let mut join_conjuncts: [[&'a Expr<'a>; MAX_JOIN_PARAMS]; MAX_JOIN_RELS] =
-        [[&Expr::Null; MAX_JOIN_PARAMS]; MAX_JOIN_RELS];
+    let scans = per_relation(
+        arena,
+        n,
+        JoinScan {
+            params: &[],
+            clause_params: &[],
+            param_others: &[],
+            classes: [NO_CLASS; 64],
+            merging: 0,
+            order: Keys::NONE,
+            rel_rows: &[],
+            total_table_pages: 0.0,
+            describe: None,
+        },
+    )?;
+    // Each relation's parameters' conjuncts.
+    let join_conjuncts = per_relation(arena, n, &[][..] as &'a [&'a Expr<'a>])?;
     // The clause each parameter is: an outer join's clause, or `None` for
     // a class's.
-    let mut param_clause = [[None::<ClauseId>; MAX_JOIN_PARAMS]; MAX_JOIN_RELS];
+    let param_clause = per_relation(arena, n, &[][..] as &'a [Option<ClauseId>])?;
     let mut total_table_pages = 0.0;
     let member_class = |member: Member| {
         classes
@@ -3814,12 +3883,23 @@ fn modeled_join_over<'a>(
         }
     }
     for table in 0..n {
+        // A subquery's relation has no pages (`set_base_rel_sizes`).
+        if laterals[table].is_some() {
+            continue;
+        }
         if removed & Relids::of(table) == Relids::EMPTY {
             total_table_pages += super::relation_size(storage, scope.slots[table], txid).pages;
         }
         let scan = &mut scans[table];
         scan.order = query_keys;
         let relids: Relids = Relids::of(table);
+        // The relation's parameters, as `scan`'s lists hold them.
+        let mut params = crate::mem::arena::ArenaList::new(arena);
+        let mut clause_params = crate::mem::arena::ArenaList::new(arena);
+        let mut param_others = crate::mem::arena::ArenaList::new(arena);
+        let mut conjuncts = crate::mem::arena::ArenaList::new(arena);
+        let mut clause_of = crate::mem::arena::ArenaList::new(arena);
+        let full = |_| crate::sql::eval::arena_full();
         // `pathkeys_useful_for_merging` at the relation: a class with a
         // member elsewhere, or one a mergeable clause of its `joininfo`
         // sorts by.
@@ -3935,16 +4015,13 @@ fn modeled_join_over<'a>(
                     }
                 }
             };
-            let at = usize::from(scan.param_count);
-            if at == MAX_JOIN_PARAMS {
-                return Err(join_params_full());
-            }
-            scan.params[at] = (own_class, other_rel);
-            scan.param_others[at] = clause.relids & !BASE_RELIDS;
-            scan.clause_params |= 1 << at;
-            join_conjuncts[table][at] = expression;
-            param_clause[table][at] = Some(id as ClauseId);
-            scan.param_count += 1;
+            params.push((own_class, other_rel)).map_err(full)?;
+            param_others
+                .push(clause.relids & !BASE_RELIDS)
+                .map_err(full)?;
+            clause_params.push(true).map_err(full)?;
+            conjuncts.push(expression).map_err(full)?;
+            clause_of.push(Some(id as ClauseId)).map_err(full)?;
         }
         for (class_id, class) in classes.iter().enumerate() {
             // Without a btree index no path is parameterized by a class.
@@ -3974,23 +4051,48 @@ fn modeled_join_over<'a>(
                 if other.base_relids() & relids != Relids::EMPTY {
                     continue;
                 }
-                let at = usize::from(scan.param_count);
-                if at == MAX_JOIN_PARAMS {
-                    return Err(join_params_full());
-                }
-                scan.params[at] = (class_id as u8, other.rel);
-                scan.param_others[at] = other.nulling | other.reads;
-                join_conjuncts[table][at] = equality(scope, &expressions, *own, *other, arena)?;
-                scan.param_count += 1;
+                params.push((class_id as u8, other.rel)).map_err(full)?;
+                param_others
+                    .push(other.nulling | other.reads)
+                    .map_err(full)?;
+                clause_params.push(false).map_err(full)?;
+                conjuncts
+                    .push(equality(scope, &expressions, *own, *other, arena)?)
+                    .map_err(full)?;
+                clause_of.push(None).map_err(full)?;
             }
         }
+        scan.params = params.as_slice();
+        scan.clause_params = clause_params.as_slice();
+        scan.param_others = param_others.as_slice();
+        join_conjuncts[table] = conjuncts.as_slice();
+        param_clause[table] = clause_of.as_slice();
     }
-    for scan in &mut scans[..n] {
+    for scan in scans.iter_mut() {
         scan.total_table_pages = total_table_pages;
     }
     // The columns above each relation's scan: the output's and those a join
     // or outer join reads (`attr_needed`).
-    let mut join_columns = [0u64; MAX_JOIN_RELS];
+    let join_columns = per_relation(arena, n, 0u64)?;
+    // The outer columns each `LATERAL` subquery reads, needed at it
+    // (`find_lateral_references`, before the conditions' columns).
+    for lateral in laterals.iter().take(n).flatten() {
+        for var in lateral.vars {
+            join_columns[usize::from(var.rel)] |= 1 << var.column;
+            note(usize::from(var.rel), usize::from(var.column));
+        }
+    }
+    let lateral_readers = |table: usize, column: usize| {
+        (0..n)
+            .filter(|&reader| {
+                laterals[reader].is_some_and(|lateral| {
+                    lateral
+                        .vars
+                        .contains(&Member::plain(table as u8, column as u16))
+                })
+            })
+            .fold(Relids::EMPTY, |relids, reader| relids | Relids::of(reader))
+    };
     for &((rel, column), relids, _) in prepared.needed.borrowed_slice() {
         if relids != Relids::EMPTY && column < 64 {
             join_columns[usize::from(rel)] |= 1 << column;
@@ -4000,13 +4102,13 @@ fn modeled_join_over<'a>(
     // Each relation's paths (`set_base_rel_sizes`, then
     // `set_base_rel_pathlists`, whose parameterized paths read the other
     // relations' rows).
-    let mut rels = [None::<ModeledRel<'a>>; MAX_JOIN_RELS];
-    let mut planned_paths = [None::<super::paths::JoinRelPaths<'a>>; MAX_JOIN_RELS];
+    let rels = per_relation(arena, n, None::<ModeledRel<'a>>)?;
+    let planned_paths = per_relation(arena, n, None::<super::paths::JoinRelPaths<'a>>)?;
     let mut needed = crate::mem::arena::ArenaList::<NeededColumn>::new(arena);
-    let mut rel_rows = [0.0f64; MAX_JOIN_RELS];
+    let rel_rows = per_relation(arena, n, 0.0f64)?;
     // The indexes each relation's first sizing found, which the
     // extracted restrictions' estimates read.
-    let mut sized_indexes = [&[][..]; MAX_JOIN_RELS];
+    let sized_indexes = per_relation(arena, n, &[][..])?;
     // Each join `OR` clause's selectivity divisors, one per restriction
     // extracted from it (`consider_new_or_clause`).
     let mut or_divisors = crate::mem::arena::ArenaList::<(usize, f64)>::new(arena);
@@ -4017,6 +4119,9 @@ fn modeled_join_over<'a>(
             // `extract_restriction_or_clauses`.
             let mut extracted = false;
             for table in 0..n {
+                if laterals[table].is_some() {
+                    continue;
+                }
                 let relids: Relids = Relids::of(table);
                 for (id, clause) in clauses.borrowed_slice()[..placed_join_count]
                     .iter()
@@ -4096,6 +4201,56 @@ fn modeled_join_over<'a>(
             }
         }
         for table in 0..n {
+            if let Some(lateral) = laterals[table] {
+                // Its size is its plan's (`set_subquery_size_estimates`);
+                // its columns' widths are its target list's.
+                let above = output[table] | join_columns[table];
+                rel_rows[table] = lateral.rows;
+                if pass == 2 {
+                    let (columns, appeared) = {
+                        let held = appearance.borrow();
+                        (held.0[table], held.1[table])
+                    };
+                    for &column in &columns[..appeared] {
+                        let column = usize::from(column);
+                        if above & 1 << column == 0 {
+                            continue;
+                        }
+                        needed
+                            .push(NeededColumn {
+                                rel: table as u8,
+                                column: column as u16,
+                                width: lateral.widths[column],
+                                needed_by: prepared.needed_by((table as u8, column as u16))
+                                    & !Relids::of(table),
+                                output: output[table] & 1 << column != 0,
+                            })
+                            .map_err(|_| crate::sql::eval::arena_full())?;
+                    }
+                }
+                let single = arena
+                    .alloc(FromClause {
+                        base: *source(from, table),
+                        joins: &[],
+                    })
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                rels[table] = Some(ModeledRel {
+                    from: single,
+                    restriction: None,
+                    joins: &[],
+                    scan: JoinScan {
+                        rel_rows: arena
+                            .alloc_slice_copy(rel_rows)
+                            .map_err(|_| crate::sql::eval::arena_full())?,
+                        ..scans[table]
+                    },
+                    read: above,
+                    output: above,
+                    paths: &[],
+                    lateral: Some(lateral),
+                });
+                continue;
+            }
             let single = match rels[table] {
                 Some(rel) => rel.from,
                 None => arena
@@ -4115,12 +4270,12 @@ fn modeled_join_over<'a>(
             };
             let above = (output[table] | join_columns[table]) & all;
             let scan = JoinScan {
-                rel_rows,
+                rel_rows: arena
+                    .alloc_slice_copy(rel_rows)
+                    .map_err(|_| crate::sql::eval::arena_full())?,
                 ..scans[table]
             };
-            let joins = arena
-                .alloc_slice_copy(&join_conjuncts[table][..usize::from(scan.param_count)])
-                .map_err(|_| crate::sql::eval::arena_full())?;
+            let joins = join_conjuncts[table];
             let read = above | restriction_columns(&single_scope, restrictions[table]);
             let condition = joined_condition(restrictions[table], joins, arena)?;
             let planned = super::scan_path(
@@ -4151,13 +4306,17 @@ fn modeled_join_over<'a>(
                     read,
                     output: above,
                     paths: &[],
+                    lateral: None,
                 });
                 continue;
             }
             planned_paths[table] = Some(paths);
             let slot = scope.slots[table];
-            let (appearance, appeared) = *appearance.borrow();
-            for column in appearance[table][..appeared[table]]
+            let (columns, appeared) = {
+                let held = appearance.borrow();
+                (held.0[table], held.1[table])
+            };
+            for column in columns[..appeared]
                 .iter()
                 .map(|&column| usize::from(column))
                 .filter(|&column| above & 1 << column != 0)
@@ -4171,7 +4330,8 @@ fn modeled_join_over<'a>(
                         } else {
                             f64::from(super::column_width(storage, txid, slot, column))
                         },
-                        needed_by: prepared.needed_by((table as u8, column as u16))
+                        needed_by: (prepared.needed_by((table as u8, column as u16))
+                            | lateral_readers(table, column))
                             & !Relids::of(table),
                         output: output[table] & 1 << column != 0,
                     })
@@ -4284,15 +4444,64 @@ fn modeled_join_over<'a>(
             }
         }
     }
-    let mut base_paths = [&[][..]; MAX_JOIN_RELS];
-    let mut base = [BaseRel {
-        rows: 0.0,
-        width: 0.0,
-        paths: &[],
-        unique: &[],
-        fixed: 0,
-    }; MAX_JOIN_RELS];
+    let base_paths = per_relation(arena, n, &[][..])?;
+    let base = per_relation(
+        arena,
+        n,
+        BaseRel {
+            rows: 0.0,
+            width: 0.0,
+            paths: &[],
+            unique: &[],
+            fixed: 0,
+            lateral: Relids::EMPTY,
+            lateral_vars: &[],
+        },
+    )?;
     for table in 0..n {
+        if let Some(lateral) = laterals[table] {
+            // Its one path scans the subquery's plan, parameterized by the
+            // relations it reads (`create_subqueryscan_path`). A target list
+            // of all its columns in order is trivial: the scan costs what
+            // its plan does (`cost_subqueryscan`), and `setrefs.c` removes
+            // it. Another target list is outside the model.
+            let (columns, appeared) = {
+                let held = appearance.borrow();
+                (held.0[table], held.1[table])
+            };
+            let columns = &columns[..appeared];
+            if columns.len() != lateral.widths.len()
+                || columns
+                    .iter()
+                    .enumerate()
+                    .any(|(at, &column)| usize::from(column) != at)
+            {
+                return Ok(None);
+            }
+            let path = BasePath {
+                startup: lateral.startup,
+                total: lateral.total,
+                rows: lateral.rows,
+                disabled: 0,
+                keys: Keys::NONE,
+                param: lateral.relids,
+                enforced: ClauseList::EMPTY,
+                mark_restore: false,
+                indexed_join_quals: false,
+            };
+            base[table] = BaseRel {
+                rows: lateral.rows,
+                width: lateral.widths.iter().sum(),
+                paths: arena
+                    .alloc_slice_copy(&[path])
+                    .map_err(|_| crate::sql::eval::arena_full())?,
+                unique: &[],
+                fixed: 0,
+                lateral: lateral.relids,
+                lateral_vars: lateral.vars,
+            };
+            continue;
+        }
         let rel = rels[table].expect("planned");
         let paths = planned_paths[table].expect("planned");
         // A dummy relation has no paths and derives no clauses.
@@ -4303,6 +4512,8 @@ fn modeled_join_over<'a>(
                 paths: &[],
                 unique: &[],
                 fixed: paths.fixed,
+                lateral: Relids::EMPTY,
+                lateral_vars: &[],
             };
             continue;
         }
@@ -4332,8 +4543,12 @@ fn modeled_join_over<'a>(
                      derive: &mut dyn FnMut(u8, u8, u8) -> Result<ClauseId, SqlError>|
          -> Result<Option<ClauseList>, SqlError> {
             let mut list = ClauseList::EMPTY;
-            let params = &rel.scan.params[..usize::from(rel.scan.param_count)];
-            for (at, (&(_, other), clause)) in params.iter().zip(param_clause[table]).enumerate() {
+            let params = rel.scan.params;
+            for (at, (&(_, other), clause)) in params
+                .iter()
+                .zip(param_clause[table].iter().copied())
+                .enumerate()
+            {
                 if let Some(id) = clause
                     && (Relids::of(other) | rel.scan.param_others[at]) & !param == Relids::EMPTY
                 {
@@ -4471,17 +4686,16 @@ fn modeled_join_over<'a>(
                 .alloc_slice_copy(&unique[..unique_count])
                 .map_err(|_| crate::sql::eval::arena_full())?,
             fixed: paths.fixed,
+            lateral: Relids::EMPTY,
+            lateral_vars: &[],
         };
     }
     // Each relation's class clauses as the derived clauses orient them,
     // which a scan's `Recheck Cond` and `Filter` print.
     for (table, slot) in rels.iter_mut().enumerate().take(n) {
         let rel = slot.expect("planned");
-        let mut joins = [&Expr::Null; MAX_JOIN_PARAMS];
-        for (at, &(class, other_rel)) in rel.scan.params[..usize::from(rel.scan.param_count)]
-            .iter()
-            .enumerate()
-        {
+        let joins = per_relation(arena, rel.scan.params.len(), &Expr::Null)?;
+        for (at, &(class, other_rel)) in rel.scan.params.iter().enumerate() {
             if param_clause[table][at].is_some() {
                 joins[at] = rel.joins[at];
                 continue;
@@ -4519,21 +4733,20 @@ fn modeled_join_over<'a>(
                 rel.joins[at]
             };
         }
-        *slot = Some(ModeledRel {
-            joins: arena
-                .alloc_slice_copy(&joins[..usize::from(rel.scan.param_count)])
-                .map_err(|_| crate::sql::eval::arena_full())?,
-            ..rel
-        });
+        *slot = Some(ModeledRel { joins, ..rel });
     }
     // The statistics the selectivities read.
-    let statistics: [Option<TableStatistics>; MAX_JOIN_RELS] = core::array::from_fn(|table| {
-        (table < n).then(|| storage.table_statistics(scope.slots[table], txid))
-    });
+    let statistics = arena
+        .alloc_owned_slice_with(n, |table| {
+            laterals[table]
+                .is_none()
+                .then(|| storage.table_statistics(scope.slots[table], txid))
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?;
     // Each relation's variables: its indexes' key expressions
     // (`examine_variable` reads their statistics), then its expression
     // members that no key expression is.
-    let mut variables = [None::<super::ExpressionVariables<'a>>; MAX_JOIN_RELS];
+    let variables = per_relation(arena, n, None::<super::ExpressionVariables<'a>>)?;
     let mut expression_columns = [0usize; MAX_JOIN_EXPRESSIONS];
     let mut expression_vars = [VarList::default(); MAX_JOIN_EXPRESSIONS];
     // An expression of several relations has no variable of its own:
@@ -4607,34 +4820,36 @@ fn modeled_join_over<'a>(
                 .map_err(|_| crate::sql::eval::arena_full())?,
         });
     }
-    let planners: [Option<Planner<'_, 'a>>; MAX_JOIN_RELS] = core::array::from_fn(|table| {
-        let statistics = statistics[table].as_ref()?;
-        let slot = scope.slots[table];
-        let definition = scope.defs.stored(table)?;
-        Some(Planner {
-            variables: variables[table].unwrap_or(super::ExpressionVariables {
-                first: definition.columns().len(),
-                variables: &[],
-            }),
-            storage,
-            txid,
-            slot,
-            definition,
-            statistics,
-            statistics_key: 0,
-            size: super::relation_size(storage, slot, txid),
-            costs,
-            indexes: planned_paths[table].map_or(&[][..], |paths| paths.indexes),
-            extended: &[],
-            arena,
+    let planners = arena
+        .alloc_owned_slice_with(n, |table| -> Option<Planner<'_, 'a>> {
+            let statistics = statistics[table].as_ref()?;
+            let slot = scope.slots[table];
+            let definition = scope.defs.stored(table)?;
+            Some(Planner {
+                variables: variables[table].unwrap_or(super::ExpressionVariables {
+                    first: definition.columns().len(),
+                    variables: &[],
+                }),
+                storage,
+                txid,
+                slot,
+                definition,
+                statistics,
+                statistics_key: 0,
+                size: super::relation_size(storage, slot, txid),
+                costs,
+                indexes: planned_paths[table].map_or(&[][..], |paths| paths.indexes),
+                extended: &[],
+                arena,
+            })
         })
-    });
+        .map_err(|_| crate::sql::eval::arena_full())?;
     // The conditions other than equalities evaluated at joins: one
     // relation's (`clause_selectivity` as a restriction, its evaluation
     // cost) or several relations' (`join_estimate`).
     let early_reader = RelStatistics {
         planners: &planners,
-        rels: &base,
+        rels: base,
         expression_columns: &expression_columns,
         expression_vars: &expression_vars,
     };
@@ -4657,7 +4872,7 @@ fn modeled_join_over<'a>(
         super::super::plan::qual_cost(expression, &scope_columns, storage, txid, arena) / 2.0
             * costs.cpu_operator
     };
-    let mut single_rel_columns = [0u64; MAX_JOIN_RELS];
+    let single_rel_columns = per_relation(arena, n, 0u64)?;
     for (id, clause) in clauses
         .as_mut_slice()
         .map_err(|_| crate::sql::eval::arena_full())?[..placed_join_count]
@@ -4766,13 +4981,15 @@ fn modeled_join_over<'a>(
         referenced_rows: 1.0,
     }; 32];
     let mut foreign_count = 0;
-    for referencing in 0..n {
+    for referencing in (0..n).filter(|&table| laterals[table].is_none()) {
         let definition = scope.defs.stored(referencing).expect("plain table");
         for key in definition.fkeys() {
             if key.validation == crate::storage::ConstraintValidation::NotEnforced {
                 continue;
             }
-            for referenced in (0..n).filter(|&other| other != referencing) {
+            for referenced in
+                (0..n).filter(|&other| other != referencing && laterals[other].is_none())
+            {
                 let parent = scope.defs.stored(referenced).expect("plain table");
                 if parent.name.as_str() != key.parent.as_str()
                     || parent.schema.as_str() != key.parent_schema.as_str()
@@ -4851,6 +5068,9 @@ fn modeled_join_over<'a>(
     let column_width = |(table, column): (usize, usize)| {
         if prepared.false_relids == Relids::of(table) {
             return 0.0;
+        }
+        if let Some(lateral) = laterals[table] {
+            return lateral.widths[column];
         }
         f64::from(super::column_width(
             storage,
@@ -5073,17 +5293,18 @@ fn modeled_join_over<'a>(
     });
     let reader = RelStatistics {
         planners: &planners,
-        rels: &base,
+        rels: base,
         expression_columns: &expression_columns,
         expression_vars: &expression_vars,
     };
-    let subproblems = &prepared.subproblems[..prepared.subproblem_count];
+    let subproblems = prepared.subproblems.borrowed_slice();
     let problem = JoinProblem {
+        pool: storage.join_search(),
         rels: &base[..n],
         classes,
         specials: &prepared.specials[..prepared.special_count],
         subproblems,
-        subproblem_items: &prepared.subproblem_items[..prepared.subproblem_item_count],
+        subproblem_items: prepared.subproblem_items.borrowed_slice(),
         clauses: clauses.as_slice(),
         needed: needed.as_slice(),
         expression_costs: &expression_costs,
@@ -5221,22 +5442,7 @@ fn modeled_join_over<'a>(
                             usize::from(group_columns_count),
                         )
                     });
-            let order_sizing =
-                problem_group_aggregates
-                    .filter(|_| chosen.hashed)
-                    .and_then(|aggregates| {
-                        super::aggregate::hash_agg_sizing(
-                            &super::aggregate::AggregateCosts {
-                                unsized_states: false,
-                                ..aggregates
-                            },
-                            chosen.groups,
-                            output_width,
-                            usize::from(group_columns_count),
-                        )
-                    });
             Some(ModeledGroup {
-                order_sizing,
                 hashed: chosen.hashed,
                 aggregated: problem_group_aggregates
                     .is_some_and(|aggregates| aggregates.aggregated()),
@@ -5391,12 +5597,12 @@ fn join_is_removable(
 
 /// What `remove_useless_self_joins` removed: the relation kept in each
 /// removed relation's place.
-pub(crate) type KeptFor = [Option<u8>; MAX_JOIN_RELS];
+pub(crate) type KeptFor<'a> = &'a [Option<u8>];
 
 /// The self-joins removed and whether one the model does not remove
 /// (an expression or subquery reads a scan) may be one PostgreSQL removes.
-struct SelfJoins {
-    kept_for: KeptFor,
+struct SelfJoins<'a> {
+    kept_for: &'a mut [Option<u8>],
     removed: Relids,
     declined: bool,
 }
@@ -5628,9 +5834,9 @@ fn remove_self_joins<'a>(
     expressions: &Expressions<'a>,
     removed: Relids,
     arena: &'a Arena,
-) -> Result<SelfJoins, SqlError> {
+) -> Result<SelfJoins<'a>, SqlError> {
     let mut joins = SelfJoins {
-        kept_for: [None; MAX_JOIN_RELS],
+        kept_for: per_relation(arena, scope.n, None)?,
         removed: Relids::EMPTY,
         declined: false,
     };
@@ -5639,11 +5845,14 @@ fn remove_self_joins<'a>(
     }
     // The pairs found not unique when all their join clauses were
     // self-join clauses (`non_unique_for_rels`), by kept relation.
-    let mut non_unique = [Relids::EMPTY; MAX_JOIN_RELS];
-    for problem in 0..prepared.subproblem_count {
-        let super::joins::Subproblem { first, count } = prepared.subproblems[problem];
+    let non_unique = per_relation(arena, scope.n, Relids::EMPTY)?;
+    for problem in 0..prepared.subproblems.len() {
+        let super::joins::Subproblem { first, count } =
+            prepared.subproblems.borrowed_slice()[problem];
         let mut candidates = Relids::EMPTY;
-        for &item in &prepared.subproblem_items[usize::from(first)..usize::from(first + count)] {
+        for &item in &prepared.subproblem_items.borrowed_slice()
+            [usize::from(first)..usize::from(first + count)]
+        {
             if item.count_ones() == 1
                 && item & !BASE_RELIDS == Relids::EMPTY
                 && item & removed == Relids::EMPTY
@@ -5673,7 +5882,7 @@ fn remove_self_joins<'a>(
                     expressions,
                     group,
                     &mut joins,
-                    &mut non_unique,
+                    non_unique,
                     arena,
                 )?;
                 group &= !gone;
@@ -5698,7 +5907,7 @@ fn remove_self_joins_one_group<'a>(
     expressions: &Expressions<'a>,
     group: Relids,
     joins: &mut SelfJoins,
-    non_unique: &mut [Relids; MAX_JOIN_RELS],
+    non_unique: &mut [Relids],
     arena: &'a Arena,
 ) -> Result<Relids, SqlError> {
     let mut result = Relids::EMPTY;
@@ -5964,7 +6173,7 @@ fn removable_self_join(
     if crate::sql::guc::planner_value("enable_self_join_elimination") == 0.0 {
         return false;
     }
-    let n = scope.n.min(MAX_JOIN_RELS);
+    let n = scope.n;
     for r in 0..n {
         for k in r + 1..n {
             if removed & (Relids::of(r) | Relids::of(k)) != Relids::EMPTY
@@ -6053,22 +6262,12 @@ fn single_member(member: Member, arena: &Arena) -> Result<&[Member], SqlError> {
         .map_err(|_| crate::sql::eval::arena_full())?)
 }
 
-/// A relation's scan equated with more relations than it holds join
-/// parameters for.
-fn join_params_full() -> SqlError {
-    crate::sql_err!(
-        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        "join search capacity exceeded: an indexed relation's scan holds at most {} join clauses",
-        MAX_JOIN_PARAMS
-    )
-}
-
 /// The join preparation's capacities exceeded.
 fn preparation_full() -> SqlError {
     crate::sql_err!(
         crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        "join search capacity exceeded: a query holds at most {} conditions and {} equivalence classes of {} members",
-        join_tree::MAX_QUALS,
+        "join search capacity exceeded: a query holds at most {} conditions per relation of max_join_relations and {} equivalence classes of {} members",
+        join_tree::QUALS_PER_RELATION,
         join_tree::MAX_CLASSES,
         super::joins::MAX_MEMBERS
     )
@@ -6120,9 +6319,239 @@ fn plain_table(
         && !definition.row_level_security.enabled
 }
 
+/// A `LATERAL` subquery the search plans as a base relation
+/// (`set_subquery_pathlist`): its query, planned alone with the outer
+/// columns it reads as parameters (`PARAM_EXEC`), whose one path is a
+/// `SubqueryScan` parameterized by their relations.
+#[derive(Clone, Copy)]
+pub(crate) struct LateralRel<'a> {
+    pub(crate) select: &'a Select<'a>,
+    /// The relations whose columns it reads (`lateral_relids`).
+    pub(crate) relids: Relids,
+    /// The outer columns it reads, each once, in the order
+    /// `extract_lateral_references` finds them: a `Memoize` cache's key.
+    pub(crate) vars: &'a [Member],
+    pub(crate) startup: f64,
+    pub(crate) total: f64,
+    pub(crate) rows: f64,
+    /// Each output column's width (`set_subquery_size_estimates`).
+    pub(crate) widths: &'a [f64],
+}
+
+/// Whether `expression` reads a statement parameter, which a custom plan
+/// of the subquery would print as its value.
+fn reads_parameter(expression: &Expr<'_>) -> bool {
+    let mut reads = false;
+    let _ = super::super::walk_expression_tree(expression, &mut |node| {
+        reads |= matches!(node, Expr::Param(_));
+    });
+    reads
+}
+
+/// The relation at FROM position `table` as a [`LateralRel`]: a `LATERAL`
+/// subquery of one plain table, without grouping, sublinks or windows,
+/// that reads the columns of earlier plain relations of the query (none of
+/// them another `LATERAL` subquery) in its `WHERE` only, reads no statement
+/// parameter, calls nothing volatile (its join runs it to its end) and is
+/// written after a comma or `CROSS JOIN`. `None` for any other relation.
+fn lateral_rel<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    from: &'a FromClause<'a>,
+    scope: &QueryScope<'a>,
+    table: usize,
+    laterals: &[Option<LateralRel<'a>>],
+    arena: &'a Arena,
+) -> Result<Option<LateralRel<'a>>, SqlError> {
+    let tref = source(from, table);
+    let Some(select) = tref.subquery else {
+        return Ok(None);
+    };
+    if !scope.lateral[table]
+        || table == 0
+        || !matches!(
+            from.joins[table - 1].kind,
+            JoinKind::Comma | JoinKind::Cross
+        )
+        || tref.col_alias.is_some()
+        || tref.sample.is_some()
+        || tref.func_args.is_some()
+        || tref.rows_from.is_some()
+        || tref.cte.is_some()
+        || tref.join_members.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(sub_from) = select.from.as_ref() else {
+        return Ok(None);
+    };
+    let order = select.order_by.iter().map(|order| order.expression);
+    let items = select.items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } => Some(*expression),
+        _ => None,
+    });
+    let expressions = items
+        .clone()
+        .chain(select.where_clause)
+        .chain(order.clone())
+        .chain(select.limit)
+        .chain(select.offset);
+    if !sub_from.joins.is_empty()
+        || select.set_body.is_some()
+        || !select.with.is_empty()
+        || !select.locking.is_empty()
+        || select.distinct
+        || !select.distinct_on.is_empty()
+        || !select.grouping_sets.is_empty()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.with_ties
+        || expressions.clone().any(|expression| {
+            expression.contains_subquery()
+                || crate::sql::query::expr_has_window(expression)
+                || expression.contains_volatile_function().is_some()
+                || reads_parameter(expression)
+        })
+        || crate::sql::query::has_set_returning_items(select.items, storage, txid)
+    {
+        return Ok(None);
+    }
+    let sub_scope = QueryScope::resolve_schema(storage, sub_from, txid, arena, None)?;
+    if sub_scope.n != 1 || !plain_table(storage, txid, &sub_scope, 0, &sub_from.base) {
+        return Ok(None);
+    }
+    // The outer columns, read in `WHERE` only.
+    let mut vars = [Member::plain(0, 0); super::joins::MAX_KEYS];
+    let mut count = 0;
+    let mut relids = Relids::EMPTY;
+    let mut plannable = true;
+    let mut outer_reference = |qualifier: Option<&str>, name: &str, condition: bool| {
+        if sub_scope.probe_column(qualifier, name).is_some() {
+            return;
+        }
+        match scope.probe_column(qualifier, name) {
+            // A `Memoize` keys by it through its type's hash operator class
+            // (`paraminfo_get_equal_hashops`).
+            Some(ResolvedColumn::Table(outer, column))
+                if condition
+                    && outer < table
+                    && laterals[outer].is_none()
+                    && column < 64
+                    && scope.defs.stored(outer).is_some_and(|definition| {
+                        crate::sql::query::join_exec::datum_type_hashable(
+                            definition.columns()[column].ctype,
+                        )
+                    }) =>
+            {
+                let var = Member::plain(outer as u8, column as u16);
+                if !vars[..count].contains(&var) {
+                    if count == vars.len() {
+                        plannable = false;
+                        return;
+                    }
+                    vars[count] = var;
+                    count += 1;
+                }
+                relids |= Relids::of(outer);
+            }
+            _ => plannable = false,
+        }
+    };
+    for expression in items.chain(order).chain(select.limit).chain(select.offset) {
+        expression.for_each_column_reference(&mut |qualifier, name| {
+            outer_reference(qualifier, name, false)
+        });
+    }
+    if let Some(condition) = select.where_clause {
+        condition.for_each_column_reference(&mut |qualifier, name| {
+            outer_reference(qualifier, name, true)
+        });
+    }
+    if !plannable || relids == Relids::EMPTY {
+        return Ok(None);
+    }
+    // Each output column's width: a column's analyzed width, else its
+    // type's (`set_rel_width`).
+    let definition = sub_scope.defs.stored(0).expect("plain table");
+    let slot = sub_scope.slots[0];
+    let mut widths = crate::mem::arena::ArenaList::new(arena);
+    for item in select.items {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for column in 0..definition.columns().len() {
+                    widths
+                        .push(f64::from(super::column_width(storage, txid, slot, column)))
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                }
+            }
+            SelectItem::Expr { expression, .. } => {
+                let column = match expression {
+                    Expr::Column { qualifier, name } => {
+                        match sub_scope.probe_column(*qualifier, name) {
+                            Some(ResolvedColumn::Table(0, column)) => Some(column),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let width = match column {
+                    Some(column) => f64::from(super::column_width(storage, txid, slot, column)),
+                    None => {
+                        let Ok((type_oid, type_mod)) = crate::sql::exec::infer_type_catalog(
+                            expression,
+                            Some(definition),
+                            storage,
+                            txid,
+                            arena,
+                        ) else {
+                            return Ok(None);
+                        };
+                        let Some((ctype, None)) =
+                            crate::sql::exec::catalog_column_type(storage, txid, type_oid)
+                        else {
+                            return Ok(None);
+                        };
+                        super::type_average_width(ctype, i32::from(type_mod))
+                    }
+                };
+                widths
+                    .push(width)
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+            }
+            _ => return Ok(None),
+        }
+    }
+    let widths = widths
+        .into_mut_slice()
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    if scope
+        .defs
+        .get(table)
+        .is_none_or(|definition| definition.n_columns != widths.len())
+    {
+        return Ok(None);
+    }
+    let Some((startup, total, rows, _)) =
+        crate::sql::explain::lateral_subquery_costs(storage, txid, scope, select, relids, arena)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(LateralRel {
+        select,
+        relids,
+        vars: arena
+            .alloc_slice_copy(&vars[..count])
+            .map_err(|_| crate::sql::eval::arena_full())?,
+        startup,
+        total,
+        rows: super::clamp_row_est(rows),
+        widths,
+    }))
+}
+
 struct RelStatistics<'r, 's, 'a> {
-    planners: &'r [Option<Planner<'s, 'a>>; MAX_JOIN_RELS],
-    rels: &'r [BaseRel<'r>; MAX_JOIN_RELS],
+    planners: &'r [Option<Planner<'s, 'a>>],
+    rels: &'r [BaseRel<'r>],
     /// Each expression member's variable in its relation's planner.
     expression_columns: &'r [usize; MAX_JOIN_EXPRESSIONS],
     /// Each expression member's columns.
@@ -6151,18 +6580,16 @@ impl RelStatistics<'_, '_, '_> {
         &'s self,
         members: &'s [Member],
     ) -> impl Iterator<Item = (usize, ([usize; 64], usize))> + 's {
-        let mut order = [0u8; MAX_JOIN_RELS];
-        let mut count = 0;
         let mut done = Relids::EMPTY;
-        for member in members {
-            for rel in (member.base_relids() & !done).rels() {
+        let order = members
+            .iter()
+            .flat_map(|member| member.base_relids().rels())
+            .filter(move |&rel| {
+                let new = !done.contains(u32::from(rel));
                 done |= Relids::of(rel);
-                order[count] = rel;
-                count += 1;
-            }
-        }
-        (0..count).map(move |at| {
-            let rel = order[at];
+                new
+            });
+        order.map(move |rel| {
             let mut columns = [0usize; 64];
             let found = self.group_columns(members, rel, &mut columns);
             (usize::from(rel), (columns, found))

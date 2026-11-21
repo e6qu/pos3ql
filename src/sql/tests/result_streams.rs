@@ -429,7 +429,10 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
                 50,
             ),
             ColdRequest::Copy => query("COPY cold_orders TO STDOUT"),
-            ColdRequest::Distinct => paged_request("SELECT DISTINCT id, code FROM cold_orders", 50),
+            ColdRequest::Distinct => paged_request(
+                "SELECT DISTINCT id, code FROM cold_orders ORDER BY id, code",
+                50,
+            ),
             ColdRequest::Grouped => paged_request(
                 "SELECT id, max(code), count(*) FROM cold_orders GROUP BY id ORDER BY id",
                 50,

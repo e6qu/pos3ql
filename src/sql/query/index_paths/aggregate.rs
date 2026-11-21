@@ -28,12 +28,14 @@ pub(crate) struct AggregateCosts {
     pub(crate) transition_space: f64,
     /// The transition states (`list_length(root->aggtransinfos)`).
     pub(crate) transitions: usize,
-    /// The bytes each group's by-reference transition states allocate when
-    /// a hash aggregate starts the group, in state order.
+    /// The bytes each by-reference initial value a hash aggregate copies
+    /// when it starts a group, in state order.
     pub(crate) per_group: [u16; MAX_SIZED_STATES],
     pub(crate) per_group_count: usize,
-    /// A state allocates memory per group the hash aggregate memory model
-    /// does not reproduce.
+    /// A state allocates as its input arrives ([`StateMemory::input_driven`]).
+    pub(crate) input_driven: bool,
+    /// A state's memory per group is outside the hash aggregate memory
+    /// model.
     pub(crate) unsized_states: bool,
     /// An aggregate has `DISTINCT` or `ORDER BY` inputs
     /// (`numOrderedAggs`), which forbids hashing and which PostgreSQL may
@@ -50,31 +52,7 @@ impl AggregateCosts {
 }
 
 use crate::sql::query::postgres_memory::MAX_SIZED_STATES;
-
-/// The bytes a transition state of transition function `function` allocates
-/// in the aggregate's memory when its group starts, as PostgreSQL 18.6 does,
-/// given that `space` is what `get_agg_clause_costs` charges for it: a copy
-/// of an array initial value (`'{0,0}'` is a 40-byte `int8[]`), or the
-/// 48-byte `Int128AggState` of the integer `avg`, `sum(int8)` and variance
-/// states. `None` for a state that allocates otherwise (text, numeric and
-/// collecting states).
-fn group_allocation(function: i32, space: f64) -> Option<u16> {
-    match function {
-        // int2_avg_accum, int4_avg_accum: `{0,0}` as `int8[]`.
-        1962 | 1963 => Some(40),
-        // float4_accum, float8_accum: `{0,0,0}` as `float8[]`.
-        208 | 222 => Some(48),
-        // float8_regr_accum: six `float8` elements.
-        2806 => Some(72),
-        // int8_avg_accum, int2_accum, int4_accum.
-        2746 | 1834 | 1835 => Some(48),
-        // Collecting states of no planned space.
-        2333 | 3173 | 3180 | 3265 | 3268 | 3535 | 3543 | 4051 | 4299 | 6225 | 6275 | 6277
-        | 6278 | 6279 | 6283 | 6285 | 6286 | 6287 => None,
-        _ if space == 0.0 => Some(0),
-        _ => None,
-    }
-}
+use crate::sql::query::transition_memory::StateMemory;
 
 /// `AggStrategy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,10 +66,13 @@ pub(crate) enum AggStrategy {
 
 /// One transition state, which aggregates of the same inputs share.
 #[derive(Clone, Copy)]
-struct Transition<'a> {
+pub(crate) struct Transition<'a> {
     function: i32,
     initial: Option<&'static str>,
-    call: &'a Expr<'a>,
+    /// The first aggregate call the state feeds.
+    pub(crate) call: &'a Expr<'a>,
+    /// What the state takes in a hash aggregate's memory, when modelled.
+    pub(crate) memory: Option<StateMemory>,
 }
 
 /// The inputs of two aggregate calls are the same (`find_compatible_agg`'s
@@ -141,6 +122,19 @@ pub(crate) fn aggregate_costs<'a>(
     columns: &dyn crate::sql::exec::ColTypeResolver,
     arena: &'a Arena,
 ) -> Result<Option<AggregateCosts>, SqlError> {
+    Ok(aggregate_transitions(expressions, storage, txid, columns, arena)?.map(|(costs, _)| costs))
+}
+
+/// [`aggregate_costs`] with the transition states, in the order PostgreSQL
+/// numbers them when `expressions` are its target list and then its
+/// `HAVING` qualification.
+pub(crate) fn aggregate_transitions<'a>(
+    expressions: &[&'a Expr<'a>],
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    arena: &'a Arena,
+) -> Result<Option<(AggregateCosts, &'a [Transition<'a>])>, SqlError> {
     let costs = Costs::current();
     let mut calls = ArenaList::new(arena);
     for expression in expressions {
@@ -185,13 +179,6 @@ pub(crate) fn aggregate_costs<'a>(
         }) {
             continue;
         }
-        transitions
-            .push(Transition {
-                function: aggregate.transition,
-                initial: aggregate.initial,
-                call,
-            })
-            .map_err(|_| crate::sql::eval::arena_full())?;
         result.transitions += 1;
         result.transition_per_tuple += aggregate.transition_cost * costs.cpu_operator;
         for argument in *args {
@@ -229,16 +216,25 @@ pub(crate) fn aggregate_costs<'a>(
             }
         };
         result.transition_space += space;
-        match group_allocation(aggregate.transition, space) {
-            Some(0) => {}
-            Some(bytes) if result.per_group_count < MAX_SIZED_STATES => {
+        let memory = StateMemory::of(aggregate.transition, space);
+        match memory {
+            Some(StateMemory::Initial(bytes)) if result.per_group_count < MAX_SIZED_STATES => {
                 result.per_group[result.per_group_count] = bytes;
                 result.per_group_count += 1;
             }
-            Some(_) | None => result.unsized_states = true,
+            Some(StateMemory::Initial(_)) | None => result.unsized_states = true,
+            Some(memory) => result.input_driven |= memory.input_driven(),
         }
+        transitions
+            .push(Transition {
+                function: aggregate.transition,
+                initial: aggregate.initial,
+                call,
+                memory,
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
     }
-    Ok(Some(result))
+    Ok(Some((result, transitions.as_slice())))
 }
 
 /// The per-row cost of evaluating `expressions` above an aggregation
@@ -421,7 +417,9 @@ pub(crate) fn hash_agg_sizing(
         columns,
         transitions: aggregates.transitions,
         per_group: aggregates.per_group,
-        per_group_count: aggregates.per_group_count,
+        per_group_count: u8::try_from(aggregates.per_group_count)
+            .expect("at most MAX_SIZED_STATES initial values"),
+        input_driven: aggregates.input_driven,
     })
 }
 

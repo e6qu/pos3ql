@@ -114,7 +114,7 @@ struct Live<'a> {
     paths: RelPaths<'a>,
     /// Each tree column's position in the member, `usize::MAX` when absent.
     columns: &'a [usize],
-    shape: QueryShape,
+    shape: QueryShape<'a>,
     needed: Option<ColumnSet>,
     /// The width of its paths' rows above it.
     width: f64,
@@ -1071,7 +1071,7 @@ fn member_inputs<'a>(
     shape: QueryShape,
     needed: Option<ColumnSet>,
     arena: &'a Arena,
-) -> Result<(&'a [usize], Option<ColumnSet>, QueryShape), SqlError> {
+) -> Result<(&'a [usize], Option<ColumnSet>, QueryShape<'a>), SqlError> {
     let member = storage.table_def(leaf, txid);
     let columns = &*arena
         .alloc_slice_with(definition.n_columns, |column| {

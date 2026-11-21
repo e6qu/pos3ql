@@ -78,7 +78,11 @@ The model covers:
   index-ordered groupings with keys reordered to the index
   (`get_useful_group_keys_orderings`, `905`), `HAVING` costs and default
   selectivities, and `LIMIT`/`OFFSET` via `adjust_limit_rows_costs` (`821`).
-  A grouping whose keys all conditions fix is refused.
+  A `GroupAggregate`'s input sort holds the keys and the columns its
+  aggregates read (`make_group_input_target`) and spills under `work_mem`
+  as `tuplesort` does; a limit over an `ORDER BY` of its keys stops it early,
+  and `Rows Removed by Filter` counts only the groups `HAVING` removed before
+  it stopped (`965`). A grouping whose keys all conditions fix is refused.
 - Grouping sets arranged as PostgreSQL does (`extract_rollup_sets`,
   `reorder_grouping_sets`, `DiscreteKnapsack`, `MixedAggregate`), with
   PostgreSQL's costs over one table (`802`).
@@ -106,7 +110,9 @@ from their support functions.
 Partitioned tables and inheritance trees read alone, or written by an
 `UPDATE` or `DELETE` that joins nothing, are planned member by member
 (`set_append_rel_pathlist`, `750`, `751`): an `Append`, an ordered `Append`
-(`partitions_are_ordered`) or a `Merge Append`. Pruning follows `partprune.c`
+(`partitions_are_ordered`) or a `Merge Append`. A member whose path reads an
+index seeks it with the query's conditions and counts an index scan in its
+statistics (`964`). Pruning follows `partprune.c`
 and constraint exclusion; constants and custom plan arguments prune at
 planning, generic plan arguments and stable functions at executor startup
 (`Subplans Removed`), and execution prunes with every value it knows
@@ -122,7 +128,8 @@ path `pg_catalog, pg_temp`, as PostgreSQL's `RestrictSearchPath` does (`754`).
 
 PostgreSQL's costs read page counts, so pos3ql emulates its layouts: rows
 packed in physical order, a btree laid out as `_bt_buildadd` fills its pages
-(an index grown by inserts uses the size estimate), and a visibility map whose
+(an index grown by inserts is costed as if built, although PostgreSQL's page
+splits leave it larger), and a visibility map whose
 pages stay all-visible after `VACUUM` until an update, delete or insert. A
 single-column btree's NULL keys form their own run at the end of the index
 (`862`). The btree layout is computed from column statistics, so it can
@@ -188,7 +195,21 @@ plan. Covered:
 - `EXPLAIN VERBOSE` target lists as `createplan.c` builds them (`930`).
 - Row estimates as doubles clamped at `MAXIMUM_ROWCOUNT` (1e100), so GEQO
   finds PostgreSQL's plan for huge cross products (`970`, `971`).
-- A parameterized scan's filter testing a subplan costs `cost_subplan` (`950`).
+- A parameterized scan's filter testing a subplan costs `cost_subplan` (`950`),
+  and a correlated scalar subquery in a select list costs its subplan per row,
+  its outer columns parameters of unknown value (`PARAM_EXEC`, `977`).
+- A `LATERAL` subquery of one table that PostgreSQL keeps as a subquery
+  (aggregates without `GROUP BY`, `ORDER BY`, `LIMIT`), reading earlier tables'
+  columns in its `WHERE`, written after a comma or `CROSS JOIN` and read by the
+  select list as all of its columns in order: a base relation sized from its
+  own plan (`set_subquery_pathlist`), whose one path is parameterized by the
+  tables it reads, so it joins on the inside of nested loops
+  (`join_is_legal`'s lateral rules), under a `Memoize` keyed by those columns
+  in binary mode when the cache pays (`paraminfo_get_equal_hashops`), with
+  `Hits`, `Misses`, `Evictions`, `Overflows` and `Memory Usage` as
+  `ExecMemoize` counts them (`977`). Other `LATERAL` subqueries run pos3ql's
+  own join order; `EXPLAIN` with costs of them fails with `0A000`, and with
+  `enable_memoize` on, so does any `EXPLAIN` of one PostgreSQL may memoize.
 
 Hash joins build on the first outer row, return matches in bucket-chain order
 (re-chained as `ExecHashIncreaseNumBuckets` does), keep a one-batch table
@@ -200,15 +221,25 @@ search out of such joins. Merge joins sort with PostgreSQL's quicksort and
 replay a `Materialize`'s mark and restore (`910`); a merge join reads an index
 scan in order as far as it fetches (`945`).
 
-**Capacities.** The search plans up to 128 relations, 256 conditions, 64
-equivalence classes of up to 255 members, 32 clauses of one join and 65,535
-clauses, in the statement arena (`sql_arena_bytes`); past any of them a query
-fails with `54000` naming the capacity. Paths take 288 bytes each. A
-relation with a btree index holds 16 join parameters, so an indexed relation
-equated with more than 16 others fails with `54000`. `EXPLAIN` of a
-64-relation `USING` chain takes about 4 MB of the arena and a 128-relation
-chain's GEQO search about 8 MB. Queries of more than 128 relations run
-pos3ql's own join order.
+**Capacities.** The startup setting `max_join_relations` (2 to 255, default
+128) sets how many relations one query's search plans; a query of more fails
+with `54000` naming the setting, where PostgreSQL would plan it. Each
+relation of the setting adds two conditions to the query's capacity (256 at
+the default). The search also holds 64 equivalence classes of up to 255
+members, 32 clauses of one join and 65,535 clauses; past any of them a query
+fails with `54000` naming the capacity. Everything else it holds per
+relation, join tree node, condition or join parameter (an indexed
+relation's columns equated with other relations') is sized by the query and
+taken from the statement arena (`sql_arena_bytes`), which a query too large
+for it exhausts with `54000`. `EXPLAIN` of a 64-relation `USING` chain takes
+about 4 MB of the arena and a 128-relation chain's GEQO search about 8 MB;
+the GEQO search keeps memory per tour it evaluates, so at the default 32 MiB
+arena a 140-relation chain plans (`978`) and a 150-relation one fails with
+`54000`. A chain of left joins holds one equivalence class per join clause,
+so more than 64 of them fail with `54000`. The genetic search's pool,
+`(500 + 2) * (max_join_relations + 1)` four-byte genes plus an edge table
+(about 260 KB at the default, 520 KB at 255), is reserved at startup and
+shared by the server's connections one search at a time.
 
 **Outside the search** (never-analyzed tables, row locks, and the shapes
 listed in [PLAN.md](../PLAN.md#close-application-compatibility-gaps)), pos3ql
@@ -234,6 +265,21 @@ statistics (`631`, `651`-`653`): a hash join building on the smaller relation,
 or a nested loop over a `Materialize` without an equality; a join keeping both
 sides without an equality fails as PostgreSQL's full join does (`0A000`).
 
+### Pull-based join executor (planned)
+
+The search's plan runs in `join_exec.rs`, which pushes each joined row
+through a callback; the retained executor (`retained/`) pulls rows and
+resumes after a storage wait but runs only nested-loop and hash levels in
+FROM order. The planned single executor replaces both: one node record per
+plan path from a pool reserved at startup (`54000` naming the pool when a
+plan needs more), each exposing its current row as per-relation slots that
+stay valid until its next advance, so no row grows the statement arena.
+Sort runs `tuplesort.c`'s port, HashAggregate drives `hashagg.rs`, and
+`EXPLAIN ANALYZE` counters live in the node records. Its scan node needs
+every scan path to resume mid-scan; today only sequential heap scans
+(`RowCursor`) do, while index, bitmap, function and `LATERAL` scans run
+to completion through callbacks.
+
 ## Sorting, hashing and memory figures
 
 Every sort that orders rows the client sees runs one port of `tuplesort.c`
@@ -242,6 +288,11 @@ past `work_mem` forms runs where `dumptuples` does and merges them as
 `mergeruns` does, and a limit directly above bounds a heap. `EXPLAIN ANALYZE`
 prints PostgreSQL's `Sort Method` (`quicksort`, `top-N heapsort`, `external
 merge`), `Memory` and `Disk` (8,176-byte tape blocks, `906`; `476`, `820`).
+A sort under a limit takes its rows as they arrive (`980`): once it forms
+its bounded heap it keeps only the rows the limit returns, in two
+`plan_build_bytes` leases (`54000` naming the setting when they fill), so
+`ORDER BY ... LIMIT n` over a join of any size holds `n` rows. A sort
+without a limit holds every row in the statement arena.
 Values are charged at PostgreSQL's sizes, including `jsonb`
 (`convertToJsonb`), arrays, records, ranges, multiranges, `tsquery` and
 `jsonpath`; `pg_column_size` reports the same (`919`). A value with no size
@@ -261,6 +312,20 @@ default hash function (`881`, `922`, `924`); an enum key hashes its `pg_enum`
 OID as `hashenum` does, but those OIDs come from pos3ql's own identity band
 (`925` sorts its groups). `Batches`, `Memory Usage` and `Disk Usage` follow
 `hash_agg_update_metrics` for one to seven grouping columns.
+
+The transition values count as PostgreSQL's transition functions allocate
+them in `aset.c`'s chunks and freelists (`963`): `min` and `max` of `text`,
+`character`, `bytea`, `inet`, `numeric`, `interval`, `time with time zone`
+and `tid` keep a copy of the value they return; `sum`, `avg` and the
+variances of `numeric` and `bigint` keep a 144-byte `NumericAggState` whose
+digit buffers grow with the inputs' weights and scales; `string_agg` keeps
+a 1kB buffer it doubles, `array_agg` an array of eight elements it doubles
+and a copy of each element passed by reference; the integer and interval
+sums allocate their state on their first call, so a group whose `FILTER`
+rejects every row takes none. Other aggregates that allocate per group
+(`json_agg`, `range_agg`, `array_agg` of arrays, `min` and `max` of arrays,
+records and bit strings, ordered-set aggregates) leave the memory, and so a
+hashed grouping's order, unmodelled: `0A000` where the order shows.
 
 A one-table `GROUP BY` or `DISTINCT` of expressions plans as PostgreSQL's
 does (`929`); a `DISTINCT` takes its `ORDER BY` items first
@@ -292,7 +357,11 @@ chunk limit, so after a hash aggregate under `work_mem` below 1MB
 `work_mem` (on PostgreSQL 18.6 a later `string_agg` grouping reported other
 figures at 1MB, 4MB and 16MB). pos3ql records that per session and fails a
 later hash aggregate whose bucket array falls between the lower limit and
-8 kB with `0A000` (`926`, `928`).
+8 kB with `0A000` (`926`, `928`). The transition values' context is itself
+a work context: a fresh one takes `work_mem`'s limit, one recycled after a
+statement that freed many contexts (on PostgreSQL 18.6, a five-way join)
+keeps 8 kB. A transition value between the lower limit and 8 kB therefore
+fails with `0A000` under `work_mem` below 1MB, or after such an aggregate.
 
 A hash join's `Hash` node reports the table PostgreSQL builds: at least 1,024
 buckets, doubled while rows outnumber them, and `Memory Usage` from each row's

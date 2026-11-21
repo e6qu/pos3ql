@@ -4186,7 +4186,7 @@ struct GroupedScan<'a> {
     path: query::index_paths::ScanPath<'a>,
     /// The query shape and read columns the path was planned for, which
     /// the scan's execution plans it from again.
-    shape: query::index_paths::QueryShape,
+    shape: query::index_paths::QueryShape<'a>,
     needed: Option<crate::storage::ColumnSet>,
     sort_keys: &'a [KeyItem<'a>],
     group_keys: &'a [KeyItem<'a>],
@@ -4594,7 +4594,7 @@ pub(crate) fn grouped_scan_context<'a>(
     arena: &'a Arena,
 ) -> Result<
     Option<(
-        query::index_paths::QueryShape,
+        query::index_paths::QueryShape<'a>,
         Option<crate::storage::ColumnSet>,
     )>,
     SqlError,
@@ -8047,7 +8047,11 @@ fn plan_pulled_select<'a>(
                         txid,
                         scope.as_ref(),
                         statement,
-                        KeyLabel::Group,
+                        if aggregate_name == "HashAggregate" {
+                            KeyLabel::Group
+                        } else {
+                            KeyLabel::GroupInput
+                        },
                         keys,
                         arena,
                     )?,
@@ -17301,6 +17305,59 @@ fn printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), SqlError> {
         )),
         None => Ok(()),
     }
+}
+
+/// The plan of a `LATERAL` subquery the join search plans as a base
+/// relation (`set_subquery_pathlist`): the subquery planned on its own, the
+/// outer columns it reads (relations `outer` of `scope`) parameters of
+/// unknown value (`PARAM_EXEC`), its nodes counted in `block`. `None` when
+/// the model does not plan it or a node's costs are outside it.
+pub(super) fn lateral_subquery_plan<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    select: &Select<'_>,
+    outer: Relids,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<Option<Plan<'a>>, SqlError> {
+    // The subquery's relations join the statement's range table, so its
+    // sort keys print qualified.
+    let pushed = push_outer_mask(scope, outer);
+    let prior = SUBPLAN_RELATIONS.with(|planned| planned.replace(true));
+    let planned = plan_select(storage, txid, select, None, block, arena);
+    SUBPLAN_RELATIONS.with(|planned| planned.set(prior));
+    pop_outer_relations(pushed);
+    let plan = match planned {
+        Ok(plan) => plan,
+        Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok((plan.count > 0
+        && plan.nodes[..plan.count]
+            .iter()
+            .all(|node| !node.unmodeled_costs && node.subplan.is_none()))
+    .then_some(plan))
+}
+
+/// The top node of [`lateral_subquery_plan`]: its startup and total costs,
+/// rows and width.
+pub(crate) fn lateral_subquery_costs(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    select: &Select<'_>,
+    outer: Relids,
+    arena: &Arena,
+) -> Result<Option<(f64, f64, f64, u32)>, SqlError> {
+    Ok(
+        lateral_subquery_plan(storage, txid, scope, select, outer, BlockId::ROOT, arena)?.map(
+            |plan| {
+                let top = &plan.nodes[0];
+                (top.startup_cost, top.total_cost, top.rows, top.width)
+            },
+        ),
+    )
 }
 
 /// Whether a LATERAL subquery reading a relation filters it by a column of

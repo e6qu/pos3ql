@@ -208,12 +208,22 @@ mod macos {
 
 /// A test rendezvous whose waits never allocate. The macOS standard barrier
 /// lazily boxes its pthread mutex and condition variable on first use, which
-/// aborts inside a `forbid_alloc` section.
+/// aborts inside a `forbid_alloc` section, so macOS waiters spin. Linux's
+/// futex-backed mutex and condition variable allocate nothing, and waiters
+/// block: under Miri a spinning waiter would share the interpreter's single
+/// host thread with the threads it waits for, slowing them several times.
 #[cfg(test)]
 pub(crate) struct Barrier {
     parties: usize,
+    #[cfg(target_os = "macos")]
     arrived: core::sync::atomic::AtomicUsize,
+    #[cfg(target_os = "macos")]
     generation: core::sync::atomic::AtomicUsize,
+    /// Threads arrived in the current generation, and the generation.
+    #[cfg(target_os = "linux")]
+    state: std::sync::Mutex<(usize, usize)>,
+    #[cfg(target_os = "linux")]
+    released: std::sync::Condvar,
 }
 
 #[cfg(test)]
@@ -221,12 +231,19 @@ impl Barrier {
     pub(crate) const fn new(parties: usize) -> Self {
         Self {
             parties,
+            #[cfg(target_os = "macos")]
             arrived: core::sync::atomic::AtomicUsize::new(0),
+            #[cfg(target_os = "macos")]
             generation: core::sync::atomic::AtomicUsize::new(0),
+            #[cfg(target_os = "linux")]
+            state: std::sync::Mutex::new((0, 0)),
+            #[cfg(target_os = "linux")]
+            released: std::sync::Condvar::new(),
         }
     }
 
     /// Blocks until `parties` threads have called `wait` for this generation.
+    #[cfg(target_os = "macos")]
     pub(crate) fn wait(&self) {
         use core::sync::atomic::Ordering;
         let generation = self.generation.load(Ordering::Acquire);
@@ -238,6 +255,28 @@ impl Barrier {
         }
         while self.generation.load(Ordering::Acquire) == generation {
             std::thread::yield_now();
+        }
+    }
+
+    /// Blocks until `parties` threads have called `wait` for this generation.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn wait(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let generation = state.1;
+        state.0 += 1;
+        if state.0 == self.parties {
+            *state = (0, generation.wrapping_add(1));
+            self.released.notify_all();
+            return;
+        }
+        while state.1 == generation {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(|poison| poison.into_inner());
         }
     }
 }

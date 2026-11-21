@@ -1390,7 +1390,7 @@ fn scope_expressions_retained(
 #[allow(clippy::type_complexity)]
 fn reader_grouping<'a>(
     statement: &'a Select<'a>,
-    columns: &CatalogScopeCols<'_, 'a, '_, '_>,
+    columns: &CatalogScopeCols<'_, 'a, '_, 'a>,
     catalog: &dyn super::super::eval::CatalogAccess,
     groups_itself: bool,
     arena: &'a Arena,

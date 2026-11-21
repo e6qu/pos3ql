@@ -315,3 +315,47 @@ fn row_capacity_wait_honors_statement_timeout() {
     drop(engine);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
+
+#[test]
+fn partition_routed_write_waits_for_checkpoint_to_free_overlay_slots() {
+    let (mut engine, mut budget, config) = durable_fixture("cache-space-partition", Some(64));
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE routed(id integer, k integer) PARTITION BY RANGE (id); \
+         CREATE TABLE routed_a PARTITION OF routed FOR VALUES FROM (0) TO (50); \
+         CREATE TABLE routed_b PARTITION OF routed FOR VALUES FROM (50) TO (100); \
+         CREATE INDEX ON routed (k); \
+         INSERT INTO routed SELECT i, i % 7 FROM generate_series(0, 39) AS g(i)",
+        false,
+    );
+    engine.enable_async_block_reads();
+    // Rows routed to either partition wait for the checkpoint that saves the
+    // committed rows, as a plain table's write does.
+    let insert = "INSERT INTO routed SELECT i, i % 7 FROM generate_series(40, 79) AS g(i)";
+    assert!(matches!(
+        run(&mut engine, &mut session, insert),
+        ExecutionStatus::Blocked {
+            wait: StatementWait::CacheCapacity,
+            ..
+        }
+    ));
+    assert!(
+        beat_until_complete(&mut engine, &mut session, insert, 4096).is_some(),
+        "the routed waiter did not resume after checkpoint cleanup"
+    );
+    assert!(
+        !message_types(session.send.readable()).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(session.send.readable())
+    );
+    let rows = session.success(
+        &mut engine,
+        "SELECT count(*), sum(id) FROM routed WHERE k = 3",
+        false,
+    );
+    assert_eq!(data_rows(&rows), ["11|418"]);
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}

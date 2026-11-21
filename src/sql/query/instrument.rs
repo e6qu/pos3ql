@@ -777,25 +777,32 @@ impl SortTuples {
         positions: &mut [usize],
         compare: SortCompare<'_>,
     ) -> Result<usize, crate::sql::SqlError> {
-        use super::postgres_memory::{SortTuples as Copies, allocset_chunk_space, maxalign};
-        let copies = self.copies((count > 0).then(|| row_at(0)));
-        let charge = |length: usize| match copies {
-            Copies::Datum => 0,
-            Copies::Bump => maxalign(length),
-            Copies::AllocSet => allocset_chunk_space(length),
-        };
-        let length = |row: usize| {
-            source
-                .with(|sizing| self.length(Some(sizing), row_at(row)))
-                .unwrap_or(0)
-        };
         super::postgres_memory::bounded_heap_charge(
             count,
             heapify_at,
-            |row| charge(length(row)),
+            |row| self.chunk(source, row_at(0), row_at(row)),
             positions,
             |new, worst| Ok(compare(row_at(new), row_at(worst))?.is_lt()),
         )
+    }
+
+    /// What a bounded sort's copy of `row` charges (`bounded_heap_charge`'s
+    /// chunk); `first` is the first row the sort read.
+    pub(crate) fn chunk(
+        &self,
+        source: super::postgres_memory::SizeSource<'_>,
+        first: &[u8],
+        row: &[u8],
+    ) -> usize {
+        use super::postgres_memory::{SortTuples as Copies, allocset_chunk_space, maxalign};
+        let length = source
+            .with(|sizing| self.length(Some(sizing), row))
+            .unwrap_or(0);
+        match self.copies(Some(first)) {
+            Copies::Datum => 0,
+            Copies::Bump => maxalign(length),
+            Copies::AllocSet => allocset_chunk_space(length),
+        }
     }
 
     /// What PostgreSQL's sort of `count` rows (`row_at`, in arrival order)
@@ -1810,6 +1817,19 @@ pub(crate) fn held_heap<R>(
     Ok(result)
 }
 
+/// The leading heap pages of the table in `slot` its visibility map marks
+/// all-visible: the pages VACUUM set that no later change touched. Only
+/// VACUUM sets the map, so where the rows live never changes it.
+pub(crate) fn all_visible_pages(storage: &crate::storage::Storage, slot: usize, txid: u32) -> u64 {
+    if storage.relation_cumulative_statistics(slot).n_dead_tup != 0 {
+        return 0;
+    }
+    storage
+        .table_statistics(slot, txid)
+        .relation_all_visible_pages()
+        .max(0) as u64
+}
+
 /// The heap page map of the table in `slot` (see [`held_heap`]).
 pub(crate) fn heap_pages<'a>(
     storage: &crate::storage::Storage,
@@ -2312,6 +2332,13 @@ impl Node {
     /// Counts a row the node's `Filter` removed.
     pub(crate) fn filtered(self) {
         self.with(|slot, _| slot.counters.filtered = slot.counters.filtered.saturating_add(1));
+    }
+
+    /// Counts `count` rows the node's `Filter` removed.
+    pub(crate) fn add_filtered(self, count: u64) {
+        self.with(|slot, _| {
+            slot.counters.filtered = slot.counters.filtered.saturating_add(count);
+        });
     }
 
     /// Counts a row the node's `Join Filter` removed.

@@ -10468,6 +10468,16 @@ impl Engine {
         Ok(total_rows)
     }
 
+    /// A partitioned table has no storage: VACUUM processes its partitions
+    /// and leaves its own counts and statistics as they were.
+    fn vacuums_storage(&self, slot: usize, txid: u32) -> bool {
+        !self
+            .storage
+            .table_def(slot, txid)
+            .partition
+            .is_partitioned()
+    }
+
     fn record_vacuum_targets(
         &mut self,
         targets: &[ast::MaintenanceTarget<'_>],
@@ -10480,6 +10490,7 @@ impl Engine {
                 if self.storage.table_slot_visible_to(slot, txid)
                     && self.storage.relation_visible_to_current_session(slot, txid)
                     && self.maintenance_permitted(slot, txid)
+                    && self.vacuums_storage(slot, txid)
                 {
                     self.work.reset();
                     if full {
@@ -10504,6 +10515,7 @@ impl Engine {
                         || (target.inheritance == ast::RelationInheritance::Descendants
                             && self.storage.relation_descends_from(slot, root, txid)))
                     && self.maintenance_permitted(slot, txid)
+                    && self.vacuums_storage(slot, txid)
                 {
                     self.work.reset();
                     if full {

@@ -15,7 +15,10 @@ use crate::sql::eval::SqlError;
 use crate::sql::eval::sqlstate;
 use crate::sql::guc::PrngState;
 
-use super::{MAX_JOIN_RELS, Relids, Search};
+use crate::mem::budget::{Budget, BudgetError};
+use crate::mem::fixed_vec::FixedVec;
+
+use super::{Relids, Search};
 
 /// `Gene`: a relation's 1-based position among the problem's initial
 /// relations.
@@ -25,8 +28,6 @@ type Gene = i32;
 /// (`50 * geqo_effort` at `geqo_effort = 10`). A larger `geqo_pool_size`
 /// fails with a named error.
 pub(crate) const MAX_POOL: usize = 500;
-/// Genes of one chromosome, with `alloc_chromo`'s spare.
-const STRING: usize = MAX_JOIN_RELS + 1;
 
 /// `Chromosome`: a pool slot's string and its fitness (`worth`).
 #[derive(Clone, Copy)]
@@ -43,35 +44,90 @@ struct Edge {
     unused_edges: i32,
 }
 
-/// The pool's strings, the two parents' and the edge table, sized for
-/// [`MAX_POOL`] individuals of [`MAX_JOIN_RELS`] relations and reserved
-/// with the process image.
+// SAFETY: an edge is integers only, so all zeros is a valid, empty edge.
+unsafe impl crate::mem::fixed_vec::Zeroable for Edge {}
+
+#[cfg(test)]
+const NO_EDGE: Edge = Edge {
+    edge_list: [0; 4],
+    total_edges: 0,
+    unused_edges: 0,
+};
+
+/// The join search's startup reservation: the most relations one query
+/// plans (`max_join_relations`) and the genetic search's pool, sized for
+/// [`MAX_POOL`] individuals of that many relations. One genetic search
+/// uses the pool at a time.
+pub(crate) struct JoinSearchPool {
+    max_relations: usize,
+    memory: Mutex<PoolMemory>,
+}
+
+/// The pool's strings (each `stride` genes, with `alloc_chromo`'s spare),
+/// the two parents' after them, and the edge table.
 struct PoolMemory {
-    strings: [[Gene; STRING]; MAX_POOL + 2],
+    stride: usize,
+    strings: FixedVec<Gene>,
     data: [Chromosome; MAX_POOL],
     order: [u32; MAX_POOL],
-    edges: [Edge; STRING],
+    edges: FixedVec<Edge>,
 }
 
 const MOMMA: usize = MAX_POOL;
 const DADDY: usize = MAX_POOL + 1;
 
-static POOL_MEMORY: Mutex<PoolMemory> = Mutex::new(PoolMemory {
-    strings: [[0; STRING]; MAX_POOL + 2],
-    data: [Chromosome {
-        string: 0,
-        worth: 0.0,
-    }; MAX_POOL],
-    order: [0; MAX_POOL],
-    edges: [Edge {
-        edge_list: [0; 4],
-        total_edges: 0,
-        unused_edges: 0,
-    }; STRING],
-});
+impl PoolMemory {
+    fn string(&self, at: usize) -> &[Gene] {
+        &self.strings[at * self.stride..(at + 1) * self.stride]
+    }
+
+    fn string_mut(&mut self, at: usize) -> &mut [Gene] {
+        &mut self.strings[at * self.stride..(at + 1) * self.stride]
+    }
+
+    /// Copies string `from` over string `to`.
+    fn copy_string(&mut self, from: usize, to: usize) {
+        let stride = self.stride;
+        self.strings
+            .copy_within(from * stride..(from + 1) * stride, to * stride);
+    }
+}
+
+impl JoinSearchPool {
+    /// Startup bytes of a pool for `max_relations` relations.
+    pub(crate) fn budget_bytes(max_relations: usize) -> usize {
+        let stride = max_relations + 1;
+        (MAX_POOL + 2) * stride * size_of::<Gene>() + stride * size_of::<Edge>() + size_of::<Self>()
+    }
+
+    pub(crate) fn new(budget: &mut Budget, max_relations: usize) -> Result<Self, BudgetError> {
+        budget.draw(size_of::<Self>(), "join search pool")?;
+        let stride = max_relations + 1;
+        let strings = FixedVec::zeroed(budget, "join search pool", (MAX_POOL + 2) * stride)?;
+        let edges = FixedVec::zeroed(budget, "join search pool", stride)?;
+        Ok(Self {
+            max_relations,
+            memory: Mutex::new(PoolMemory {
+                stride,
+                strings,
+                data: [Chromosome {
+                    string: 0,
+                    worth: 0.0,
+                }; MAX_POOL],
+                order: [0; MAX_POOL],
+                edges,
+            }),
+        })
+    }
+
+    /// `max_join_relations`.
+    pub(crate) fn max_relations(&self) -> usize {
+        self.max_relations
+    }
+}
 
 std::thread_local! {
-    /// This thread holds [`POOL_MEMORY`].
+    /// This thread holds its join search pool.
     static SEARCHING: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -153,23 +209,14 @@ struct Clump {
     size: usize,
 }
 
-/// `gimme_tree`'s clumps, larger ones first.
-struct Clumps {
-    items: [Clump; MAX_JOIN_RELS],
+/// `gimme_tree`'s clumps, larger ones first, in a slice of the search's
+/// work space.
+struct Clumps<'w> {
+    items: &'w mut [Clump],
     len: usize,
 }
 
-impl Clumps {
-    const fn new() -> Self {
-        Self {
-            items: [Clump {
-                rel: Relids::EMPTY,
-                size: 0,
-            }; MAX_JOIN_RELS],
-            len: 0,
-        }
-    }
-
+impl Clumps<'_> {
     fn as_slice(&self) -> &[Clump] {
         &self.items[..self.len]
     }
@@ -226,11 +273,20 @@ impl Search<'_, '_, '_> {
             ));
         }
         let _searching = Searching::enter();
-        let mut guard = POOL_MEMORY
+        let length = number_of_rels;
+        let arena = self.arena;
+        let work = super::arena_slice(arena, 2 * length, |_| Clump {
+            rel: Relids::EMPTY,
+            size: 0,
+        })?;
+        let tour = super::arena_slice(arena, length, |_| 0)?;
+        let mut guard = self
+            .problem
+            .pool
+            .memory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let memory = &mut *guard;
-        let length = number_of_rels;
         for (at, chromosome) in memory.data[..pool_size].iter_mut().enumerate() {
             chromosome.string = at;
         }
@@ -239,8 +295,8 @@ impl Search<'_, '_, '_> {
         let mut bad = 0;
         while at < pool_size {
             let string = memory.data[at].string;
-            init_tour(&mut random, &mut memory.strings[string][..length]);
-            let worth = self.geqo_eval(&memory.strings[string][..length])?;
+            init_tour(&mut random, &mut memory.string_mut(string)[..length]);
+            let worth = self.geqo_eval(&memory.string(string)[..length], work)?;
             if self.outside.is_some() {
                 return Ok(None);
             }
@@ -265,27 +321,25 @@ impl Search<'_, '_, '_> {
                 }
             }
             let (momma, daddy) = (memory.data[first], memory.data[second]);
-            memory.strings[MOMMA] = memory.strings[momma.string];
-            memory.strings[DADDY] = memory.strings[daddy.string];
+            memory.copy_string(momma.string, MOMMA);
+            memory.copy_string(daddy.string, DADDY);
             // Edge recombination: the kid is momma's string.
-            gimme_edge_table(
-                &memory.strings[MOMMA][..length],
-                &memory.strings[DADDY][..length],
-                &mut memory.edges,
-            );
+            let stride = memory.stride;
             let PoolMemory { strings, edges, .. } = memory;
-            gimme_tour(&mut random, edges, &mut strings[MOMMA][..length])?;
-            let worth = self.geqo_eval(&memory.strings[MOMMA][..length])?;
+            let (_, parents) = strings.split_at_mut(MOMMA * stride);
+            let (momma_string, daddy_string) = parents.split_at_mut(stride);
+            gimme_edge_table(&momma_string[..length], &daddy_string[..length], edges);
+            gimme_tour(&mut random, edges, &mut momma_string[..length])?;
+            let worth = self.geqo_eval(&memory.string(MOMMA)[..length], work)?;
             if self.outside.is_some() {
                 return Ok(None);
             }
             spread_chromo(memory, pool_size, length, worth);
         }
         let best = memory.data[0].string;
-        let mut tour = [0; STRING];
-        tour[..length].copy_from_slice(&memory.strings[best][..length]);
+        tour.copy_from_slice(&memory.string(best)[..length]);
         drop(guard);
-        let best = self.gimme_tree(&tour[..length])?;
+        let best = self.gimme_tree(tour, work)?;
         if self.outside.is_some() {
             return Ok(None);
         }
@@ -295,9 +349,9 @@ impl Search<'_, '_, '_> {
     /// `geqo_eval`: the cost of `tour`'s cheapest plan, `f64::MAX` when it
     /// joins nothing legal; the relations and paths it built are dropped
     /// (its memory context), the clauses it derived kept.
-    fn geqo_eval(&mut self, tour: &[Gene]) -> Result<f64, SqlError> {
+    fn geqo_eval(&mut self, tour: &[Gene], work: &mut [Clump]) -> Result<f64, SqlError> {
         let saved = self.save_joins();
-        let joinrel = self.gimme_tree(tour)?;
+        let joinrel = self.gimme_tree(tour, work)?;
         let fitness = match joinrel {
             Some(relids) if self.outside.is_none() => {
                 self.path(self.rel(relids).cheapest_total).total
@@ -311,8 +365,16 @@ impl Search<'_, '_, '_> {
     /// `gimme_tree`: joins the tour's relations in its order, postponing
     /// joins without a join clause or order restriction, then forces the
     /// remaining clumps together.
-    fn gimme_tree(&mut self, tour: &[Gene]) -> Result<Option<Relids>, SqlError> {
-        let mut clumps = Clumps::new();
+    fn gimme_tree(
+        &mut self,
+        tour: &[Gene],
+        work: &mut [Clump],
+    ) -> Result<Option<Relids>, SqlError> {
+        let (first, second) = work.split_at_mut(tour.len());
+        let mut clumps = Clumps {
+            items: first,
+            len: 0,
+        };
         for &gene in tour {
             let rel = self.levels[1].borrowed_slice()[gene as usize - 1];
             self.merge_clump(&mut clumps, Clump { rel, size: 1 }, false)?;
@@ -321,7 +383,10 @@ impl Search<'_, '_, '_> {
             }
         }
         if clumps.len > 1 {
-            let mut forced = Clumps::new();
+            let mut forced = Clumps {
+                items: second,
+                len: 0,
+            };
             for &clump in clumps.as_slice() {
                 self.merge_clump(&mut forced, clump, true)?;
                 if self.outside.is_some() {
@@ -336,7 +401,7 @@ impl Search<'_, '_, '_> {
     /// `merge_clump`.
     fn merge_clump(
         &mut self,
-        clumps: &mut Clumps,
+        clumps: &mut Clumps<'_>,
         mut new: Clump,
         force: bool,
     ) -> Result<(), SqlError> {
@@ -465,8 +530,10 @@ fn spread_chromo(memory: &mut PoolMemory, pool_size: usize, length: usize, worth
         }
     };
     let worst = data[pool_size - 1].string;
-    let momma = memory.strings[MOMMA];
-    memory.strings[worst][..length].copy_from_slice(&momma[..length]);
+    let stride = memory.stride;
+    memory
+        .strings
+        .copy_within(MOMMA * stride..MOMMA * stride + length, worst * stride);
     let data = &mut memory.data[..pool_size];
     data[pool_size - 1].worth = worth;
     let mut swap = data[pool_size - 1];
@@ -477,7 +544,7 @@ fn spread_chromo(memory: &mut PoolMemory, pool_size: usize, length: usize, worth
 
 /// `gimme_edge_table`: the edges of both parents' circular tours, an edge
 /// both share stored negated.
-fn gimme_edge_table(tour1: &[Gene], tour2: &[Gene], edges: &mut [Edge; STRING]) {
+fn gimme_edge_table(tour1: &[Gene], tour2: &[Gene], edges: &mut [Edge]) {
     let num_gene = tour1.len();
     for edge in &mut edges[1..=num_gene] {
         edge.total_edges = 0;
@@ -493,7 +560,7 @@ fn gimme_edge_table(tour1: &[Gene], tour2: &[Gene], edges: &mut [Edge; STRING]) 
 }
 
 /// `gimme_edge`.
-fn gimme_edge(gene1: Gene, gene2: Gene, edges: &mut [Edge; STRING]) {
+fn gimme_edge(gene1: Gene, gene2: Gene, edges: &mut [Edge]) {
     let (city1, city2) = (gene1 as usize, gene2);
     let entry = &mut edges[city1];
     let count = entry.total_edges as usize;
@@ -511,7 +578,7 @@ fn gimme_edge(gene1: Gene, gene2: Gene, edges: &mut [Edge; STRING]) {
 /// `gimme_tour`: a new tour from the edge table, shared edges first.
 fn gimme_tour(
     random: &mut Random,
-    edges: &mut [Edge; STRING],
+    edges: &mut [Edge],
     new_gene: &mut [Gene],
 ) -> Result<(), SqlError> {
     let num_gene = new_gene.len();
@@ -530,7 +597,7 @@ fn gimme_tour(
 }
 
 /// `remove_gene`: drops `gene` from the edge lists of its neighbors.
-fn remove_gene(gene: Gene, edge: Edge, edges: &mut [Edge; STRING]) {
+fn remove_gene(gene: Gene, edge: Edge, edges: &mut [Edge]) {
     for &listed in &edge.edge_list[..edge.unused_edges.max(0) as usize] {
         let possess_edge = listed.unsigned_abs() as usize;
         let genes_remaining = edges[possess_edge].unused_edges.max(0) as usize;
@@ -547,7 +614,7 @@ fn remove_gene(gene: Gene, edge: Edge, edges: &mut [Edge; STRING]) {
 
 /// `gimme_gene`: a shared edge, else a random one among the neighbors
 /// with the fewest unused edges.
-fn gimme_gene(random: &mut Random, edge: Edge, edges: &[Edge; STRING]) -> Result<Gene, SqlError> {
+fn gimme_gene(random: &mut Random, edge: Edge, edges: &[Edge]) -> Result<Gene, SqlError> {
     let mut minimum_edges = 5;
     let mut minimum_count = -1;
     let used = edge.unused_edges.max(0) as usize;
@@ -584,7 +651,7 @@ fn edge_failure(
     random: &mut Random,
     gene: &[Gene],
     index: usize,
-    edges: &[Edge; STRING],
+    edges: &[Edge],
 ) -> Result<Gene, SqlError> {
     let num_gene = gene.len();
     let fail_gene = gene[index];
@@ -656,11 +723,7 @@ mod tests {
     #[test]
     fn edge_recombination_yields_a_permutation() {
         let mut random = Random(PrngState::seeded(0.0));
-        let mut edges = [Edge {
-            edge_list: [0; 4],
-            total_edges: 0,
-            unused_edges: 0,
-        }; STRING];
+        let mut edges = [NO_EDGE; 21];
         let (mut one, mut two) = ([0; 20], [0; 20]);
         init_tour(&mut random, &mut one);
         init_tour(&mut random, &mut two);

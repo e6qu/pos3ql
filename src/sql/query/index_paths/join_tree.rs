@@ -14,23 +14,26 @@
 
 use super::joins::Outside;
 use super::joins::{
-    BASE_RELIDS, CloneKind, EquivalenceClass, MAX_JOIN_RELS, MAX_MEMBERS, Member, OJ_SHIFT, Relids,
-    SpecialJoin, SpecialKind, Subproblem,
+    BASE_RELIDS, CloneKind, EquivalenceClass, MAX_MEMBERS, Member, OJ_SHIFT, Relids, SpecialJoin,
+    SpecialKind, Subproblem,
 };
 use crate::mem::arena::{Arena, ArenaList};
 
-/// Quals of one query the preparation holds: two per relation, as a
-/// chain of `USING` joins on two columns has.
-pub(crate) const MAX_QUALS: usize = 2 * MAX_JOIN_RELS;
-/// Nodes of one join tree, numbered by `u8`.
-pub(crate) const MAX_NODES: usize = 256;
+/// Quals one query's preparation holds per relation of `max_join_relations`:
+/// two, as a chain of `USING` joins on two columns has.
+pub(crate) const QUALS_PER_RELATION: usize = 2;
+/// A join tree node's number. A tree of `n` relations has at most `3 n + 2`
+/// nodes: the relations, a join per written join, and a `FROM` list per
+/// parenthesized join and at the top.
+pub(crate) type NodeId = u16;
+/// A join domain's number (`JoinDomain`): the query's, one per left or anti
+/// join, and three per full join.
+type DomainId = u16;
 /// Columns a qual's strictness names.
 pub(crate) const MAX_QUAL_VARS: usize = 8;
 /// Equivalence classes of one query: a pathkey names its class in six
 /// bits ([`super::joins::KEY_CLASS`]).
 pub(crate) const MAX_CLASSES: usize = super::joins::KEY_CLASS as usize + 1;
-/// Outer, semi and anti joins of one query.
-pub(crate) const MAX_SPECIALS: usize = MAX_JOIN_RELS;
 /// A qual's number among its query's quals.
 pub(crate) type QualId = u16;
 /// No qual: a column a class needs.
@@ -120,13 +123,13 @@ pub(crate) enum TreeNode {
     Rel(u8),
     /// `children[first..first + count]`.
     From {
-        first: u8,
-        count: u8,
+        first: NodeId,
+        count: NodeId,
     },
     Join {
         kind: TreeJoin,
-        left: u8,
-        right: u8,
+        left: NodeId,
+        right: NodeId,
         /// Its order among the written outer joins (the join's range
         /// table entry), or `None` for an inner or semi join.
         rtindex: Option<u8>,
@@ -135,14 +138,16 @@ pub(crate) enum TreeNode {
 
 /// The written join tree and its quals, each attached to the node whose
 /// `ON` or `WHERE` holds it.
-pub(crate) struct Tree {
-    pub(crate) nodes: [TreeNode; MAX_NODES],
+pub(crate) struct Tree<'a> {
+    pub(crate) nodes: &'a mut [TreeNode],
     pub(crate) node_count: usize,
-    pub(crate) children: [u8; MAX_NODES],
+    pub(crate) children: &'a mut [NodeId],
     pub(crate) child_count: usize,
-    pub(crate) root: u8,
-    pub(crate) quals: [Qual; MAX_QUALS],
-    pub(crate) qual_node: [u8; MAX_QUALS],
+    pub(crate) root: NodeId,
+    /// Its quals, up to [`QUALS_PER_RELATION`] per relation of
+    /// `max_join_relations`.
+    pub(crate) quals: &'a mut [Qual],
+    pub(crate) qual_node: &'a mut [NodeId],
     pub(crate) qual_count: usize,
     /// Base relations.
     pub(crate) rels: usize,
@@ -162,23 +167,29 @@ pub(crate) struct Tree {
     pub(crate) expression_parts: [Option<(Var, Var)>; super::joins::MAX_JOIN_EXPRESSIONS],
 }
 
-impl Tree {
-    pub(crate) fn new(rels: usize) -> Self {
-        Self {
-            nodes: [TreeNode::Rel(0); MAX_NODES],
+impl<'a> Tree<'a> {
+    /// The tree of a query of `rels` relations, within the preparation's
+    /// capacity for `max_relations` (`max_join_relations`), in `arena`.
+    pub(crate) fn new(rels: usize, max_relations: usize, arena: &'a Arena) -> Option<Self> {
+        let nodes = 3 * rels + 2;
+        let quals = QUALS_PER_RELATION * max_relations;
+        Some(Self {
+            nodes: arena.alloc_slice_with(nodes, |_| TreeNode::Rel(0)).ok()?,
             node_count: 0,
-            children: [0; MAX_NODES],
+            children: arena.alloc_slice_with(nodes, |_| 0).ok()?,
             child_count: 0,
             root: 0,
-            quals: [Qual {
-                rels: Relids::EMPTY,
-                vars: VarList::default(),
-                nonnullable: Relids::EMPTY,
-                strict_vars: VarList::default(),
-                forced_null: None,
-                shape: Shape::Other,
-            }; MAX_QUALS],
-            qual_node: [0; MAX_QUALS],
+            quals: arena
+                .alloc_slice_with(quals, |_| Qual {
+                    rels: Relids::EMPTY,
+                    vars: VarList::default(),
+                    nonnullable: Relids::EMPTY,
+                    strict_vars: VarList::default(),
+                    forced_null: None,
+                    shape: Shape::Other,
+                })
+                .ok()?,
+            qual_node: arena.alloc_slice_with(quals, |_| 0).ok()?,
             qual_count: 0,
             rels,
             enable_hashagg: true,
@@ -186,32 +197,34 @@ impl Tree {
             join_collapse_limit: 8,
             expression_vars: [VarList::default(); super::joins::MAX_JOIN_EXPRESSIONS],
             expression_parts: [None; super::joins::MAX_JOIN_EXPRESSIONS],
-        }
+        })
     }
+}
 
+impl Tree<'_> {
     /// Adds a node, returning its number.
-    pub(crate) fn node(&mut self, node: TreeNode) -> Option<u8> {
+    pub(crate) fn node(&mut self, node: TreeNode) -> Option<NodeId> {
         let at = self.node_count;
         *self.nodes.get_mut(at)? = node;
         self.node_count += 1;
-        Some(at as u8)
+        Some(at as NodeId)
     }
 
     /// A `FROM` list of `items`.
-    pub(crate) fn list_of(&mut self, items: &[u8]) -> Option<u8> {
+    pub(crate) fn list_of(&mut self, items: &[NodeId]) -> Option<NodeId> {
         let first = self.child_count;
         for &item in items {
             *self.children.get_mut(self.child_count)? = item;
             self.child_count += 1;
         }
         self.node(TreeNode::From {
-            first: first as u8,
-            count: items.len() as u8,
+            first: first as NodeId,
+            count: items.len() as NodeId,
         })
     }
 
     /// Attaches `qual` to `node`.
-    pub(crate) fn qual(&mut self, node: u8, qual: Qual) -> Option<QualId> {
+    pub(crate) fn qual(&mut self, node: NodeId, qual: Qual) -> Option<QualId> {
         let at = self.qual_count;
         *self.quals.get_mut(at)? = qual;
         self.qual_node[at] = node;
@@ -219,19 +232,19 @@ impl Tree {
         Some(at as QualId)
     }
 
-    fn items(&self, first: u8, count: u8) -> &[u8] {
+    fn items(&self, first: NodeId, count: NodeId) -> &[NodeId] {
         &self.children[usize::from(first)..usize::from(first) + usize::from(count)]
     }
 
     /// The quals attached to `node`, in order.
-    fn quals_of(&self, node: u8) -> impl Iterator<Item = QualId> + '_ {
+    fn quals_of(&self, node: NodeId) -> impl Iterator<Item = QualId> + '_ {
         (0..self.qual_count)
             .filter(move |&at| self.qual_node[at] == node)
             .map(|at| at as QualId)
     }
 
     /// The base relations under `node`.
-    fn base_rels(&self, node: u8) -> Relids {
+    fn base_rels(&self, node: NodeId) -> Relids {
         match self.nodes[usize::from(node)] {
             TreeNode::Rel(rel) => Relids::of(rel),
             TreeNode::From { first, count } => self
@@ -242,7 +255,7 @@ impl Tree {
         }
     }
 
-    fn contains_outer(&self, node: u8) -> bool {
+    fn contains_outer(&self, node: NodeId) -> bool {
         match self.nodes[usize::from(node)] {
             TreeNode::Rel(_) => false,
             TreeNode::From { first, count } => self
@@ -258,6 +271,10 @@ impl Tree {
 
 /// Where a qual went (`RestrictInfo` placement).
 #[derive(Clone, Copy, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "held by value in arena slices, never boxed; a join qual carries relation sets"
+)]
 pub(crate) enum Placed {
     /// A restriction of one relation's scan (`baserestrictinfo`).
     Restriction { rel: u8, qual: QualId },
@@ -292,12 +309,11 @@ pub(crate) struct JoinQual {
 
 /// The prepared problem.
 pub(crate) struct Prepared<'a> {
-    pub(crate) specials: [SpecialJoin; MAX_SPECIALS],
+    arena: &'a Arena,
+    pub(crate) specials: &'a mut [SpecialJoin],
     pub(crate) special_count: usize,
-    pub(crate) subproblems: [Subproblem; MAX_JOIN_RELS],
-    pub(crate) subproblem_count: usize,
-    pub(crate) subproblem_items: [Relids; 2 * MAX_JOIN_RELS],
-    pub(crate) subproblem_item_count: usize,
+    pub(crate) subproblems: ArenaList<'a, Subproblem>,
+    pub(crate) subproblem_items: ArenaList<'a, Relids>,
     pub(crate) classes: [EquivalenceClass<'a>; MAX_CLASSES],
     pub(crate) class_count: usize,
     /// Each class's constant, by the qual that equated it.
@@ -343,7 +359,7 @@ impl<'a> Prepared<'a> {
             return Err("a removable join's relation in an equivalence class");
         }
         let mut kept = 0;
-        let mut dropped_quals = [false; MAX_QUALS + 1];
+        let mut dropped_quals = ArenaList::new(self.arena);
         let placed = self.placed.as_mut_slice().map_err(|_| ARENA)?;
         for index in 0..placed.len() {
             let mut entry = placed[index];
@@ -366,7 +382,7 @@ impl<'a> Prepared<'a> {
                         || !(join.pushed_down
                             || join.required & !join_plus_commute != Relids::EMPTY)
                     {
-                        dropped_quals[usize::from(join.qual)] = true;
+                        dropped_quals.push(join.qual).map_err(|_| ARENA)?;
                         false
                     } else {
                         join.relids &= !gone;
@@ -392,7 +408,7 @@ impl<'a> Prepared<'a> {
             }
             // A column only a dropped clause read stays in its relation's
             // target list (`reltarget` is not rebuilt), needed by no join.
-            let relids = if qual != NO_QUAL && dropped_quals[usize::from(qual)] {
+            let relids = if qual != NO_QUAL && dropped_quals.borrowed_slice().contains(&qual) {
                 Relids::of(var.0)
             } else {
                 relids & !gone
@@ -420,12 +436,13 @@ impl<'a> Prepared<'a> {
             }
         }
         let mut kept = 0;
-        for problem in &mut self.subproblems[..self.subproblem_count] {
+        let items = self.subproblem_items.as_mut_slice().map_err(|_| ARENA)?;
+        for problem in self.subproblems.as_mut_slice().map_err(|_| ARENA)? {
             let first = kept;
             for index in usize::from(problem.first)..usize::from(problem.first + problem.count) {
-                let item = self.subproblem_items[index] & !gone;
+                let item = items[index] & !gone;
                 if !item.is_empty() {
-                    self.subproblem_items[kept] = item;
+                    items[kept] = item;
                     kept += 1;
                 }
             }
@@ -434,7 +451,7 @@ impl<'a> Prepared<'a> {
                 count: (kept - first) as u16,
             };
         }
-        self.subproblem_item_count = kept;
+        self.subproblem_items.truncate(kept);
         Ok(())
     }
 
@@ -630,14 +647,15 @@ impl<'a> Prepared<'a> {
         self.false_relids = rename_relids(self.false_relids);
         // `remove_rel_from_joinlist`.
         let mut kept_items = 0;
-        for problem in &mut self.subproblems[..self.subproblem_count] {
+        let items = self.subproblem_items.as_mut_slice().map_err(|_| ARENA)?;
+        for problem in self.subproblems.as_mut_slice().map_err(|_| ARENA)? {
             let first = kept_items;
             for index in usize::from(problem.first)..usize::from(problem.first + problem.count) {
-                let item = self.subproblem_items[index];
+                let item = items[index];
                 if item == gone {
                     continue;
                 }
-                self.subproblem_items[kept_items] = rename_relids(item);
+                items[kept_items] = rename_relids(item);
                 kept_items += 1;
             }
             *problem = Subproblem {
@@ -645,7 +663,7 @@ impl<'a> Prepared<'a> {
                 count: (kept_items - first) as u16,
             };
         }
-        self.subproblem_item_count = kept_items;
+        self.subproblem_items.truncate(kept_items);
         Ok((restrictions, joins))
     }
 
@@ -677,7 +695,7 @@ struct BuildClass {
     has_const: bool,
     /// Its constant: the qual that equated it, the constant's identity
     /// and its join domain (`em_jdomain`).
-    constant: Option<(QualId, u16, u8)>,
+    constant: Option<(QualId, u16, DomainId)>,
     merged_into: Option<u8>,
     sources: u8,
     /// Whether `reconsider_outer_join_clauses` derived one of its
@@ -693,66 +711,71 @@ struct Pending {
 
 /// The state of one preparation.
 struct Prep<'t, 'a> {
-    tree: &'t Tree,
+    tree: &'t Tree<'t>,
     /// The classes' members, each class's in its own run.
+    arena: &'a Arena,
     member_pool: ArenaList<'a, Member>,
-    kinds: [Option<TreeJoin>; MAX_NODES],
+    /// Per node of the tree:
+    kinds: &'a mut [Option<TreeJoin>],
     /// Left and right children after `reduce_outer_joins` swapped a
     /// right join's.
-    sides: [(u8, u8); MAX_NODES],
+    sides: &'a mut [(NodeId, NodeId)],
     /// Each outer join node's bit.
-    oj: [Relids; MAX_NODES],
-    qualscope: [Relids; MAX_NODES],
-    inner_join_rels: [Relids; MAX_NODES],
-    left_rels: [Relids; MAX_NODES],
-    right_rels: [Relids; MAX_NODES],
-    nonnullable_rels: [Relids; MAX_NODES],
+    oj: &'a mut [Relids],
+    qualscope: &'a mut [Relids],
+    inner_join_rels: &'a mut [Relids],
+    left_rels: &'a mut [Relids],
+    right_rels: &'a mut [Relids],
+    nonnullable_rels: &'a mut [Relids],
     /// Each node's special join, by its position in `specials`.
-    special_of: [Option<u8>; MAX_NODES],
-    specials: [SpecialJoin; MAX_SPECIALS],
+    special_of: &'a mut [Option<u8>],
+    /// At most one per node.
+    specials: &'a mut [SpecialJoin],
     special_count: usize,
     /// The post-order list of nodes (`item_list`).
-    items: [u8; MAX_NODES],
+    items: &'a mut [NodeId],
     item_count: usize,
     /// Postponed quals of the left joins (`oj_joinclauses`), each with
-    /// its join's node, in order.
-    postponed: [(u8, QualId); MAX_QUALS],
+    /// its join's node, in order; at most one per qual.
+    postponed: &'a mut [(NodeId, QualId)],
     postponed_count: usize,
     classes: [BuildClass; MAX_CLASSES],
     class_count: usize,
     placed: ArenaList<'a, Placed>,
-    sources: [(QualId, u8); MAX_QUALS],
+    /// At most one per qual.
+    sources: &'a mut [(QualId, u8)],
     source_count: usize,
     needed: ArenaList<'a, (Var, Relids, QualId)>,
     left_join: ArenaList<'a, Pending>,
     right_join: ArenaList<'a, Pending>,
     full_join: ArenaList<'a, Pending>,
-    /// The `COALESCE(left, right) = constant` quals of the query's join
-    /// domain: the qual, its sides and its constant, with each one's
-    /// placement, which an ordinary filter of the joined rows takes when no
-    /// full join clause matches it.
     /// Each node's join domain (`JoinDomain`): the query's is 0.
-    domain: [u8; MAX_NODES],
-    domain_count: u8,
+    domain: &'a mut [DomainId],
+    domain_count: DomainId,
     /// The node each join domain holds the relations of (`jd_relids`):
     /// a left or anti join's nullable side, a full join's side; `None`
-    /// for the query's and a full join's quals' domain.
-    domain_root: [Option<u8>; MAX_NODES],
-    /// The join lists: each list's elements, a negative entry naming a
-    /// nested list by `-(index + 1)`.
-    lists: [[i16; MAX_JOIN_RELS]; MAX_NODES],
-    list_len: [u8; MAX_NODES],
-    list_count: usize,
+    /// for the query's and a full join's quals' domain. At most three
+    /// per node.
+    domain_root: &'a mut [Option<NodeId>],
+    /// The join lists, each a run of `elements`: a relation's number, or
+    /// a negative entry naming a nested list by `-(index + 1)`.
+    lists: ArenaList<'a, (u32, u16)>,
+    elements: ArenaList<'a, i16>,
+    /// The elements of the lists being collected, innermost last.
+    collecting: ArenaList<'a, i16>,
     contradictory: bool,
     false_relids: Relids,
 }
 
+/// A join list element naming nested list `list`.
+fn nested(list: usize) -> i16 {
+    -(list as i16 + 1)
+}
+
 /// The join problems `make_rel_from_joinlist` collects.
-struct Subproblems {
-    subproblems: [Subproblem; MAX_JOIN_RELS],
-    count: usize,
-    items: [Relids; 2 * MAX_JOIN_RELS],
-    item_count: usize,
+struct Subproblems<'a> {
+    subproblems: ArenaList<'a, Subproblem>,
+    items: ArenaList<'a, Relids>,
 }
 
 /// A capacity of the preparation exceeded; the caller reports it as a
@@ -763,40 +786,50 @@ pub(crate) const ARENA: Outside = "the statement arena exhausted";
 
 /// Prepares `tree` as `query_planner` does up to the join search, its
 /// lists in `arena`.
-pub(crate) fn prepare<'a>(tree: &Tree, arena: &'a Arena) -> Result<Prepared<'a>, Outside> {
+pub(crate) fn prepare<'a>(tree: &Tree<'_>, arena: &'a Arena) -> Result<Prepared<'a>, Outside> {
+    let nodes = tree.node_count;
+    let quals = tree.quals.len();
+    let slice = |len: usize, fill| arena.alloc_slice_with(len, |_| fill).map_err(|_| ARENA);
     let mut prep = Prep {
         tree,
+        arena,
         member_pool: ArenaList::new(arena),
-        kinds: [None; MAX_NODES],
-        sides: [(0, 0); MAX_NODES],
-        oj: [Relids::EMPTY; MAX_NODES],
-        qualscope: [Relids::EMPTY; MAX_NODES],
-        inner_join_rels: [Relids::EMPTY; MAX_NODES],
-        left_rels: [Relids::EMPTY; MAX_NODES],
-        right_rels: [Relids::EMPTY; MAX_NODES],
-        nonnullable_rels: [Relids::EMPTY; MAX_NODES],
-        special_of: [None; MAX_NODES],
-        specials: [SpecialJoin {
-            kind: SpecialKind::Left,
-            min_left: Relids::EMPTY,
-            min_right: Relids::EMPTY,
-            syn_left: Relids::EMPTY,
-            syn_right: Relids::EMPTY,
-            oj: Relids::EMPTY,
-            lhs_strict: false,
-            commute_above_l: Relids::EMPTY,
-            commute_above_r: Relids::EMPTY,
-            commute_below_l: Relids::EMPTY,
-            commute_below_r: Relids::EMPTY,
-            semi_rhs: [Member::plain(0, 0); super::joins::MAX_KEYS],
-            semi_count: 0,
-            semi_can_btree: false,
-            semi_can_hash: false,
-        }; MAX_SPECIALS],
+        kinds: arena.alloc_slice_with(nodes, |_| None).map_err(|_| ARENA)?,
+        sides: arena
+            .alloc_slice_with(nodes, |_| (0, 0))
+            .map_err(|_| ARENA)?,
+        oj: slice(nodes, Relids::EMPTY)?,
+        qualscope: slice(nodes, Relids::EMPTY)?,
+        inner_join_rels: slice(nodes, Relids::EMPTY)?,
+        left_rels: slice(nodes, Relids::EMPTY)?,
+        right_rels: slice(nodes, Relids::EMPTY)?,
+        nonnullable_rels: slice(nodes, Relids::EMPTY)?,
+        special_of: arena.alloc_slice_with(nodes, |_| None).map_err(|_| ARENA)?,
+        specials: arena
+            .alloc_slice_with(nodes, |_| SpecialJoin {
+                kind: SpecialKind::Left,
+                min_left: Relids::EMPTY,
+                min_right: Relids::EMPTY,
+                syn_left: Relids::EMPTY,
+                syn_right: Relids::EMPTY,
+                oj: Relids::EMPTY,
+                lhs_strict: false,
+                commute_above_l: Relids::EMPTY,
+                commute_above_r: Relids::EMPTY,
+                commute_below_l: Relids::EMPTY,
+                commute_below_r: Relids::EMPTY,
+                semi_rhs: [Member::plain(0, 0); super::joins::MAX_KEYS],
+                semi_count: 0,
+                semi_can_btree: false,
+                semi_can_hash: false,
+            })
+            .map_err(|_| ARENA)?,
         special_count: 0,
-        items: [0; MAX_NODES],
+        items: arena.alloc_slice_with(nodes, |_| 0).map_err(|_| ARENA)?,
         item_count: 0,
-        postponed: [(0, 0); MAX_QUALS],
+        postponed: arena
+            .alloc_slice_with(quals, |_| (0, 0))
+            .map_err(|_| ARENA)?,
         postponed_count: 0,
         classes: [BuildClass {
             members: BuildMembers {
@@ -812,18 +845,22 @@ pub(crate) fn prepare<'a>(tree: &Tree, arena: &'a Arena) -> Result<Prepared<'a>,
         }; MAX_CLASSES],
         class_count: 0,
         placed: ArenaList::new(arena),
-        sources: [(0, 0); MAX_QUALS],
+        sources: arena
+            .alloc_slice_with(quals, |_| (0, 0))
+            .map_err(|_| ARENA)?,
         source_count: 0,
         needed: ArenaList::new(arena),
         left_join: ArenaList::new(arena),
         right_join: ArenaList::new(arena),
         full_join: ArenaList::new(arena),
-        domain: [0; MAX_NODES],
+        domain: arena.alloc_slice_with(nodes, |_| 0).map_err(|_| ARENA)?,
         domain_count: 1,
-        domain_root: [None; MAX_NODES],
-        lists: [[0; MAX_JOIN_RELS]; MAX_NODES],
-        list_len: [0; MAX_NODES],
-        list_count: 0,
+        domain_root: arena
+            .alloc_slice_with(3 * nodes + 1, |_| None)
+            .map_err(|_| ARENA)?,
+        lists: ArenaList::new(arena),
+        elements: ArenaList::new(arena),
+        collecting: ArenaList::new(arena),
         contradictory: false,
         false_relids: Relids::EMPTY,
     };
@@ -837,12 +874,19 @@ pub(crate) fn prepare<'a>(tree: &Tree, arena: &'a Arena) -> Result<Prepared<'a>,
         }
     }
     prep.reduce_outer_joins(tree.root, Relids::EMPTY, VarList::default())?;
-    prep.number_outer_joins();
+    prep.number_outer_joins()?;
     prep.assign_domains(tree.root, 0);
     let top = prep.deconstruct_recurse(tree.root)?;
+    // Each relation's nulling outer joins where a qual is read.
+    let nulling = arena
+        .alloc_slice_with(tree.rels, |_| Relids::EMPTY)
+        .map_err(|_| ARENA)?;
+    let base_nulling = arena
+        .alloc_slice_with(tree.rels, |_| Relids::EMPTY)
+        .map_err(|_| ARENA)?;
     for at in 0..prep.item_count {
         let item = prep.items[at];
-        prep.distribute_node(item)?;
+        prep.distribute_node(item, nulling)?;
     }
     for at in 0..prep.item_count {
         let item = prep.items[at];
@@ -850,17 +894,15 @@ pub(crate) fn prepare<'a>(tree: &Tree, arena: &'a Arena) -> Result<Prepared<'a>,
             .iter()
             .any(|&(node, _)| node == item)
         {
-            prep.distribute_oj_quals(item)?;
+            prep.distribute_oj_quals(item, base_nulling, nulling)?;
         }
     }
     prep.reconsider_outer_join_clauses()?;
     prep.generate_base_implied_equalities()?;
     // `make_rel_from_joinlist`: each nested list's problem first.
     let mut problems = Subproblems {
-        subproblems: [Subproblem::default(); MAX_JOIN_RELS],
-        count: 0,
-        items: [Relids::EMPTY; 2 * MAX_JOIN_RELS],
-        item_count: 0,
+        subproblems: ArenaList::new(arena),
+        items: ArenaList::new(arena),
     };
     prep.make_rel_from_joinlist(top, &mut problems)?;
     // The classes in their final order.
@@ -901,12 +943,11 @@ pub(crate) fn prepare<'a>(tree: &Tree, arena: &'a Arena) -> Result<Prepared<'a>,
         }
     }
     Ok(Prepared {
+        arena,
         specials: prep.specials,
         special_count: prep.special_count,
         subproblems: problems.subproblems,
-        subproblem_count: problems.count,
         subproblem_items: problems.items,
-        subproblem_item_count: problems.item_count,
         classes,
         class_count,
         class_constant,
@@ -934,7 +975,7 @@ impl Prep<'_, '_> {
     /// `reduce_outer_joins_pass2`.
     fn reduce_outer_joins(
         &mut self,
-        node: u8,
+        node: NodeId,
         nonnullable: Relids,
         forced_null: VarList,
     ) -> Result<(), Outside> {
@@ -1051,7 +1092,7 @@ impl Prep<'_, '_> {
 
     /// Each node's join domain: a left or anti join's quals and nullable
     /// side form a domain, a full join's quals one and each side another.
-    fn assign_domains(&mut self, node: u8, domain: u8) {
+    fn assign_domains(&mut self, node: NodeId, domain: DomainId) {
         let at = usize::from(node);
         self.domain[at] = domain;
         match self.tree.nodes[at] {
@@ -1090,15 +1131,18 @@ impl Prep<'_, '_> {
         }
     }
 
-    fn next_domain(&mut self) -> u8 {
+    fn next_domain(&mut self) -> DomainId {
         self.domain_count += 1;
         self.domain_count - 1
     }
 
     /// Gives each join still outer its bit, in the order of the written
     /// joins' range table entries.
-    fn number_outer_joins(&mut self) {
-        let mut order = [(u8::MAX, 0u8); MAX_NODES];
+    fn number_outer_joins(&mut self) -> Result<(), Outside> {
+        let order = self
+            .arena
+            .alloc_slice_with(self.tree.node_count, |_| (u8::MAX, 0 as NodeId))
+            .map_err(|_| ARENA)?;
         let mut count = 0;
         for (at, node) in self.tree.nodes[..self.tree.node_count].iter().enumerate() {
             if let TreeNode::Join {
@@ -1110,7 +1154,7 @@ impl Prep<'_, '_> {
                     Some(TreeJoin::Left | TreeJoin::Full | TreeJoin::Anti)
                 )
             {
-                order[count] = (rtindex, at as u8);
+                order[count] = (rtindex, at as NodeId);
                 count += 1;
             }
         }
@@ -1118,26 +1162,52 @@ impl Prep<'_, '_> {
         for (bit, &(_, node)) in order[..count].iter().enumerate() {
             self.oj[usize::from(node)] = Relids::of(OJ_SHIFT + bit as u32);
         }
+        Ok(())
     }
 
-    fn push_list(&mut self, elements: &[i16]) -> Result<usize, Outside> {
-        let at = self.list_count;
-        if at == MAX_NODES || elements.len() > MAX_JOIN_RELS {
-            return Err(FULL);
+    /// Adds the list of the elements collected since `from`, returning its
+    /// number, and drops them from the collection.
+    fn push_collected(&mut self, from: usize) -> Result<usize, Outside> {
+        let at = self.lists.len();
+        let collected = &self.collecting.borrowed_slice()[from..];
+        let first = self.elements.len();
+        for &element in collected {
+            self.elements.push(element).map_err(|_| ARENA)?;
         }
-        self.lists[at][..elements.len()].copy_from_slice(elements);
-        self.list_len[at] = elements.len() as u8;
-        self.list_count += 1;
+        self.lists
+            .push((first as u32, collected.len() as u16))
+            .map_err(|_| ARENA)?;
+        self.collecting.truncate(from);
         Ok(at)
     }
 
+    /// Adds the list of `elements`, returning its number.
+    fn push_list(&mut self, elements: &[i16]) -> Result<usize, Outside> {
+        let from = self.collecting.len();
+        for &element in elements {
+            self.collecting.push(element).map_err(|_| ARENA)?;
+        }
+        self.push_collected(from)
+    }
+
+    /// Collects the elements of list `at`.
+    fn collect_list(&mut self, at: usize) -> Result<(), Outside> {
+        let (first, len) = self.lists.borrowed_slice()[at];
+        for index in first as usize..first as usize + usize::from(len) {
+            let element = self.elements.borrowed_slice()[index];
+            self.collecting.push(element).map_err(|_| ARENA)?;
+        }
+        Ok(())
+    }
+
     fn list(&self, at: usize) -> &[i16] {
-        &self.lists[at][..usize::from(self.list_len[at])]
+        let (first, len) = self.lists.borrowed_slice()[at];
+        &self.elements.borrowed_slice()[first as usize..first as usize + usize::from(len)]
     }
 
     /// `deconstruct_recurse`: each node's scopes, the post-order item list,
     /// and the node's join list, returned by its number.
-    fn deconstruct_recurse(&mut self, node: u8) -> Result<usize, Outside> {
+    fn deconstruct_recurse(&mut self, node: NodeId) -> Result<usize, Outside> {
         let at = usize::from(node);
         let tree = self.tree;
         let joinlist = match tree.nodes[at] {
@@ -1147,8 +1217,7 @@ impl Prep<'_, '_> {
             }
             TreeNode::From { first, count } => {
                 let limit = self.tree.from_collapse_limit;
-                let mut elements = [0i16; MAX_JOIN_RELS];
-                let mut len = 0;
+                let from = self.collecting.len();
                 let items = tree.items(first, count);
                 for (position, &item) in items.iter().enumerate() {
                     let sub = self.deconstruct_recurse(item)?;
@@ -1156,20 +1225,17 @@ impl Prep<'_, '_> {
                     self.inner_join_rels[at] = self.inner_join_rels[usize::from(item)];
                     let remaining = items.len() - position - 1;
                     let members = self.list(sub).len();
+                    let len = self.collecting.len() - from;
                     if members <= 1 || (len + members + remaining) as i64 <= limit {
-                        for &element in self.list(sub) {
-                            *elements.get_mut(len).ok_or(FULL)? = element;
-                            len += 1;
-                        }
+                        self.collect_list(sub)?;
                     } else {
-                        *elements.get_mut(len).ok_or(FULL)? = -(sub as i16 + 1);
-                        len += 1;
+                        self.collecting.push(nested(sub)).map_err(|_| ARENA)?;
                     }
                 }
                 if items.len() > 1 {
                     self.inner_join_rels[at] = self.qualscope[at];
                 }
-                self.push_list(&elements[..len])?
+                self.push_collected(from)?
             }
             TreeNode::Join { .. } => {
                 let kind = self.kinds[at].expect("a join");
@@ -1204,31 +1270,23 @@ impl Prep<'_, '_> {
                 }
                 let (left_len, right_len) =
                     (self.list(left_list).len(), self.list(right_list).len());
-                let nested = |list: usize| -(list as i16 + 1);
                 if kind == TreeJoin::Full {
                     let pair = self.push_list(&[nested(left_list), nested(right_list)])?;
                     self.push_list(&[nested(pair)])?
                 } else if (left_len + right_len) as i64 <= self.tree.join_collapse_limit {
-                    let mut elements = [0i16; MAX_JOIN_RELS];
-                    elements[..left_len].copy_from_slice(self.list(left_list));
-                    let right_elements = self.lists[right_list];
-                    elements[left_len..left_len + right_len]
-                        .copy_from_slice(&right_elements[..right_len]);
-                    self.push_list(&elements[..left_len + right_len])?
+                    let from = self.collecting.len();
+                    self.collect_list(left_list)?;
+                    self.collect_list(right_list)?;
+                    self.push_collected(from)?
                 } else {
                     // A side of one element joins as itself, not as a
                     // one-element sublist.
-                    let part = |list: usize, len: usize, lists: &[[i16; MAX_JOIN_RELS]]| {
-                        if len == 1 {
-                            lists[list][0]
-                        } else {
-                            nested(list)
-                        }
+                    let part = |list: &[i16], at: usize| {
+                        if list.len() == 1 { list[0] } else { nested(at) }
                     };
-                    self.push_list(&[
-                        part(left_list, left_len, &self.lists),
-                        part(right_list, right_len, &self.lists),
-                    ])?
+                    let left_part = part(self.list(left_list), left_list);
+                    let right_part = part(self.list(right_list), right_list);
+                    self.push_list(&[left_part, right_part])?
                 }
             }
         };
@@ -1242,10 +1300,13 @@ impl Prep<'_, '_> {
     fn make_rel_from_joinlist(
         &self,
         list: usize,
-        out: &mut Subproblems,
+        out: &mut Subproblems<'_>,
     ) -> Result<Relids, Outside> {
-        let mut items = [Relids::EMPTY; MAX_JOIN_RELS];
         let elements = self.list(list);
+        let items = self
+            .arena
+            .alloc_slice_with(elements.len(), |_| Relids::EMPTY)
+            .map_err(|_| ARENA)?;
         for (at, &element) in elements.iter().enumerate() {
             items[at] = if element >= 0 {
                 Relids::of(element as u8)
@@ -1253,21 +1314,19 @@ impl Prep<'_, '_> {
                 self.make_rel_from_joinlist((-element - 1) as usize, out)?
             };
         }
-        let items = &items[..elements.len()];
         if items.len() == 1 {
             return Ok(items[0]);
         }
-        let first = out.item_count;
-        out.items
-            .get_mut(first..first + items.len())
-            .ok_or(FULL)?
-            .copy_from_slice(items);
-        out.item_count += items.len();
-        *out.subproblems.get_mut(out.count).ok_or(FULL)? = Subproblem {
-            first: first as u16,
-            count: items.len() as u16,
-        };
-        out.count += 1;
+        let first = out.items.len();
+        for &item in items.iter() {
+            out.items.push(item).map_err(|_| ARENA)?;
+        }
+        out.subproblems
+            .push(Subproblem {
+                first: u16::try_from(first).map_err(|_| FULL)?,
+                count: items.len() as u16,
+            })
+            .map_err(|_| ARENA)?;
         Ok(items
             .iter()
             .fold(Relids::EMPTY, |relids, &item| relids | item))
@@ -1275,7 +1334,7 @@ impl Prep<'_, '_> {
 
     /// The outer joins below `node` nulling relation `rel`
     /// (`varnullingrels` of a column read at `node`).
-    fn nulling_below(&self, node: u8, rel: u8) -> Relids {
+    fn nulling_below(&self, node: NodeId, rel: u8) -> Relids {
         let at = usize::from(node);
         match self.tree.nodes[at] {
             TreeNode::Rel(_) => Relids::EMPTY,
@@ -1294,7 +1353,7 @@ impl Prep<'_, '_> {
     }
 
     /// The outer joins at or below `node` nulling relation `rel`.
-    fn nulling_below_item(&self, node: u8, rel: u8) -> Relids {
+    fn nulling_below_item(&self, node: NodeId, rel: u8) -> Relids {
         let at = usize::from(node);
         let below = self.nulling_below(node, rel);
         if !matches!(self.tree.nodes[at], TreeNode::Join { .. }) {
@@ -1314,24 +1373,20 @@ impl Prep<'_, '_> {
     }
 
     /// The nulling of each relation's columns in a qual read at `node`.
-    fn nulling_at(&self, node: u8) -> [Relids; MAX_JOIN_RELS] {
-        core::array::from_fn(|rel| {
-            if rel < self.tree.rels {
-                self.nulling_below(node, rel as u8)
-            } else {
-                Relids::EMPTY
-            }
-        })
+    fn nulling_at(&self, node: NodeId, out: &mut [Relids]) {
+        for (rel, nulling) in out.iter_mut().enumerate() {
+            *nulling = self.nulling_below(node, rel as u8);
+        }
     }
 
     /// `deconstruct_distribute`.
-    fn distribute_node(&mut self, node: u8) -> Result<(), Outside> {
+    fn distribute_node(&mut self, node: NodeId, nulling: &mut [Relids]) -> Result<(), Outside> {
         let at = usize::from(node);
         let tree = self.tree;
         match tree.nodes[at] {
             TreeNode::Rel(_) => Ok(()),
             TreeNode::From { .. } => {
-                let nulling = self.nulling_at(node);
+                self.nulling_at(node, nulling);
                 for qual in tree.quals_of(node) {
                     self.distribute_qual(
                         qual,
@@ -1351,11 +1406,11 @@ impl Prep<'_, '_> {
             }
             TreeNode::Join { .. } => {
                 let kind = self.kinds[at].expect("a join");
-                let nulling = self.nulling_at(node);
+                self.nulling_at(node, nulling);
                 let (special, mut ojscope) = if kind == TreeJoin::Inner {
                     (None, None)
                 } else {
-                    let special = self.make_outerjoininfo(node, kind, &nulling)?;
+                    let special = self.make_outerjoininfo(node, kind, nulling)?;
                     let info = self.specials[usize::from(special)];
                     let scope = if kind == TreeJoin::Semi {
                         None
@@ -1399,9 +1454,9 @@ impl Prep<'_, '_> {
     /// `make_outerjoininfo`.
     fn make_outerjoininfo(
         &mut self,
-        node: u8,
+        node: NodeId,
         kind: TreeJoin,
-        nulling: &[Relids; MAX_JOIN_RELS],
+        nulling: &[Relids],
     ) -> Result<u8, Outside> {
         let at = usize::from(node);
         let (left_rels, right_rels) = (self.left_rels[at], self.right_rels[at]);
@@ -1413,7 +1468,7 @@ impl Prep<'_, '_> {
             TreeJoin::Inner | TreeJoin::Right => unreachable!("a special join"),
         };
         let id = self.special_count;
-        if id == MAX_SPECIALS {
+        if id == self.specials.len() || id > usize::from(u8::MAX) {
             return Err(FULL);
         }
         let mut info = SpecialJoin {
@@ -1532,12 +1587,7 @@ impl Prep<'_, '_> {
     /// `compute_semijoin_info`: a semi join's inner columns compared by
     /// equalities with the outer relations, when every condition reading
     /// both sides is one.
-    fn compute_semijoin_info(
-        &self,
-        node: u8,
-        info: &mut SpecialJoin,
-        nulling: &[Relids; MAX_JOIN_RELS],
-    ) {
+    fn compute_semijoin_info(&self, node: NodeId, info: &mut SpecialJoin, nulling: &[Relids]) {
         let right = info.syn_right;
         let mut count = 0usize;
         for qual in self.tree.quals_of(node) {
@@ -1573,29 +1623,41 @@ impl Prep<'_, '_> {
     }
 
     /// `deconstruct_distribute_oj_quals`.
-    fn distribute_oj_quals(&mut self, node: u8) -> Result<(), Outside> {
+    fn distribute_oj_quals(
+        &mut self,
+        node: NodeId,
+        base_nulling: &mut [Relids],
+        nulling: &mut [Relids],
+    ) -> Result<(), Outside> {
         let at = usize::from(node);
         let special = self.special_of[at].expect("a left join");
         let info = self.specials[usize::from(special)];
         let qualscope = info.syn_left | info.syn_right | info.oj;
         let ojscope = info.min_left | info.min_right;
         let nonnullable = info.syn_left;
-        let mut postponed = [0; MAX_QUALS];
-        let mut count = 0;
-        for &(held, qual) in &self.postponed[..self.postponed_count] {
-            if held == node {
-                postponed[count] = qual;
-                count += 1;
-            }
+        let count = self.postponed[..self.postponed_count]
+            .iter()
+            .filter(|&&(held, _)| held == node)
+            .count();
+        let quals = self
+            .arena
+            .alloc_slice_with(count, |_| 0)
+            .map_err(|_| ARENA)?;
+        for (slot, &(_, qual)) in quals.iter_mut().zip(
+            self.postponed[..self.postponed_count]
+                .iter()
+                .filter(|&&(held, _)| held == node),
+        ) {
+            *slot = qual;
         }
-        let quals = &postponed[..count];
-        let base_nulling = self.nulling_at(node);
+        let quals = &*quals;
+        self.nulling_at(node, base_nulling);
         if info.commute_above_r != Relids::EMPTY || info.commute_below_l != Relids::EMPTY {
             let (above, below) = (info.commute_above_r, info.commute_below_l);
             // The quals without the nulling of the joins it commutes with
             // from below.
-            let mut nulling = base_nulling;
-            for relids in &mut nulling {
+            nulling.copy_from_slice(base_nulling);
+            for relids in nulling.iter_mut() {
                 *relids &= !below;
             }
             let mut incompatible = below | above | info.oj;
@@ -1686,7 +1748,7 @@ impl Prep<'_, '_> {
     fn distribute_qual(
         &mut self,
         qual_id: QualId,
-        node: u8,
+        node: NodeId,
         special: Option<u8>,
         qualscope: Relids,
         ojscope: Option<Relids>,
@@ -1694,7 +1756,7 @@ impl Prep<'_, '_> {
         incompatible: Relids,
         allow_equivalence: bool,
         clone: CloneKind,
-        nulling: [Relids; MAX_JOIN_RELS],
+        nulling: &[Relids],
         postpone: bool,
     ) -> Result<(), Outside> {
         let qual = *self.qual(qual_id);
@@ -1726,7 +1788,7 @@ impl Prep<'_, '_> {
             relids = ojscope.expect("an outer join's scope");
         } else {
             pushed_down = true;
-            if self.redundant_nullability(&qual, &nulling) {
+            if self.redundant_nullability(&qual, nulling) {
                 return Ok(());
             }
             maybe_equivalence = allow_equivalence;
@@ -1755,8 +1817,8 @@ impl Prep<'_, '_> {
         };
         match qual.shape {
             Shape::Columns(left, right) => {
-                let left_member = self.var_member(left, &nulling);
-                let right_member = self.var_member(right, &nulling);
+                let left_member = self.var_member(left, nulling);
+                let right_member = self.var_member(right, nulling);
                 // `can_join`: each side reads relations the other does not.
                 let can_join = left_member.relids() & right_member.relids() == Relids::EMPTY;
                 if maybe_equivalence {
@@ -1799,7 +1861,7 @@ impl Prep<'_, '_> {
                 }
             }
             Shape::Constant { var, constant } => {
-                let member = self.var_member(var, &nulling);
+                let member = self.var_member(var, nulling);
                 if maybe_equivalence {
                     let domain = self.domain[usize::from(node)];
                     if self.process_equivalence(qual_id, member, None, Some(constant), domain)? {
@@ -1839,7 +1901,7 @@ impl Prep<'_, '_> {
 
     /// `check_redundant_nullability_qual`: `column IS NULL` of a column an
     /// anti join below nulls is true.
-    fn redundant_nullability(&self, qual: &Qual, nulling: &[Relids; MAX_JOIN_RELS]) -> bool {
+    fn redundant_nullability(&self, qual: &Qual, nulling: &[Relids]) -> bool {
         let Some((rel, _)) = qual.forced_null else {
             return false;
         };
@@ -1882,7 +1944,7 @@ impl Prep<'_, '_> {
 
     /// The live class holding constant `constant` of join domain
     /// `domain`.
-    fn class_of_constant(&self, constant: u16, domain: u8) -> Option<u8> {
+    fn class_of_constant(&self, constant: u16, domain: DomainId) -> Option<u8> {
         (0..self.class_count)
             .find(|&at| {
                 self.classes[at].merged_into.is_none()
@@ -1952,7 +2014,7 @@ impl Prep<'_, '_> {
         left: Member,
         right: Option<Member>,
         constant: Option<u16>,
-        domain: u8,
+        domain: DomainId,
     ) -> Result<bool, Outside> {
         if right == Some(left) {
             return Err("an equality of a column with itself");
@@ -2041,7 +2103,7 @@ impl Prep<'_, '_> {
     /// then is a dummy relation. Inside an outer join it is a gating
     /// condition of the domain's relations apart from the nullable sides
     /// of the left joins within (`get_join_domain_min_rels`).
-    fn contradiction(&mut self, domain: u8) -> Result<(), Outside> {
+    fn contradiction(&mut self, domain: DomainId) -> Result<(), Outside> {
         if domain == 0 {
             self.contradictory = true;
             return Ok(());
@@ -2061,7 +2123,7 @@ impl Prep<'_, '_> {
 
     /// The base relations under `node` apart from the nullable sides of
     /// the left joins there.
-    fn min_rels(&self, node: u8) -> Result<Relids, Outside> {
+    fn min_rels(&self, node: NodeId) -> Result<Relids, Outside> {
         let at = usize::from(node);
         match self.tree.nodes[at] {
             TreeNode::Rel(table) => Ok(Relids::of(table)),
@@ -2329,7 +2391,7 @@ impl Prep<'_, '_> {
             }
         }
         member.reads = relids & !Relids::of(var.0);
-        for (rel, nulled) in nulling.iter().enumerate().take(MAX_JOIN_RELS) {
+        for (rel, nulled) in nulling.iter().enumerate() {
             if relids & Relids::of(rel) != Relids::EMPTY {
                 member.nulling |= *nulled;
             }
@@ -2341,6 +2403,10 @@ impl Prep<'_, '_> {
     /// constant restricted to it; a class of members of other relations
     /// keeps its members' columns at each of its relations.
     fn generate_base_implied_equalities(&mut self) -> Result<(), Outside> {
+        let previous = self
+            .arena
+            .alloc_slice_with(self.tree.rels, |_| None::<Member>)
+            .map_err(|_| ARENA)?;
         for at in 0..self.class_count {
             let held = self.classes[at];
             if held.merged_into.is_some() {
@@ -2385,7 +2451,7 @@ impl Prep<'_, '_> {
                 continue;
             }
             // Each plain member equated with the relation's previous one.
-            let mut previous = [None::<Member>; MAX_JOIN_RELS];
+            previous.fill(None);
             for &member in members {
                 if member.nulling != Relids::EMPTY || member.reads != Relids::EMPTY {
                     continue;
@@ -2427,9 +2493,12 @@ mod tests {
 
     /// A statement arena for one preparation.
     fn arena() -> Arena {
-        let mut budget = crate::mem::budget::Budget::new(1 << 21);
-        Arena::new(&mut budget, "join preparation", 1 << 20).expect("arena")
+        let mut budget = crate::mem::budget::Budget::new(1 << 24);
+        Arena::new(&mut budget, "join preparation", 1 << 23).expect("arena")
     }
+
+    /// The most relations a query plans.
+    const MOST: usize = super::super::joins::RELATION_NUMBERS;
 
     /// `left.column = right.column`, strict for both.
     fn equality(left: Var, right: Var) -> Qual {
@@ -2462,8 +2531,13 @@ mod tests {
 
     /// `rel0 <kind> rel1 ON 0.0 = 1.0 <kind> rel2 ON 1.1 = 2.0`, with
     /// `where_quals` in `WHERE`.
-    fn chain(first: TreeJoin, second: TreeJoin, where_quals: &[Qual]) -> Tree {
-        let mut tree = Tree::new(3);
+    fn chain<'a>(
+        arena: &'a Arena,
+        first: TreeJoin,
+        second: TreeJoin,
+        where_quals: &[Qual],
+    ) -> Tree<'a> {
+        let mut tree = Tree::new(3, 3, arena).expect("room");
         let a = tree.node(TreeNode::Rel(0)).expect("room");
         let b = tree.node(TreeNode::Rel(1)).expect("room");
         let c = tree.node(TreeNode::Rel(2)).expect("room");
@@ -2494,13 +2568,14 @@ mod tests {
         tree
     }
 
-    /// A chain of `MAX_JOIN_RELS` relations inner joined by `columns`
-    /// equalities of each relation with the first one, as `USING` joins
-    /// on those columns read.
-    fn using_chain(columns: u16) -> Tree {
-        let mut tree = Tree::new(MAX_JOIN_RELS);
+    /// A chain of the most relations a query plans, inner joined by
+    /// `columns` equalities of each relation with the first one, as
+    /// `USING` joins on those columns read: more join tree nodes than a
+    /// byte numbers.
+    fn using_chain(arena: &Arena, columns: u16) -> Tree<'_> {
+        let mut tree = Tree::new(MOST, MOST, arena).expect("room");
         let mut current = tree.node(TreeNode::Rel(0)).expect("room");
-        for rel in 1..MAX_JOIN_RELS as u8 {
+        for rel in 1..MOST as u8 {
             let right = tree.node(TreeNode::Rel(rel)).expect("room");
             current = tree
                 .node(TreeNode::Join {
@@ -2522,11 +2597,13 @@ mod tests {
     #[test]
     fn using_chains_of_the_most_relations_fit() {
         let arena = arena();
-        let prepared = prepare(&using_chain(2), &arena).expect("modeled");
+        let tree = using_chain(&arena, 2);
+        assert!(tree.node_count > 256);
+        let prepared = prepare(&tree, &arena).expect("modeled");
         let classes = prepared.classes();
         assert_eq!(classes.len(), 2);
         for (column, class) in classes.iter().enumerate() {
-            assert_eq!(class.count(), MAX_JOIN_RELS);
+            assert_eq!(class.count(), MOST);
             assert!(class.members().iter().enumerate().all(|(rel, member)| (
                 usize::from(member.rel),
                 usize::from(member.column)
@@ -2534,9 +2611,9 @@ mod tests {
         }
         // Two more conditions fill the conditions' capacity; the caller
         // reports the one past it by name.
-        let mut tree = using_chain(2);
+        let mut tree = using_chain(&arena, 2);
         let root = tree.root;
-        for _ in 0..MAX_QUALS - 2 * (MAX_JOIN_RELS - 1) {
+        for _ in 0..QUALS_PER_RELATION * MOST - 2 * (MOST - 1) {
             assert!(tree.qual(root, equality((0, 2), (1, 2))).is_some());
         }
         assert!(tree.qual(root, equality((0, 2), (1, 2))).is_none());
@@ -2546,7 +2623,7 @@ mod tests {
     fn left_joins_commute_by_identity_three() {
         let arena = arena();
         let prepared =
-            prepare(&chain(TreeJoin::Left, TreeJoin::Left, &[]), &arena).expect("modeled");
+            prepare(&chain(&arena, TreeJoin::Left, TreeJoin::Left, &[]), &arena).expect("modeled");
         let specials = &prepared.specials[..prepared.special_count];
         assert_eq!(specials.len(), 2);
         let (one, two) = (specials[0], specials[1]);
@@ -2577,7 +2654,12 @@ mod tests {
         // `WHERE rel1.column1 = rel2.column0` rejects the NULLs both left
         // joins would return.
         let prepared = prepare(
-            &chain(TreeJoin::Left, TreeJoin::Left, &[equality((1, 1), (2, 0))]),
+            &chain(
+                &arena,
+                TreeJoin::Left,
+                TreeJoin::Left,
+                &[equality((1, 1), (2, 0))],
+            ),
             &arena,
         )
         .expect("modeled");
@@ -2588,7 +2670,7 @@ mod tests {
     fn is_null_of_a_compared_column_makes_an_anti_join() {
         let arena = arena();
         let prepared = prepare(
-            &chain(TreeJoin::Inner, TreeJoin::Left, &[is_null((2, 0))]),
+            &chain(&arena, TreeJoin::Inner, TreeJoin::Left, &[is_null((2, 0))]),
             &arena,
         )
         .expect("modeled");
@@ -2606,8 +2688,11 @@ mod tests {
     #[test]
     fn a_right_join_swaps_its_sides() {
         let arena = arena();
-        let prepared =
-            prepare(&chain(TreeJoin::Right, TreeJoin::Inner, &[]), &arena).expect("modeled");
+        let prepared = prepare(
+            &chain(&arena, TreeJoin::Right, TreeJoin::Inner, &[]),
+            &arena,
+        )
+        .expect("modeled");
         let special = prepared.specials[0];
         assert_eq!(special.kind, SpecialKind::Left);
         assert_eq!(
@@ -2615,10 +2700,14 @@ mod tests {
             (Relids::from_mask(2), Relids::from_mask(1))
         );
         // The join list starts with the swapped join's preserved side.
-        let top = prepared.subproblems[prepared.subproblem_count - 1];
+        let top = *prepared
+            .subproblems
+            .borrowed_slice()
+            .last()
+            .expect("a problem");
         let first = usize::from(top.first);
         assert_eq!(
-            &prepared.subproblem_items[first..first + usize::from(top.count)],
+            &prepared.subproblem_items.borrowed_slice()[first..first + usize::from(top.count)],
             &[2, 1, 4].map(Relids::from_mask)
         );
     }

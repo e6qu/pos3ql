@@ -27,6 +27,39 @@ impl fmt::Display for CapacityError {
 
 impl std::error::Error for CapacityError {}
 
+/// A type every value of whose bytes all zero is valid.
+///
+/// # Safety
+/// An all-zero bit pattern must be a valid value of the type.
+pub unsafe trait Zeroable: Copy {}
+
+// SAFETY: zero is a valid integer.
+unsafe impl Zeroable for i32 {}
+// SAFETY: zero is a valid integer.
+unsafe impl Zeroable for u32 {}
+// SAFETY: zero is a valid integer.
+unsafe impl Zeroable for u64 {}
+// SAFETY: zero is a valid integer.
+unsafe impl Zeroable for usize {}
+
+impl<T: Zeroable> FixedVec<T> {
+    /// A full vector of `capacity` zero values. The allocation arrives zeroed
+    /// (the allocator's fresh zero pages), so no element is written one at a
+    /// time.
+    pub fn zeroed(
+        budget: &mut Budget,
+        what: &'static str,
+        capacity: usize,
+    ) -> Result<Self, BudgetError> {
+        budget.draw_array(capacity, size_of::<T>(), what)?;
+        Ok(Self {
+            what,
+            buffer: Box::new_zeroed_slice(capacity),
+            len: capacity,
+        })
+    }
+}
+
 impl<T> FixedVec<T> {
     pub fn new(
         budget: &mut Budget,
@@ -77,6 +110,10 @@ impl<T> FixedVec<T> {
     }
 
     pub fn clear(&mut self) {
+        if !core::mem::needs_drop::<T>() {
+            self.len = 0;
+            return;
+        }
         while self.pop().is_some() {}
     }
 
@@ -147,6 +184,19 @@ mod tests {
         let err = v.push(3).unwrap_err();
         assert_eq!(err.what, "conn_slots");
         assert_eq!(err.capacity, 2);
+    }
+
+    #[test]
+    fn zeroed_vectors_are_full_of_zeros_and_draw_budget() {
+        let mut budget = Budget::new(16);
+        let v = FixedVec::<u32>::zeroed(&mut budget, "zeros", 4).unwrap();
+        assert_eq!(v.as_slice(), &[0; 4]);
+        assert_eq!(
+            FixedVec::<u32>::zeroed(&mut budget, "more", 1)
+                .unwrap_err()
+                .what,
+            "more"
+        );
     }
 
     #[test]

@@ -777,25 +777,32 @@ impl SortTuples {
         positions: &mut [usize],
         compare: SortCompare<'_>,
     ) -> Result<usize, crate::sql::SqlError> {
-        use super::postgres_memory::{SortTuples as Copies, allocset_chunk_space, maxalign};
-        let copies = self.copies((count > 0).then(|| row_at(0)));
-        let charge = |length: usize| match copies {
-            Copies::Datum => 0,
-            Copies::Bump => maxalign(length),
-            Copies::AllocSet => allocset_chunk_space(length),
-        };
-        let length = |row: usize| {
-            source
-                .with(|sizing| self.length(Some(sizing), row_at(row)))
-                .unwrap_or(0)
-        };
         super::postgres_memory::bounded_heap_charge(
             count,
             heapify_at,
-            |row| charge(length(row)),
+            |row| self.chunk(source, row_at(0), row_at(row)),
             positions,
             |new, worst| Ok(compare(row_at(new), row_at(worst))?.is_lt()),
         )
+    }
+
+    /// What a bounded sort's copy of `row` charges (`bounded_heap_charge`'s
+    /// chunk); `first` is the first row the sort read.
+    pub(crate) fn chunk(
+        &self,
+        source: super::postgres_memory::SizeSource<'_>,
+        first: &[u8],
+        row: &[u8],
+    ) -> usize {
+        use super::postgres_memory::{SortTuples as Copies, allocset_chunk_space, maxalign};
+        let length = source
+            .with(|sizing| self.length(Some(sizing), row))
+            .unwrap_or(0);
+        match self.copies(Some(first)) {
+            Copies::Datum => 0,
+            Copies::Bump => maxalign(length),
+            Copies::AllocSet => allocset_chunk_space(length),
+        }
     }
 
     /// What PostgreSQL's sort of `count` rows (`row_at`, in arrival order)

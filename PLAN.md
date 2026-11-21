@@ -259,9 +259,13 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   memory context, so joins up to `max_join_relations` plan in the default
   statement arena (a 150-relation `USING` chain exhausts 32 MiB today), and
   equivalence classes past 64 (a chain of more than 64 left joins) fit.
-- [ ] *In progress:* `ORDER BY` over a large join streams the joined rows into
-  the retained, spilling sort (seven 8-row tables cross joined with `ORDER BY
-  1 LIMIT 1` fails with `54000` today).
+- [x] `ORDER BY ... LIMIT` over a large join keeps only the limit's rows once
+  its sort forms its bounded heap (seven 8-row tables cross joined, `980`).
+- [ ] *In progress:* `ORDER BY` without a limit over a join larger than the
+  statement arena sorts in runs over `plan_build_bytes` leases (it fails with
+  `54000` today). The pull executor's scan node first needs index, bitmap,
+  function and `LATERAL` scans that resume mid-scan (only sequential heap
+  scans do, through `RowCursor`).
 - [ ] `GROUP BY` of an expression other than a full join's merged column
   (`0A000` when costs print).
 - [ ] Conditions comparing expressions of several relations other than by a

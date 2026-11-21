@@ -264,6 +264,21 @@ statistics (`631`, `651`-`653`): a hash join building on the smaller relation,
 or a nested loop over a `Materialize` without an equality; a join keeping both
 sides without an equality fails as PostgreSQL's full join does (`0A000`).
 
+### Pull-based join executor (planned)
+
+The search's plan runs in `join_exec.rs`, which pushes each joined row
+through a callback; the retained executor (`retained/`) pulls rows and
+resumes after a storage wait but runs only nested-loop and hash levels in
+FROM order. The planned single executor replaces both: one node record per
+plan path from a pool reserved at startup (`54000` naming the pool when a
+plan needs more), each exposing its current row as per-relation slots that
+stay valid until its next advance, so no row grows the statement arena.
+Sort runs `tuplesort.c`'s port, HashAggregate drives `hashagg.rs`, and
+`EXPLAIN ANALYZE` counters live in the node records. Its scan node needs
+every scan path to resume mid-scan; today only sequential heap scans
+(`RowCursor`) do, while index, bitmap, function and `LATERAL` scans run
+to completion through callbacks.
+
 ## Sorting, hashing and memory figures
 
 Every sort that orders rows the client sees runs one port of `tuplesort.c`
@@ -272,6 +287,11 @@ past `work_mem` forms runs where `dumptuples` does and merges them as
 `mergeruns` does, and a limit directly above bounds a heap. `EXPLAIN ANALYZE`
 prints PostgreSQL's `Sort Method` (`quicksort`, `top-N heapsort`, `external
 merge`), `Memory` and `Disk` (8,176-byte tape blocks, `906`; `476`, `820`).
+A sort under a limit takes its rows as they arrive (`980`): once it forms
+its bounded heap it keeps only the rows the limit returns, in two
+`plan_build_bytes` leases (`54000` naming the setting when they fill), so
+`ORDER BY ... LIMIT n` over a join of any size holds `n` rows. A sort
+without a limit holds every row in the statement arena.
 Values are charged at PostgreSQL's sizes, including `jsonb`
 (`convertToJsonb`), arrays, records, ranges, multiranges, `tsquery` and
 `jsonpath`; `pg_column_size` reports the same (`919`). A value with no size

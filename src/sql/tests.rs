@@ -17,6 +17,7 @@ mod builtin_argument_binding;
 mod builtin_routine_changes;
 mod builtin_routine_comments;
 mod cache_space_waits;
+mod candidate_cursor_waits;
 mod canonical_sequences;
 mod cast_and_operator_class_descriptions;
 mod catalog_capture_selection;

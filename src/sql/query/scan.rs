@@ -9366,11 +9366,19 @@ fn scan_source_mode<'a>(
         retain_match: Option<&core::cell::Cell<bool>>,
         operation: impl FnOnce() -> R,
     ) -> R {
-        let mark = enabled.then(|| arena.mark());
+        recycled_from(arena, arena.mark(), enabled, retain_match, operation)
+    }
+
+    /// As [`recycled`], releasing everything allocated since `mark`.
+    fn recycled_from<R>(
+        arena: &Arena,
+        mark: crate::mem::arena::ArenaMark,
+        enabled: bool,
+        retain_match: Option<&core::cell::Cell<bool>>,
+        operation: impl FnOnce() -> R,
+    ) -> R {
         let result = operation();
-        if let Some(mark) = mark
-            && !retain_match.is_some_and(core::cell::Cell::get)
-        {
+        if enabled && !retain_match.is_some_and(core::cell::Cell::get) {
             // SAFETY: recycling callers consume their source row inside
             // `operation`; no reference into its arena suffix is observed
             // after this point.
@@ -11756,23 +11764,27 @@ fn scan_source_mode<'a>(
                 // and fetch one row at a time so LIMIT can stop before unrelated
                 // object-resident table rows are point-read.
                 if let Some(access) = access.filter(|access| access.preserves_order) {
-                    for (this, &rowid) in access.rowids.iter().enumerate() {
-                        check_timeout()?;
-                        let Some(state) = storage.row_state(slot, rowid)? else {
-                            continue;
-                        };
-                        let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
-                            continue;
+                    let mut cursor =
+                        crate::storage::CandidateCursor::open(storage, slot, txid, access.rowids);
+                    loop {
+                        // A recycled row's bytes go with it.
+                        let mark = arena.mark();
+                        let Some(row) = cursor.next(storage, arena)? else {
+                            break;
                         };
                         storage.record_relation_tuple_read(
                             txid,
                             slot,
                             Some(access.statistics()),
                         )?;
-                        let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
-                            let bytes = storage.row_bytes(slot, rowid, home, arena)?;
-                            visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
-                        })?;
+                        let keep_scanning =
+                            recycled_from(arena, mark, recycle_rows, retain_match, || {
+                                visit_candidate!(
+                                    row.position,
+                                    BoundRow::Encoded(row.bytes),
+                                    Some(row.rowid)
+                                )
+                            })?;
                         if !keep_scanning {
                             return Ok(false);
                         }
@@ -11836,10 +11848,17 @@ fn scan_source_mode<'a>(
                         });
                     }
                 }
-                for (this, row) in ordered[..fill].iter().copied().flatten().enumerate() {
-                    let rowid = row.rowid();
-                    let home = row.read()?;
-                    check_timeout()?;
+                let mut cursor = crate::storage::CandidateCursor::open_selected(
+                    storage,
+                    slot,
+                    txid,
+                    &ordered[..fill],
+                );
+                loop {
+                    let mark = arena.mark();
+                    let Some(row) = cursor.next(storage, arena)? else {
+                        break;
+                    };
                     if hashed.is_none() {
                         storage.record_relation_tuple_read(
                             txid,
@@ -11847,11 +11866,14 @@ fn scan_source_mode<'a>(
                             access.map(|access| access.statistics()),
                         )?;
                     }
-                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
-                        let bytes =
-                            storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?;
-                        visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
-                    })?;
+                    let keep_scanning =
+                        recycled_from(arena, mark, recycle_rows, retain_match, || {
+                            visit_candidate!(
+                                row.position,
+                                BoundRow::Encoded(row.bytes),
+                                Some(row.rowid)
+                            )
+                        })?;
                     if !keep_scanning {
                         return Ok(false);
                     }

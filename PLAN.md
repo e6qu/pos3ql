@@ -241,7 +241,11 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   executor below so the result-stream and cursor tests keep streaming.
 - [ ] *In progress:* a retained pull-based executor whose merge join, sort,
   hash and hash aggregate nodes keep their state between rows, as the retained
-  nested-loop and hash levels do.
+  nested-loop and hash levels do. Index, index-only and bitmap scans read
+  their candidates through `CandidateCursor`, which resumes the candidate a
+  storage wait interrupted; the scan node still has to hold it, with the
+  chosen path's counts and `LIMIT` stop as node state. A `LATERAL`
+  subquery's rows become a subtree of the same plan.
 - [x] `LATERAL` subqueries of one table planned by the search, with `Memoize`
   and exact `EXPLAIN ANALYZE` counters (`977`). A scan reading spilled rows
   decodes the columns a `LATERAL` body reads of it, so an aggregate over
@@ -268,9 +272,7 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   rows were sized once).
 - [ ] *In progress:* `ORDER BY` without a limit over a join larger than the
   statement arena sorts in runs over `plan_build_bytes` leases (it fails with
-  `54000` today). The pull executor's scan node first needs index, bitmap,
-  function and `LATERAL` scans that resume mid-scan (only sequential heap
-  scans do, through `RowCursor`).
+  `54000` today). It needs the pull executor's scan node.
 - [ ] `GROUP BY` of an expression other than a full join's merged column
   (`0A000` when costs print).
 - [ ] Conditions comparing expressions of several relations other than by a

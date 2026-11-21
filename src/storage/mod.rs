@@ -231,6 +231,7 @@ pub(crate) use row_map::{RowEntries, RowMap, RowOverlayPool};
 use row_reads::RowReadView;
 pub(crate) use row_reads::RowReadVisitor;
 pub(crate) use row_reads::{LockedRowRecheck, RowRead, RowSelfChange};
+pub(crate) use row_scans::candidates::CandidateCursor;
 pub(crate) use row_scans::cursor::{CursorRow, RowCursor, RowCursorBuffers};
 pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
 #[cfg(test)]

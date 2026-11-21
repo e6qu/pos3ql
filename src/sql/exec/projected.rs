@@ -495,7 +495,7 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             5 + str_value.len()
         }
         Datum::Text(str_value) => {
-            out[0] = 5;
+            out[0] = PROJECTED_TEXT_TAG;
             out[1..5].copy_from_slice(&(str_value.len() as u32).to_le_bytes());
             out[5..5 + str_value.len()].copy_from_slice(str_value.as_bytes());
             5 + str_value.len()
@@ -801,6 +801,29 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
 /// payload length. This is the one place the projected encoding's tag
 /// sizes live: a second, hand-written copy in the sort path drifted from
 /// it and panicked the server on every tag it had not been taught.
+/// The tag of an encoded `text` value: a little-endian `u32` length, then
+/// its UTF-8 bytes.
+pub(crate) const PROJECTED_TEXT_TAG: u8 = 5;
+
+/// The encoded length of the value tagged `tag` at `at`, the size
+/// [`decode_projected_value`] returns, read without decoding fixed-width
+/// values or text.
+pub(crate) fn projected_value_size(bytes: &[u8], tag: u8, at: usize) -> usize {
+    let size = match tag {
+        0 | 36 => 0,
+        1 | 40 => 1,
+        2 | 35 | 48 => 4,
+        47 => 6,
+        41 | 44 | 46 => 8,
+        PROJECTED_TEXT_TAG => {
+            4 + u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+        }
+        _ => return decode_projected_value(bytes, tag, at).1,
+    };
+    debug_assert_eq!(size, decode_projected_value(bytes, tag, at).1);
+    size
+}
+
 pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, usize) {
     match tag {
         0 => (Datum::Null, 0),
@@ -884,7 +907,7 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             ))),
             4,
         ),
-        5 => {
+        PROJECTED_TEXT_TAG => {
             let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             (
                 Datum::Text(
@@ -1343,7 +1366,7 @@ impl<'a> ProjectedValue<'a> {
         let mut at = 2usize;
         for _ in 0..col {
             let tag = bytes[at];
-            at += 1 + decode_projected_value(bytes, tag, at + 1).1;
+            at += 1 + projected_value_size(bytes, tag, at + 1);
         }
         Self { bytes, tag_at: at }
     }

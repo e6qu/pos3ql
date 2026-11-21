@@ -1859,10 +1859,11 @@ use set_rows::PlpgsqlSetResult;
 mod projected;
 use numeric_loops::NumericLoopFrames;
 pub(crate) use projected::{
-    ProjectedValue, compare_projected_key, compare_projected_prefix, compare_projected_rows,
-    compare_projected_values, decode_projected_row_into, encode_projected_by_into,
-    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows, projected_row_len,
-    projected_row_len_by, projected_row_width, try_each_record_field, unpack_projected_rows,
+    PROJECTED_TEXT_TAG, ProjectedValue, compare_projected_key, compare_projected_prefix,
+    compare_projected_rows, compare_projected_values, decode_projected_row_into,
+    encode_projected_by_into, encode_projected_into, encode_projected_persistent_pub,
+    pack_projected_rows, projected_row_len, projected_row_len_by, projected_row_width,
+    projected_value_size, try_each_record_field, unpack_projected_rows,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,

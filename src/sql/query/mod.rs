@@ -17628,14 +17628,14 @@ fn project_row_skipping<'a>(
                         vals[c]
                     }
                 };
-                for k in 0..scope.star_columns() {
+                for entry in scope.star_entries() {
                     if n == MAX_PROJ {
                         return Err(sql_err!(
                             sqlstate::TOO_MANY_COLUMNS,
                             "target lists can have at most 1664 entries"
                         ));
                     }
-                    out[n] = match scope.star_entry(k) {
+                    out[n] = match entry {
                         ResolvedColumn::Table(t, c) => value_of(t, c),
                         // Merged USING/NATURAL column: first non-null side.
                         ResolvedColumn::Merged(m) => {

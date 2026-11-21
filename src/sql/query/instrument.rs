@@ -677,14 +677,10 @@ impl SortTuples {
         sizing: Option<&super::postgres_memory::Sizing<'_>>,
         row: &[u8],
     ) -> Option<usize> {
-        let mut columns = [0usize; MAX_SORT_COLUMNS];
-        for (column, &held) in columns.iter_mut().zip(&self.columns[..self.count]) {
-            *column = usize::from(held);
-        }
         super::postgres_memory::projected_tuple_len_with_tids(
             sizing,
             row,
-            (!self.all).then_some(&columns[..self.count]),
+            (!self.all).then_some(&self.columns[..self.count]),
             self.tids,
         )
     }
@@ -756,6 +752,17 @@ impl SortTuples {
         copies_of_first: Option<&[u8]>,
         row: &[u8],
     ) -> Result<Option<usize>, crate::sql::SqlError> {
+        Ok(self.push_charged(source, model, copies_of_first, row)?.0)
+    }
+
+    /// [`Self::push`], also returning the row's [`Self::chunk`], sized once.
+    pub(crate) fn push_charged(
+        &self,
+        source: super::postgres_memory::SizeSource<'_>,
+        model: &mut super::postgres_memory::TuplesortModel,
+        copies_of_first: Option<&[u8]>,
+        row: &[u8],
+    ) -> Result<(Option<usize>, usize), crate::sql::SqlError> {
         let copies = self.copies(copies_of_first);
         let (length, written) = source
             .with(|sizing| {
@@ -763,7 +770,16 @@ impl SortTuples {
                 Some((length, self.tape_bytes(Some(sizing), row, length, copies)?))
             })
             .ok_or_else(unsized_value)?;
-        Ok(model.push(length, written))
+        Ok((model.push(length, written), Self::charge(copies, length)))
+    }
+
+    fn charge(copies: super::postgres_memory::SortTuples, length: usize) -> usize {
+        use super::postgres_memory::{SortTuples as Copies, allocset_chunk_space, maxalign};
+        match copies {
+            Copies::Datum => 0,
+            Copies::Bump => maxalign(length),
+            Copies::AllocSet => allocset_chunk_space(length),
+        }
     }
 
     /// What the rows of a bounded sort charge once its heap took them
@@ -794,15 +810,10 @@ impl SortTuples {
         first: &[u8],
         row: &[u8],
     ) -> usize {
-        use super::postgres_memory::{SortTuples as Copies, allocset_chunk_space, maxalign};
         let length = source
             .with(|sizing| self.length(Some(sizing), row))
             .unwrap_or(0);
-        match self.copies(Some(first)) {
-            Copies::Datum => 0,
-            Copies::Bump => maxalign(length),
-            Copies::AllocSet => allocset_chunk_space(length),
-        }
+        Self::charge(self.copies(Some(first)), length)
     }
 
     /// What PostgreSQL's sort of `count` rows (`row_at`, in arrival order)

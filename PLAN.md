@@ -261,6 +261,12 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   equivalence classes past 64 (a chain of more than 64 left joins) fit.
 - [x] `ORDER BY ... LIMIT` over a large join keeps only the limit's rows once
   its sort forms its bounded heap (seven 8-row tables cross joined, `980`).
+  `SELECT *` of that join `ORDER BY 1 LIMIT 1` takes 1.1 s against
+  PostgreSQL 18's 0.24 s (5.5 s before rows were sized once, by their encoded
+  bytes, and relation widths read without walking definition images).
+- [ ] A row the formed bounded heap rejects is still projected and encoded
+  before the comparison; comparing its sort keys first would skip the rest
+  (the remaining factor over PostgreSQL in `980`'s seven-table join).
 - [ ] *In progress:* `ORDER BY` without a limit over a join larger than the
   statement arena sorts in runs over `plan_build_bytes` leases (it fails with
   `54000` today). The pull executor's scan node first needs index, bitmap,

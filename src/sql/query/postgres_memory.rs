@@ -359,25 +359,52 @@ fn stored_projected(
     at: usize,
     hint: Option<i32>,
 ) -> Option<Option<Stored>> {
+    stored_projected_sized(sizing, row, tag, at, hint).0
+}
+
+/// [`stored_projected`] with the value's encoded length. Text is measured
+/// from its encoded length without decoding it.
+fn stored_projected_sized(
+    sizing: Option<&Sizing<'_>>,
+    row: &[u8],
+    tag: u8,
+    at: usize,
+    hint: Option<i32>,
+) -> (Option<Option<Stored>>, usize) {
     if matches!(tag, 19 | 51 | 202 | 204) {
+        let size = crate::sql::exec::projected_value_size(row, tag, at);
         let mut fields = [None::<Stored>; crate::sql::exec::MAX_PROJ];
         let mut count = 0usize;
-        crate::sql::exec::try_each_record_field(row, tag, at, &mut |type_oid, tag, at| {
-            *fields.get_mut(count)? = stored_projected(sizing, row, tag, at, Some(type_oid))?;
-            count += 1;
-            Some(())
-        })?;
-        let length = composite_length(fields[..count].iter().map(|&field| Some(field)))?;
-        return Some(Some(Stored {
-            layout: crate::sql::type_layouts::builtin(2249)?,
-            payload: length - 4,
-        }));
+        let stored =
+            crate::sql::exec::try_each_record_field(row, tag, at, &mut |type_oid, tag, at| {
+                *fields.get_mut(count)? = stored_projected(sizing, row, tag, at, Some(type_oid))?;
+                count += 1;
+                Some(())
+            })
+            .and_then(|()| composite_length(fields[..count].iter().map(|&field| Some(field))))
+            .and_then(|length| {
+                Some(Some(Stored {
+                    layout: crate::sql::type_layouts::builtin(2249)?,
+                    payload: length - 4,
+                }))
+            });
+        return (stored, size);
     }
-    let (value, _) = crate::sql::exec::decode_projected_value(row, tag, at);
+    if tag == crate::sql::exec::PROJECTED_TEXT_TAG && hint.is_none() {
+        let size = crate::sql::exec::projected_value_size(row, tag, at);
+        let stored = crate::sql::type_layouts::builtin(25).map(|layout| {
+            Some(Stored {
+                layout,
+                payload: size - 4,
+            })
+        });
+        return (stored, size);
+    }
+    let (value, size) = crate::sql::exec::decode_projected_value(row, tag, at);
     if value.is_null() {
-        return Some(None);
+        return (Some(None), size);
     }
-    stored(sizing, hint, &value).map(Some)
+    (stored(sizing, hint, &value).map(Some), size)
 }
 
 /// The stored form of column `column` of an encoded row.
@@ -390,7 +417,7 @@ pub(crate) fn stored_column(
     for _ in 0..column {
         let tag = row[at];
         at += 1;
-        at += crate::sql::exec::decode_projected_value(row, tag, at).1;
+        at += crate::sql::exec::projected_value_size(row, tag, at);
     }
     let tag = row[at];
     stored_projected(sizing, row, tag, at + 1, None)
@@ -444,17 +471,28 @@ pub(crate) fn projected_tuple_len(
 }
 
 /// [`projected_tuple_len`] with `tids` row identities after the values.
-pub(crate) fn projected_tuple_len_with_tids(
+pub(crate) fn projected_tuple_len_with_tids<C: Copy + Into<usize>>(
     sizing: Option<&Sizing<'_>>,
     row: &[u8],
-    columns: Option<&[usize]>,
+    columns: Option<&[C]>,
     tids: usize,
 ) -> Option<usize> {
     if let Some(columns) = columns {
+        // One walk over the row for ascending columns: the walk restarts
+        // only at a column before the previous one.
+        let (mut walked, mut at) = (0usize, 2usize);
         return minimal_tuple_len(
-            columns
-                .iter()
-                .map(|&column| stored_column(sizing, row, column)),
+            columns.iter().map(|&column| {
+                let column = column.into();
+                if column < walked {
+                    (walked, at) = (0, 2);
+                }
+                while walked < column {
+                    at += 1 + crate::sql::exec::projected_value_size(row, row[at], at + 1);
+                    walked += 1;
+                }
+                stored_projected(sizing, row, row[at], at + 1, None)
+            }),
             tids,
         );
     }
@@ -464,8 +502,7 @@ pub(crate) fn projected_tuple_len_with_tids(
         (0..width).map(|_| {
             let tag = row[at];
             at += 1;
-            let size = crate::sql::exec::decode_projected_value(row, tag, at).1;
-            let column = stored_projected(sizing, row, tag, at, None);
+            let (column, size) = stored_projected_sized(sizing, row, tag, at, None);
             at += size;
             column
         }),

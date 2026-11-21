@@ -523,6 +523,9 @@ enum ScopeDefinition<'a> {
     },
     Retained {
         table: usize,
+        image: crate::storage::DefinitionImageId,
+        /// The retained definition's column count, read on every row.
+        n_columns: usize,
         names: &'a [&'a str],
     },
 }
@@ -543,11 +546,25 @@ impl<'a> QueryDefinitions<'a> {
                     .retained_relation(image)
                     .expect("scope retains its catalog definition"),
             ),
-            ScopeDefinition::Retained { table, .. } => Some(RelationDefinition::from_definition(
-                self.images
-                    .retained_definition(table, self.transaction)
-                    .expect("scope retains its registered definition"),
+            ScopeDefinition::Retained { image, .. } => Some(RelationDefinition::from_definition(
+                self.images.retained_table(image),
             )),
+        }
+    }
+
+    /// A retained table's column count, without reading its image.
+    fn retained_columns(&self, index: usize) -> Option<usize> {
+        match self.sources.get(index).copied().flatten()? {
+            ScopeDefinition::Retained { n_columns, .. } => Some(n_columns),
+            _ => None,
+        }
+    }
+
+    /// `get(index)?.n_columns`, read without a retained table's image.
+    pub(crate) fn n_columns(&self, index: usize) -> Option<usize> {
+        match self.retained_columns(index) {
+            Some(n_columns) => Some(n_columns),
+            None => Some(self.get(index)?.n_columns),
         }
     }
 
@@ -555,17 +572,20 @@ impl<'a> QueryDefinitions<'a> {
         match self.sources.get(index).copied().flatten()? {
             ScopeDefinition::Synthetic {
                 table: Some(table), ..
-            }
-            | ScopeDefinition::Retained { table, .. } => {
-                self.images.retained_definition(table, self.transaction)
-            }
+            } => self.images.retained_definition(table, self.transaction),
+            ScopeDefinition::Retained { image, .. } => Some(self.images.retained_table(image)),
             ScopeDefinition::Relation { .. } => None,
             ScopeDefinition::Synthetic { table: None, .. } => None,
         }
     }
 
-    fn retain(&self, storage: &Storage, table: usize) -> Result<&TableDef, SqlError> {
-        self.images.definition(storage, table, self.transaction)
+    fn retain(
+        &self,
+        storage: &Storage,
+        table: usize,
+    ) -> Result<(crate::storage::DefinitionImageId, &TableDef), SqlError> {
+        let image = self.images.retain_table(storage, table, self.transaction)?;
+        Ok((image, self.images.retained_table(image)))
     }
 
     fn set_arena(&mut self, index: usize, definition: RelationDefinition<'a>) {
@@ -3345,7 +3365,7 @@ impl<'d> QueryScope<'d> {
                 tref.schema.unwrap_or(tref.table),
             ));
         };
-        let stored_def = self.defs.retain(storage, slot)?;
+        let (image, stored_def) = self.defs.retain(storage, slot)?;
         let source_scope = self
             .type_sources
             .as_ref()
@@ -3431,7 +3451,7 @@ impl<'d> QueryScope<'d> {
                     .iter()
                     .flatten()
                     .find_map(|source| match source {
-                        ScopeDefinition::Retained { table, names } if *table == slot => {
+                        ScopeDefinition::Retained { table, names, .. } if *table == slot => {
                             Some(*names)
                         }
                         _ => None,
@@ -3450,7 +3470,12 @@ impl<'d> QueryScope<'d> {
                         &*names
                     }
                 };
-                ScopeDefinition::Retained { table: slot, names }
+                ScopeDefinition::Retained {
+                    table: slot,
+                    image,
+                    n_columns: stored_def.n_columns,
+                    names,
+                }
             }
         };
         self.defs.sources[self.n] = Some(source);
@@ -4038,6 +4063,18 @@ impl<'d> QueryScope<'d> {
         } else {
             self.total_columns()
         }
+    }
+
+    /// Every `SELECT *` output column in order, reading each relation's
+    /// definition once.
+    pub(crate) fn star_entries(&self) -> impl Iterator<Item = ResolvedColumn> + '_ {
+        let outputs = self.output[..self.n_output].iter().copied();
+        let tables = if self.n_output > 0 { 0 } else { self.n };
+        let tables = (0..tables).flat_map(move |t| {
+            let columns = self.defs.get(t).expect("resolved").n_columns;
+            (0..columns).map(move |c| ResolvedColumn::Table(t, c))
+        });
+        outputs.chain(tables)
     }
 
     /// The i-th `SELECT *` output column.
@@ -4697,6 +4734,10 @@ impl<'d> QueryScope<'d> {
     /// Width of an entry in flat (table-by-table) row layouts: its visible
     /// columns, plus the member columns of a parenthesized join.
     pub(crate) fn stored_width(&self, table: usize) -> usize {
+        // A retained table's definition lists exactly its columns.
+        if let Some(n_columns) = self.defs.retained_columns(table) {
+            return n_columns;
+        }
         let definition = self.defs.get(table).expect("resolved");
         if self.members.iter().any(|member| member.table == table) {
             definition.columns.len()
@@ -4844,12 +4885,14 @@ mod tests {
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage.create_table(definition("original", 1)).unwrap();
+        let images = storage.table_definition_images();
+        let image = images.retain_table(&storage, table, 0).unwrap();
         let mut sources = [Some(ScopeDefinition::Retained {
             table,
+            image,
+            n_columns: 1,
             names: &["c0"],
         })];
-        let images = storage.table_definition_images();
-        images.definition(&storage, table, 0).unwrap();
         let definitions = QueryDefinitions {
             sources: &mut sources,
             images,

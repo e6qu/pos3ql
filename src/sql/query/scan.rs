@@ -5092,7 +5092,7 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
                         let width = if self.scope.derived[table].is_some() {
                             crate::sql::exec::projected_row_width(bytes)
                         } else {
-                            self.scope.defs.get(table).expect("resolved").n_columns
+                            self.scope.defs.n_columns(table).expect("resolved")
                         };
                         let start = buffer_offsets[position];
                         Some(&buffers[start..start + width])
@@ -5100,7 +5100,7 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
                     Some(BoundRow::Values(values)) if self.scope.stores_rows(table) => {
                         // A leaf of an inheritance tree carries its oid past
                         // the relation's columns.
-                        let width = self.scope.defs.get(table).expect("resolved").n_columns;
+                        let width = self.scope.defs.n_columns(table).expect("resolved");
                         Some(&values[..width.min(values.len())])
                     }
                     Some(BoundRow::Values(values)) => Some(values),
@@ -5137,7 +5137,7 @@ impl<'v> JoinRow<'_, 'v, '_> {
                 if !order[..count].contains(&table) {
                     return Err(missing());
                 }
-                let width = self.scope.defs.get(table).expect("resolved").n_columns;
+                let width = self.scope.defs.n_columns(table).expect("resolved");
                 match bound[table] {
                     None => Ok(Datum::Null),
                     Some(BoundRow::Values(values)) if values.len() > width => Ok(values[width]),
@@ -5278,7 +5278,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
 
     fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'v>, SqlError> {
         let table = self.scope.source(qualifier)?.table;
-        let visible = self.scope.defs.get(table).expect("resolved").n_columns;
+        let visible = self.scope.defs.n_columns(table).expect("resolved");
         self.table_values(table)
             .and_then(|values| values.get(visible + index))
             .copied()

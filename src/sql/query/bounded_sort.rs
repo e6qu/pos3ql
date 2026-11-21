@@ -115,6 +115,8 @@ struct Heap<'a> {
     order: &'a mut [u32],
     count: usize,
     entries: &'a mut [(u32, u32)],
+    /// Each entry's row's charge.
+    charges: &'a mut [usize],
     rows: HeapRows,
     charge: usize,
 }
@@ -170,7 +172,9 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
         let model = self
             .model
             .get_or_insert_with(|| self.tuples.model(Some(first), Some(self.bound)));
-        self.tuples.push(self.source, model, Some(first), row)?;
+        let (_, chunk) = self
+            .tuples
+            .push_charged(self.source, model, Some(first), row)?;
         let bounded = model.bounded();
         let Some(heap) = self.heap.as_mut() else {
             self.early.push(row).map_err(|_| arena_full())?;
@@ -180,12 +184,12 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
             return Ok(());
         };
         // `bounded_heap_charge` for a row past the heap's forming.
-        let chunk = self.tuples.chunk(self.source, first, row);
         heap.charge += chunk;
         let Heap {
             order,
             count,
             entries,
+            charges,
             rows,
             charge,
         } = heap;
@@ -204,9 +208,8 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
             HeapOffer::Insert => unreachable!("a formed heap is full"),
             HeapOffer::Discard => *charge -= chunk,
             HeapOffer::ReplaceTop(top) => {
-                *charge -= self
-                    .tuples
-                    .chunk(self.source, first, rows.row(entries, top));
+                *charge -= charges[top as usize];
+                charges[top as usize] = chunk;
                 rows.store(entries, top, row)?;
                 let mut by_id = |left: u32, right: u32| {
                     compare(rows.row(entries, left), rows.row(entries, right))
@@ -259,8 +262,14 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
             .arena
             .alloc_persistent_slice_with(self.bound, |_| (0u32, 0u32))
             .map_err(|_| arena_full())?;
+        let charges = self
+            .arena
+            .alloc_persistent_slice_with(self.bound, |_| 0usize)
+            .map_err(|_| arena_full())?;
         for (position, at) in order.iter_mut().enumerate().take(count) {
-            rows.store(entries, position as u32, early[*at as usize])?;
+            let row = early[*at as usize];
+            rows.store(entries, position as u32, row)?;
+            charges[position] = self.tuples.chunk(self.source, first, row);
             *at = position as u32;
         }
         rows.garbage = 0;
@@ -268,6 +277,7 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
             order,
             count,
             entries,
+            charges,
             rows,
             charge,
         });
@@ -297,6 +307,7 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
             entries,
             rows,
             charge,
+            ..
         } = heap;
         let order = &mut order[..count];
         pg_qsort::sort_bounded_heap(order, &mut |left, right| {

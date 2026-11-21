@@ -244,10 +244,27 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     }
 }
 
+/// The projected values and sort keys of one row, reused from row to row:
+/// a row reads only the prefix it wrote.
+pub(super) struct ProjectionBuffers<'a> {
+    projected: [Datum<'a>; MAX_PROJ],
+    keys: [Datum<'a>; MAX_PROJ],
+}
+
+impl ProjectionBuffers<'_> {
+    pub(super) fn new() -> Self {
+        Self {
+            projected: [Datum::Null; MAX_PROJ],
+            keys: [Datum::Null; MAX_PROJ],
+        }
+    }
+}
+
 /// Projects each source row before deriving its sort keys. Keys that name
 /// output columns reuse their saved values, including volatile expressions.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn for_each_materialized_projection<'a>(
+    buffers: &mut ProjectionBuffers<'a>,
     storage: &'a Storage,
     scope: &QueryScope<'a>,
     statement: &'a Select<'a>,
@@ -306,7 +323,7 @@ fn for_each_materialized_projection<'a>(
         } else {
             row_hooks
         };
-        let mut projected = [Datum::Null; MAX_PROJ];
+        let ProjectionBuffers { projected, keys } = &mut *buffers;
         let width = project_row_skipping(
             statement.items,
             postponed,
@@ -315,10 +332,9 @@ fn for_each_materialized_projection<'a>(
             arena,
             params,
             use_hooks,
-            &mut projected,
+            projected,
             outer,
         )?;
-        let mut keys = [Datum::Null; MAX_PROJ];
         let chained_row = Chained { inner: row, outer };
         for (key, expression) in order_exprs.iter().take(n_keys).enumerate() {
             let value = expression.expect("resolved").value(
@@ -343,6 +359,7 @@ fn materialized_value_at<'a>(
     n_keys: usize,
     identities_at: usize,
     raw_columns: Option<&super::scan::PaxReadDemand>,
+    source_columns: usize,
     index: usize,
 ) -> Datum<'a> {
     if index < width {
@@ -357,21 +374,22 @@ fn materialized_value_at<'a>(
             .map(Datum::Int8)
             .unwrap_or(Datum::Null);
     }
+    // Each relation's stored columns (`source_columns` in all), then one
+    // presence flag per relation.
     let mut raw_index = index - width - n_keys;
-    let source_columns = scope.stored_columns();
     if raw_index >= source_columns {
-        let table = raw_index - source_columns;
         let present = row
-            .table_present(table)
+            .table_present(raw_index - source_columns)
             .expect("materialized source is joined");
         return Datum::Bool(present);
     }
+    let Some(raw_columns) = raw_columns else {
+        return Datum::Null;
+    };
     for table in 0..scope.n {
         let column_count = scope.stored_width(table);
         if raw_index < column_count {
-            if !raw_columns
-                .is_some_and(|columns| columns.references_column(table, raw_index, column_count))
-            {
+            if !raw_columns.references_column(table, raw_index, column_count) {
                 return Datum::Null;
             }
             let values = row.table_values(table).expect("bound");
@@ -437,6 +455,8 @@ struct MaterializedLayout<'p> {
     identities_at: usize,
     stored_width: usize,
     raw_columns: Option<&'p super::scan::PaxReadDemand>,
+    /// [`QueryScope::stored_columns`], summed once per statement.
+    source_columns: usize,
 }
 
 /// Encodes one projected source row into the statement arena's persistent
@@ -473,6 +493,7 @@ fn encode_materialized_row_in<'a>(
             layout.n_keys,
             layout.identities_at,
             layout.raw_columns,
+            layout.source_columns,
             index,
         )
     };
@@ -1136,11 +1157,14 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                 + self.plan.n_raw
                 + self.plan.n_identities,
             raw_columns: self.plan.raw_columns.as_ref(),
+            source_columns: self.scope.stored_columns(),
         };
         // The re-run plan's first row stands for the locked row, also when a
         // set-returning projection expands it.
         let mut rebuilt = None;
+        let mut projection_buffers = ProjectionBuffers::new();
         for_each_materialized_projection(
+            &mut projection_buffers,
             storage,
             scope,
             self.statement,
@@ -2357,12 +2381,16 @@ pub(crate) fn materialized_rows<'a>(
     // Whether rows encode into the arena's front, which the streamed sort
     // rewinds after taking each row.
     let front = core::cell::Cell::new(false);
+    let streams = streamed.is_some();
+    let source_columns = scope.stored_columns();
+    let mut projection_buffers = ProjectionBuffers::new();
     // Evaluate each projection once, in scan order. Encoded rows and their
     // references survive the scan's per-row scratch rewinds in the arena tail.
     let mut encode_into = |row: &JoinRow<'_, 'a, '_>,
                            rows: &mut ArenaList<'a, &'a [u8]>,
                            scan_window: Option<usize>| {
         for_each_materialized_projection(
+            &mut projection_buffers,
             storage,
             scope,
             statement,
@@ -2394,6 +2422,7 @@ pub(crate) fn materialized_rows<'a>(
                         identities_at,
                         stored_width,
                         raw_columns: raw_columns.as_ref(),
+                        source_columns,
                     },
                     !front.get(),
                     arena,
@@ -2414,6 +2443,13 @@ pub(crate) fn materialized_rows<'a>(
                     }
                     None => output,
                 };
+                // The streamed sort compares each row as it arrives, so its
+                // keys must be comparable under their collations first.
+                if streams {
+                    for (key, &collation) in key_collations.iter().enumerate().take(n_keys) {
+                        storage.validate_text_collation(collation, &keys[key])?;
+                    }
+                }
                 rows.push(output).map_err(|_| arena_full())?;
                 Ok(())
             },
@@ -2503,12 +2539,6 @@ pub(crate) fn materialized_rows<'a>(
         let more = encode_into(row, &mut pending, None)?;
         for at in 0..pending.len() {
             let output: &'a [u8] = pending.borrowed_slice()[at];
-            for (key, &collation) in key_collations.iter().enumerate().take(n_keys) {
-                storage.validate_text_collation(
-                    collation,
-                    &crate::sql::exec::decode_projected_pub(output, width + key),
-                )?;
-            }
             sort.push(output, &mut streamed_compare)?;
         }
         pending.truncate(0);
@@ -3190,6 +3220,7 @@ pub(crate) fn external_materialized_into<'a>(
     offset: u64,
     emit: &mut ExternalRowEmitter<'_>,
 ) -> Result<u64, SqlError> {
+    let source_columns = scope.stored_columns();
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, outer, arena)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let source_rowids = arena
@@ -3249,6 +3280,7 @@ pub(crate) fn external_materialized_into<'a>(
         let mut logical_index = 0u64;
         let mut emitted = 0u64;
         let mut keep_emitting = true;
+        let mut projection_buffers = ProjectionBuffers::new();
         scan_source_recycling_with_indexed_candidates(
             storage,
             scope,
@@ -3265,6 +3297,7 @@ pub(crate) fn external_materialized_into<'a>(
                 source_rowids.fill(None);
                 source_rowids[..row.rowids.len()].copy_from_slice(row.rowids);
                 for_each_materialized_projection(
+                    &mut projection_buffers,
                     storage,
                     scope,
                     statement,
@@ -3413,9 +3446,11 @@ pub(crate) fn external_materialized_into<'a>(
     let mut distinct_rows =
         (statement.distinct && plan.n_on == 0 && stages.unique.hash_agg_sizing().is_some())
             .then(|| ArenaList::new_persistent(arena));
+    let mut projection_buffers = ProjectionBuffers::new();
     let mut push = |row: &JoinRow<'_, 'a, '_>| {
         let mark = arena.mark();
         let result = for_each_materialized_projection(
+            &mut projection_buffers,
             storage,
             scope,
             statement,
@@ -3449,6 +3484,7 @@ pub(crate) fn external_materialized_into<'a>(
                             identities_at: plan.identities_at,
                             stored_width: plan.width + plan.n_keys + plan.n_raw + plan.n_identities,
                             raw_columns: plan.raw_columns.as_ref(),
+                            source_columns,
                         },
                         false,
                         arena,
@@ -3479,6 +3515,7 @@ pub(crate) fn external_materialized_into<'a>(
                             plan.n_keys,
                             plan.identities_at,
                             plan.raw_columns.as_ref(),
+                            source_columns,
                             index,
                         );
                     }
@@ -3499,6 +3536,7 @@ pub(crate) fn external_materialized_into<'a>(
                             plan.n_keys,
                             plan.identities_at,
                             plan.raw_columns.as_ref(),
+                            source_columns,
                             index,
                         );
                     }
@@ -3524,6 +3562,7 @@ pub(crate) fn external_materialized_into<'a>(
                                     plan.n_keys,
                                     plan.identities_at,
                                     plan.raw_columns.as_ref(),
+                                    source_columns,
                                     index,
                                 )
                             },

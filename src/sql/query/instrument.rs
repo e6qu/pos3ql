@@ -1828,6 +1828,19 @@ pub(crate) fn held_heap<R>(
     Ok(result)
 }
 
+/// The leading heap pages of the table in `slot` its visibility map marks
+/// all-visible: the pages VACUUM set that no later change touched. Only
+/// VACUUM sets the map, so where the rows live never changes it.
+pub(crate) fn all_visible_pages(storage: &crate::storage::Storage, slot: usize, txid: u32) -> u64 {
+    if storage.relation_cumulative_statistics(slot).n_dead_tup != 0 {
+        return 0;
+    }
+    storage
+        .table_statistics(slot, txid)
+        .relation_all_visible_pages()
+        .max(0) as u64
+}
+
 /// The heap page map of the table in `slot` (see [`held_heap`]).
 pub(crate) fn heap_pages<'a>(
     storage: &crate::storage::Storage,
@@ -2330,6 +2343,13 @@ impl Node {
     /// Counts a row the node's `Filter` removed.
     pub(crate) fn filtered(self) {
         self.with(|slot, _| slot.counters.filtered = slot.counters.filtered.saturating_add(1));
+    }
+
+    /// Counts `count` rows the node's `Filter` removed.
+    pub(crate) fn add_filtered(self, count: u64) {
+        self.with(|slot, _| {
+            slot.counters.filtered = slot.counters.filtered.saturating_add(count);
+        });
     }
 
     /// Counts a row the node's `Join Filter` removed.

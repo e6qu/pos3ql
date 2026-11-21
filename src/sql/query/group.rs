@@ -871,6 +871,11 @@ pub(super) fn groups_for_mask<'a>(
     }
     let mut output_count = 0usize;
     let mut consumed = 0usize;
+    // The groups `HAVING` removed, counted once the groups the plan reads are
+    // known.
+    let removed = arena
+        .alloc_slice_with(n_groups, |_| false)
+        .map_err(|_| arena_full())?;
     for at in 0..n_groups {
         if group_bound.is_some_and(|bound| output_count >= bound) {
             break;
@@ -942,7 +947,7 @@ pub(super) fn groups_for_mask<'a>(
             match eval_full(h, arena, params, &schema, &having_hooks)? {
                 Datum::Bool(true) => {}
                 Datum::Bool(false) | Datum::Null => {
-                    aggregate.filtered();
+                    removed[g] = true;
                     continue;
                 }
                 _ => {
@@ -1038,6 +1043,22 @@ pub(super) fn groups_for_mask<'a>(
         }
         _ => (false, consumed),
     };
+    // A plan stopped by its limit filtered only the groups it read.
+    let read_groups = |step: usize| {
+        if descending {
+            n_groups - 1 - step
+        } else {
+            step
+        }
+    };
+    let filtered = if ordered_bound.is_some() && group_bound.is_none() && order.is_none() {
+        (0..counted)
+            .filter(|&step| removed[read_groups(step)])
+            .count()
+    } else {
+        removed.iter().filter(|&&removed| removed).count()
+    };
+    aggregate.add_filtered(filtered as u64);
     let whole_groups = if agg_nodes.is_empty() {
         counted.saturating_sub(1)
     } else {

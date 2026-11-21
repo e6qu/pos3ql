@@ -80,8 +80,9 @@ The model covers:
   selectivities, and `LIMIT`/`OFFSET` via `adjust_limit_rows_costs` (`821`).
   A `GroupAggregate`'s input sort holds the keys and the columns its
   aggregates read (`make_group_input_target`) and spills under `work_mem`
-  as `tuplesort` does; a limit over an `ORDER BY` of its keys stops it early
-  (`965`). A grouping whose keys all conditions fix is refused.
+  as `tuplesort` does; a limit over an `ORDER BY` of its keys stops it early,
+  and `Rows Removed by Filter` counts only the groups `HAVING` removed before
+  it stopped (`965`). A grouping whose keys all conditions fix is refused.
 - Grouping sets arranged as PostgreSQL does (`extract_rollup_sets`,
   `reorder_grouping_sets`, `DiscreteKnapsack`, `MixedAggregate`), with
   PostgreSQL's costs over one table (`802`).

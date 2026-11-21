@@ -44,6 +44,10 @@ struct Edge {
     unused_edges: i32,
 }
 
+// SAFETY: an edge is integers only, so all zeros is a valid, empty edge.
+unsafe impl crate::mem::fixed_vec::Zeroable for Edge {}
+
+#[cfg(test)]
 const NO_EDGE: Edge = Edge {
     edge_list: [0; 4],
     total_edges: 0,
@@ -99,14 +103,8 @@ impl JoinSearchPool {
     pub(crate) fn new(budget: &mut Budget, max_relations: usize) -> Result<Self, BudgetError> {
         budget.draw(size_of::<Self>(), "join search pool")?;
         let stride = max_relations + 1;
-        let mut strings = FixedVec::new(budget, "join search pool", (MAX_POOL + 2) * stride)?;
-        while strings.len() < strings.capacity() {
-            strings.push(0).expect("a reserved gene");
-        }
-        let mut edges = FixedVec::new(budget, "join search pool", stride)?;
-        while edges.len() < edges.capacity() {
-            edges.push(NO_EDGE).expect("a reserved edge");
-        }
+        let strings = FixedVec::zeroed(budget, "join search pool", (MAX_POOL + 2) * stride)?;
+        let edges = FixedVec::zeroed(budget, "join search pool", stride)?;
         Ok(Self {
             max_relations,
             memory: Mutex::new(PoolMemory {

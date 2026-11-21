@@ -49,6 +49,7 @@ mod geometry_assignments;
 mod hash_aggregate_context_reuse;
 mod hash_outer_joins;
 mod index_expression_mutability;
+mod index_only_spilled_heap_fetches;
 mod index_parent_ownership;
 mod indirect_execute_privileges;
 mod information_schema_domains;

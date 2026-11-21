@@ -19,7 +19,10 @@ REFRESH MATERIALIZED VIEW m754_empty;
 -- An ordinary statement keeps the session's path.
 SELECT a::posint754 FROM t754;
 INSERT INTO t754 VALUES (-2, 1) RETURNING a::posint754;
-DELETE FROM t754 WHERE a < 0;
+-- A deleted row stays visible to an index build while any other session's
+-- snapshot predates the delete; TRUNCATE leaves no such row.
+TRUNCATE t754;
+INSERT INTO t754 VALUES (1, 5);
 CREATE INDEX t754_dom ON t754 ((a::posint754));
 REFRESH MATERIALIZED VIEW m754_empty;
 UPDATE t754 SET a = -3;

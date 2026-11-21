@@ -2065,7 +2065,8 @@ mod tests {
             stream.write_all(&body).unwrap();
             listener.set_nonblocking(true).unwrap();
             stream.set_nonblocking(true).unwrap();
-            for _ in 0..1_000_000 {
+            let deadline = crate::test_wait::deadline();
+            while Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut writer, _)) => {
                         read_request(&mut writer);
@@ -2096,15 +2097,14 @@ mod tests {
         store.enable_async_gets();
         store.set_read_owner(Some(ReadOwner(1)));
         assert_eq!(store.prefetch(&id).unwrap(), PrefetchState::Scheduled);
-        let mut complete = false;
-        for _ in 0..10_000 {
-            if store.advance_pending_read(0).unwrap() {
-                complete = true;
-                break;
-            }
+        let deadline = crate::test_wait::deadline();
+        while !store.advance_pending_read(0).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "mock object response did not complete"
+            );
             std::thread::yield_now();
         }
-        assert!(complete, "mock object response did not complete");
         store
             .put(b"concurrent write", BlockType::SstIndexV2, 0)
             .unwrap();
@@ -2225,15 +2225,14 @@ mod tests {
         assert!(store.next_read_deadline().is_some());
         release_response_tx.send(()).unwrap();
 
-        let mut complete = false;
-        for _ in 0..10_000 {
-            if store.advance_pending_read(0).unwrap() {
-                complete = true;
-                break;
-            }
+        let deadline = crate::test_wait::deadline();
+        while !store.advance_pending_read(0).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "mock packed response did not complete"
+            );
             std::thread::yield_now();
         }
-        assert!(complete, "mock packed response did not complete");
         assert!(!store.async_reads_busy());
         store.disable_async_gets();
         assert_eq!(
@@ -2387,15 +2386,14 @@ mod tests {
         );
         assert_eq!(store.io_stats().object_gets, 2);
         release_hedge.send(()).unwrap();
-        let mut complete = false;
-        for _ in 0..10_000 {
-            if store.advance_pending_read(1).unwrap() {
-                complete = true;
-                break;
-            }
+        let deadline = crate::test_wait::deadline();
+        while !store.advance_pending_read(1).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "hedged response did not complete"
+            );
             std::thread::yield_now();
         }
-        assert!(complete, "hedged response did not complete");
         assert_eq!(
             store.get(&id, &mut output).unwrap(),
             (payload.len(), BlockType::SstData)

@@ -8047,7 +8047,11 @@ fn plan_pulled_select<'a>(
                         txid,
                         scope.as_ref(),
                         statement,
-                        KeyLabel::Group,
+                        if aggregate_name == "HashAggregate" {
+                            KeyLabel::Group
+                        } else {
+                            KeyLabel::GroupInput
+                        },
                         keys,
                         arena,
                     )?,

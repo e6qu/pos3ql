@@ -196,6 +196,7 @@ pub(super) fn groups_for_mask<'a>(
     n_order: usize,
     pax_demand: super::PaxReadDemand,
     group_bound: Option<usize>,
+    ordered_bound: Option<(usize, bool)>,
     planned: &PlannedJoin<'a>,
 ) -> Result<(&'a [&'a [u8]], bool), SqlError> {
     let n_keys = statement.group_by.len();
@@ -224,24 +225,31 @@ pub(super) fn groups_for_mask<'a>(
     let (n_groups, rep_keys): (usize, &[&[u8]]) = if storage.spill_attached() && n_keys > 0 {
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
-        // PostgreSQL sorts the grouping columns, when the aggregates read
-        // no column (see the in-memory path).
-        if input_sort.measured() && grouping_sort_is_keys(statement, agg_nodes, mask) {
-            let columns: [usize; crate::sql::parser::MAX_GROUP_TERMS] =
-                core::array::from_fn(|column| column);
+        // PostgreSQL sorts the grouping columns and the columns the
+        // aggregates read (see the in-memory path); the rows carry them
+        // between the keys and the input position.
+        let input_columns =
+            if input_sort.measured() && !grouping_sort_is_keys(statement, agg_nodes, mask) {
+                Some(grouping_input_columns(statement, agg_nodes)?)
+            } else {
+                None
+            };
+        let sorted_width = n_keys + input_columns.as_ref().map_or(0, |columns| columns.len);
+        if input_sort.measured() {
+            let columns: [usize; GROUPING_INPUT_WIDTH] = core::array::from_fn(|column| column);
             sorter.size_as_postgres(
-                instrument::SortTuples::new(Some(&columns[..n_keys]), 0, false),
+                instrument::SortTuples::new(Some(&columns[..sorted_width]), 0, false),
                 None,
                 txid,
             );
         }
         // Equal keys keep input order, so each group reports its first input
         // row's key, as PostgreSQL's hashed grouping does.
-        let input_position = |row: &[u8]| match crate::sql::exec::decode_projected_pub(row, n_keys)
-        {
-            Datum::Int4(position) => position,
-            _ => 0,
-        };
+        let input_position =
+            |row: &[u8]| match crate::sql::exec::decode_projected_pub(row, sorted_width) {
+                Datum::Int4(position) => position,
+                _ => 0,
+            };
         let mut compare = |a: &[u8], b: &[u8]| {
             compare_group_rows(storage, txid, group_collations, a, b)
                 .map(|ordering| ordering.then_with(|| input_position(a).cmp(&input_position(b))))
@@ -296,16 +304,24 @@ pub(super) fn groups_for_mask<'a>(
                 for (value, &collation) in key_vals[..n_keys].iter().zip(group_collations) {
                     storage.validate_text_collation(collation, value)?;
                 }
+                let mut inputs = [Datum::Null; MAX_INPUT_COLUMNS];
+                if let Some(columns) = &input_columns {
+                    for (value, column) in inputs.iter_mut().zip(columns.columns()) {
+                        *value = eval_full(column, arena, params, row, row_hooks)?;
+                    }
+                }
                 let row_idx = at;
                 storage
                     .with_block_store(|blocks| {
                         sorter.push_projected_by(
                             storage,
                             blocks,
-                            n_keys + 1,
+                            sorted_width + 1,
                             |i| {
                                 if i < n_keys {
                                     key_vals[i]
+                                } else if i < sorted_width {
+                                    inputs[i - n_keys]
                                 } else {
                                     Datum::Int4(row_idx as i32)
                                 }
@@ -336,7 +352,7 @@ pub(super) fn groups_for_mask<'a>(
                 .expect("spill-attached block store")?;
             while let Some(context) = reader.context() {
                 let Datum::Int4(row_index) =
-                    crate::sql::exec::decode_projected_pub(context.row, n_keys)
+                    crate::sql::exec::decode_projected_pub(context.row, sorted_width)
                 else {
                     unreachable!("grouping runs end with the input row position")
                 };
@@ -366,6 +382,22 @@ pub(super) fn groups_for_mask<'a>(
         let key_rows = if n_keys == 0 { 0 } else { row_count };
         let keys: &mut [(&[u8], u32)] = arena
             .alloc_slice_with(key_rows, |_| (empty, 0u32))
+            .map_err(|_| arena_full())?;
+        // PostgreSQL's sort below a `GroupAggregate` holds the grouping
+        // keys, then each column the aggregates read
+        // (`make_group_input_target`); those rows size the sort.
+        let input_columns = if n_keys > 0
+            && input_sort.measured()
+            && !grouping_sort_is_keys(statement, agg_nodes, mask)
+        {
+            Some(grouping_input_columns(statement, agg_nodes)?)
+        } else {
+            None
+        };
+        let sort_rows: &mut [&[u8]] = arena
+            .alloc_slice_with(if input_columns.is_some() { key_rows } else { 0 }, |_| {
+                empty
+            })
             .map_err(|_| arena_full())?;
         if n_keys > 0 {
             let mut at = 0usize;
@@ -422,6 +454,17 @@ pub(super) fn groups_for_mask<'a>(
                     keys[at].0 =
                         crate::sql::exec::encode_projected_pub(&key_vals[..n_keys], arena)?;
                     keys[at].1 = at as u32;
+                    if let Some(columns) = &input_columns {
+                        let mut values = [Datum::Null; GROUPING_INPUT_WIDTH];
+                        values[..n_keys].copy_from_slice(&key_vals[..n_keys]);
+                        for (value, column) in values[n_keys..].iter_mut().zip(columns.columns()) {
+                            *value = eval_full(column, arena, params, row, row_hooks)?;
+                        }
+                        sort_rows[at] = crate::sql::exec::encode_projected_pub(
+                            &values[..n_keys + columns.len],
+                            arena,
+                        )?;
+                    }
                     at += 1;
                     Ok(true)
                 },
@@ -439,29 +482,22 @@ pub(super) fn groups_for_mask<'a>(
             // PostgreSQL sorts the rows its scan returns: the grouping
             // columns, and the aggregates' input columns, which pos3ql's
             // key rows do not hold.
-            let key_only = grouping_sort_is_keys(statement, agg_nodes, mask);
-            let space = if key_only {
-                let rows = arena
-                    .alloc_slice_with(keys.len(), |at| keys[at].0)
-                    .map_err(|_| arena_full())?;
-                instrument::SortSpace::postgres(
-                    super::postgres_memory::SizeSource { storage, txid },
-                    rows,
-                    None,
-                    false,
-                    false,
-                )?
+            // The rows in arrival order: the keys alone, or with the
+            // aggregates' input columns.
+            let rows: &[&[u8]] = if input_columns.is_some() {
+                sort_rows
             } else {
-                instrument::SortSpace {
-                    method: instrument::SortMethod::Quicksort,
-                    bytes: keys
-                        .iter()
-                        .fold(core::mem::size_of_val(&*keys), |bytes, key| {
-                            bytes.saturating_add(key.0.len())
-                        }),
-                }
+                arena
+                    .alloc_slice_with(keys.len(), |at| keys[at].0)
+                    .map_err(|_| arena_full())?
             };
-            input_sort.sorted(space);
+            input_sort.sorted(instrument::SortSpace::postgres(
+                super::postgres_memory::SizeSource { storage, txid },
+                rows,
+                None,
+                false,
+                false,
+            )?);
         }
         let ng = {
             let mut g = 0usize;
@@ -977,11 +1013,35 @@ pub(super) fn groups_for_mask<'a>(
     // group's rows and the first row of the next one, a `Group` (no
     // aggregates) only its last group's first row; a hashed grouping read
     // every row.
-    let stopped = group_bound.is_some_and(|bound| output_count >= bound);
+    // A limit over an `ORDER BY` the sorted grouping's key order already
+    // satisfies (`descending` reads the groups from the last) stops it too,
+    // at the group of its last row that passes `HAVING`: the plan has no
+    // sort above the grouping.
+    let mut descending = false;
+    let (stopped, counted) = match (group_bound, ordered_bound) {
+        (Some(bound), _) => (output_count >= bound, consumed),
+        (None, Some((bound, reversed))) if order.is_none() => {
+            descending = reversed;
+            let mut passed = 0usize;
+            let mut counted = n_groups;
+            for step in 0..n_groups {
+                let group = if reversed { n_groups - 1 - step } else { step };
+                if !per_group[group].is_empty() {
+                    passed += 1;
+                }
+                if passed == bound {
+                    counted = step + 1;
+                    break;
+                }
+            }
+            (counted < n_groups, counted)
+        }
+        _ => (false, consumed),
+    };
     let whole_groups = if agg_nodes.is_empty() {
-        consumed.saturating_sub(1)
+        counted.saturating_sub(1)
     } else {
-        consumed
+        counted
     };
     let rows_read = if n_keys == 0 || !sorted_grouping || !stopped || whole_groups == n_groups {
         row_count
@@ -990,7 +1050,8 @@ pub(super) fn groups_for_mask<'a>(
             .alloc_slice_with(n_groups, |_| false)
             .map_err(|_| arena_full())?;
         for at in 0..whole_groups {
-            taken[order.map_or(at, |order| order[at] as usize)] = true;
+            let position = if descending { n_groups - 1 - at } else { at };
+            taken[order.map_or(position, |order| order[at] as usize)] = true;
         }
         group_of[..row_count]
             .iter()
@@ -2328,6 +2389,11 @@ pub(super) fn grouped_rows<'a>(
     let group_bound = bound.filter(|&bound| {
         bound > 0 && statement.order_by.is_empty() && !statement.distinct && masks.len() == 1
     });
+    let ordered_bound = bound
+        .filter(|&bound| bound > 0 && !statement.distinct && masks.len() == 1)
+        .and_then(|bound| {
+            grouping_order_direction(statement).map(|descending| (bound, descending))
+        });
     // Each set's scans, keys, and aggregate states are temporary. Preserve its
     // self-contained encoded rows in the persistent tail, then recycle front
     // scratch before the next set so 4,096 sets do not multiply workspace.
@@ -2358,6 +2424,7 @@ pub(super) fn grouped_rows<'a>(
             n_order,
             pax_columns,
             group_bound,
+            ordered_bound,
             &planned,
         )?;
         hash_ordered = ordered && masks.len() == 1 && !statement.distinct;
@@ -3219,6 +3286,92 @@ pub(super) fn record_distinct_hash_memory(
 /// Whether PostgreSQL's sort of a `GroupAggregate`'s input holds only the
 /// grouping columns pos3ql's key rows hold: every key is in the set and no
 /// aggregate reads a column.
+/// Whether the `ORDER BY` is a prefix of the grouping keys, all ascending
+/// with NULLs last (`Some(false)`) or all descending with NULLs first
+/// (`Some(true)`): the order a sorted grouping returns its groups in.
+fn grouping_order_direction(statement: &Select<'_>) -> Option<bool> {
+    let item_at = |expression: &Expr<'_>| match expression {
+        Expr::Int(position) if *position >= 1 => {
+            match statement.items.get(*position as usize - 1) {
+                Some(SelectItem::Expr { expression, .. }) => Some(**expression),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let first = statement.order_by.first()?;
+    let descending = first.descending;
+    (statement.order_by.len() <= statement.group_by.len()
+        && statement
+            .order_by
+            .iter()
+            .zip(statement.group_by)
+            .all(|(item, key)| {
+                let ordered = item_at(item.expression).unwrap_or(*item.expression);
+                let grouped = item_at(key).unwrap_or(**key);
+                item.descending == descending
+                    && item.nulls_first == descending
+                    && ordered == grouped
+            }))
+    .then_some(descending)
+}
+
+/// The widest row a grouping's input sort holds: its keys and the columns
+/// its aggregates read.
+const GROUPING_INPUT_WIDTH: usize = crate::sql::parser::MAX_GROUP_TERMS + MAX_INPUT_COLUMNS;
+/// The columns besides its keys a grouping's input sort is modelled for.
+const MAX_INPUT_COLUMNS: usize = 64;
+
+/// The distinct columns a grouping's aggregates read, in first-read order:
+/// what `make_group_input_target` adds after the grouping keys.
+struct GroupingInputColumns<'a> {
+    columns: [Option<&'a Expr<'a>>; MAX_INPUT_COLUMNS],
+    len: usize,
+}
+
+impl<'a> GroupingInputColumns<'a> {
+    fn columns(&self) -> impl Iterator<Item = &'a Expr<'a>> + '_ {
+        self.columns[..self.len]
+            .iter()
+            .map(|column| column.expect("collected column"))
+    }
+}
+
+fn grouping_input_columns<'a>(
+    statement: &'a Select<'a>,
+    agg_nodes: &[(*const Expr<'a>, &'a Expr<'a>)],
+) -> Result<GroupingInputColumns<'a>, SqlError> {
+    let mut collected = GroupingInputColumns {
+        columns: [None; MAX_INPUT_COLUMNS],
+        len: 0,
+    };
+    let mut overflow = false;
+    for (_, aggregate) in agg_nodes {
+        super::walk_expression_tree(aggregate, &mut |node| {
+            let Expr::Column { qualifier, name } = node else {
+                return;
+            };
+            let same = |other: &Expr<'_>| matches!(other, Expr::Column { qualifier: q, name: n } if q == qualifier && n == name);
+            if statement.group_by.iter().any(|key| same(key)) || collected.columns().any(same) {
+                return;
+            }
+            if collected.len == MAX_INPUT_COLUMNS {
+                overflow = true;
+                return;
+            }
+            collected.columns[collected.len] = Some(node);
+            collected.len += 1;
+        })?;
+    }
+    if overflow {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN ANALYZE of a grouping sort whose aggregates read more than 64 columns is not supported"
+        ));
+    }
+    Ok(collected)
+}
+
 fn grouping_sort_is_keys(
     statement: &Select<'_>,
     agg_nodes: &[(*const Expr<'_>, &Expr<'_>)],

@@ -8968,16 +8968,11 @@ fn chosen_scan_counts<'a>(
     let (pages, page_count, visible_pages) =
         if buffers || matches!(path.kind, ScanKind::Bitmap | ScanKind::IndexOnly) {
             let (pages, page_count) = instrument::heap_pages(storage, slot, txid, arena)?;
-            let statistics = storage.table_statistics(slot, txid);
-            let activity = storage.relation_cumulative_statistics(slot);
-            // The visibility map keeps the pages VACUUM set that no later
-            // change touched.
-            let visible = if activity.n_dead_tup != 0 {
-                0
-            } else {
-                statistics.relation_all_visible_pages().max(0) as u64
-            };
-            (pages, page_count, visible)
+            (
+                pages,
+                page_count,
+                instrument::all_visible_pages(storage, slot, txid),
+            )
         } else {
             (&[][..], 0, 0)
         };
@@ -11560,12 +11555,15 @@ fn scan_source_mode<'a>(
                     .then_some(scope.target_hash_candidates)
                     .flatten();
                 // The path PostgreSQL chooses for the one relation sets the
-                // rows' order and what EXPLAIN ANALYZE counts. Counting reads
-                // every row, as the path's own index conditions select them.
-                let chosen = if depth == 0
+                // rows' order, unless an ordered index access's candidates
+                // already follow it, and what EXPLAIN ANALYZE counts.
+                // Counting reads every row, as the path's own index
+                // conditions select them.
+                let ordered_access = access.is_some_and(|access| access.preserves_order);
+                let described = if depth == 0
                     && scope.n == 1
                     && hashed.is_none()
-                    && access.is_none_or(|access| !access.preserves_order)
+                    && (!ordered_access || instrument::active())
                 {
                     match (
                         planned,
@@ -11588,6 +11586,7 @@ fn scan_source_mode<'a>(
                 } else {
                     None
                 };
+                let chosen = described.filter(|_| !ordered_access);
                 let access = access.filter(|access| {
                     chosen.is_none() || !instrument::active() || access.reaches_path
                 });
@@ -11611,17 +11610,7 @@ fn scan_source_mode<'a>(
                     StopAfterScope::enter(slot, chosen.and_then(|path| path.stop_after));
                 let _bitmap_loop;
                 let _tree_loops;
-                // A described path whose index candidates already come in its
-                // order (a merge join's ordered input) runs on them; it still
-                // counts what its path reads.
-                let counted = chosen.or_else(|| {
-                    planned.filter(|_| {
-                        depth == 0
-                            && scope.n == 1
-                            && instrument::active()
-                            && access.is_some_and(|access| access.preserves_order)
-                    })
-                });
+                let counted = chosen.or(described);
                 let _chosen_scope = match counted {
                     Some(path) if instrument::active() => {
                         use super::index_paths::ScanKind;

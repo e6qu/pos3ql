@@ -2367,18 +2367,8 @@ impl<'r, 'a> Runner<'r, 'a> {
         }
         let (heap, relation_pages) =
             super::instrument::heap_pages(self.storage, slot, self.txid, self.arena)?;
-        // The visibility map keeps the pages VACUUM set that no later change
-        // touched.
-        let visible = index_only.then(|| {
-            if self.storage.relation_cumulative_statistics(slot).n_dead_tup != 0 {
-                0
-            } else {
-                self.storage
-                    .table_statistics(slot, self.txid)
-                    .relation_all_visible_pages()
-                    .max(0) as u64
-            }
-        });
+        let visible =
+            index_only.then(|| super::instrument::all_visible_pages(self.storage, slot, self.txid));
         Ok(LazyPages {
             rel,
             model: super::instrument::PageModel {

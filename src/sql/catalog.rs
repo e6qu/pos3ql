@@ -21691,7 +21691,7 @@ fn pg_class<'a>(
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(table_row_type_oid(storage, slot, false)),
                 acl(storage, relation_object, txid, arena)?,
-                Datum::Int4(0),
+                Datum::Int4(statistics.relation_all_visible_pages()),
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
@@ -28137,9 +28137,7 @@ fn pg_stat_tables<'a>(
     transaction_local: bool,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require(name, false);
-    let indexes = (!transaction_local)
-        .then(|| collect_indexes(storage, txid, TableSelection::All, arena))
-        .transpose()?;
+    let indexes = collect_indexes(storage, txid, TableSelection::All, arena)?;
     let rows = arena
         .alloc_slice_with(storage.table_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -28149,12 +28147,21 @@ fn pg_stat_tables<'a>(
             continue;
         }
         let table = storage.table_def(table_slot, txid);
+        // The views list partitioned tables too (`relkind` `p`).
         if table.kind != crate::storage::TableKind::Local
-            || table.partition.is_partitioned()
             || !statistics_schema_in_scope(table.schema.as_str(), scope)
         {
             continue;
         }
+        // The index columns sum over the table's indexes: NULL without one.
+        let indexed = indexes.iter().any(|index| index.table_slot == table_slot);
+        let index_count = |value: u64| {
+            if indexed {
+                statistics_count(value)
+            } else {
+                Datum::Null
+            }
+        };
         let identity = [
             Datum::Oid(user_table_oid(storage, table_slot) as u32),
             text(table.schema.as_str(), arena)?,
@@ -28169,8 +28176,8 @@ fn pg_stat_tables<'a>(
                     identity[2],
                     statistics_count(statistics.seq_scan),
                     statistics_count(statistics.seq_tup_read),
-                    statistics_count(statistics.idx_scan),
-                    statistics_count(statistics.idx_tup_fetch),
+                    index_count(statistics.idx_scan),
+                    index_count(statistics.idx_tup_fetch),
                     statistics_count(statistics.n_tup_ins),
                     statistics_count(statistics.n_tup_upd),
                     statistics_count(statistics.n_tup_del),
@@ -28185,7 +28192,6 @@ fn pg_stat_tables<'a>(
             let mut idx_tup_fetch = 0u64;
             let mut last_idx_scan: Option<i64> = None;
             for index in indexes
-                .expect("cumulative table statistics collected indexes")
                 .iter()
                 .filter(|index| index.table_slot == table_slot)
             {
@@ -28209,9 +28215,9 @@ fn pg_stat_tables<'a>(
                         .last_seq_scan
                         .map_or(Datum::Null, Datum::Timestamptz),
                     statistics_count(statistics.seq_tup_read),
-                    statistics_count(idx_scan),
+                    index_count(idx_scan),
                     last_idx_scan.map_or(Datum::Null, Datum::Timestamptz),
-                    statistics_count(idx_tup_fetch),
+                    index_count(idx_tup_fetch),
                     statistics_count(statistics.n_tup_ins),
                     statistics_count(statistics.n_tup_upd),
                     statistics_count(statistics.n_tup_del),

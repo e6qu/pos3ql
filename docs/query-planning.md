@@ -106,7 +106,9 @@ from their support functions.
 Partitioned tables and inheritance trees read alone, or written by an
 `UPDATE` or `DELETE` that joins nothing, are planned member by member
 (`set_append_rel_pathlist`, `750`, `751`): an `Append`, an ordered `Append`
-(`partitions_are_ordered`) or a `Merge Append`. Pruning follows `partprune.c`
+(`partitions_are_ordered`) or a `Merge Append`. A member whose path reads an
+index seeks it with the query's conditions and counts an index scan in its
+statistics (`964`). Pruning follows `partprune.c`
 and constraint exclusion; constants and custom plan arguments prune at
 planning, generic plan arguments and stable functions at executor startup
 (`Subplans Removed`), and execution prunes with every value it knows
@@ -122,7 +124,8 @@ path `pg_catalog, pg_temp`, as PostgreSQL's `RestrictSearchPath` does (`754`).
 
 PostgreSQL's costs read page counts, so pos3ql emulates its layouts: rows
 packed in physical order, a btree laid out as `_bt_buildadd` fills its pages
-(an index grown by inserts uses the size estimate), and a visibility map whose
+(an index grown by inserts is costed as if built, although PostgreSQL's page
+splits leave it larger), and a visibility map whose
 pages stay all-visible after `VACUUM` until an update, delete or insert. A
 single-column btree's NULL keys form their own run at the end of the index
 (`862`). The btree layout is computed from column statistics, so it can

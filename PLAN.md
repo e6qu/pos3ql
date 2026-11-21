@@ -412,8 +412,6 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   sorter's first 256 KiB chunk sort ties in PostgreSQL's order (needs
   `work_mem`-sized run buffers and a streaming merge over up to 500 tapes); a
   bounded sort outgrowing its heap under `EXPLAIN ANALYZE` (`0A000`).
-- [ ] *In progress:* partition seek: a partition member is read through its
-  own index as PostgreSQL's costs choose.
 - [ ] *In progress:* pglz compression and TOAST sizes, so hash, sort and
   statistics figures match for values PostgreSQL compresses or stores out of
   line (rows over about 2 kB).
@@ -433,6 +431,13 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 
 #### Statistics
 
+- [ ] Index layouts and counters: a btree grown by inserts has the pages
+  PostgreSQL's page splits and deduplication leave (an index created before
+  6,000 inserts is costed as built, 8.00 below PostgreSQL's full scan);
+  an index's `pg_class.relpages` and `reltuples` (0 today); cumulative
+  counters for `CREATE INDEX`'s heap scan, the heap fetches of bitmap and
+  index-only scans (`idx_tup_fetch`), and partition index scans read only
+  for their order.
 - [ ] Range and multirange histograms; `compute_distinct_stats` for types
   without an ordering; widths of compressed values; the binary form of a
   composite value inside a statistics array (sent as text today).
@@ -614,6 +619,13 @@ lists the shared pools today.
 
 **Remaining:**
 
+- [ ] A transaction writes more rows than `row_overlay_slots`, `txn_rows` or
+  `table_metadata_leases` hold: its uncommitted rows and prepared index keys
+  move out of memory (a 10,000-row `INSERT` fails with `54000` under the
+  8,192 defaults today, as no checkpoint can free its own rows).
+- [ ] Local mode (`object_store = off`) saves checkpointed rows outside
+  memory, so its tables together can hold more rows than
+  `row_overlay_slots`.
 - [ ] A write that cannot pause (`COPY FROM`, a statement after its first
   unreplayable effect) waits for a checkpoint when `row_overlay_slots` or
   `row_history_slots` are exhausted, without a restart (`54000` today).

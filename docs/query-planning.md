@@ -188,7 +188,21 @@ plan. Covered:
 - `EXPLAIN VERBOSE` target lists as `createplan.c` builds them (`930`).
 - Row estimates as doubles clamped at `MAXIMUM_ROWCOUNT` (1e100), so GEQO
   finds PostgreSQL's plan for huge cross products (`970`, `971`).
-- A parameterized scan's filter testing a subplan costs `cost_subplan` (`950`).
+- A parameterized scan's filter testing a subplan costs `cost_subplan` (`950`),
+  and a correlated scalar subquery in a select list costs its subplan per row,
+  its outer columns parameters of unknown value (`PARAM_EXEC`, `977`).
+- A `LATERAL` subquery of one table that PostgreSQL keeps as a subquery
+  (aggregates without `GROUP BY`, `ORDER BY`, `LIMIT`), reading earlier tables'
+  columns in its `WHERE`, written after a comma or `CROSS JOIN` and read by the
+  select list as all of its columns in order: a base relation sized from its
+  own plan (`set_subquery_pathlist`), whose one path is parameterized by the
+  tables it reads, so it joins on the inside of nested loops
+  (`join_is_legal`'s lateral rules), under a `Memoize` keyed by those columns
+  in binary mode when the cache pays (`paraminfo_get_equal_hashops`), with
+  `Hits`, `Misses`, `Evictions`, `Overflows` and `Memory Usage` as
+  `ExecMemoize` counts them (`977`). Other `LATERAL` subqueries run pos3ql's
+  own join order; `EXPLAIN` with costs of them fails with `0A000`, and with
+  `enable_memoize` on, so does any `EXPLAIN` of one PostgreSQL may memoize.
 
 Hash joins build on the first outer row, return matches in bucket-chain order
 (re-chained as `ExecHashIncreaseNumBuckets` does), keep a one-batch table

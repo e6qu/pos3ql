@@ -44,6 +44,8 @@ pub(crate) struct ModeledRel<'a> {
     pub(crate) output: u64,
     /// Its paths, by the search's [`super::joins::PathKind::Scan`] number.
     pub(crate) paths: &'a [JoinCandidate],
+    /// A `LATERAL` subquery's query, which its one path runs instead.
+    pub(crate) lateral: Option<LateralRel<'a>>,
 }
 
 /// The scan of one path of a modeled join's base relation: the path, the
@@ -2093,9 +2095,54 @@ fn modeled_join_over<'a>(
             return Ok(None);
         }
     }
+    let mut laterals = [None::<LateralRel<'a>>; MAX_JOIN_RELS];
     for table in 0..n {
         let tref = source(from, table);
-        if !plain_table(storage, txid, scope, table, tref) {
+        if plain_table(storage, txid, scope, table, tref) {
+            continue;
+        }
+        match lateral_rel(storage, txid, from, scope, table, &laterals, arena)? {
+            Some(lateral) => laterals[table] = Some(lateral),
+            None => return Ok(None),
+        }
+    }
+    let lateral_relids = (0..n)
+        .filter(|&table| laterals[table].is_some())
+        .fold(Relids::EMPTY, |relids, table| relids | Relids::of(table));
+    // A `LATERAL` subquery's columns are read by the select list alone, as
+    // plain columns, in a query without grouping or windows.
+    if lateral_relids != Relids::EMPTY {
+        let reads_lateral = |expression: &Expr<'_>| {
+            let mut reads = false;
+            expression.for_each_column_reference(&mut |qualifier, name| {
+                reads |= matches!(scope.probe_column(qualifier, name),
+                    Some(ResolvedColumn::Table(table, _)) if laterals[table].is_some());
+            });
+            reads
+        };
+        if windowed
+            || presorting
+            || statement.distinct
+            || !statement.group_by.is_empty()
+            || statement.having.is_some()
+            || statement.where_clause.is_some_and(reads_lateral)
+            || from
+                .joins
+                .iter()
+                .filter_map(|join| join.on)
+                .any(reads_lateral)
+            || statement
+                .order_by
+                .iter()
+                .any(|order| reads_lateral(order.expression))
+            || statement.items.iter().any(|item| match item {
+                SelectItem::Expr { expression, .. } => {
+                    !matches!(expression, Expr::Column { .. }) && reads_lateral(expression)
+                }
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
+                SelectItem::RecordStar(_) => true,
+            })
+        {
             return Ok(None);
         }
     }
@@ -2113,11 +2160,12 @@ fn modeled_join_over<'a>(
             appeared[table] += 1;
         }
     };
-    let width = |table: usize| {
-        scope
+    let width = |table: usize| match laterals[table] {
+        Some(lateral) => lateral.widths.len().min(64),
+        None => scope
             .defs
             .stored(table)
-            .map_or(0, |def| def.columns().len().min(64))
+            .map_or(0, |def| def.columns().len().min(64)),
     };
     // The select list's expressions' widths and their cost per row; an
     // aggregating query's per group (`create_agg_path`'s target cost).
@@ -2241,6 +2289,9 @@ fn modeled_join_over<'a>(
     }
     // The `GROUP BY` columns, once each, which the joined rows return.
     let grouped = !statement.group_by.is_empty();
+    if lateral_relids != Relids::EMPTY && aggregated {
+        return Ok(None);
+    }
     // Windows over one relation's groups are not planned here.
     if windowed && n == 1 && aggregated {
         return Ok(None);
@@ -2724,7 +2775,13 @@ fn modeled_join_over<'a>(
         SelfJoins {
             kept_for: [None; MAX_JOIN_RELS],
             removed: Relids::EMPTY,
-            declined: removable_self_join(storage, txid, scope, &prepared, removed),
+            declined: removable_self_join(
+                storage,
+                txid,
+                scope,
+                &prepared,
+                removed | lateral_relids,
+            ),
         }
     } else {
         remove_self_joins(
@@ -2734,7 +2791,8 @@ fn modeled_join_over<'a>(
             &mut prepared,
             &mut quals[..=tree.qual_count],
             &expressions,
-            removed,
+            // A `LATERAL` subquery is no table scan to merge.
+            removed | lateral_relids,
             arena,
         )?
     };
@@ -3810,6 +3868,10 @@ fn modeled_join_over<'a>(
         }
     }
     for table in 0..n {
+        // A subquery's relation has no pages (`set_base_rel_sizes`).
+        if laterals[table].is_some() {
+            continue;
+        }
         if removed & Relids::of(table) == Relids::EMPTY {
             total_table_pages += super::relation_size(storage, scope.slots[table], txid).pages;
         }
@@ -3987,6 +4049,25 @@ fn modeled_join_over<'a>(
     // The columns above each relation's scan: the output's and those a join
     // or outer join reads (`attr_needed`).
     let mut join_columns = [0u64; MAX_JOIN_RELS];
+    // The outer columns each `LATERAL` subquery reads, needed at it
+    // (`find_lateral_references`, before the conditions' columns).
+    for lateral in laterals.iter().take(n).flatten() {
+        for var in lateral.vars {
+            join_columns[usize::from(var.rel)] |= 1 << var.column;
+            note(usize::from(var.rel), usize::from(var.column));
+        }
+    }
+    let lateral_readers = |table: usize, column: usize| {
+        (0..n)
+            .filter(|&reader| {
+                laterals[reader].is_some_and(|lateral| {
+                    lateral
+                        .vars
+                        .contains(&Member::plain(table as u8, column as u16))
+                })
+            })
+            .fold(Relids::EMPTY, |relids, reader| relids | Relids::of(reader))
+    };
     for &((rel, column), relids, _) in prepared.needed.borrowed_slice() {
         if relids != Relids::EMPTY && column < 64 {
             join_columns[usize::from(rel)] |= 1 << column;
@@ -4013,6 +4094,9 @@ fn modeled_join_over<'a>(
             // `extract_restriction_or_clauses`.
             let mut extracted = false;
             for table in 0..n {
+                if laterals[table].is_some() {
+                    continue;
+                }
                 let relids: Relids = Relids::of(table);
                 for (id, clause) in clauses.borrowed_slice()[..placed_join_count]
                     .iter()
@@ -4092,6 +4176,51 @@ fn modeled_join_over<'a>(
             }
         }
         for table in 0..n {
+            if let Some(lateral) = laterals[table] {
+                // Its size is its plan's (`set_subquery_size_estimates`);
+                // its columns' widths are its target list's.
+                let above = output[table] | join_columns[table];
+                rel_rows[table] = lateral.rows;
+                if pass == 2 {
+                    let (appearance, appeared) = *appearance.borrow();
+                    for &column in &appearance[table][..appeared[table]] {
+                        let column = usize::from(column);
+                        if above & 1 << column == 0 {
+                            continue;
+                        }
+                        needed
+                            .push(NeededColumn {
+                                rel: table as u8,
+                                column: column as u16,
+                                width: lateral.widths[column],
+                                needed_by: prepared.needed_by((table as u8, column as u16))
+                                    & !Relids::of(table),
+                                output: output[table] & 1 << column != 0,
+                            })
+                            .map_err(|_| crate::sql::eval::arena_full())?;
+                    }
+                }
+                let single = arena
+                    .alloc(FromClause {
+                        base: *source(from, table),
+                        joins: &[],
+                    })
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                rels[table] = Some(ModeledRel {
+                    from: single,
+                    restriction: None,
+                    joins: &[],
+                    scan: JoinScan {
+                        rel_rows,
+                        ..scans[table]
+                    },
+                    read: above,
+                    output: above,
+                    paths: &[],
+                    lateral: Some(lateral),
+                });
+                continue;
+            }
             let single = match rels[table] {
                 Some(rel) => rel.from,
                 None => arena
@@ -4147,6 +4276,7 @@ fn modeled_join_over<'a>(
                     read,
                     output: above,
                     paths: &[],
+                    lateral: None,
                 });
                 continue;
             }
@@ -4167,7 +4297,8 @@ fn modeled_join_over<'a>(
                         } else {
                             f64::from(super::column_width(storage, txid, slot, column))
                         },
-                        needed_by: prepared.needed_by((table as u8, column as u16))
+                        needed_by: (prepared.needed_by((table as u8, column as u16))
+                            | lateral_readers(table, column))
                             & !Relids::of(table),
                         output: output[table] & 1 << column != 0,
                     })
@@ -4287,8 +4418,50 @@ fn modeled_join_over<'a>(
         paths: &[],
         unique: &[],
         fixed: 0,
+        lateral: Relids::EMPTY,
+        lateral_vars: &[],
     }; MAX_JOIN_RELS];
     for table in 0..n {
+        if let Some(lateral) = laterals[table] {
+            // Its one path scans the subquery's plan, parameterized by the
+            // relations it reads (`create_subqueryscan_path`). A target list
+            // of all its columns in order is trivial: the scan costs what
+            // its plan does (`cost_subqueryscan`), and `setrefs.c` removes
+            // it. Another target list is outside the model.
+            let (appearance, appeared) = *appearance.borrow();
+            let columns = &appearance[table][..appeared[table]];
+            if columns.len() != lateral.widths.len()
+                || columns
+                    .iter()
+                    .enumerate()
+                    .any(|(at, &column)| usize::from(column) != at)
+            {
+                return Ok(None);
+            }
+            let path = BasePath {
+                startup: lateral.startup,
+                total: lateral.total,
+                rows: lateral.rows,
+                disabled: 0,
+                keys: Keys::NONE,
+                param: lateral.relids,
+                enforced: ClauseList::EMPTY,
+                mark_restore: false,
+                indexed_join_quals: false,
+            };
+            base[table] = BaseRel {
+                rows: lateral.rows,
+                width: lateral.widths.iter().sum(),
+                paths: arena
+                    .alloc_slice_copy(&[path])
+                    .map_err(|_| crate::sql::eval::arena_full())?,
+                unique: &[],
+                fixed: 0,
+                lateral: lateral.relids,
+                lateral_vars: lateral.vars,
+            };
+            continue;
+        }
         let rel = rels[table].expect("planned");
         let paths = planned_paths[table].expect("planned");
         // A dummy relation has no paths and derives no clauses.
@@ -4299,6 +4472,8 @@ fn modeled_join_over<'a>(
                 paths: &[],
                 unique: &[],
                 fixed: paths.fixed,
+                lateral: Relids::EMPTY,
+                lateral_vars: &[],
             };
             continue;
         }
@@ -4467,6 +4642,8 @@ fn modeled_join_over<'a>(
                 .alloc_slice_copy(&unique[..unique_count])
                 .map_err(|_| crate::sql::eval::arena_full())?,
             fixed: paths.fixed,
+            lateral: Relids::EMPTY,
+            lateral_vars: &[],
         };
     }
     // Each relation's class clauses as the derived clauses orient them,
@@ -4524,7 +4701,8 @@ fn modeled_join_over<'a>(
     }
     // The statistics the selectivities read.
     let statistics: [Option<TableStatistics>; MAX_JOIN_RELS] = core::array::from_fn(|table| {
-        (table < n).then(|| storage.table_statistics(scope.slots[table], txid))
+        (table < n && laterals[table].is_none())
+            .then(|| storage.table_statistics(scope.slots[table], txid))
     });
     // Each relation's variables: its indexes' key expressions
     // (`examine_variable` reads their statistics), then its expression
@@ -4762,13 +4940,15 @@ fn modeled_join_over<'a>(
         referenced_rows: 1.0,
     }; 32];
     let mut foreign_count = 0;
-    for referencing in 0..n {
+    for referencing in (0..n).filter(|&table| laterals[table].is_none()) {
         let definition = scope.defs.stored(referencing).expect("plain table");
         for key in definition.fkeys() {
             if key.validation == crate::storage::ConstraintValidation::NotEnforced {
                 continue;
             }
-            for referenced in (0..n).filter(|&other| other != referencing) {
+            for referenced in
+                (0..n).filter(|&other| other != referencing && laterals[other].is_none())
+            {
                 let parent = scope.defs.stored(referenced).expect("plain table");
                 if parent.name.as_str() != key.parent.as_str()
                     || parent.schema.as_str() != key.parent_schema.as_str()
@@ -4847,6 +5027,9 @@ fn modeled_join_over<'a>(
     let column_width = |(table, column): (usize, usize)| {
         if prepared.false_relids == Relids::of(table) {
             return 0.0;
+        }
+        if let Some(lateral) = laterals[table] {
+            return lateral.widths[column];
         }
         f64::from(super::column_width(
             storage,
@@ -6099,6 +6282,236 @@ fn plain_table(
         && !storage.relation_has_descendants(slot, txid)
         && storage.table_statistics(slot, txid).valid
         && !definition.row_level_security.enabled
+}
+
+/// A `LATERAL` subquery the search plans as a base relation
+/// (`set_subquery_pathlist`): its query, planned alone with the outer
+/// columns it reads as parameters (`PARAM_EXEC`), whose one path is a
+/// `SubqueryScan` parameterized by their relations.
+#[derive(Clone, Copy)]
+pub(crate) struct LateralRel<'a> {
+    pub(crate) select: &'a Select<'a>,
+    /// The relations whose columns it reads (`lateral_relids`).
+    pub(crate) relids: Relids,
+    /// The outer columns it reads, each once, in the order
+    /// `extract_lateral_references` finds them: a `Memoize` cache's key.
+    pub(crate) vars: &'a [Member],
+    pub(crate) startup: f64,
+    pub(crate) total: f64,
+    pub(crate) rows: f64,
+    /// Each output column's width (`set_subquery_size_estimates`).
+    pub(crate) widths: &'a [f64],
+}
+
+/// Whether `expression` reads a statement parameter, which a custom plan
+/// of the subquery would print as its value.
+fn reads_parameter(expression: &Expr<'_>) -> bool {
+    let mut reads = false;
+    let _ = super::super::walk_expression_tree(expression, &mut |node| {
+        reads |= matches!(node, Expr::Param(_));
+    });
+    reads
+}
+
+/// The relation at FROM position `table` as a [`LateralRel`]: a `LATERAL`
+/// subquery of one plain table, without grouping, sublinks or windows,
+/// that reads the columns of earlier plain relations of the query (none of
+/// them another `LATERAL` subquery) in its `WHERE` only, reads no statement
+/// parameter, calls nothing volatile (its join runs it to its end) and is
+/// written after a comma or `CROSS JOIN`. `None` for any other relation.
+fn lateral_rel<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    from: &'a FromClause<'a>,
+    scope: &QueryScope<'a>,
+    table: usize,
+    laterals: &[Option<LateralRel<'a>>],
+    arena: &'a Arena,
+) -> Result<Option<LateralRel<'a>>, SqlError> {
+    let tref = source(from, table);
+    let Some(select) = tref.subquery else {
+        return Ok(None);
+    };
+    if !scope.lateral[table]
+        || table == 0
+        || !matches!(
+            from.joins[table - 1].kind,
+            JoinKind::Comma | JoinKind::Cross
+        )
+        || tref.col_alias.is_some()
+        || tref.sample.is_some()
+        || tref.func_args.is_some()
+        || tref.rows_from.is_some()
+        || tref.cte.is_some()
+        || tref.join_members.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(sub_from) = select.from.as_ref() else {
+        return Ok(None);
+    };
+    let order = select.order_by.iter().map(|order| order.expression);
+    let items = select.items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } => Some(*expression),
+        _ => None,
+    });
+    let expressions = items
+        .clone()
+        .chain(select.where_clause)
+        .chain(order.clone())
+        .chain(select.limit)
+        .chain(select.offset);
+    if !sub_from.joins.is_empty()
+        || select.set_body.is_some()
+        || !select.with.is_empty()
+        || !select.locking.is_empty()
+        || select.distinct
+        || !select.distinct_on.is_empty()
+        || !select.grouping_sets.is_empty()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.with_ties
+        || expressions.clone().any(|expression| {
+            expression.contains_subquery()
+                || crate::sql::query::expr_has_window(expression)
+                || expression.contains_volatile_function().is_some()
+                || reads_parameter(expression)
+        })
+        || crate::sql::query::has_set_returning_items(select.items, storage, txid)
+    {
+        return Ok(None);
+    }
+    let sub_scope = QueryScope::resolve_schema(storage, sub_from, txid, arena, None)?;
+    if sub_scope.n != 1 || !plain_table(storage, txid, &sub_scope, 0, &sub_from.base) {
+        return Ok(None);
+    }
+    // The outer columns, read in `WHERE` only.
+    let mut vars = [Member::plain(0, 0); super::joins::MAX_KEYS];
+    let mut count = 0;
+    let mut relids = Relids::EMPTY;
+    let mut plannable = true;
+    let mut outer_reference = |qualifier: Option<&str>, name: &str, condition: bool| {
+        if sub_scope.probe_column(qualifier, name).is_some() {
+            return;
+        }
+        match scope.probe_column(qualifier, name) {
+            // A `Memoize` keys by it through its type's hash operator class
+            // (`paraminfo_get_equal_hashops`).
+            Some(ResolvedColumn::Table(outer, column))
+                if condition
+                    && outer < table
+                    && laterals[outer].is_none()
+                    && column < 64
+                    && scope.defs.stored(outer).is_some_and(|definition| {
+                        crate::sql::query::join_exec::datum_type_hashable(
+                            definition.columns()[column].ctype,
+                        )
+                    }) =>
+            {
+                let var = Member::plain(outer as u8, column as u16);
+                if !vars[..count].contains(&var) {
+                    if count == vars.len() {
+                        plannable = false;
+                        return;
+                    }
+                    vars[count] = var;
+                    count += 1;
+                }
+                relids |= Relids::of(outer);
+            }
+            _ => plannable = false,
+        }
+    };
+    for expression in items.chain(order).chain(select.limit).chain(select.offset) {
+        expression.for_each_column_reference(&mut |qualifier, name| {
+            outer_reference(qualifier, name, false)
+        });
+    }
+    if let Some(condition) = select.where_clause {
+        condition.for_each_column_reference(&mut |qualifier, name| {
+            outer_reference(qualifier, name, true)
+        });
+    }
+    if !plannable || relids == Relids::EMPTY {
+        return Ok(None);
+    }
+    // Each output column's width: a column's analyzed width, else its
+    // type's (`set_rel_width`).
+    let definition = sub_scope.defs.stored(0).expect("plain table");
+    let slot = sub_scope.slots[0];
+    let mut widths = crate::mem::arena::ArenaList::new(arena);
+    for item in select.items {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for column in 0..definition.columns().len() {
+                    widths
+                        .push(f64::from(super::column_width(storage, txid, slot, column)))
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                }
+            }
+            SelectItem::Expr { expression, .. } => {
+                let column = match expression {
+                    Expr::Column { qualifier, name } => {
+                        match sub_scope.probe_column(*qualifier, name) {
+                            Some(ResolvedColumn::Table(0, column)) => Some(column),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let width = match column {
+                    Some(column) => f64::from(super::column_width(storage, txid, slot, column)),
+                    None => {
+                        let Ok((type_oid, type_mod)) = crate::sql::exec::infer_type_catalog(
+                            expression,
+                            Some(definition),
+                            storage,
+                            txid,
+                            arena,
+                        ) else {
+                            return Ok(None);
+                        };
+                        let Some((ctype, None)) =
+                            crate::sql::exec::catalog_column_type(storage, txid, type_oid)
+                        else {
+                            return Ok(None);
+                        };
+                        super::type_average_width(ctype, i32::from(type_mod))
+                    }
+                };
+                widths
+                    .push(width)
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+            }
+            _ => return Ok(None),
+        }
+    }
+    let widths = widths
+        .into_mut_slice()
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    if scope
+        .defs
+        .get(table)
+        .is_none_or(|definition| definition.n_columns != widths.len())
+    {
+        return Ok(None);
+    }
+    let Some((startup, total, rows, _)) =
+        crate::sql::explain::lateral_subquery_costs(storage, txid, scope, select, relids, arena)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(LateralRel {
+        select,
+        relids,
+        vars: arena
+            .alloc_slice_copy(&vars[..count])
+            .map_err(|_| crate::sql::eval::arena_full())?,
+        startup,
+        total,
+        rows: super::clamp_row_est(rows),
+        widths,
+    }))
 }
 
 struct RelStatistics<'r, 's, 'a> {

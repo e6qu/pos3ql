@@ -519,6 +519,11 @@ pub(crate) struct BaseRel<'p> {
     pub(crate) unique: &'p [u64],
     /// The columns its restrictions equate with a constant.
     pub(crate) fixed: u64,
+    /// The relations a `LATERAL` subquery reads (`lateral_relids`, which
+    /// are its `direct_lateral_relids`), empty for a table.
+    pub(crate) lateral: Relids,
+    /// The outer columns it reads (`lateral_vars`), which key a `Memoize`.
+    pub(crate) lateral_vars: &'p [Member],
 }
 
 /// One path of a base relation.
@@ -1196,6 +1201,8 @@ struct Search<'p, 'a, 's> {
     buckets: ArenaList<'a, [Option<(f64, f64)>; 2]>,
     /// `all_baserels`.
     all_baserels: Relids,
+    /// `hasLateralRTEs`: a base relation is a `LATERAL` subquery.
+    has_lateral: bool,
     /// `consider_startup` of every relation: the query has a `LIMIT`
     /// (`root->tuple_fraction > 0`).
     consider_startup: bool,
@@ -1244,6 +1251,7 @@ pub(crate) fn search<'a>(
         param_rows: ArenaList::new(arena),
         buckets: ArenaList::new(arena),
         all_baserels: Relids::below(n as u32) & !problem.removed,
+        has_lateral: problem.rels.iter().any(|rel| rel.lateral != Relids::EMPTY),
         consider_startup: problem
             .upper
             .limit
@@ -1820,8 +1828,43 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             })
     }
 
+    /// `lateral_relids` of relation `relids`: its base relations' less
+    /// its own (`min_join_parameterization`). Without placeholders a
+    /// relation's `direct_lateral_relids` are these too.
+    fn lateral_relids(&self, relids: Relids) -> Relids {
+        if !self.has_lateral {
+            return Relids::EMPTY;
+        }
+        (relids & BASE_RELIDS)
+            .rels()
+            .fold(Relids::EMPTY, |lateral, rel| {
+                lateral | self.problem.rels[usize::from(rel)].lateral
+            })
+            & !relids
+    }
+
+    /// `lateral_referencers` of a base relation; a join relation has none.
+    fn lateral_referencers(&self, relids: Relids) -> Relids {
+        if !self.has_lateral || (relids & BASE_RELIDS).count_ones() != 1 {
+            return Relids::EMPTY;
+        }
+        self.problem
+            .rels
+            .iter()
+            .enumerate()
+            .filter(|(_, rel)| rel.lateral.overlaps(relids))
+            .fold(Relids::EMPTY, |referencers, (at, _)| {
+                referencers | Relids::of(at)
+            })
+    }
+
     /// `has_join_restriction`.
     fn has_join_restriction(&self, relids: Relids) -> bool {
+        if self.lateral_relids(relids) != Relids::EMPTY
+            || self.lateral_referencers(relids) != Relids::EMPTY
+        {
+            return true;
+        }
         self.specials.iter().any(|special| {
             special.kind != SpecialKind::Full
                 && !(special.min_left & !relids == Relids::EMPTY
@@ -1833,6 +1876,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
 
     /// `have_join_order_restriction`.
     fn order_restriction(&mut self, left: Relids, right: Relids) -> Result<bool, SqlError> {
+        // A direct lateral reference between the two joins them
+        // regardless of outer joins.
+        if self.lateral_relids(right).overlaps(left) || self.lateral_relids(left).overlaps(right) {
+            return Ok(true);
+        }
         let restricted = self.specials.iter().any(|special| {
             special.kind != SpecialKind::Full
                 && ((special.min_left & !left == Relids::EMPTY
@@ -1876,6 +1924,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     ) -> Result<Option<(Option<u8>, bool)>, SqlError> {
         let mut matched: Option<u8> = None;
         let mut reversed = false;
+        let mut unique_ified = false;
         let mut must_be_left = false;
         let subset = |small: Relids, big: Relids| small & !big == Relids::EMPTY;
         for (id, special) in self.specials.iter().enumerate() {
@@ -1915,6 +1964,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 }
                 matched = Some(id);
                 reversed = false;
+                unique_ified = true;
             } else if special.kind == SpecialKind::Semi
                 && special.syn_right == rel1
                 && self.unique_path(rel1, id)?.is_some()
@@ -1924,6 +1974,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 }
                 matched = Some(id);
                 reversed = true;
+                unique_ified = true;
             } else {
                 if special.min_right & rel1 != Relids::EMPTY
                     && special.min_right & rel2 != Relids::EMPTY
@@ -1944,7 +1995,66 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         {
             return Ok(None);
         }
+        if self.has_lateral
+            && !self.lateral_legal(rel1, rel2, joined, matched, reversed, unique_ified)
+        {
+            return Ok(None);
+        }
         Ok(Some((matched, reversed)))
+    }
+
+    /// `join_is_legal`'s constraints of `LATERAL` references: the
+    /// referencing side joins inside a nested loop, only to a relation it
+    /// reads directly, and the join's remaining parameterization stays
+    /// joinable past the outer joins' right sides.
+    fn lateral_legal(
+        &self,
+        rel1: Relids,
+        rel2: Relids,
+        joined: Relids,
+        matched: Option<u8>,
+        reversed: bool,
+        unique_ified: bool,
+    ) -> bool {
+        let forward = rel1.overlaps(self.lateral_relids(rel2));
+        let backward = rel2.overlaps(self.lateral_relids(rel1));
+        let not_nestloop = |reversed: bool| {
+            matched.is_some_and(|id| {
+                reversed || unique_ified || self.special(id).kind == SpecialKind::Full
+            })
+        };
+        if forward && backward {
+            return false;
+        }
+        if forward && not_nestloop(reversed) {
+            return false;
+        }
+        if backward && not_nestloop(!reversed) {
+            return false;
+        }
+        let lateral = self.lateral_relids(joined);
+        if lateral == Relids::EMPTY {
+            return true;
+        }
+        let mut plus_right = joined;
+        loop {
+            let mut more = false;
+            for special in self.specials {
+                if special.kind == SpecialKind::Full {
+                    continue;
+                }
+                if special.min_left.overlaps(plus_right)
+                    && special.min_right & !plus_right != Relids::EMPTY
+                {
+                    plus_right |= special.min_right;
+                    more = true;
+                }
+            }
+            if !more {
+                break;
+            }
+        }
+        !plus_right.overlaps(lateral)
     }
 
     /// `create_unique_path` of relation `relids`, the inner relation of
@@ -3634,6 +3744,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 param_source |= self.all_baserels & !other.min_left;
             }
         }
+        // A `LATERAL` subquery's paths are all parameterized by what it
+        // reads: the join's remaining lateral references are sources too.
+        param_source |= self.lateral_relids(joined);
         let inputs = JoinInputs {
             outer,
             inner,
@@ -4098,7 +4211,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             return Ok(None);
         }
         let enforced = self.enforced(inner);
-        if enforced.len == 0
+        // A `LATERAL` subquery's outer columns key the cache too
+        // (`innerrel->lateral_vars`).
+        let lateral_vars = match inner_path.kind {
+            PathKind::Scan { rel, .. } => self.problem.rels[usize::from(rel)].lateral_vars,
+            _ => &[],
+        };
+        if (enforced.len == 0 && lateral_vars.is_empty())
             || (inputs.inner_unique
                 && inputs
                     .restrict
@@ -4133,6 +4252,19 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             } else {
                 return Ok(None);
             };
+            if !keys[..key_count].contains(&key) {
+                if key_count == MAX_KEYS {
+                    return Ok(None);
+                }
+                keys[key_count] = key;
+                key_count += 1;
+                width += self.column_width(key);
+            }
+        }
+        // `paraminfo_get_equal_hashops` keys lateral references in binary
+        // mode: it cannot tell how the subquery reads them.
+        for &key in lateral_vars {
+            binary = true;
             if !keys[..key_count].contains(&key) {
                 if key_count == MAX_KEYS {
                     return Ok(None);
@@ -5669,6 +5801,8 @@ mod tests {
                     paths: &[seq(1000.0, 16.0)],
                     unique: &[],
                     fixed: 0,
+                    lateral: Relids::EMPTY,
+                    lateral_vars: &[],
                 },
                 BaseRel {
                     rows: 2000.0,
@@ -5676,6 +5810,8 @@ mod tests {
                     paths: &[seq(2000.0, 29.0)],
                     unique: &[],
                     fixed: 0,
+                    lateral: Relids::EMPTY,
+                    lateral_vars: &[],
                 },
             ],
             classes: &[class],
@@ -5742,5 +5878,136 @@ mod tests {
         assert_eq!(plan.path(outer).relids, Relids::from_mask(2));
         assert_eq!(plan.path(inner).relids, Relids::from_mask(1));
         assert_eq!((top.startup, top.total, top.rows), (28.5, 85.0, 2000.0));
+    }
+
+    /// [`Uniform`] whose `Memoize` keys repeat: ten distinct values.
+    struct TenKeys;
+
+    impl JoinStatistics for TenKeys {
+        fn equality(&self, left: Member, right: Member) -> Result<f64, SqlError> {
+            Uniform.equality(left, right)
+        }
+        fn semi(&self, left: Member, right: Member, rows: f64) -> Result<f64, SqlError> {
+            Uniform.semi(left, right, rows)
+        }
+        fn bucket(&self, member: Member, buckets: f64) -> Result<(f64, f64), SqlError> {
+            Uniform.bucket(member, buckets)
+        }
+        fn merge_range(
+            &self,
+            left: Member,
+            right: Member,
+            left_descending: bool,
+            right_descending: bool,
+        ) -> Result<Option<[f64; 4]>, SqlError> {
+            Uniform.merge_range(left, right, left_descending, right_descending)
+        }
+        fn groups(&self, _: &[Member], calls: f64) -> Result<f64, SqlError> {
+            Ok(calls.min(10.0))
+        }
+        fn num_groups(&self, members: &[Member], rows: f64) -> Result<f64, SqlError> {
+            Uniform.num_groups(members, rows)
+        }
+    }
+
+    #[test]
+    fn lateral_subquery_joins_inside_a_memoized_nested_loop() {
+        // lo(a, x) 1000 rows, a with ten values, and `LATERAL (SELECT
+        // count(*) FROM li WHERE li.b = lo.a) s`, whose plan costs
+        // 85.625..85.635 for its one row, as PostgreSQL plans
+        // `SELECT * FROM lo, LATERAL (...) s`: Nested Loop
+        // (cost=85.64..981.12) over a Memoize keyed by lo.a.
+        let mut budget = crate::mem::budget::Budget::new(1 << 21);
+        let arena = Arena::new(&mut budget, "join search", 1 << 20).unwrap();
+        let lateral = BasePath {
+            startup: 85.625,
+            total: 85.635,
+            rows: 1.0,
+            param: Relids::of(0u8),
+            ..seq(1.0, 85.635)
+        };
+        let base = |rows, width, paths, lateral, lateral_vars| BaseRel {
+            rows,
+            width,
+            paths,
+            unique: &[],
+            fixed: 0,
+            lateral,
+            lateral_vars,
+        };
+        let needed = |rel, column, width, needed_by| NeededColumn {
+            rel,
+            column,
+            width,
+            needed_by,
+            output: true,
+        };
+        let (outer_paths, lateral_paths) = ([seq(1000.0, 15.0)], [lateral]);
+        let lateral_vars = [Member::plain(0, 0)];
+        let rels = [
+            base(1000.0, 8.0, &outer_paths, Relids::EMPTY, &[]),
+            base(1.0, 8.0, &lateral_paths, Relids::of(0u8), &lateral_vars),
+        ];
+        let mut problem = JoinProblem {
+            rels: &rels,
+            classes: &[],
+            specials: &[],
+            subproblems: &[Subproblem { first: 0, count: 2 }],
+            subproblem_items: &[Relids::of(0u8), Relids::of(1u8)],
+            clauses: &[],
+            needed: &[
+                needed(0, 0, 4.0, Relids::of(1u8)),
+                needed(0, 1, 4.0, Relids::EMPTY),
+                needed(1, 0, 8.0, Relids::EMPTY),
+            ],
+            expression_costs: &[],
+            settings: settings(),
+            foreign_keys: &[],
+            removed: Relids::EMPTY,
+            upper: UpperProblem {
+                sort: Keys::NONE,
+                limit: None,
+                width: 16.0,
+                target_cost: 0.0,
+                group: None,
+                windows: WindowsProblem::NONE,
+                windows_output_cost: 0.0,
+            },
+            dummy: false,
+            false_relids: Relids::EMPTY,
+        };
+        let plan = search(&problem, &TenKeys, &arena).unwrap().unwrap();
+        let top = plan.path(plan.top);
+        let PathKind::NestLoop { outer, inner, .. } = top.kind else {
+            panic!("{top:?}");
+        };
+        assert_eq!(plan.path(outer).relids, Relids::of(0u8));
+        let PathKind::Memoize {
+            key_count, binary, ..
+        } = plan.path(inner).kind
+        else {
+            panic!("{:?}", plan.path(inner));
+        };
+        assert_eq!((key_count, binary), (1, true));
+        assert_eq!(
+            format!("{:.2}..{:.2}", top.startup, top.total),
+            "85.64..981.12"
+        );
+        assert_eq!(top.rows, 1000.0);
+        // Without a cache the subquery runs once per outer row.
+        problem.settings.memoize = false;
+        let plan = search(&problem, &TenKeys, &arena).unwrap().unwrap();
+        let top = plan.path(plan.top);
+        let PathKind::NestLoop { inner, .. } = top.kind else {
+            panic!("{top:?}");
+        };
+        assert!(matches!(
+            plan.path(inner).kind,
+            PathKind::Scan { rel: 1, .. }
+        ));
+        assert_eq!(
+            format!("{:.2}..{:.2}", top.startup, top.total),
+            "85.62..85660.00"
+        );
     }
 }

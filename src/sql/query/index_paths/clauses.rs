@@ -438,6 +438,14 @@ impl<'a> Analyzer<'_, '_, 'a> {
     /// Whether `expression` is an uncorrelated scalar subquery, which
     /// PostgreSQL runs as an InitPlan whose output parameter the condition
     /// compares: a constant whose value planning does not know.
+    /// A column of an enclosing query (a correlated subquery's or a
+    /// `LATERAL` subquery's outer reference): a parameter its plan reads,
+    /// of unknown value at planning (`PARAM_EXEC`).
+    fn outer_reference(&self, expression: &Expr<'_>) -> bool {
+        matches!(expression, Expr::Column { qualifier, name }
+            if self.scope.probe_column(*qualifier, name).is_none())
+    }
+
     fn init_plan_output(&self, expression: &'a Expr<'a>) -> Result<bool, SqlError> {
         Ok(matches!(expression, Expr::Subquery(_))
             && !crate::sql::query::subquery_node_correlated(
@@ -766,6 +774,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                         .outer_operands
                         .iter()
                         .any(|outer| core::ptr::eq(*outer, operand))
+                    || self.outer_reference(operand)
                     || self.init_plan_output(operand)?
                 {
                     None

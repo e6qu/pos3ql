@@ -332,7 +332,7 @@ impl RowProgress {
     pub(crate) fn keep_source_row(
         &mut self,
         index: usize,
-        values: &[Datum<'_>],
+        values: super::SourceRow<'_>,
         arena: &Arena,
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
@@ -344,15 +344,16 @@ impl RowProgress {
             return Ok(());
         }
         let mark = arena.mark();
-        let saved = encode_projected_pub(values, arena).and_then(|row| {
-            transition_rows::SavedTransitionRows::capture(
-                TransitionRows {
-                    old: core::slice::from_ref(&row),
-                    new: &[],
-                },
-                pool,
-            )
-        });
+        let saved = projected::encode_projected_formed(values.values, values.forms, arena)
+            .and_then(|row| {
+                transition_rows::SavedTransitionRows::capture(
+                    TransitionRows {
+                        old: core::slice::from_ref(&row),
+                        new: &[],
+                    },
+                    pool,
+                )
+            });
         // SAFETY: the encoded row was copied into the saved owner.
         unsafe { arena.rewind_to(mark) };
         self.source_row = Some((index, saved?));
@@ -414,7 +415,7 @@ impl RowProgress {
         &self,
         index: usize,
         arena: &'out Arena,
-    ) -> Result<Option<&'out [Datum<'out>]>, SqlError> {
+    ) -> Result<Option<super::SourceRow<'out>>, SqlError> {
         let Some((_, saved)) = self.source_row.as_ref().filter(|(kept, _)| *kept == index) else {
             return Ok(None);
         };
@@ -433,7 +434,12 @@ impl RowProgress {
         let values = arena
             .alloc_slice_copy(&values[..width])
             .map_err(|_| crate::sql::query::arena_full_pub())?;
-        Ok(Some(&*values))
+        let forms = arena
+            .alloc_slice_with(width, |column| {
+                projected::projected_stored_form(row, column)
+            })
+            .map_err(|_| crate::sql::query::arena_full_pub())?;
+        Ok(Some(super::SourceRow { values, forms }))
     }
 
     /// A step's attempt starts at `mark`: a row an earlier step ended at

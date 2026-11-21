@@ -1513,9 +1513,9 @@ impl<'s, 'a: 's> Planner<'s, 'a> {
                         crate::storage::rowenc::decode(bytes, schema, &mut values)?;
                         self.row_value(column, &values[..n_columns])
                     }
-                    crate::storage::SpilledRowRepresentation::Values(values) => {
-                        self.row_value(column, values)
-                    }
+                    crate::storage::SpilledRowRepresentation::Values(
+                        &crate::storage::SpilledValues { values, .. },
+                    ) => self.row_value(column, values),
                 };
                 observe(value);
                 // SAFETY: the evaluated key was copied out above.
@@ -1611,7 +1611,9 @@ impl<'s, 'a: 's> Planner<'s, 'a> {
                         crate::storage::rowenc::decode(bytes, schema, &mut values)?;
                         check(&values[..n_columns]);
                     }
-                    crate::storage::SpilledRowRepresentation::Values(values) => check(values),
+                    crate::storage::SpilledRowRepresentation::Values(
+                        &crate::storage::SpilledValues { values, .. },
+                    ) => check(values),
                 }
             }
             Ok(core::ops::ControlFlow::Continue(()))

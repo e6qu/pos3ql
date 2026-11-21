@@ -37,7 +37,10 @@ impl SavedValues {
             self.width = Some(0);
             return Ok(());
         }
-        let length = projected_row_len_by(width, &value_at)?;
+        // A local value keeps no stored form: its readers treat a value TOAST
+        // may have stored otherwise as not modelled.
+        let formed = |column| Ok((value_at(column), StoredForm::Inline));
+        let length = projected_row_len_by(width, formed)?;
         let capacity = length
             .checked_next_power_of_two()
             .ok_or_else(full)?
@@ -54,7 +57,7 @@ impl SavedValues {
         }
         // Encoding repeats the same validation before its first write. After
         // successful sizing there is no fallible conversion or helper call.
-        encode_projected_by_into(width, value_at, &mut self.bytes[..length])?;
+        encode_projected_by_into(width, formed, &mut self.bytes[..length])?;
         self.length = length;
         self.width = Some(width);
         Ok(())

@@ -19,6 +19,7 @@ use crate::sql::eval::{
 use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::Datum;
 use crate::storage::Storage;
+use crate::storage::StoredForm;
 use crate::{sql_err, stack_format};
 
 use super::group::row_passes_correlated_where;
@@ -2562,6 +2563,9 @@ pub(crate) fn project_window_rows<'a>(
     let proj_rows: &mut [&[Datum]] = arena
         .alloc_slice_with(count, |_| empty)
         .map_err(|_| arena_full())?;
+    let form_rows: &mut [&[StoredForm]] = arena
+        .alloc_slice_with(count, |_| &[][..])
+        .map_err(|_| arena_full())?;
     let sort_keys: &mut [&[Datum]] = arena
         .alloc_slice_with(count, |_| empty)
         .map_err(|_| arena_full())?;
@@ -2590,6 +2594,7 @@ pub(crate) fn project_window_rows<'a>(
             merge_action: hooks.merge_action,
         };
         let mut projected = [Datum::Null; MAX_PROJ];
+        let mut forms = [StoredForm::Inline; MAX_PROJ];
         let np = project_row(
             statement.items,
             scope,
@@ -2598,10 +2603,14 @@ pub(crate) fn project_window_rows<'a>(
             params,
             &win_hooks,
             &mut projected,
+            &mut forms,
             outer,
         )?;
         proj_rows[out] = &*arena
             .alloc_slice_copy(&projected[..np])
+            .map_err(|_| arena_full())?;
+        form_rows[out] = &*arena
+            .alloc_slice_copy(&forms[..np])
             .map_err(|_| arena_full())?;
         let keys: &mut [Datum] = arena
             .alloc_slice_with(n_order, |_| Datum::Null)
@@ -2633,6 +2642,7 @@ pub(crate) fn project_window_rows<'a>(
         .map_err(|_| arena_full())?;
     Ok(Some(WindowRows {
         rows: proj_rows,
+        forms: form_rows,
         sort_keys,
         collations,
         tuple_columns,
@@ -2653,6 +2663,8 @@ struct ModeledRows<'a> {
 
 pub(crate) struct WindowRows<'a> {
     pub(crate) rows: &'a [&'a [Datum<'a>]],
+    /// The stored form each value of `rows` keeps.
+    pub(crate) forms: &'a [&'a [StoredForm]],
     sort_keys: &'a [&'a [Datum<'a>]],
     collations: &'a [Collation],
     /// The columns of the tuple PostgreSQL's sort holds: the output columns
@@ -2704,11 +2716,15 @@ impl<'a> WindowRows<'a> {
         let rows = arena
             .alloc_slice_with(unique, |k| self.rows[index[k]])
             .map_err(|_| arena_full())?;
+        let forms = arena
+            .alloc_slice_with(unique, |k| self.forms[index[k]])
+            .map_err(|_| arena_full())?;
         let sort_keys = arena
             .alloc_slice_with(unique, |k| self.sort_keys[index[k]])
             .map_err(|_| arena_full())?;
         Ok(Self {
             rows,
+            forms,
             sort_keys,
             collations: self.collations,
             tuple_columns: self.tuple_columns,
@@ -3207,7 +3223,7 @@ pub(crate) fn external_window_into<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     limit: u64,
     offset: u64,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<bool, SqlError>,
+    emit: &mut crate::sql::query::RowEmitter<'_>,
 ) -> Result<u64, SqlError> {
     let stages = super::materialize::materialized_stages(limit != u64::MAX);
     let _stages = stages.start();
@@ -3362,26 +3378,28 @@ pub(crate) fn external_window_into<'a>(
                             blocks,
                             n_keys + total + scope.n + 1,
                             |index| {
+                                // Window rows read back without their forms.
                                 if index < n_keys {
-                                    key_vals[index]
+                                    Ok((key_vals[index], StoredForm::Inline))
                                 } else if index < n_keys + total {
                                     let flat = index - n_keys;
                                     for (t, offset) in offs.iter().enumerate().take(scope.n) {
                                         let nc = scope.stored_width(t);
                                         if flat < offset + nc {
                                             let vals = row.table_values(t).expect("bound");
-                                            return if vals.is_empty() {
+                                            let value = if vals.is_empty() {
                                                 Datum::Null
                                             } else {
                                                 vals[flat - offset]
                                             };
+                                            return Ok((value, StoredForm::Inline));
                                         }
                                     }
                                     unreachable!("flat window column is in scope")
                                 } else if index < n_keys + total + scope.n {
-                                    oids[index - n_keys - total]
+                                    Ok((oids[index - n_keys - total], StoredForm::Inline))
                                 } else {
-                                    Datum::Int8(row_position)
+                                    Ok((Datum::Int8(row_position), StoredForm::Inline))
                                 }
                             },
                             &mut spec_compare,
@@ -3434,11 +3452,15 @@ pub(crate) fn external_window_into<'a>(
                                 storage,
                                 blocks,
                                 4,
-                                |index| match index {
-                                    0 => Datum::Int8(pos),
-                                    1 => Datum::Int4(wi as i32),
-                                    2 => out[r],
-                                    _ => Datum::Int8(rank_of[r]),
+                                |index| {
+                                    let value = match index {
+                                        0 => Datum::Int8(pos),
+                                        1 => Datum::Int4(wi as i32),
+                                        2 => out[r],
+                                        _ => Datum::Int8(rank_of[r]),
+                                    };
+                                    // `passed_form` decides the form of a window value.
+                                    Ok((value, StoredForm::Inline))
                                 },
                                 &mut win_compare,
                             )
@@ -3703,6 +3725,7 @@ pub(crate) fn external_window_into<'a>(
                 merge_action: hooks.merge_action,
             };
             let mut projected = [Datum::Null; MAX_PROJ];
+            let mut forms = [StoredForm::Inline; MAX_PROJ];
             let np = project_row(
                 statement.items,
                 scope,
@@ -3711,6 +3734,7 @@ pub(crate) fn external_window_into<'a>(
                 params,
                 &win_hooks,
                 &mut projected,
+                &mut forms,
                 outer,
             )?;
             debug_assert_eq!(np, width);
@@ -3735,15 +3759,18 @@ pub(crate) fn external_window_into<'a>(
                         blocks,
                         width + n_order + chain.len(),
                         |index| {
-                            if index < width {
-                                projected[index]
+                            Ok(if index < width {
+                                (projected[index], forms[index])
                             } else if index < width + n_order {
-                                keys[index - width]
+                                (keys[index - width], StoredForm::Inline)
                             } else {
-                                Datum::Int8(
-                                    ranks[chain[chain.len() - 1 - (index - width - n_order)]],
+                                (
+                                    Datum::Int8(
+                                        ranks[chain[chain.len() - 1 - (index - width - n_order)]],
+                                    ),
+                                    StoredForm::Inline,
                                 )
-                            }
+                            })
                         },
                         &mut out_compare,
                     )
@@ -3814,10 +3841,13 @@ pub(crate) fn external_window_into<'a>(
                 below_limit.row();
                 stages.limit.row();
                 let mut output = [Datum::Null; MAX_PROJ];
-                for (column, value) in output.iter_mut().enumerate().take(width) {
-                    *value = crate::sql::exec::decode_projected_col_record(row, column, arena)?;
+                let mut forms = [StoredForm::Inline; MAX_PROJ];
+                for column in 0..width {
+                    output[column] =
+                        crate::sql::exec::decode_projected_col_record(row, column, arena)?;
+                    forms[column] = crate::sql::exec::projected_stored_form(row, column);
                 }
-                if !emit(&output[..width])? {
+                if !emit(&output[..width], &forms[..width])? {
                     false
                 } else {
                     emitted += 1;
@@ -3902,7 +3932,8 @@ pub(crate) fn window_select<'a>(
                 None,
                 limit,
                 offset,
-                &mut |values| match super::emit_data_row(storage, txid, arena, responder, values) {
+                &mut |values, _| match super::emit_data_row(storage, txid, arena, responder, values)
+                {
                     Ok(Ok(())) => Ok(true),
                     Ok(Err(error)) => Err(error),
                     Err(_) => {

@@ -68,8 +68,12 @@ pub(crate) struct PathScan<'a> {
     /// by cost once.
     filter: Option<&'a Expr<'a>>,
     schema: &'a [ColType],
-    /// The current row's values and identity, valid until the next call.
+    /// The current row's values, their stored forms and its identity,
+    /// valid until the next call.
     values: &'a mut [Datum<'a>],
+    forms: &'a mut [StoredForm],
+    /// Whether a column of the table can hold a value with a stored form.
+    formed: bool,
     rowid: [Option<u64>; 1],
     sequential: Option<RowCursor>,
     candidates: Option<CandidateRows<'a>>,
@@ -145,6 +149,12 @@ impl<'a> PathScan<'a> {
         let values = arena
             .alloc_slice_with(scope.stored_width(0).max(n_columns), |_| Datum::Null)
             .map_err(|_| arena_full())?;
+        let forms = arena
+            .alloc_slice_with(values.len(), |_| StoredForm::Inline)
+            .map_err(|_| arena_full())?;
+        let formed = schema
+            .iter()
+            .any(|&ctype| rowenc::column_carries_stored_form(ctype));
         use super::super::index_paths::ScanKind;
         let (scan_node, bitmap_node, tree_nodes, counts) = if instrument::active() {
             let scan_node = instrument::node(instrument::Role::Scan(0));
@@ -194,6 +204,8 @@ impl<'a> PathScan<'a> {
             filter,
             schema,
             values,
+            forms,
+            formed,
             rowid: [None],
             sequential: None,
             candidates: None,
@@ -229,6 +241,7 @@ impl<'a> PathScan<'a> {
             values: JoinRowValues::Flat {
                 values: self.values,
                 offsets: &[0],
+                forms: Some(self.forms),
             },
             rowids: &self.rowid,
             visible: 1,
@@ -238,6 +251,22 @@ impl<'a> PathScan<'a> {
     /// The current row's values.
     pub(crate) fn values(&self) -> &[Datum<'a>] {
         &self.values[..self.scope.stored_width(0)]
+    }
+
+    /// The stored forms of the current row's values, in `arena`; empty when
+    /// every one is as `heap_form_tuple` forms it.
+    pub(crate) fn stored_forms(&self, arena: &'a Arena) -> Result<&'a [StoredForm], SqlError> {
+        let width = self.scope.stored_width(0);
+        if self.forms[..width]
+            .iter()
+            .all(|&form| form == StoredForm::Inline)
+        {
+            return Ok(&[]);
+        }
+        let forms = arena
+            .alloc_slice_copy(&self.forms[..width])
+            .map_err(|_| arena_full())?;
+        Ok(forms)
     }
 
     /// The row identity of the current row.
@@ -550,14 +579,24 @@ impl<'a> PathScan<'a> {
         };
         storage.record_relation_tuple_read(txid, slot, statistics)?;
         let n_columns = self.schema.len();
-        match representation {
+        let encoded = match representation {
             crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                 rowenc::decode(bytes, self.schema, &mut self.values[..n_columns])?;
+                bytes
             }
             crate::storage::SpilledRowRepresentation::Values(values) => {
-                let len = values.len().min(n_columns);
-                self.values[..len].copy_from_slice(&values[..len]);
+                let len = values.values.len().min(n_columns);
+                self.values[..len].copy_from_slice(&values.values[..len]);
+                values.encoded
             }
+        };
+        // The forms the row's encoding records for its leading columns; a
+        // column added after the row was written reads its default, formed
+        // inline.
+        self.forms.fill(StoredForm::Inline);
+        if self.formed {
+            let width = rowenc::encoded_column_count(encoded)?.min(n_columns);
+            rowenc::stored_forms(encoded, &self.schema[..width], &mut self.forms[..width])?;
         }
         refresh_catalog_object_names(storage, txid, &mut self.values[..n_columns], arena)?;
         self.rowid = [Some(rowid)];

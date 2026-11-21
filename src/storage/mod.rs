@@ -265,6 +265,7 @@ use crate::store::BlockStore;
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
+pub(crate) use rowenc::StoredForm;
 pub(crate) use rowenc::{MAX_COLUMNS, MAX_RELATION_COLUMNS};
 
 const COLUMN_SET_WORDS: usize = MAX_COLUMNS.div_ceil(u64::BITS as usize);
@@ -710,7 +711,17 @@ pub(crate) struct SpilledRow<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum SpilledRowRepresentation<'a> {
     Encoded(&'a [u8]),
-    Values(&'a [Datum<'a>]),
+    /// A PAX row's decoded columns, held apart so a batch of rows stays
+    /// small.
+    Values(&'a SpilledValues<'a>),
+}
+
+/// A PAX row's decoded columns and the table encoding of those leading
+/// columns, which records each value's stored form.
+#[derive(Clone, Copy)]
+pub(crate) struct SpilledValues<'a> {
+    pub(crate) values: &'a [Datum<'a>],
+    pub(crate) encoded: &'a [u8],
 }
 
 /// Key and payload borrow one caller-owned scratch row for the callback only.
@@ -37796,7 +37807,19 @@ impl Storage {
                                     )
                                 },
                             )?;
-                            SpilledRowRepresentation::Values(&*values)
+                            SpilledRowRepresentation::Values(
+                                arena
+                                    .alloc(SpilledValues {
+                                        values: &*values,
+                                        encoded: &*encoded,
+                                    })
+                                    .map_err(|_| {
+                                        sql_err!(
+                                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                            "spilled PAX values exceed the statement arena; raise work_arena_bytes"
+                                        )
+                                    })?,
+                            )
                         } else {
                             let allocate = || {
                                 arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
@@ -38679,7 +38702,10 @@ impl Storage {
                         )?;
                         &decoded[..n_columns]
                     }
-                    SpilledRowRepresentation::Values(values) => values,
+                    SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                        values,
+                        ..
+                    }) => values,
                 };
                 let Some((key_len, payload_len, hash)) =
                     self.encode_value_binding_values(table_slot, binding, values, output)?
@@ -39160,16 +39186,23 @@ impl Storage {
             for row in batch {
                 crate::sql::query::check_timeout()?;
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
-                let (length, values) = match row.representation {
+                let (length, tuple) = match row.representation {
                     SpilledRowRepresentation::Encoded(bytes) => {
                         rowenc::decode(bytes, schema, &mut decoded)?;
-                        (bytes.len(), &decoded[..n_columns])
+                        (
+                            bytes.len(),
+                            heap_layout::stored_tuple_length(bytes, &decoded[..n_columns], schema)?,
+                        )
                     }
-                    SpilledRowRepresentation::Values(values) => {
-                        (rowenc::encoded_len(values), values)
-                    }
+                    SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                        values,
+                        encoded,
+                    }) => (
+                        encoded.len(),
+                        heap_layout::stored_tuple_length(encoded, values, schema)?,
+                    ),
                 };
-                packing.add(heap_layout::tuple_length(values, schema));
+                packing.add(tuple);
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(length as u64);
             }
@@ -39180,7 +39213,11 @@ impl Storage {
             self.with_row_bytes(table_slot, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, schema, &mut values)?;
-                packing.add(heap_layout::tuple_length(&values[..n_columns], schema));
+                packing.add(heap_layout::stored_tuple_length(
+                    bytes,
+                    &values[..n_columns],
+                    schema,
+                )?);
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(bytes.len() as u64);
                 Ok(())
@@ -39326,16 +39363,14 @@ impl Storage {
         scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
             for row in batch {
                 crate::sql::query::check_timeout()?;
-                match row.representation {
-                    SpilledRowRepresentation::Encoded(bytes) => {
-                        observe(bytes.len(), &mut |out| out.copy_from_slice(bytes));
-                    }
-                    SpilledRowRepresentation::Values(values) => {
-                        observe(rowenc::encoded_len(values), &mut |out| {
-                            rowenc::encode(values, out)
-                        });
-                    }
-                }
+                // A PAX row's encoding, which records its values' stored
+                // forms, holds every column of a full scan.
+                let (SpilledRowRepresentation::Encoded(bytes)
+                | SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                    encoded: bytes,
+                    ..
+                })) = row.representation;
+                observe(bytes.len(), &mut |out| out.copy_from_slice(bytes));
             }
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
@@ -39378,20 +39413,15 @@ impl Storage {
             scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
                 for row in batch {
                     crate::sql::query::check_timeout()?;
-                    match row.representation {
-                        SpilledRowRepresentation::Encoded(bytes) => {
-                            copy(bytes.len(), &mut |out| {
-                                out.copy_from_slice(bytes);
-                                Ok(())
-                            })?
-                        }
-                        SpilledRowRepresentation::Values(values) => {
-                            copy(rowenc::encoded_len(values), &mut |out| {
-                                rowenc::encode(values, out);
-                                Ok(())
-                            })?
-                        }
-                    }
+                    let (SpilledRowRepresentation::Encoded(bytes)
+                    | SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                        encoded: bytes,
+                        ..
+                    })) = row.representation;
+                    copy(bytes.len(), &mut |out| {
+                        out.copy_from_slice(bytes);
+                        Ok(())
+                    })?;
                 }
                 Ok(core::ops::ControlFlow::Continue(()))
             })?;
@@ -39519,10 +39549,11 @@ impl Storage {
         for (position, &row) in sample_rows.iter().enumerate() {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(row, &schema[..n_columns], &mut values)?;
-            let page = packing.add(heap_layout::tuple_length(
+            let page = packing.add(heap_layout::stored_tuple_length(
+                row,
                 &values[..n_columns],
                 &schema[..n_columns],
-            ));
+            )?);
             if position as u64 == first_new_row && first_new_page.is_none() {
                 first_new_page = Some(page);
             }
@@ -39735,7 +39766,10 @@ impl Storage {
                             rowenc::decode(bytes, &member_schema[..width], &mut decoded)?;
                             &decoded[..width]
                         }
-                        SpilledRowRepresentation::Values(values) => values,
+                        SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                            values,
+                            ..
+                        }) => values,
                     };
                     project(values)?;
                 }
@@ -44378,7 +44412,10 @@ impl Storage {
                             rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
                             &decoded[..n_columns]
                         }
-                        SpilledRowRepresentation::Values(values) => values,
+                        SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                            values,
+                            ..
+                        }) => values,
                     };
                     let hashes = self
                         .values_enforcer_hashes_for(&arena, selection, bindings, values, &mut buf);

@@ -7526,14 +7526,14 @@ fn external_recursive_tree(
         arena,
         params,
         sequences,
-        &mut |values| {
+        &mut |values, forms| {
             storage
                 .with_block_store(|blocks| {
                     sorter.push_projected_by(
                         storage,
                         blocks,
                         values.len(),
-                        |column| values[column],
+                        |column| Ok((values[column], forms[column])),
                         &mut compare,
                     )
                 })

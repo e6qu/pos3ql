@@ -992,6 +992,14 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 pub(crate) struct EnclosingRow<'s, 'a>(pub(crate) &'s dyn ColumnLookup<'a>);
 
 impl<'b, 'a: 'b> ColumnLookup<'b> for EnclosingRow<'_, 'a> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        self.0.stored_form(qualifier, name)
+    }
+
     fn resolve_column_type_unsuggested(
         &self,
         qualifier: Option<&str>,
@@ -1099,6 +1107,17 @@ impl RoutineVariables<'_, '_> {
 }
 
 impl<'b, 'a: 'b> ColumnLookup<'b> for RoutineVariables<'_, 'a> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'b>, SqlError> {
         if self.names(qualifier, name) {
             return self.0.lookup(qualifier, name);
@@ -1178,6 +1197,15 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for RoutineVariables<'_, 'a> {
 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
+
+    /// The TOAST form of the column's value when it is a stored datum the
+    /// statement passes on (PostgreSQL passes a stored value on unchanged);
+    /// `None` for a value the statement formed.
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, SqlError>;
 
     /// [`Self::lookup`] for a caller that may still find the column in an
     /// enclosing scope: a missing column's spelling suggestion is left to the
@@ -2121,6 +2149,14 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 /// A reference to a lookup is itself a lookup, so `&dyn ColumnLookup` can be
 /// passed to the generic `eval`/`where_passes` helpers.
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, SqlError> {
+        (**self).stored_form(qualifier, name)
+    }
+
     fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
         (**self).outer_aggregate(call)
     }
@@ -2394,6 +2430,16 @@ pub(crate) fn empty_scope_column_error(qualifier: Option<&str>, name: &str) -> S
 }
 
 impl<'a> ColumnLookup<'a> for NoColumns {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn is_empty_scope(&self) -> bool {
         true
     }
@@ -4227,6 +4273,14 @@ impl<'a> StatementSubqueryScope<'_, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for StatementSubqueryScope<'_, 'a> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        self.row.stored_form(qualifier, name)
+    }
+
     fn resolve_column_type_unsuggested(
         &self,
         qualifier: Option<&str>,
@@ -16266,6 +16320,17 @@ mod tests {
                 }
                 struct Columns;
                 impl<'a> ColumnLookup<'a> for Columns {
+                    fn stored_form(
+                        &self,
+                        qualifier: Option<&str>,
+                        name: &str,
+                    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError>
+                    {
+                        // A lookup of names and types, with no stored values.
+                        let _ = (qualifier, name);
+                        Ok(None)
+                    }
+
                     fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
                         panic!("collation inference must not evaluate an argument")
                     }
@@ -16324,6 +16389,17 @@ mod tests {
         }];
         struct Columns;
         impl<'a> ColumnLookup<'a> for Columns {
+            fn stored_form(
+                &self,
+                qualifier: Option<&str>,
+                name: &str,
+            ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError>
+            {
+                // A lookup of names and types, with no stored values.
+                let _ = (qualifier, name);
+                Ok(None)
+            }
+
             fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
                 panic!("collation inference must not read row values")
             }
@@ -16933,6 +17009,17 @@ mod tests {
     fn whole_row_argument_types_do_not_read_values() {
         struct SchemaOnly;
         impl<'a> ColumnLookup<'a> for SchemaOnly {
+            fn stored_form(
+                &self,
+                qualifier: Option<&str>,
+                name: &str,
+            ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError>
+            {
+                // A lookup of names and types, with no stored values.
+                let _ = (qualifier, name);
+                Ok(None)
+            }
+
             fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
                 panic!("type inference must not read a row");
             }
@@ -16992,6 +17079,17 @@ mod tests {
             }
         }
         impl<'a> ColumnLookup<'a> for Hidden {
+            fn stored_form(
+                &self,
+                qualifier: Option<&str>,
+                name: &str,
+            ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError>
+            {
+                // A lookup of names and types, with no stored values.
+                let _ = (qualifier, name);
+                Ok(None)
+            }
+
             fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
                 Err(sql_err!(
                     sqlstate::UNDEFINED_TABLE,

@@ -1027,6 +1027,17 @@ fn left_items<'s, 'd>(
 }
 
 impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
+            return left_items(self).stored_form(qualifier, name);
+        }
+        self.answer(qualifier, name, self.target().stored_form(qualifier, name))
+    }
+
     fn suggest_columns(
         &self,
         suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
@@ -1254,6 +1265,16 @@ pub(crate) struct OuterColumnTypes<'s, 'row>(pub(crate) &'s dyn ColumnLookup<'ro
 pub(crate) struct ResolverColumns<'s>(pub(crate) &'s dyn crate::sql::exec::ColTypeResolver);
 
 impl<'a> ColumnLookup<'a> for ResolverColumns<'_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.0.resolve(qualifier, name).map(|_| Datum::Null)
     }
@@ -1294,6 +1315,16 @@ impl<'a> ColumnLookup<'a> for ResolverColumns<'_> {
 }
 
 impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn suggest_columns(
         &self,
         suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
@@ -1360,6 +1391,16 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn suggest_columns(
         &self,
         suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
@@ -2680,31 +2721,28 @@ impl<'d> QueryScope<'d> {
         let _block = super::instrument::enter(super::instrument::Segment::Derived(
             u16::try_from(position).unwrap_or(u16::MAX),
         ));
-        let select_rows =
-            |emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>| match order {
-                super::group::RowOrder::Observed => {
-                    select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
-                }
-                super::group::RowOrder::Unobserved => {
-                    super::group::with_unobserved_order(sub, || {
-                        select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
-                    })
-                }
-            };
+        let select_rows = |emit: &mut crate::sql::query::RowSink<'_>| match order {
+            super::group::RowOrder::Observed => {
+                select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
+            }
+            super::group::RowOrder::Unobserved => super::group::with_unobserved_order(sub, || {
+                select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
+            }),
+        };
         if storage.spill_attached() {
             // A stable all-equal sort is an insertion-order spool. Resetting
             // one leased producer cannot disturb a nested child's producer.
             let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
             let mut sorter = storage.external_sorter()?;
             sorter.reset();
-            select_rows(&mut |values| {
+            select_rows(&mut |values, forms| {
                 storage
                     .with_block_store(|blocks| {
                         sorter.push_projected_by(
                             storage,
                             blocks,
                             values.len(),
-                            |column| values[column],
+                            |column| Ok((values[column], forms[column])),
                             &mut compare,
                         )
                     })
@@ -2721,8 +2759,8 @@ impl<'d> QueryScope<'d> {
             let mut store: *mut &[u8] = core::ptr::null_mut();
             let mut len = 0usize;
             let mut cap = 0usize;
-            select_rows(&mut |values| {
-                let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
+            select_rows(&mut |values, forms| {
+                let encoded = crate::sql::exec::encode_projected_formed(values, forms, arena)?;
                 if len == cap {
                     let new_cap = if cap == 0 { 8 } else { cap * 2 };
                     let fresh: &mut [&[u8]] = arena

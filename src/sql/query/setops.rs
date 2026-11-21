@@ -14,6 +14,7 @@ use crate::sql::exec::{self, MAX_PROJ};
 use crate::sql::external::ExternalRun;
 use crate::sql::types::{ColDesc, ColType, CollationDerivation, Datum};
 use crate::storage::Storage;
+use crate::storage::StoredForm;
 use crate::{sql_err, stack_format};
 
 use super::{
@@ -218,7 +219,7 @@ pub(crate) fn set_query_into_rows<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    emit: &mut crate::sql::query::RowSink<'_>,
 ) -> Result<(), SqlError> {
     let bound_catalog = super::storage_catalog(storage, arena, txid);
     let bound_queries = super::ProceduralSubqueries { storage, txid };
@@ -322,10 +323,25 @@ pub(crate) fn set_query_into_rows<'a>(
     }
     for row in &rows[start..end] {
         let mut values = [Datum::Null; MAX_PROJ];
-        for (column, value) in values.iter_mut().enumerate().take(column_count) {
-            *value = exec::decode_projected_col_record(row, column, arena)?;
-        }
-        emit(&values[..column_count])?;
+        let mut forms = [StoredForm::Inline; MAX_PROJ];
+        decode_set_row(row, column_count, arena, &mut values, &mut forms)?;
+        emit(&values[..column_count], &forms[..column_count])?;
+    }
+    Ok(())
+}
+
+/// Decodes the first `width` columns of the set operation row `row` and the
+/// stored form each keeps.
+fn decode_set_row<'a>(
+    row: &'a [u8],
+    width: usize,
+    arena: &'a Arena,
+    values: &mut [Datum<'a>; MAX_PROJ],
+    forms: &mut [StoredForm; MAX_PROJ],
+) -> Result<(), SqlError> {
+    for column in 0..width {
+        values[column] = exec::decode_projected_col_record(row, column, arena)?;
+        forms[column] = exec::projected_stored_form(row, column);
     }
     Ok(())
 }
@@ -536,7 +552,7 @@ fn external_set_leaf<'a>(
         context.params,
         context.outer,
         context.sequences,
-        &mut |values| {
+        &mut |values, forms| {
             if values.len() != target.len() {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -547,6 +563,7 @@ fn external_set_leaf<'a>(
             for column in 0..target.len() {
                 coerced[column] = coerce_set_value(values[column], target[column], context.arena)?;
             }
+            let kept = crate::sql::toast::converted_forms(values, &coerced[..target.len()], forms);
             context
                 .storage
                 .with_block_store(|blocks| {
@@ -554,7 +571,7 @@ fn external_set_leaf<'a>(
                         context.storage,
                         blocks,
                         target.len(),
-                        |column| coerced[column],
+                        |column| Ok((coerced[column], kept[column])),
                         &mut compare,
                     )
                 })
@@ -827,7 +844,7 @@ pub(crate) fn external_set_body_into<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    emit: &mut crate::sql::query::RowSink<'_>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(), SqlError> {
     let bound_catalog = super::storage_catalog(storage, arena, txid);
@@ -956,10 +973,9 @@ pub(crate) fn external_set_body_into<'a>(
         if logical >= offset {
             stages.limit.row();
             let mut values = [Datum::Null; MAX_PROJ];
-            for (column, value) in values.iter_mut().enumerate().take(column_count) {
-                *value = exec::decode_projected_col_record(context.row, column, arena)?;
-            }
-            emit(&values[..column_count])?;
+            let mut forms = [StoredForm::Inline; MAX_PROJ];
+            decode_set_row(context.row, column_count, arena, &mut values, &mut forms)?;
+            emit(&values[..column_count], &forms[..column_count])?;
         }
         if with_ties && limit > 0 && logical + 1 == window {
             context.boundary[..context.row.len()].copy_from_slice(context.row);
@@ -2259,7 +2275,7 @@ fn stream_set_tree<'a>(
                 params,
                 outer,
                 sequences,
-                &mut |vals| {
+                &mut |vals, forms| {
                     if vals.len() != n {
                         return Err(sql_err!(
                             sqlstate::SYNTAX_ERROR,
@@ -2270,7 +2286,12 @@ fn stream_set_tree<'a>(
                     for c in 0..n {
                         coerced[c] = coerce_set_value(vals[c], target[c], arena)?;
                     }
-                    emit(exec::encode_projected_persistent_pub(&coerced[..n], arena)?)
+                    let kept = crate::sql::toast::converted_forms(vals, &coerced[..n], forms);
+                    emit(exec::encode_projected_persistent_pub(
+                        &coerced[..n],
+                        &kept[..n],
+                        arena,
+                    )?)
                 },
             )
         }
@@ -2382,7 +2403,7 @@ fn eval_set_leaf<'a>(
         params,
         outer,
         sequences,
-        &mut |vals| {
+        &mut |vals, forms| {
             if vals.len() != n {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -2393,7 +2414,8 @@ fn eval_set_leaf<'a>(
             for c in 0..n {
                 coerced[c] = coerce_set_value(vals[c], target[c], arena)?;
             }
-            let encoded = exec::encode_projected_persistent_pub(&coerced[..n], arena)?;
+            let kept = crate::sql::toast::converted_forms(vals, &coerced[..n], forms);
+            let encoded = exec::encode_projected_persistent_pub(&coerced[..n], &kept[..n], arena)?;
             rows.push(encoded).map_err(|_| arena_full())?;
             Ok(())
         },

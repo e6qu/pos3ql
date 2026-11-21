@@ -20,7 +20,8 @@ use crate::sql::eval::{
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::storage::{
-    ColumnSet, MAX_COLUMNS, MAX_INDEX_COLS, PolicyCommandKind, Storage, TableDef, rowenc,
+    ColumnSet, MAX_COLUMNS, MAX_INDEX_COLS, PolicyCommandKind, Storage, StoredForm, TableDef,
+    rowenc,
 };
 use crate::util::StackStr;
 
@@ -670,6 +671,16 @@ pub(crate) fn row_security_passes<'a>(
 }
 
 impl<'a> ColumnLookup<'a> for NoColumns {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn is_empty_scope(&self) -> bool {
         true
     }
@@ -690,7 +701,7 @@ pub(super) fn latest_locked_source<'a>(
     slot: usize,
     rowid: u64,
     arena: &'a Arena,
-) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+) -> Result<Option<BoundRow<'a>>, SqlError> {
     let Some(state) = storage.row_state(slot, rowid)? else {
         return Ok(None);
     };
@@ -711,10 +722,17 @@ pub(super) fn latest_locked_source<'a>(
     let values = arena
         .alloc_slice_with(logical.n_columns, |_| Datum::Null)
         .map_err(|_| arena_full())?;
-    crate::storage::RelationColumnMap::new(logical, physical, arena)?
-        .project(&physical_values[..physical.n_columns], values);
+    let mapping = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
+    mapping.project(&physical_values[..physical.n_columns], values);
     refresh_catalog_object_names(storage, txid, values, arena)?;
-    Ok(Some(values))
+    let forms = member_forms(
+        &schema[..physical.n_columns],
+        mapping,
+        Some(bytes),
+        logical.n_columns,
+        arena,
+    )?;
+    Ok(Some(BoundRow::Values { values, forms }))
 }
 
 /// The SELECT row-security policy a stored source's scan applies.
@@ -847,6 +865,17 @@ mod tests {
         use crate::sql::types::Datum;
         struct Unknown;
         impl<'a> ColumnLookup<'a> for Unknown {
+            fn stored_form(
+                &self,
+                qualifier: Option<&str>,
+                name: &str,
+            ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError>
+            {
+                // A lookup of names and types, with no stored values.
+                let _ = (qualifier, name);
+                Ok(None)
+            }
+
             fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
                 panic!("scope classification must not read values");
             }
@@ -891,6 +920,17 @@ mod tests {
         use crate::sql::types::{ColType, Datum};
         struct Scope(bool);
         impl<'a> ColumnLookup<'a> for Scope {
+            fn stored_form(
+                &self,
+                qualifier: Option<&str>,
+                name: &str,
+            ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError>
+            {
+                // A lookup of names and types, with no stored values.
+                let _ = (qualifier, name);
+                Ok(None)
+            }
+
             fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
                 if self.col_type(qualifier, name).is_some() {
                     Ok(Datum::Int4(7))
@@ -911,6 +951,17 @@ mod tests {
         }
         struct Hidden;
         impl<'a> ColumnLookup<'a> for Hidden {
+            fn stored_form(
+                &self,
+                qualifier: Option<&str>,
+                name: &str,
+            ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError>
+            {
+                // A lookup of names and types, with no stored values.
+                let _ = (qualifier, name);
+                Ok(None)
+            }
+
             fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
                 panic!("column typing must not read values");
             }
@@ -1198,7 +1249,31 @@ impl<'a> IndexedCandidates<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum BoundRow<'a> {
     Encoded(&'a [u8]),
-    Values(&'a [Datum<'a>]),
+    /// Decoded columns and where their stored forms come from.
+    Values {
+        values: &'a [Datum<'a>],
+        forms: RowForms<'a>,
+    },
+}
+
+/// A partition tree's row: its values and its stored bytes.
+type TreeRow<'a> = (&'a mut [Datum<'a>], &'a [u8]);
+
+/// Where the TOAST forms of a bound row's decoded values come from.
+#[derive(Clone, Copy)]
+pub(crate) enum RowForms<'a> {
+    /// Values the statement formed, or a source that stores no rows: no
+    /// value has a stored form.
+    Fresh,
+    /// The table encoding of the row's leading columns, which records each
+    /// stored value's form.
+    Encoded(&'a [u8]),
+    /// Each value's form, aligned with the values.
+    Listed(&'a [crate::storage::StoredForm]),
+    /// A stored row read through a path that does not keep its forms, such
+    /// as an index-only scan: a value TOAST may have stored compressed or
+    /// out of line has a form the model does not know.
+    Unknown,
 }
 
 /// Fixed physical-column demand for every base table in one source scan.
@@ -5017,6 +5092,9 @@ pub(crate) enum JoinRowValues<'s, 'v> {
     Flat {
         values: &'s [Datum<'v>],
         offsets: &'s [usize],
+        /// Each value's stored form, aligned with `values`; `None` when the
+        /// row's producer does not keep them, as [`RowForms::Unknown`].
+        forms: Option<&'s [crate::storage::StoredForm]>,
     },
 }
 
@@ -5093,17 +5171,19 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
                         let start = buffer_offsets[position];
                         Some(&buffers[start..start + width])
                     }
-                    Some(BoundRow::Values(values)) if self.scope.stores_rows(table) => {
+                    Some(BoundRow::Values { values, .. }) if self.scope.stores_rows(table) => {
                         // A leaf of an inheritance tree carries its oid past
                         // the relation's columns.
                         let width = self.scope.defs.n_columns(table).expect("resolved");
                         Some(&values[..width.min(values.len())])
                     }
-                    Some(BoundRow::Values(values)) => Some(values),
+                    Some(BoundRow::Values { values, .. }) => Some(values),
                     None => Some(&[]),
                 }
             }
-            JoinRowValues::Flat { values, offsets } => {
+            JoinRowValues::Flat {
+                values, offsets, ..
+            } => {
                 let start = *offsets.get(table)?;
                 let width = self.scope.stored_width(table);
                 Some(&values[start..start + width])
@@ -5113,6 +5193,79 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
 }
 
 impl<'v> JoinRow<'_, 'v, '_> {
+    /// The TOAST form column `column` of FROM item `table` holds in this
+    /// row: `None` for a value the statement formed, or a NULL.
+    pub(crate) fn column_form(
+        &self,
+        table: usize,
+        column: usize,
+    ) -> Result<Option<crate::storage::StoredForm>, SqlError> {
+        let Some(value) = self
+            .table_values(table)
+            .and_then(|values| values.get(column).copied())
+        else {
+            return Ok(None);
+        };
+        if !rowenc::carries_stored_form(&value) {
+            return Ok(None);
+        }
+        let unknown = || {
+            if crate::sql::toast::may_be_toasted(&value) {
+                StoredForm::Unmodelled
+            } else {
+                StoredForm::Inline
+            }
+        };
+        let form = match self.values {
+            JoinRowValues::Flat {
+                offsets,
+                forms: Some(forms),
+                ..
+            } => offsets
+                .get(table)
+                .and_then(|offset| forms.get(offset + column).copied())
+                .unwrap_or(StoredForm::Inline),
+            JoinRowValues::Flat { forms: None, .. } => unknown(),
+            JoinRowValues::Bound { bound, .. } => match bound[table] {
+                None => StoredForm::Inline,
+                Some(BoundRow::Encoded(bytes)) if self.scope.derived[table].is_some() => {
+                    crate::sql::exec::projected_stored_form(bytes, column)
+                }
+                Some(BoundRow::Encoded(bytes)) => self.encoded_form(table, bytes, column)?,
+                Some(BoundRow::Values { forms, .. }) => match forms {
+                    RowForms::Fresh => StoredForm::Inline,
+                    RowForms::Encoded(bytes) => self.encoded_form(table, bytes, column)?,
+                    RowForms::Listed(forms) => {
+                        forms.get(column).copied().unwrap_or(StoredForm::Inline)
+                    }
+                    RowForms::Unknown => unknown(),
+                },
+            },
+        };
+        Ok((form != StoredForm::Inline).then_some(form))
+    }
+
+    /// The form column `column` holds in `bytes`, the table encoding of the
+    /// leading columns of stored FROM item `table`.
+    fn encoded_form(
+        &self,
+        table: usize,
+        bytes: &[u8],
+        column: usize,
+    ) -> Result<crate::storage::StoredForm, SqlError> {
+        let definition = self.scope.defs.get(table).expect("resolved");
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        definition.schema(&mut schema);
+        let width = rowenc::encoded_column_count(bytes)?.min(definition.n_columns);
+        if column >= width {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a stored row's encoding lacks a column the query reads"
+            ));
+        }
+        rowenc::stored_form(bytes, &schema[..width], column)
+    }
+
     /// The `tableoid` of a stored table's current row: the leaf of an
     /// inheritance tree it was read from, or the table itself. Null for an
     /// outer join's null-extended row.
@@ -5136,11 +5289,15 @@ impl<'v> JoinRow<'_, 'v, '_> {
                 let width = self.scope.defs.n_columns(table).expect("resolved");
                 match bound[table] {
                     None => Ok(Datum::Null),
-                    Some(BoundRow::Values(values)) if values.len() > width => Ok(values[width]),
+                    Some(BoundRow::Values { values, .. }) if values.len() > width => {
+                        Ok(values[width])
+                    }
                     Some(_) => self.scope.relation_oid(table),
                 }
             }
-            JoinRowValues::Flat { values, offsets } => {
+            JoinRowValues::Flat {
+                values, offsets, ..
+            } => {
                 offsets.get(table).ok_or_else(missing)?;
                 // A window row keeps each item's leaf oid after its columns.
                 let total = self.scope.stored_columns();
@@ -5269,6 +5426,30 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 }
                 Ok(Datum::Null)
             }
+        }
+    }
+
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, SqlError> {
+        match self.visible_column(qualifier, name)? {
+            ResolvedColumn::Table(table, column) => self.column_form(table, column),
+            // A merged `USING` column is its first non-null side's datum.
+            ResolvedColumn::Merged(merged) => {
+                for &(table, column) in self.scope.merged[merged].parts {
+                    let present = self
+                        .table_values(table)
+                        .and_then(|values| values.get(column))
+                        .is_some_and(|value| !value.is_null());
+                    if present {
+                        return self.column_form(table, column);
+                    }
+                }
+                Ok(None)
+            }
+            ResolvedColumn::TableOid(_) => Ok(None),
         }
     }
 
@@ -5668,6 +5849,27 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             .map_err(|error| self.suggested(q, name, error))
     }
 
+    fn stored_form(
+        &self,
+        q: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, SqlError> {
+        let saved = crate::sql::error_position::save_pending();
+        let inner = self.inner.lookup_unsuggested(q, name).is_ok();
+        crate::sql::error_position::restore_pending(saved);
+        if inner {
+            if self.inner_column_wins(q, name) {
+                return self.inner.stored_form(q, name);
+            }
+        } else if q.is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) {
+            return Ok(None);
+        }
+        match self.outer {
+            Some(outer) => outer.stored_form(q, name),
+            None => Ok(None),
+        }
+    }
+
     fn lookup_unsuggested(&self, q: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         let saved = crate::sql::error_position::save_pending();
         match self.inner.lookup_unsuggested(q, name) {
@@ -5849,8 +6051,8 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
             params,
             Some(outer),
             base_hooks.sequences,
-            &mut |vals| {
-                let enc = crate::sql::exec::encode_projected_pub(vals, arena)?;
+            &mut |vals, forms| {
+                let enc = crate::sql::exec::encode_projected_formed(vals, forms, arena)?;
                 if len == cap {
                     let new_cap = if cap == 0 { 8 } else { cap * 2 };
                     let fresh: &mut [&[u8]] = arena
@@ -5986,7 +6188,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
                             storage,
                             blocks,
                             width,
-                            |column| values[column],
+                            |column| Ok((values[column], StoredForm::Inline)),
                             &mut compare,
                         )
                     })
@@ -6067,7 +6269,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
                             storage,
                             blocks,
                             width,
-                            |column| values[column],
+                            |column| Ok((values[column], StoredForm::Inline)),
                             &mut compare,
                         )
                     })
@@ -6166,14 +6368,14 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
         params,
         Some(outer),
         base_hooks.sequences,
-        &mut |values| {
+        &mut |values, forms| {
             storage
                 .with_block_store(|blocks| {
                     sorter.push_projected_by(
                         storage,
                         blocks,
                         values.len(),
-                        |column| values[column],
+                        |column| Ok((values[column], forms[column])),
                         &mut compare,
                     )
                 })
@@ -6349,11 +6551,14 @@ fn record_external_match(
                 blocks,
                 2,
                 |column| {
-                    if column == 0 {
-                        Datum::Int4(depth as i32)
-                    } else {
-                        Datum::Int8((index ^ (1u64 << 63)) as i64)
-                    }
+                    Ok((
+                        if column == 0 {
+                            Datum::Int4(depth as i32)
+                        } else {
+                            Datum::Int8((index ^ (1u64 << 63)) as i64)
+                        },
+                        StoredForm::Inline,
+                    ))
                 },
                 &mut compare,
             )
@@ -8412,7 +8617,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
             .alloc_slice_with(rows.len() * count, |_| Datum::Null)
             .map_err(|_| arena_full())?;
         for (at, &rowid) in rows.iter().enumerate() {
-            if let Some(values) = self.row(member, rowid)? {
+            if let Some((values, _)) = self.row(member, rowid)? {
                 for (key_at, key) in self.order.iter().enumerate() {
                     if let OrderKey::Column { column, .. } = key {
                         keys[at * count + key_at] = values[*column];
@@ -8425,11 +8630,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
 
     /// The row `rowid` of `member`, decoded into the tree's columns with the
     /// member's oid after them.
-    fn row(
-        &self,
-        member: &TreeMember<'a>,
-        rowid: u64,
-    ) -> Result<Option<&'a mut [Datum<'a>]>, SqlError> {
+    fn row(&self, member: &TreeMember<'a>, rowid: u64) -> Result<Option<TreeRow<'a>>, SqlError> {
         let storage = self.storage;
         let Some(state) = storage.row_state(member.leaf, rowid)? else {
             return Ok(None);
@@ -8449,7 +8650,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
             .mapping
             .project(&physical[..member.schema.len()], &mut values[..columns]);
         values[columns] = member.leaf_oid;
-        Ok(Some(values))
+        Ok(Some((values, bytes)))
     }
 
     /// The encoded length of the row `rowid` of `member`.
@@ -8469,7 +8670,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
     /// Whether `rowid` of `member` passes the scan's conditions, counted as
     /// the member's scan counts the rows its path reaches.
     fn passes(&self, member: &TreeMember<'a>, rowid: u64) -> Result<Option<bool>, SqlError> {
-        let Some(values) = self.row(member, rowid)? else {
+        let Some((values, _)) = self.row(member, rowid)? else {
             return Ok(None);
         };
         let row = crate::sql::exec::RowCtx {
@@ -8587,7 +8788,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
                 member.head = at;
                 return Ok(Some(at));
             }
-            let Some(values) = self.row(member, member.rows[at])? else {
+            let Some((values, _)) = self.row(member, member.rows[at])? else {
                 continue;
             };
             let row = crate::sql::exec::RowCtx {
@@ -8635,7 +8836,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
             return Ok(());
         }
         let rowid = member.rows[member.head];
-        let Some(values) = self.row(member, rowid)? else {
+        let Some((values, _)) = self.row(member, rowid)? else {
             return Ok(());
         };
         let row = crate::sql::exec::RowCtx {
@@ -9140,27 +9341,32 @@ pub(super) fn heap_pages_of_rows<'a>(
         .map_err(|_| arena_full())?;
     let mut packing = crate::storage::heap_layout::HeapPacking::new();
     let mut filled = 0usize;
-    let mut place = |rowid: u64, values: &[Datum<'_>]| {
-        let page = packing.add(crate::storage::heap_layout::tuple_length(values, schema));
+    let mut place = |rowid: u64, bytes: &[u8], values: &[Datum<'_>]| -> Result<(), SqlError> {
+        let page = packing.add(crate::storage::heap_layout::stored_tuple_length(
+            bytes, values, schema,
+        )?);
         if filled < pages.len() {
             pages[filled] = (rowid, page);
             free[page as usize] = u16::try_from(packing.free()).unwrap_or(u16::MAX);
             filled += 1;
         }
+        Ok(())
     };
     let scan = storage.captured_row_scan_in(slot, txid, arena)?;
     // A sequential scan's order: saved rows, then resident rows.
     scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
         for row in batch {
             let mut values = [Datum::Null; MAX_COLUMNS];
-            let values = match row.representation {
+            let (bytes, values) = match row.representation {
                 crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                     rowenc::decode(bytes, schema, &mut values)?;
-                    &values[..n_columns]
+                    (bytes, &values[..n_columns])
                 }
-                crate::storage::SpilledRowRepresentation::Values(values) => values,
+                crate::storage::SpilledRowRepresentation::Values(
+                    &crate::storage::SpilledValues { values, encoded },
+                ) => (encoded, values),
             };
-            place(row.rowid, values);
+            place(row.rowid, bytes, values)?;
         }
         Ok(core::ops::ControlFlow::Continue(()))
     })?;
@@ -9168,8 +9374,7 @@ pub(super) fn heap_pages_of_rows<'a>(
         storage.with_row_bytes(slot, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut values)?;
-            place(rowid, &values[..n_columns]);
-            Ok(())
+            place(rowid, bytes, &values[..n_columns])
         })?;
         Ok(core::ops::ControlFlow::Continue(()))
     })?;
@@ -9413,7 +9618,7 @@ fn scan_source_mode<'a>(
                         refresh_catalog_object_names(storage, txid, buffer, arena)?;
                     }
                 }
-                Some(BoundRow::Values(_)) | None => {}
+                Some(BoundRow::Values { .. }) | None => {}
             }
         }
         Ok(JoinRow {
@@ -9444,7 +9649,7 @@ fn scan_source_mode<'a>(
                 }
             }
             BoundRow::Encoded(bytes) => rowenc::decode(bytes, schema, output)?,
-            BoundRow::Values(values) => {
+            BoundRow::Values { values, .. } => {
                 if values.len() > output.len() {
                     return Err(arena_full());
                 }
@@ -9754,8 +9959,17 @@ fn scan_source_mode<'a>(
                             storage.record_relation_tuple_read(txid, build_slot, None)?;
                             // Rows not yet in column blocks arrive encoded.
                             match spilled.representation {
-                                crate::storage::SpilledRowRepresentation::Values(values) => {
-                                    insert(Some(spilled.rowid), BoundRow::Values(values), values)?;
+                                crate::storage::SpilledRowRepresentation::Values(
+                                    &crate::storage::SpilledValues { values, encoded },
+                                ) => {
+                                    insert(
+                                        Some(spilled.rowid),
+                                        BoundRow::Values {
+                                            values,
+                                            forms: RowForms::Encoded(encoded),
+                                        },
+                                        values,
+                                    )?;
                                 }
                                 crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                                     let mut decoded = [Datum::Null; MAX_COLUMNS];
@@ -9864,9 +10078,12 @@ fn scan_source_mode<'a>(
                 scan.for_each_spilled_row_batch(arena, recycle_rows, Some(demand), &mut |rows| {
                     for spilled in rows {
                         let row = match spilled.representation {
-                            crate::storage::SpilledRowRepresentation::Values(values) => {
-                                BoundRow::Values(values)
-                            }
+                            crate::storage::SpilledRowRepresentation::Values(
+                                &crate::storage::SpilledValues { values, encoded },
+                            ) => BoundRow::Values {
+                                values,
+                                forms: RowForms::Encoded(encoded),
+                            },
                             crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                                 BoundRow::Encoded(bytes)
                             }
@@ -10145,17 +10362,27 @@ fn scan_source_mode<'a>(
                 for spilled in rows {
                     storage.record_relation_tuple_read(txid, probe_slot, None)?;
                     // Rows not yet in column blocks arrive encoded.
-                    let values = match spilled.representation {
-                        crate::storage::SpilledRowRepresentation::Values(values) => values,
+                    let probe = match spilled.representation {
+                        crate::storage::SpilledRowRepresentation::Values(
+                            &crate::storage::SpilledValues { values, encoded },
+                        ) => BoundRow::Values {
+                            values,
+                            forms: RowForms::Encoded(encoded),
+                        },
                         crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                             let mut decoded = [Datum::Null; MAX_COLUMNS];
                             rowenc::decode(bytes, probe_schema, &mut decoded)?;
-                            &*arena
-                                .alloc_slice_copy(&decoded[..probe_schema.len()])
-                                .map_err(|_| arena_full())?
+                            BoundRow::Values {
+                                values: &*arena
+                                    .alloc_slice_copy(&decoded[..probe_schema.len()])
+                                    .map_err(|_| arena_full())?,
+                                forms: RowForms::Encoded(
+                                    &*arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?,
+                                ),
+                            }
                         }
                     };
-                    if !visit_probe(Some(spilled.rowid), BoundRow::Values(values))? {
+                    if !visit_probe(Some(spilled.rowid), probe)? {
                         stopped = true;
                         return Ok(ControlFlow::Break(()));
                     }
@@ -10814,8 +11041,11 @@ fn scan_source_mode<'a>(
                                                 bytes,
                                             ) => BoundRow::Encoded(bytes),
                                             crate::storage::SpilledRowRepresentation::Values(
+                                                &crate::storage::SpilledValues { values, encoded },
+                                            ) => BoundRow::Values {
                                                 values,
-                                            ) => BoundRow::Values(values),
+                                                forms: RowForms::Encoded(encoded),
+                                            },
                                         },
                                         Some(spilled.rowid)
                                     )
@@ -11340,16 +11570,27 @@ fn scan_source_mode<'a>(
                                 let this = index;
                                 index += 1;
                                 recycled(arena, recycle_rows, retain_match, || {
-                                    let Some(values) = scan.row(&member, rowid)? else {
+                                    let Some((values, bytes)) = scan.row(&member, rowid)? else {
                                         return Ok(true);
                                     };
+                                    let forms = member_forms(
+                                        member.schema,
+                                        member.mapping,
+                                        Some(bytes),
+                                        logical.n_columns,
+                                        arena,
+                                    )?;
                                     refresh_catalog_object_names(
                                         storage,
                                         txid,
                                         &mut values[..logical.n_columns],
                                         arena,
                                     )?;
-                                    visit_candidate!(this, BoundRow::Values(values), Some(rowid))
+                                    visit_candidate!(
+                                        this,
+                                        BoundRow::Values { values, forms },
+                                        Some(rowid)
+                                    )
                                 })?
                             }};
                         }
@@ -11460,8 +11701,12 @@ fn scan_source_mode<'a>(
                             crate::storage::RelationColumnMap::new(logical, physical, arena)?;
                         let leaf_oid =
                             Datum::Oid(crate::sql::catalog::user_table_oid(storage, leaf) as u32);
+                        let mut physical_schema = [ColType::Bool; MAX_COLUMNS];
+                        physical.schema(&mut physical_schema);
+                        let physical_schema = &physical_schema[..physical.n_columns];
                         let mut visit = |rowid: Option<u64>,
-                                         physical_values: &[Datum<'a>]|
+                                         physical_values: &[Datum<'a>],
+                                         encoded: Option<&[u8]>|
                          -> Result<bool, SqlError> {
                             check_timeout()?;
                             if !foreign {
@@ -11483,7 +11728,14 @@ fn scan_source_mode<'a>(
                                     &mut values[..logical.n_columns],
                                     arena,
                                 )?;
-                                visit_candidate!(this, BoundRow::Values(values), rowid)
+                                let forms = member_forms(
+                                    physical_schema,
+                                    mapping,
+                                    encoded,
+                                    logical.n_columns,
+                                    arena,
+                                )?;
+                                visit_candidate!(this, BoundRow::Values { values, forms }, rowid)
                             })
                         };
                         // A foreign member ships the restrictions it can to
@@ -11698,7 +11950,16 @@ fn scan_source_mode<'a>(
                                 }
                             }
                             refresh_catalog_object_names(storage, txid, values, arena)?;
-                            visit_candidate!(this, BoundRow::Values(values), Some(candidate.rowid))
+                            // An index-only scan returns the index tuple's datums,
+                            // which `index_form_tuple` forms anew.
+                            visit_candidate!(
+                                this,
+                                BoundRow::Values {
+                                    values,
+                                    forms: RowForms::Unknown,
+                                },
+                                Some(candidate.rowid)
+                            )
                         })?;
                         if !keep_scanning {
                             return Ok(false);
@@ -12243,7 +12504,7 @@ fn scan_source_mode<'a>(
                     params,
                     hooks,
                     None,
-                    &mut |_, _| {
+                    &mut |_, _, _| {
                         total += 1;
                         Ok(true)
                     },
@@ -12478,6 +12739,9 @@ fn scan_source_mode<'a>(
                 for &(leaf, first) in members {
                     let physical = definitions.definition(storage, leaf, txid)?;
                     let mapping = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
+                    let mut physical_schema = [ColType::Bool; MAX_COLUMNS];
+                    physical.schema(&mut physical_schema);
+                    let physical_schema = &physical_schema[..physical.n_columns];
                     let leaf_oid =
                         Datum::Oid(crate::sql::catalog::user_table_oid(storage, leaf) as u32);
                     let mut ordinal = first;
@@ -12491,7 +12755,7 @@ fn scan_source_mode<'a>(
                         params,
                         hooks,
                         None,
-                        &mut |rowid, physical_values| {
+                        &mut |rowid, physical_values, encoded| {
                             check_timeout()?;
                             let this = ordinal;
                             ordinal += 1;
@@ -12528,7 +12792,14 @@ fn scan_source_mode<'a>(
                                     &mut values[..logical.n_columns],
                                     arena,
                                 )?;
-                                emit_unmatched(BoundRow::Values(values), rowid, f)
+                                let forms = member_forms(
+                                    physical_schema,
+                                    mapping,
+                                    encoded,
+                                    logical.n_columns,
+                                    arena,
+                                )?;
+                                emit_unmatched(BoundRow::Values { values, forms }, rowid, f)
                             })
                         },
                     )?;
@@ -12652,8 +12923,11 @@ fn scan_source_mode<'a>(
                                             bytes,
                                         ) => BoundRow::Encoded(bytes),
                                         crate::storage::SpilledRowRepresentation::Values(
+                                            &crate::storage::SpilledValues { values, encoded },
+                                        ) => BoundRow::Values {
                                             values,
-                                        ) => BoundRow::Values(values),
+                                            forms: RowForms::Encoded(encoded),
+                                        },
                                     },
                                     Some(spilled.rowid),
                                     f,
@@ -12731,8 +13005,39 @@ fn scan_source_mode<'a>(
     Ok(())
 }
 
-/// A visitor of a member's rows: each row's identity and own columns.
-type MemberRowVisitor<'v, 'a> = dyn FnMut(Option<u64>, &[Datum<'a>]) -> Result<bool, SqlError> + 'v;
+/// The stored forms of a stored row's logical columns: its physical table
+/// encoding `encoded`, which records them, mapped through `mapping`. A
+/// foreign member's row (no encoding) holds values its server formed.
+fn member_forms<'a>(
+    schema: &[ColType],
+    mapping: crate::storage::RelationColumnMap<'_>,
+    encoded: Option<&[u8]>,
+    logical_columns: usize,
+    arena: &'a Arena,
+) -> Result<RowForms<'a>, SqlError> {
+    let Some(bytes) = encoded else {
+        return Ok(RowForms::Fresh);
+    };
+    let mut physical_forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+    let physical_forms = &mut physical_forms[..schema.len()];
+    rowenc::stored_forms(bytes, schema, physical_forms)?;
+    if physical_forms
+        .iter()
+        .all(|form| *form == crate::storage::StoredForm::Inline)
+    {
+        return Ok(RowForms::Fresh);
+    }
+    let forms = arena
+        .alloc_slice_with(logical_columns, |_| crate::storage::StoredForm::Inline)
+        .map_err(|_| arena_full())?;
+    mapping.project(physical_forms, forms);
+    Ok(RowForms::Listed(forms))
+}
+
+/// A member row's visitor: its identity, values and the table encoding that
+/// records its values' stored forms (none for a foreign member's row).
+type MemberRowVisitor<'v, 'a> =
+    dyn FnMut(Option<u64>, &[Datum<'a>], Option<&[u8]>) -> Result<bool, SqlError> + 'v;
 
 /// Visits each row of `leaf`, a member of an expanded FROM item, with its
 /// identity (none for a foreign member's, which come from its server as a
@@ -12771,7 +13076,7 @@ fn for_each_member_row<'a>(
             &mut |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 let width = crate::sql::exec::decode_projected_row_into(bytes, arena, &mut values)?;
-                visit(None, &values[..width])
+                visit(None, &values[..width], None)
             },
         );
     }
@@ -12784,14 +13089,16 @@ fn for_each_member_row<'a>(
     scan.for_each_spilled_row_batch(arena, recycle_rows, None, &mut |rows| {
         for row in rows {
             let mut decoded = [Datum::Null; MAX_COLUMNS];
-            let values = match row.representation {
+            let (values, encoded) = match row.representation {
                 crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                     rowenc::decode(bytes, schema, &mut decoded)?;
-                    &decoded[..physical.n_columns]
+                    (&decoded[..physical.n_columns], bytes)
                 }
-                crate::storage::SpilledRowRepresentation::Values(values) => values,
+                crate::storage::SpilledRowRepresentation::Values(
+                    &crate::storage::SpilledValues { values, encoded },
+                ) => (values, encoded),
             };
-            if !visit(Some(row.rowid), values)? {
+            if !visit(Some(row.rowid), values, Some(encoded))? {
                 aborted = true;
                 return Ok(core::ops::ControlFlow::Break(()));
             }
@@ -12805,7 +13112,7 @@ fn for_each_member_row<'a>(
         let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
         let mut values = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, schema, &mut values)?;
-        if !visit(Some(rowid), &values[..physical.n_columns])? {
+        if !visit(Some(rowid), &values[..physical.n_columns], Some(bytes))? {
             return Ok(core::ops::ControlFlow::Break(()));
         }
         Ok(core::ops::ControlFlow::Continue(()))

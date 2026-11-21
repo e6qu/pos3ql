@@ -227,19 +227,21 @@ impl HashTable {
         .map(Some)
     }
 
-    /// Adds one build row. A row with a NULL key can never match: it is
-    /// kept, outside every bucket, only when unmatched build rows return.
+    /// Adds one build row, whose values keep the stored forms `forms`. A row
+    /// with a NULL key can never match: it is kept, outside every bucket,
+    /// only when unmatched build rows return.
     fn insert(
         &mut self,
         storage: &Storage,
         txid: u32,
         values: &[Datum<'_>],
+        forms: &[crate::storage::StoredForm],
     ) -> Result<(), SqlError> {
         let hash = self.hash(storage, txid, values, true)?;
         if hash.is_none() && !self.shape.preserve_build {
             return Ok(());
         }
-        let length = crate::sql::exec::projected_row_len(values)?;
+        let length = crate::sql::exec::projected_row_len_formed(values, forms)?;
         let start = self.rows.len();
         let offset = |value: usize| {
             u32::try_from(value).map_err(|_| {
@@ -267,8 +269,9 @@ impl HashTable {
         for _ in 0..length {
             self.rows.push_reserved(0).map_err(build_full)?;
         }
-        crate::sql::exec::encode_projected_into(
+        crate::sql::exec::encode_projected_formed_into(
             values,
+            forms,
             &mut self.rows.as_mut_slice()[start..start + length],
         )?;
         let bucket = hash.map(|hash| (hash as usize) & (self.buckets.len() - 1));
@@ -1238,7 +1241,9 @@ impl<'a> JoinState<'a> {
                         .get(level.table)
                         .expect("build definition")
                         .n_columns;
-                    table.insert(storage, txid, &values[..width])
+                    let mut forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+                    pending.stored_forms(scope, level.table, &mut forms[..values.len()])?;
+                    table.insert(storage, txid, &values[..width], &forms[..width])
                 });
                 // SAFETY: the decoded values were consumed by the insert.
                 unsafe { work.rewind_to(work_mark) };
@@ -1390,7 +1395,14 @@ impl<'a> JoinState<'a> {
                 ),
             };
             pending.decode_table(scope, level.table, values)?;
-            bound[level.table] = Some(scan::BoundRow::Values(values));
+            let forms = work
+                .alloc_slice_with(values.len(), |_| crate::storage::StoredForm::Inline)
+                .map_err(|_| arena_full())?;
+            pending.stored_forms(scope, level.table, forms)?;
+            bound[level.table] = Some(scan::BoundRow::Values {
+                values,
+                forms: scan::RowForms::Listed(forms),
+            });
             rowids[level.table] = rowid;
         }
         each(&scan::JoinRow {

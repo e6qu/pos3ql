@@ -171,6 +171,16 @@ impl<'l, 'a> LevelColumns<'l, 'a> {
 }
 
 impl<'v> crate::sql::eval::ColumnLookup<'v> for LevelColumns<'_, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn lookup(
         &self,
         _qualifier: Option<&str>,

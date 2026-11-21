@@ -504,7 +504,10 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
                         .unwrap();
                         &decoded[..]
                     }
-                    SpilledRowRepresentation::Values(values) => values,
+                    SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                        values,
+                        ..
+                    }) => values,
                 };
                 assert_eq!(values[0], Datum::Int4((count + 1) as i32));
                 let Datum::Text(code) = values[1] else {

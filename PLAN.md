@@ -442,9 +442,35 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   sorter's first 256 KiB chunk sort ties in PostgreSQL's order (needs
   `work_mem`-sized run buffers and a streaming merge over up to 500 tapes); a
   bounded sort outgrowing its heap under `EXPLAIN ANALYZE` (`0A000`).
-- [ ] *In progress:* pglz compression and TOAST sizes, so hash, sort and
-  statistics figures match for values PostgreSQL compresses or stores out of
-  line (rows over about 2 kB).
+- [x] pglz compression and TOAST stored forms: a stored row over 2032 bytes
+  keeps its widest values compressed or out of line as
+  `heap_toast_insert_or_update` stores them, and `pg_column_size`, `relpages`
+  and `ANALYZE` read the stored forms (`966`). A stored value keeps its form
+  as PostgreSQL passes the stored datum on: through column references,
+  binary-coercible casts, `COALESCE`, `NULLIF`, `GREATEST`, `LEAST` and
+  `CASE`, derived tables, sorts, joins, partition scans, `INSERT ... SELECT`,
+  `CREATE TABLE AS`, `REFRESH MATERIALIZED VIEW`, `MERGE` and `UPDATE`
+  (`967`–`969`). pglz reads a `tsvector`, `path` or `polygon` in its stored
+  binary form; a PL/pgSQL special variable such as `TG_TABLE_NAME` and a
+  scalar subquery forming its value are values formed anew, and a datum of
+  unknown form that neither pglz nor lz4 could compress is stored as one
+  formed anew (`981`, `239`).
+- [ ] *In progress:* TOAST forms the executor does not carry yet: the input
+  datum `min`, `max`, `any_value`, `mode`, `percentile_disc` and window
+  value functions return, grouping keys, scalar subqueries, window rows,
+  index-only scans, PL/pgSQL variables, trigger and `RETURNING` rows, a
+  passed value's `varchar(n)` or `char(n)` length coercion, `lz4` and
+  compression of types other than text, `bytea`, `json`, `xml`, `tsvector`,
+  `path` and `polygon`. A `tsquery`'s stored bytes depend on the function
+  that formed it (`to_tsquery` reorders its operand strings), so its
+  compression is not modelled. Such a value's form is
+  not modelled: `pg_column_size` of it, and `relpages`, `ANALYZE` or
+  `CREATE INDEX` over a table storing it, are `0A000`; so is
+  `EXPLAIN (ANALYZE, BUFFERS)` of writing a row TOAST compresses, and
+  `pg_column_size` of a short value an aggregate, window function or
+  subquery passes on (PostgreSQL keeps its one-byte header). The result of
+  a user-defined function is taken as formed anew, though PostgreSQL may
+  return a stored datum it read.
 - [ ] Hash aggregates inherit `aset.c`'s recycled executor and transition
   contexts after a session's hash aggregate under `work_mem` below 1MB
   (`0A000` from the next statement on while the bucket array is within 8 kB

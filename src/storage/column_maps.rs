@@ -58,11 +58,8 @@ impl<'arena> RelationColumnMap<'arena> {
             })
     }
 
-    pub(crate) fn project<'values>(
-        self,
-        physical: &[Datum<'values>],
-        logical: &mut [Datum<'values>],
-    ) {
+    /// Each logical column's entry of a physical row's `physical` entries.
+    pub(crate) fn project<T: Copy>(self, physical: &[T], logical: &mut [T]) {
         for (column, &source) in self.columns.iter().enumerate() {
             logical[column] = physical[usize::from(source)];
         }

@@ -1038,6 +1038,70 @@ pub(crate) fn emit_vector_binary(source: &str, mut emit: impl FnMut(&[u8])) -> u
     emitted_bytes
 }
 
+/// The data a stored tsvector holds after its varlena header (`TSVectorData`
+/// in `ts_type.h`), written into `arena`: the lexeme count, a `WordEntry`
+/// per lexeme (`haspos:1, len:11, pos:20` from the low bit), then each
+/// lexeme and, two-byte aligned, its position count and positions. The
+/// padding is zero, as `palloc0` leaves it.
+pub(crate) fn vector_stored_data<'a>(source: &str, arena: &'a Arena) -> Result<&'a [u8], SqlError> {
+    let length = crate::storage::statistics::scalar::tsvector_data_length(source);
+    let out = arena
+        .alloc_slice_with(length, |_| 0u8)
+        .map_err(|_| arena_full("tsvector"))?;
+    let bytes = source.as_bytes();
+    let mut count = 0usize;
+    let mut scan = 0usize;
+    while scan < bytes.len() {
+        if bytes[scan] == b' ' {
+            scan += 1;
+        }
+        let _ = scan_quoted(bytes, &mut scan);
+        count += 1;
+        while scan < bytes.len() && bytes[scan] != b' ' {
+            scan += 1;
+        }
+    }
+    out[..4].copy_from_slice(&(count as i32).to_ne_bytes());
+    let data = 4 + 4 * count;
+    let mut offset = 0usize;
+    let mut at = 0usize;
+    for entry in 0..count {
+        if bytes[at] == b' ' {
+            at += 1;
+        }
+        let raw = scan_quoted(bytes, &mut at);
+        let start = offset;
+        let mut write = |chunk: &[u8]| {
+            out[data + offset..data + offset + chunk.len()].copy_from_slice(chunk);
+            offset += chunk.len();
+        };
+        let lexeme = emit_unescaped(&mut write, raw);
+        let mut positions = 0usize;
+        if bytes.get(at) == Some(&b':') {
+            at += 1;
+            offset = offset.next_multiple_of(2);
+            let count_at = data + offset;
+            offset += 2;
+            loop {
+                let position = parse_position(source, &mut at)?;
+                let word = (u16::from(position.weight) << 14) | position.number;
+                out[data + offset..data + offset + 2].copy_from_slice(&word.to_ne_bytes());
+                offset += 2;
+                positions += 1;
+                if bytes.get(at) != Some(&b',') {
+                    break;
+                }
+                at += 1;
+            }
+            out[count_at..count_at + 2].copy_from_slice(&(positions as u16).to_ne_bytes());
+        }
+        let word = u32::from(positions > 0) | ((lexeme as u32) << 1) | ((start as u32) << 12);
+        out[4 + 4 * entry..8 + 4 * entry].copy_from_slice(&word.to_ne_bytes());
+    }
+    debug_assert_eq!(data + offset, length);
+    Ok(out)
+}
+
 #[derive(Clone, Copy)]
 enum CanonicalExpression<'a> {
     Lexeme {

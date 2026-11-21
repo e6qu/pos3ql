@@ -5521,7 +5521,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     arena,
                     &[],
                     false,
-                    &mut |row| {
+                    &mut |row, _| {
                         if row.len() != 1 {
                             return Err(sql_err!(
                                 sqlstate::DATATYPE_MISMATCH,
@@ -6730,7 +6730,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     &routine_params[..routine.argument_count],
                     false,
                     sequences,
-                    &mut |_| Ok(()),
+                    &mut |_, _| Ok(()),
                 )?;
             }
             let result_query = match program.result {
@@ -6758,7 +6758,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     &routine_params[..routine.argument_count],
                     false,
                     sequences,
-                    &mut |_| Ok(()),
+                    &mut |_, _| Ok(()),
                 )?;
                 return Ok(&[]);
             }
@@ -6776,7 +6776,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 &routine_params[..routine.argument_count],
                 false,
                 sequences,
-                &mut |values| {
+                // A routine's detached results are formed anew.
+                &mut |values, _| {
                     let expected_columns = table_columns.map_or(1, <[_]>::len);
                     if values.len() != expected_columns {
                         return Err(super::routine_result_width_mismatch(

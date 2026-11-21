@@ -516,6 +516,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                     let scope = ProceduralMergeScope {
                         row: &source_row,
                         outer,
+                        source_forms: None,
                     };
                     let mut chosen = None;
                     for when in statement
@@ -549,6 +550,8 @@ pub(super) fn merge_through_instead_triggers<'a>(
                     else {
                         continue;
                     };
+                    // An INSTEAD OF trigger receives the row; it stores none.
+                    let mut instead_of_forms = crate::sql::toast::CarriedForms::NONE;
                     let (mut row, explicit) = match merge_insert_values(
                         &def,
                         columns,
@@ -562,6 +565,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                         seq_session,
                         arena,
                         params,
+                        &mut instead_of_forms,
                     ) {
                         Ok(row) => row,
                         Err(error) => return sql_fail(error),
@@ -652,6 +656,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                     source_members: source.members,
                     source: source_values,
                     source_namespace_when_absent: false,
+                    source_forms: None,
                     old_name: None,
                     old: None,
                     new_name: None,
@@ -660,6 +665,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                 let scope = ProceduralMergeScope {
                     row: &lookup,
                     outer,
+                    source_forms: None,
                 };
                 if !by_source {
                     match eval_merge_expression(

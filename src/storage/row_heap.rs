@@ -493,6 +493,22 @@ impl RowHeap {
         })
     }
 
+    /// [`Self::append_row_image`] of a table row whose values are stored in
+    /// `forms`.
+    pub(crate) fn append_table_row_image(
+        &self,
+        values: &[crate::sql::types::Datum<'_>],
+        forms: &[super::rowenc::StoredForm],
+    ) -> Result<HeapRowRead, SqlError> {
+        self.append_image_with(
+            super::rowenc::encoded_len_with_forms(values, forms),
+            |out| {
+                super::rowenc::encode_with_forms(values, forms, out);
+                Ok(())
+            },
+        )
+    }
+
     #[cfg(test)]
     fn append_with(
         &self,

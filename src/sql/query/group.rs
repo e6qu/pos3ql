@@ -14,6 +14,7 @@ use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::stack_format;
+use crate::storage::StoredForm;
 
 use crate::sql::exec::MAX_PROJ;
 
@@ -94,6 +95,17 @@ struct GroupRow<'g, 's, 'd, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for GroupRow<'_, '_, '_, 'a> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // This row does not keep its values' stored forms.
+        Ok(crate::sql::toast::unknown_form(
+            &self.lookup(qualifier, name)?,
+        ))
+    }
+
     fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
         self.aggregates
             .iter()
@@ -318,13 +330,15 @@ pub(super) fn groups_for_mask<'a>(
                             blocks,
                             sorted_width + 1,
                             |i| {
-                                if i < n_keys {
+                                // Grouped rows read back without their forms.
+                                let value = if i < n_keys {
                                     key_vals[i]
                                 } else if i < sorted_width {
                                     inputs[i - n_keys]
                                 } else {
                                     Datum::Int4(row_idx as i32)
-                                }
+                                };
+                                Ok((value, StoredForm::Inline))
                             },
                             &mut compare,
                         )

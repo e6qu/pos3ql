@@ -331,7 +331,7 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
         responder: &mut Responder,
-    ) -> Result<Result<Option<&'a [Datum<'a>]>, SqlError>, WireFull> {
+    ) -> Result<Result<Option<exec::SourceRow<'a>>, SqlError>, WireFull> {
         let mut calls = progress.take_source_calls();
         let read = self.read_driven_row(
             driven, writes, &mut calls, arena, params, txn, sqlprep, cursors, guc, responder,
@@ -360,7 +360,7 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
         responder: &mut Responder,
-    ) -> Result<Result<Option<&'a [Datum<'a>]>, SqlError>, WireFull> {
+    ) -> Result<Result<Option<exec::SourceRow<'a>>, SqlError>, WireFull> {
         let prior = self.storage.read_snapshot();
         let read = self.read_driven_row_at(
             driven, writes, calls, arena, params, txn, sqlprep, cursors, guc, responder,
@@ -382,7 +382,7 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
         responder: &mut Responder,
-    ) -> Result<Result<Option<&'a [Datum<'a>]>, SqlError>, WireFull> {
+    ) -> Result<Result<Option<exec::SourceRow<'a>>, SqlError>, WireFull> {
         let snapshot = driven.snapshot;
         let txid = txn.txid;
         loop {
@@ -452,8 +452,9 @@ impl Engine {
                         return Ok(None);
                     }
                     let mut values = ArenaList::new(arena);
+                    let mut forms = ArenaList::new(arena);
                     for index in 0..reader.statement_items_len() {
-                        let item = reader.evaluate_statement_item(
+                        let (item, item_forms) = reader.evaluate_statement_item(
                             index,
                             storage,
                             txid,
@@ -463,11 +464,15 @@ impl Engine {
                             Some(invocations),
                             arena,
                         )?;
-                        for value in item {
+                        for (value, form) in item.iter().zip(item_forms) {
                             values.push(*value).map_err(|_| query::arena_full_pub())?;
+                            forms.push(*form).map_err(|_| query::arena_full_pub())?;
                         }
                     }
-                    Ok(Some(values.as_slice()))
+                    Ok(Some(exec::SourceRow {
+                        values: values.as_slice(),
+                        forms: forms.as_slice(),
+                    }))
                 },
             )?;
             let values = match row {
@@ -496,7 +501,7 @@ impl Engine {
         &mut self,
         insert: &'a ast::Insert<'a>,
         index: usize,
-        values: Option<&'a [Datum<'a>]>,
+        values: Option<exec::SourceRow<'a>>,
         progress: &mut exec::RowProgress,
         writes: &query::RoutineInvocationState,
         returned: &mut ReturnedRows<'_>,
@@ -614,7 +619,7 @@ impl Engine {
         &mut self,
         insert: &'a ast::Insert<'a>,
         index: usize,
-        values: Option<&'a [Datum<'a>]>,
+        values: Option<exec::SourceRow<'a>>,
         capture: bool,
         sub_statement: bool,
         arena: &'a Arena,

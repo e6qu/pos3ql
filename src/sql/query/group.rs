@@ -1044,9 +1044,17 @@ pub(super) fn groups_for_mask<'a>(
         _ => (false, consumed),
     };
     // A plan stopped by its limit filtered only the groups it read.
-    let read_groups = |step: usize| if descending { n_groups - 1 - step } else { step };
+    let read_groups = |step: usize| {
+        if descending {
+            n_groups - 1 - step
+        } else {
+            step
+        }
+    };
     let filtered = if ordered_bound.is_some() && group_bound.is_none() && order.is_none() {
-        (0..counted).filter(|&step| removed[read_groups(step)]).count()
+        (0..counted)
+            .filter(|&step| removed[read_groups(step)])
+            .count()
     } else {
         removed.iter().filter(|&&removed| removed).count()
     };

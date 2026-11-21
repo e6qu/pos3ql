@@ -13,7 +13,7 @@ use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, FromClause, Select, SelectItem};
 use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, SubqueryValues, eval_full, sqlstate};
-use crate::sql::exec::MAX_PROJ;
+use crate::sql::exec::{MAX_PROJ, ProjectedValue};
 use crate::sql::types::{ColType, Datum};
 use crate::storage::Storage;
 use crate::{sql_err, stack_format};
@@ -2361,6 +2361,7 @@ pub(crate) fn materialized_rows<'a>(
                 tuples,
                 super::postgres_memory::SizeSource { storage, txid },
                 bound,
+                width,
                 arena,
             )
         });
@@ -2386,9 +2387,13 @@ pub(crate) fn materialized_rows<'a>(
     let mut projection_buffers = ProjectionBuffers::new();
     // Evaluate each projection once, in scan order. Encoded rows and their
     // references survive the scan's per-row scratch rewinds in the arena tail.
+    // `top` is the first sort key of the streamed sort's formed heap's
+    // greatest row: a row whose keys are not less than its keys is one the
+    // sort would discard, so it is dropped before its encoding.
     let mut encode_into = |row: &JoinRow<'_, 'a, '_>,
                            rows: &mut ArenaList<'a, &'a [u8]>,
-                           scan_window: Option<usize>| {
+                           scan_window: Option<usize>,
+                           top: Option<ProjectedValue<'_>>| {
         for_each_materialized_projection(
             &mut projection_buffers,
             storage,
@@ -2411,6 +2416,32 @@ pub(crate) fn materialized_rows<'a>(
             has_srf,
             outer,
             &mut |row, projected, keys| {
+                // The streamed sort compares each row as it arrives, so its
+                // keys must be comparable under their collations first.
+                if streams {
+                    for (key, &collation) in key_collations.iter().enumerate().take(n_keys) {
+                        storage.validate_text_collation(collation, &keys[key])?;
+                    }
+                }
+                if let Some(top) = top {
+                    let length = crate::sql::exec::projected_row_len(keys)?;
+                    let incoming = arena
+                        .alloc_slice_with(length, |_| 0u8)
+                        .map_err(|_| arena_full())?;
+                    crate::sql::exec::encode_projected_into(keys, incoming)?;
+                    if compare_order_by_keys(
+                        storage,
+                        txid,
+                        &key_collations,
+                        statement,
+                        top,
+                        crate::sql::exec::ProjectedValue::column(incoming, 0),
+                    )?
+                    .is_le()
+                    {
+                        return Ok(());
+                    }
+                }
                 let output = encode_materialized_row_in(
                     scope,
                     row,
@@ -2443,13 +2474,6 @@ pub(crate) fn materialized_rows<'a>(
                     }
                     None => output,
                 };
-                // The streamed sort compares each row as it arrives, so its
-                // keys must be comparable under their collations first.
-                if streams {
-                    for (key, &collation) in key_collations.iter().enumerate().take(n_keys) {
-                        storage.validate_text_collation(collation, &keys[key])?;
-                    }
-                }
                 rows.push(output).map_err(|_| arena_full())?;
                 Ok(())
             },
@@ -2478,7 +2502,7 @@ pub(crate) fn materialized_rows<'a>(
                     arena,
                     params,
                     hooks,
-                    &mut |row| encode_into(row, &mut probe, None),
+                    &mut |row| encode_into(row, &mut probe, None, None),
                 )?;
             }
             let held = probe.borrowed_slice();
@@ -2530,13 +2554,13 @@ pub(crate) fn materialized_rows<'a>(
     let mut pending = ArenaList::new_persistent(arena);
     let mut encode = |row: &JoinRow<'_, 'a, '_>| {
         let Some(sort) = streamed.as_mut() else {
-            return encode_into(row, &mut rows, scan_window);
+            return encode_into(row, &mut rows, scan_window, None);
         };
         // The row's projection scratch, and its encoding once the heap
         // copies the rows it keeps, are rewound after the sort takes it.
         let mark = arena.mark();
         front.set(sort.heap_formed());
-        let more = encode_into(row, &mut pending, None)?;
+        let more = encode_into(row, &mut pending, None, sort.top())?;
         for at in 0..pending.len() {
             let output: &'a [u8] = pending.borrowed_slice()[at];
             sort.push(output, &mut streamed_compare)?;
@@ -2941,6 +2965,37 @@ pub(crate) fn compare_ordered_key(
     )
 }
 
+/// Orders two rows by their `ORDER BY` keys, each row's keys consecutive
+/// from `a` and `b`, stepping through the columns once.
+fn compare_order_by_keys(
+    storage: &Storage,
+    txid: u32,
+    key_collations: &[Collation],
+    statement: &Select<'_>,
+    mut a: crate::sql::exec::ProjectedValue<'_>,
+    mut b: crate::sql::exec::ProjectedValue<'_>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    let last = statement.order_by.len().saturating_sub(1);
+    for (key, order) in statement.order_by.iter().enumerate() {
+        let ordering = compare_ordered_key(
+            storage,
+            txid,
+            key_collations[key],
+            (order.descending, order.nulls_first),
+            a,
+            b,
+        )?;
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+        if key < last {
+            a = a.next();
+            b = b.next();
+        }
+    }
+    Ok(core::cmp::Ordering::Equal)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "external sort comparator receives plan fields explicitly"
@@ -2957,18 +3012,16 @@ fn compare_materialized_rows(
     a: &[u8],
     b: &[u8],
 ) -> Result<core::cmp::Ordering, SqlError> {
-    for (key, order) in statement.order_by.iter().enumerate() {
-        let ordering = compare_ordered_key(
-            storage,
-            txid,
-            key_collations[key],
-            (order.descending, order.nulls_first),
-            crate::sql::exec::ProjectedValue::column(a, width + key),
-            crate::sql::exec::ProjectedValue::column(b, width + key),
-        )?;
-        if !ordering.is_eq() {
-            return Ok(ordering);
-        }
+    let ordering = compare_order_by_keys(
+        storage,
+        txid,
+        key_collations,
+        statement,
+        crate::sql::exec::ProjectedValue::column(a, width),
+        crate::sql::exec::ProjectedValue::column(b, width),
+    )?;
+    if !ordering.is_eq() {
+        return Ok(ordering);
     }
     for index in 0..n_on {
         let ordering = compare_materialized_key(

@@ -290,8 +290,10 @@ merge`), `Memory` and `Disk` (8,176-byte tape blocks, `906`; `476`, `820`).
 A sort under a limit takes its rows as they arrive (`980`): once it forms
 its bounded heap it keeps only the rows the limit returns, in two
 `plan_build_bytes` leases (`54000` naming the setting when they fill), so
-`ORDER BY ... LIMIT n` over a join of any size holds `n` rows. A sort
-without a limit holds every row in the statement arena.
+`ORDER BY ... LIMIT n` over a join of any size holds `n` rows; a row whose
+sort keys are not less than the heap's greatest row's is dropped before it
+is encoded, as PostgreSQL frees it. A sort without a limit holds every row
+in the statement arena.
 Values are charged at PostgreSQL's sizes, including `jsonb`
 (`convertToJsonb`), arrays, records, ranges, multiranges, `tsquery` and
 `jsonpath`; `pg_column_size` reports the same (`919`). A value with no size

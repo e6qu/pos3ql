@@ -1307,6 +1307,10 @@ pub(super) fn run_modeled<'a>(
         width += scope.stored_width(table);
     }
     let offsets: &[usize] = offsets;
+    let widths = arena
+        .alloc_slice_with(n, |table| scope.stored_width(table))
+        .map_err(|_| arena_full())?;
+    let widths: &[usize] = widths;
     let values = arena
         .alloc_slice_with(width, |_| Datum::Null)
         .map_err(|_| arena_full())?;
@@ -1376,7 +1380,7 @@ pub(super) fn run_modeled<'a>(
         runner.check()?;
         for table in 0..n {
             let start = offsets[table];
-            let columns = scope.stored_width(table);
+            let columns = widths[table];
             // A removed self-join's relation reads the row of the scan kept
             // in its place.
             if let Some(kept) = model.kept_for[table] {
@@ -1415,7 +1419,7 @@ pub(super) fn run_modeled<'a>(
             let members = leaf..leaf + count;
             leaf += count;
             if !nested.joined.contains(table as u32) {
-                let width = scope.stored_width(members.start);
+                let width = widths[members.start];
                 written_values[at..at + width]
                     .copy_from_slice(&values[offsets[members.start]..][..width]);
                 written_rowids[table] = rowids[members.start];
@@ -1424,7 +1428,7 @@ pub(super) fn run_modeled<'a>(
             written_rowids[table] = None;
             for _ in 0..2 {
                 for member in members.clone() {
-                    let width = scope.stored_width(member);
+                    let width = widths[member];
                     written_values[at..at + width]
                         .copy_from_slice(&values[offsets[member]..][..width]);
                     at += width;

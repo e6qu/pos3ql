@@ -4065,13 +4065,21 @@ impl<'d> QueryScope<'d> {
         }
     }
 
+    /// `SELECT *` as each table's column count in order, when no `USING` or
+    /// `NATURAL` merge reorders it: [`Self::star_entries`] lists every
+    /// column of each table in turn.
+    pub(crate) fn star_tables(&self) -> Option<impl Iterator<Item = (usize, usize)> + '_> {
+        (self.n_output == 0)
+            .then(|| (0..self.n).map(|t| (t, self.defs.n_columns(t).expect("resolved"))))
+    }
+
     /// Every `SELECT *` output column in order, reading each relation's
     /// definition once.
     pub(crate) fn star_entries(&self) -> impl Iterator<Item = ResolvedColumn> + '_ {
         let outputs = self.output[..self.n_output].iter().copied();
         let tables = if self.n_output > 0 { 0 } else { self.n };
         let tables = (0..tables).flat_map(move |t| {
-            let columns = self.defs.get(t).expect("resolved").n_columns;
+            let columns = self.defs.n_columns(t).expect("resolved");
             (0..columns).map(move |c| ResolvedColumn::Table(t, c))
         });
         outputs.chain(tables)
@@ -4084,7 +4092,7 @@ impl<'d> QueryScope<'d> {
         }
         let mut k = i;
         for t in 0..self.n {
-            let n_cols = self.defs.get(t).expect("resolved").n_columns;
+            let n_cols = self.defs.n_columns(t).expect("resolved");
             if k < n_cols {
                 return ResolvedColumn::Table(t, k);
             }

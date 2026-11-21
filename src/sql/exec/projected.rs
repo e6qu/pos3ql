@@ -1371,6 +1371,28 @@ impl<'a> ProjectedValue<'a> {
         Self { bytes, tag_at: at }
     }
 
+    /// Where this value starts in its row, for [`Self::at`].
+    pub(crate) fn offset(self) -> usize {
+        self.tag_at
+    }
+
+    /// The value of `bytes` that [`Self::offset`] found at `offset`.
+    pub(crate) fn at(bytes: &'a [u8], offset: usize) -> Self {
+        Self {
+            bytes,
+            tag_at: offset,
+        }
+    }
+
+    /// The column after this one, which the row must have.
+    pub(crate) fn next(self) -> Self {
+        let tag = self.bytes[self.tag_at];
+        Self {
+            bytes: self.bytes,
+            tag_at: self.tag_at + 1 + projected_value_size(self.bytes, tag, self.tag_at + 1),
+        }
+    }
+
     /// The value as the arena-free decode returns it.
     pub(crate) fn datum(self) -> Datum<'a> {
         decode_projected_value(self.bytes, self.bytes[self.tag_at], self.tag_at + 1).0

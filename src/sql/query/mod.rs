@@ -17620,8 +17620,36 @@ fn project_row_skipping<'a>(
                 }
             }
             SelectItem::Wildcard(_) => {
-                let value_of = |t: usize, c: usize| {
-                    let vals = row.table_values(t).expect("bound");
+                if let Some(tables) = scope.star_tables() {
+                    for (t, columns) in tables {
+                        if n + columns > MAX_PROJ {
+                            return Err(sql_err!(
+                                sqlstate::TOO_MANY_COLUMNS,
+                                "target lists can have at most 1664 entries"
+                            ));
+                        }
+                        let vals = row.table_values(t).expect("bound");
+                        if vals.is_empty() {
+                            out[n..n + columns].fill(Datum::Null);
+                        } else {
+                            out[n..n + columns].copy_from_slice(&vals[..columns]);
+                        }
+                        n += columns;
+                    }
+                    continue;
+                }
+                // Star entries list a table's columns together: its values
+                // are looked up once per run of them.
+                let mut current: Option<(usize, &[Datum<'a>])> = None;
+                let mut value_of = |t: usize, c: usize| {
+                    let vals = match current {
+                        Some((table, vals)) if table == t => vals,
+                        _ => {
+                            let vals = row.table_values(t).expect("bound");
+                            current = Some((t, vals));
+                            vals
+                        }
+                    };
                     if vals.is_empty() {
                         Datum::Null
                     } else {
@@ -17693,6 +17721,13 @@ fn materialize_composite_outputs<'a>(
         return Ok(());
     };
     for value in values {
+        // Only enums, arrays and stored composites change.
+        if !matches!(
+            value,
+            Datum::Enum { .. } | Datum::Array { .. } | Datum::CompositeText { .. }
+        ) {
+            continue;
+        }
         *value = super::eval::materialize_enum_values(*value, Some(catalog), arena)?;
         *value = match *value {
             Datum::CompositeText {

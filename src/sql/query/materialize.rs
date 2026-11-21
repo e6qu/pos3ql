@@ -3127,16 +3127,20 @@ fn compare_materialized_rows(
     a: &[u8],
     b: &[u8],
 ) -> Result<core::cmp::Ordering, SqlError> {
-    let ordering = compare_order_by_keys(
-        storage,
-        txid,
-        key_collations,
-        statement,
-        crate::sql::exec::ProjectedValue::column(a, width),
-        crate::sql::exec::ProjectedValue::column(b, width),
-    )?;
-    if !ordering.is_eq() {
-        return Ok(ordering);
+    // The ORDER BY keys follow the row's `width` output columns; a sort
+    // without them has no key there to locate.
+    if n_order > 0 {
+        let ordering = compare_order_by_keys(
+            storage,
+            txid,
+            key_collations,
+            statement,
+            crate::sql::exec::ProjectedValue::column(a, width),
+            crate::sql::exec::ProjectedValue::column(b, width),
+        )?;
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
     }
     for index in 0..n_on {
         let ordering = compare_materialized_key(

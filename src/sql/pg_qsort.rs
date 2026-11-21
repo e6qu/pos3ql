@@ -132,40 +132,100 @@ pub(crate) fn pg_tuplesort(
     if bound == 0 {
         return Ok(0);
     }
-    // The reversed order puts the greatest element at the heap's top.
-    let mut reversed = |a: u32, b: u32| compare(b, a);
     let mut count = 0usize;
     for at in 0..data.len() {
         let tuple = data[at];
-        if count < bound {
-            // `tuplesort_heap_insert`: sift up.
-            let mut j = count;
-            count += 1;
-            while j > 0 {
-                let i = (j - 1) >> 1;
-                if reversed(tuple, data[i])?.is_ge() {
-                    break;
-                }
-                data[j] = data[i];
-                j = i;
+        match bounded_heap_offer(&data[..count], bound, tuple, compare)? {
+            HeapOffer::Insert => bounded_heap_insert(data, &mut count, tuple, compare)?,
+            HeapOffer::Discard => {}
+            HeapOffer::ReplaceTop(_) => {
+                bounded_heap_replace_top(&mut data[..count], tuple, compare)?
             }
-            data[j] = tuple;
-        } else if reversed(tuple, data[0])?.is_le() {
-            // Not less than the greatest kept: discarded.
-        } else {
-            heap_replace_top(&mut data[..count], tuple, &mut reversed)?;
         }
     }
-    // `sort_bounded_heap`: each greatest element moves past the heap.
-    let kept = count;
-    while count > 1 {
-        let top = data[0];
-        count -= 1;
-        let last = data[count];
-        heap_replace_top(&mut data[..count], last, &mut reversed)?;
-        data[count] = top;
+    sort_bounded_heap(&mut data[..count], compare)?;
+    Ok(count)
+}
+
+/// What a bounded heap of `bound` tuples does with the next one
+/// (`make_bounded_heap` and the `TSS_BOUNDED` case of
+/// `tuplesort_puttuple_common`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HeapOffer {
+    /// The heap is not full: [`bounded_heap_insert`] adds the tuple.
+    Insert,
+    /// Not less than the greatest kept tuple: freed.
+    Discard,
+    /// Less than the greatest kept tuple, this one, which
+    /// [`bounded_heap_replace_top`] replaces.
+    ReplaceTop(u32),
+}
+
+/// Decides [`HeapOffer`] for `tuple` against `heap`, the bounded heap's
+/// tuples, greatest first.
+pub(crate) fn bounded_heap_offer(
+    heap: &[u32],
+    bound: usize,
+    tuple: u32,
+    compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+) -> Result<HeapOffer, SqlError> {
+    if heap.len() < bound {
+        return Ok(HeapOffer::Insert);
     }
-    Ok(kept)
+    // The reversed order puts the greatest element at the heap's top.
+    Ok(if compare(heap[0], tuple)?.is_le() {
+        HeapOffer::Discard
+    } else {
+        HeapOffer::ReplaceTop(heap[0])
+    })
+}
+
+/// `tuplesort_heap_insert` in the reversed order: sifts `tuple` up from
+/// position `count`, which grows by one.
+pub(crate) fn bounded_heap_insert(
+    heap: &mut [u32],
+    count: &mut usize,
+    tuple: u32,
+    compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+) -> Result<(), SqlError> {
+    let mut j = *count;
+    *count += 1;
+    while j > 0 {
+        let i = (j - 1) >> 1;
+        if compare(heap[i], tuple)?.is_ge() {
+            break;
+        }
+        heap[j] = heap[i];
+        j = i;
+    }
+    heap[j] = tuple;
+    Ok(())
+}
+
+/// `tuplesort_heap_replace_top` in the reversed order.
+pub(crate) fn bounded_heap_replace_top(
+    heap: &mut [u32],
+    tuple: u32,
+    compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+) -> Result<(), SqlError> {
+    heap_replace_top(heap, tuple, &mut |a, b| compare(b, a))
+}
+
+/// `sort_bounded_heap`: each greatest element moves past the heap, leaving
+/// `heap` in ascending order.
+pub(crate) fn sort_bounded_heap(
+    heap: &mut [u32],
+    compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
+) -> Result<(), SqlError> {
+    let mut count = heap.len();
+    while count > 1 {
+        let top = heap[0];
+        count -= 1;
+        let last = heap[count];
+        bounded_heap_replace_top(&mut heap[..count], last, compare)?;
+        heap[count] = top;
+    }
+    Ok(())
 }
 
 /// The scratch memory [`pg_tuplesort_runs`] works in, all sized from the

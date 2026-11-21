@@ -2314,6 +2314,13 @@ impl Node {
         self.with(|slot, _| slot.counters.filtered = slot.counters.filtered.saturating_add(1));
     }
 
+    /// Counts `count` rows the node's `Filter` removed.
+    pub(crate) fn add_filtered(self, count: u64) {
+        self.with(|slot, _| {
+            slot.counters.filtered = slot.counters.filtered.saturating_add(count);
+        });
+    }
+
     /// Counts a row the node's `Join Filter` removed.
     pub(crate) fn join_filtered(self) {
         self.with(|slot, _| {

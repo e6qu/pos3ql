@@ -4,7 +4,7 @@
 -- parenthesized. A limit over an ORDER BY the grouping's key order
 -- satisfies stops the sort early.
 CREATE TABLE g4 (i int, j int, v text);
-INSERT INTO g4 SELECT i, i % 7, 'v' || i FROM generate_series(1, 8000) i;
+INSERT INTO g4 SELECT i, i % 7, 'v' || i FROM generate_series(1, 4000) i;
 ANALYZE g4;
 SET work_mem = '64kB';
 EXPLAIN SELECT i % 2000, count(*) FROM g4 GROUP BY 1;

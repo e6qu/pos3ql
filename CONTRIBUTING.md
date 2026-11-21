@@ -193,7 +193,9 @@ temporary validation workflows before the final head.
   the timeout: coverage uses `COVERAGE_SHARD` (`lib:N-of-6`, `run:<groups>`,
   `runtest:<groups>`), and external harness groups use `POS3QL_RUN_GROUPS`.
   The exact-error corpus splits by file ordinal with `POS3QL_EXACT_SHARD` and
-  `POS3QL_EXACT_SHARDS`, like the SQLLogicTest query slices.
+  `POS3QL_EXACT_SHARDS`, like the SQLLogicTest query slices. Instrumented
+  runs use twelve exact slices; on the hosted runners one slice of eight took
+  over 13 minutes, and runner speed varies by up to two times.
   Coverage tracing and `runtest:` correctness shards stay in separate matrix
   entries.
 - Bound debug data and split compilation rather than adding time. Native arm64

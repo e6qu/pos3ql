@@ -109,13 +109,14 @@ pub enum StoredForm {
 impl StoredForm {
     /// The form a value keeps when it is stored in another relation:
     /// `toast_tuple_init` fetches an out-of-line value back in line
-    /// (`detoast_external_attr`), still compressed if it was.
+    /// (`detoast_external_attr`), still compressed if it was. The saved
+    /// bytes exclude the compressed datum's four-byte header.
     pub(crate) const fn fetched(self) -> Self {
         match self {
             Self::External {
                 saved,
                 compressed: true,
-            } => Self::Compressed(saved),
+            } => Self::Compressed(saved + 4),
             Self::External {
                 compressed: false, ..
             } => Self::Inline,

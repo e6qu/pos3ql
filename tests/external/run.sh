@@ -1706,7 +1706,7 @@ if want diff; then
 step "differential vs real PostgreSQL 18 (when installed)"
 if [[ -n "${POS3QL_REFERENCE_PG_HOST:-}" || -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
   if (set -o pipefail; tests/external/differential.sh 2>&1 | tee "$WORK/differential.out"); then
-    ok "differential suite ($(grep -c '^PASS' "$WORK/differential.out") corpora)"
+    ok "differential suite ($(sed -n 's/^passed: \([0-9]*\) .*/\1/p' "$WORK/differential.out") checks passed)"
   else
     bad "differential suite"
     grep -A 32 -B 2 '^FAIL:' "$WORK/differential.out" | head -80 || true
@@ -1736,7 +1736,7 @@ object_store_secret_key = ${S3_TEST_SECRET_KEY}
 wal_upload = on
 wal_upload_sync = on
 work_arena_bytes = 192MiB" tests/external/differential.sh 2>&1 | tee "$WORK/spilldiff.out"); then
-    ok "forced-spill differential ($(grep -c '^PASS' "$WORK/spilldiff.out") corpora)"
+    ok "forced-spill differential ($(sed -n 's/^passed: \([0-9]*\) .*/\1/p' "$WORK/spilldiff.out") checks passed)"
   else
     bad "forced-spill differential"
     grep -A 32 -B 2 '^FAIL:' "$WORK/spilldiff.out" | head -80 || true

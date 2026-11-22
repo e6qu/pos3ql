@@ -7035,6 +7035,7 @@ fn recursive_key<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let fields = arena
         .alloc_slice_with(keys.len(), |_| RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -7156,6 +7157,7 @@ fn decorate_recursive_row<'a>(
                 };
                 let fields = arena
                     .alloc_slice_with(key_fields.len() + 1, |_| RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "",
                         type_oid: 0,
                         type_mod: -1,
@@ -7163,6 +7165,7 @@ fn decorate_recursive_row<'a>(
                     })
                     .map_err(|_| arena_full())?;
                 fields[0] = RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "*DEPTH*",
                     type_oid: crate::sql::types::oid::INT8,
                     type_mod: -1,

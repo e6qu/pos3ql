@@ -1221,6 +1221,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         }
         let cols = self.def.columns();
         let mut fields = [super::types::RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -1339,6 +1340,7 @@ impl<'v> ReturningLookup<'_, 'v> {
         arena: &'v Arena,
     ) -> Result<&'v [super::types::RecordField<'v>], SqlError> {
         let mut fields = [super::types::RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -1629,10 +1631,6 @@ impl<'v> ColumnLookup<'v> for JoinedReturningLookup<'_, '_, 'v> {
         self.row(qualifier).collation(qualifier, name)
     }
 
-    fn record_field_collation(&self, base: &Expr<'v>, field: &str) -> crate::sql::ast::Collation {
-        self.joined.record_field_collation(base, field)
-    }
-
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
@@ -1827,11 +1825,11 @@ pub use describe::{
     visit_record_shape_metadata as visit_record_shape_metadata_pub,
 };
 pub(crate) use describe::{
-    StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, expression_static_metadata,
-    infer_routine_argument_oid, infer_type_catalog, intrinsic_record_field_meta,
-    record_shape_metadata, record_shape_pool_bytes, routine_result_metadata, row_expansion_error,
-    unify_numeric_tower, user_routine_call_result, visit_array_constructor_conversions,
-    with_temporary_record_shapes,
+    StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, expanded_row_type,
+    expression_static_metadata, infer_routine_argument_oid, infer_type_catalog,
+    intrinsic_record_field_meta, record_shape_metadata, record_shape_pool_bytes,
+    routine_result_metadata, row_expansion_error, unify_numeric_tower, user_routine_call_result,
+    visit_array_constructor_conversions, with_temporary_record_shapes,
 };
 pub(crate) use describe::{
     bound_parameter_context_active, bound_parameter_type_oid, enter_routine_parameter_types,
@@ -24205,6 +24203,7 @@ impl<'s, 'v> TriggerTransition<'_, 's, 'v> {
         let columns = self.definition.columns();
         let fields = arena
             .alloc_slice_with(columns.len(), |index| RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: columns[index].ctype.oid(),
                 type_mod: columns[index].type_mod,
@@ -33002,32 +33001,6 @@ where
         self.transition.collation(qualifier, name)
     }
 
-    fn record_field_collation(
-        &self,
-        base: &Expr<'value>,
-        field: &str,
-    ) -> crate::sql::ast::Collation {
-        let Expr::Column {
-            qualifier: None,
-            name,
-        } = base
-        else {
-            return crate::sql::ast::Collation::None;
-        };
-        self.local_index(name)
-            .and_then(|index| match self.values[index] {
-                Datum::Record(fields) | Datum::Composite { fields, .. } => fields
-                    .iter()
-                    .find(|candidate| candidate.name == field)
-                    .and_then(|candidate| ColType::from_oid(candidate.type_oid)),
-                _ => None,
-            })
-            .filter(|ctype| ctype.is_collatable())
-            .map_or(crate::sql::ast::Collation::None, |_| {
-                crate::sql::ast::Collation::Default
-            })
-    }
-
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
@@ -37494,6 +37467,7 @@ fn static_write_locals<'a>(
         let values = record.row();
         let fields = arena
             .alloc_slice_with(columns.len(), |_| RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: 0,
                 type_mod: -1,
@@ -38229,6 +38203,7 @@ fn fit_plpgsql_row<'a>(
     };
     let fitted = arena
         .alloc_slice_with(target_oids.len(), |index| RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: target_oids[index],
             type_mod: -1,
@@ -38238,6 +38213,7 @@ fn fit_plpgsql_row<'a>(
     for ((out, &target), source) in fitted.iter_mut().zip(target_oids).zip(fields) {
         let converted = plpgsql_conversion_input(source.value, Some(target), storage, txid, arena)?;
         *out = RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: source.name,
             type_oid: if matches!(converted, Datum::Text(_))
                 && !matches!(source.value, Datum::Text(_))
@@ -38316,6 +38292,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
         ));
     }
     let mut coerced = [RecordField {
+        form: crate::storage::StoredForm::Inline,
         name: "",
         type_oid: 0,
         type_mod: -1,
@@ -38324,6 +38301,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
     for (index, (source, column)) in fields.iter().zip(definition.columns()).enumerate() {
         let cast = prepare_assignment_cast(source.type_oid, column, storage, txid, arena)?;
         coerced[index] = RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: arena
                 .alloc_str(column.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
@@ -39459,6 +39437,7 @@ fn assign_trigger_record_field<'a>(
     let arena = context.arena;
     let declared = |names: &mut dyn Iterator<Item = (&str, i32)>| {
         let mut fields = [RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -39467,6 +39446,7 @@ fn assign_trigger_record_field<'a>(
         let mut count = 0;
         for (slot, (name, type_oid)) in fields.iter_mut().zip(names) {
             *slot = RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: arena
                     .alloc_str(name)
                     .map_err(|_| super::query::arena_full_pub())?,
@@ -39553,6 +39533,7 @@ fn assign_trigger_record_field<'a>(
     {
         let sequences = crate::sql::sequence::SeqEval::new(storage, context.seq_session(), txid);
         RecordField {
+            form: crate::storage::StoredForm::Inline,
             value: coerce_routine_argument(
                 plpgsql_conversion_input(value, Some(old.type_oid), storage, txid, arena)?,
                 crate::storage::RoutineArgumentDef {
@@ -39569,6 +39550,7 @@ fn assign_trigger_record_field<'a>(
         }
     } else {
         RecordField {
+            form: crate::storage::StoredForm::Inline,
             type_oid: value.type_oid(),
             value,
             ..old
@@ -39897,6 +39879,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
             }
             let value = if record_target {
                 let mut row_fields = [RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "",
                     type_oid: 0,
                     type_mod: -1,
@@ -39904,6 +39887,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 }; MAX_PROJ];
                 for index in 0..width {
                     row_fields[index] = RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: fields[index].0,
                         type_oid: fields[index].1,
                         type_mod: fields[index].2,
@@ -39922,6 +39906,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
         let empty = if record_target && rows.as_slice().is_empty() {
             let fields = arena
                 .alloc_slice_with(width, |index| RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: fields[index].0,
                     type_oid: fields[index].1,
                     type_mod: fields[index].2,
@@ -40074,6 +40059,7 @@ fn for_dml_rows<'a>(
         )?;
         let fields = arena
             .alloc_slice_with(width, |index| RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: columns[index].type_oid,
                 type_mod: columns[index].type_mod,
@@ -40204,6 +40190,7 @@ where
                 ));
             }
             let mut fields = [RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: 0,
                 type_mod: -1,
@@ -40211,6 +40198,7 @@ where
             }; MAX_PROJ];
             for index in 0..width {
                 fields[index] = RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: result_arena
                         .alloc_str(columns[index].name)
                         .map_err(|_| super::query::arena_full_pub())?,
@@ -40229,6 +40217,7 @@ where
     let empty = if rows.as_slice().is_empty() {
         let fields = result_arena
             .alloc_slice_with(width, |index| RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: columns[index].type_oid,
                 type_mod: columns[index].type_mod,
@@ -41973,6 +41962,7 @@ fn execute_trigger_step_in<'a>(
                             }
                             if record_target {
                                 let mut fields = [RecordField {
+                                    form: crate::storage::StoredForm::Inline,
                                     name: "",
                                     type_oid: 0,
                                     type_mod: -1,
@@ -41989,6 +41979,7 @@ fn execute_trigger_step_in<'a>(
                                         None => value,
                                     };
                                     fields[index] = RecordField {
+                                        form: crate::storage::StoredForm::Inline,
                                         name: column_names[index]
                                             .expect("cursor description name initialized"),
                                         type_oid: column_type_oids[index],
@@ -42209,6 +42200,7 @@ fn execute_trigger_step_in<'a>(
                                     source_width = values.len();
                                     if record_target {
                                         let mut row_fields = [RecordField {
+                                            form: crate::storage::StoredForm::Inline,
                                             name: "",
                                             type_oid: 0,
                                             type_mod: -1,
@@ -42217,6 +42209,7 @@ fn execute_trigger_step_in<'a>(
                                             MAX_PROJ];
                                         for (index, value) in values.iter().copied().enumerate() {
                                             row_fields[index] = RecordField {
+                                                form: crate::storage::StoredForm::Inline,
                                                 name: fields[index].0,
                                                 type_oid: fields[index].1,
                                                 type_mod: fields[index].2,
@@ -42246,6 +42239,7 @@ fn execute_trigger_step_in<'a>(
                         if record_target && row_count == 0 && !statement.strict {
                             let empty = arena
                                 .alloc_slice_with(record_width, |index| RecordField {
+                                    form: crate::storage::StoredForm::Inline,
                                     name: fields[index].0,
                                     type_oid: fields[index].1,
                                     type_mod: fields[index].2,
@@ -42452,6 +42446,7 @@ fn execute_trigger_step_in<'a>(
                             if record_target && !found && !statement.strict {
                                 let fields = arena
                                     .alloc_slice_with(record_width, |index| RecordField {
+                                        form: crate::storage::StoredForm::Inline,
                                         name: "",
                                         type_oid: record_type_oids[index],
                                         type_mod: record_type_mods[index],
@@ -42480,6 +42475,7 @@ fn execute_trigger_step_in<'a>(
                             source_width = values.len();
                             if record_target {
                                 let mut fields = [RecordField {
+                                    form: crate::storage::StoredForm::Inline,
                                     name: "",
                                     type_oid: 0,
                                     type_mod: -1,
@@ -42487,6 +42483,7 @@ fn execute_trigger_step_in<'a>(
                                 }; MAX_PROJ];
                                 for (index, value) in values.iter().copied().enumerate() {
                                     fields[index] = RecordField {
+                                        form: crate::storage::StoredForm::Inline,
                                         name: arena
                                             .alloc_str(record_names[index].as_str())
                                             .map_err(|_| super::query::arena_full_pub())?,
@@ -45285,6 +45282,7 @@ impl<'a> StaticReturning<'a> {
                 Some(fields) => {
                     let row = arena
                         .alloc_slice_with(fields.len(), |index| RecordField {
+                            form: crate::storage::StoredForm::Inline,
                             name: fields[index].0,
                             type_oid: fields[index].1,
                             type_mod: fields[index].2,
@@ -45318,6 +45316,7 @@ impl<'a> StaticReturning<'a> {
         {
             let row = arena
                 .alloc_slice_with(fields.len(), |index| RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: fields[index].0,
                     type_oid: fields[index].1,
                     type_mod: fields[index].2,
@@ -73834,7 +73833,12 @@ pub(crate) fn analyze_extended_statistics(
                 sampled,
                 total,
                 true,
-                &mut |row| Ok(values[row * n_keys + index]),
+                &mut |row| {
+                    Ok((
+                        values[row * n_keys + index],
+                        crate::storage::StoredForm::Inline,
+                    ))
+                },
                 arena,
             )?;
             data.expression_statistics[usize::from(position)] = column;
@@ -75458,6 +75462,106 @@ fn for_each_index_build_row(
     Ok(())
 }
 
+/// Whether the table in slot `table_index`, which holds `rows` rows, keeps
+/// them in PostgreSQL's heap layout: it has only ever had rows inserted, all
+/// of them present, since its statistics were counted (PostgreSQL leaves an
+/// updated, deleted or rolled-back row's tuple in place until a vacuum, and
+/// a vacuum lets later rows reuse its line pointers).
+fn heap_layout_known(storage: &Storage, table_index: usize, txid: u32, rows: Option<u64>) -> bool {
+    let committed = storage.relation_cumulative_statistics(table_index);
+    let pending = storage.relation_transaction_statistics(txid, table_index);
+    committed.n_tup_upd == 0
+        && committed.n_tup_del == 0
+        && committed.n_dead_tup == 0
+        && committed.vacuum_count == 0
+        && pending.n_tup_upd == 0
+        && pending.n_tup_del == 0
+        && rows.is_none_or(|rows| committed.n_tup_ins.saturating_add(pending.n_tup_ins) == rows)
+}
+
+/// The stored rows of the table in slot `table_index` in a sequential
+/// scan's physical order, packed into heap pages.
+fn pack_stored_rows(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(crate::storage::heap_layout::HeapPacking, u64), SqlError> {
+    let definition = storage.table_def(table_index, txid);
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    let schema = &schema[..definition.n_columns];
+    let mut packing = crate::storage::heap_layout::HeapPacking::new();
+    let mut rows = 0u64;
+    let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
+    let scanned = scan.for_each_home_physically(arena, &mut |rowid, home| {
+        storage.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut values)?;
+            packing.add(crate::storage::heap_layout::stored_tuple_length(
+                bytes,
+                &values[..schema.len()],
+                schema,
+            )?);
+            rows += 1;
+            Ok(())
+        })?;
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    if scanned.is_break() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "heap layout scan stopped before completing"
+        ));
+    }
+    Ok((packing, rows))
+}
+
+/// The heap position (`ctid`) PostgreSQL gives the new row `values` of the
+/// table in slot `table_index`: after its stored rows, as the statement
+/// forms it. `None` when the table's heap layout is not known.
+pub(crate) fn new_row_heap_position(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    values: &[Datum],
+    arena: &Arena,
+) -> Result<Option<(u64, usize)>, SqlError> {
+    if !heap_layout_known(storage, table_index, txid, None) {
+        return Ok(None);
+    }
+    let mark = arena.mark();
+    let result = (|| {
+        let (mut packing, rows) = pack_stored_rows(storage, table_index, txid, arena)?;
+        if !heap_layout_known(storage, table_index, txid, Some(rows)) {
+            return Ok(None);
+        }
+        let definition = storage.table_def(table_index, txid);
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        definition.schema(&mut schema);
+        let schema = &schema[..definition.n_columns];
+        let mut forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+        crate::sql::toast::row_forms(
+            storage,
+            table_index,
+            txid,
+            values,
+            &crate::sql::toast::CarriedForms::NONE,
+            &mut forms,
+            arena,
+        )?;
+        packing.add(crate::storage::heap_layout::tuple_length_in_forms(
+            values,
+            schema,
+            &forms[..values.len()],
+        ));
+        Ok(Some(packing.position()))
+    })();
+    // SAFETY: the scan and the row's forms are consumed before returning.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
 /// Checks one row an index build reads: its row identifier, the table's
 /// column types and its values.
 type IndexRowCheck<'c> = dyn FnMut(u64, &[ColType], &[Datum]) -> Result<(), SqlError> + 'c;
@@ -75479,27 +75583,32 @@ fn scan_index_rows(
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         definition.schema(&mut schema);
         let schema = &schema[..definition.n_columns];
-        let mut validate_values = |rowid: u64, values: &[Datum]| -> Result<(), SqlError> {
-            let row_mark = arena.mark();
-            let result = crate::sql::query::index_key_calls::with_key_row(rowid, || {
-                check_index_tuple_sizes(storage, &definition, values, only, txid, arena)
-            })
-            .and_then(|()| check(rowid, schema, values));
-            // SAFETY: validation returns only an owned error or success; key
-            // values and parsed expressions are consumed before returning.
-            unsafe { arena.rewind_to(row_mark) };
-            result
-        };
+        // A stored row's heap position, while the layout may be known; an
+        // index build's error names it after the rows are counted.
+        let layout_known = heap_layout_known(storage, table_index, txid, None);
+        let mut validate_values =
+            |rowid: u64, values: &[Datum], position: (u64, usize)| -> Result<(), SqlError> {
+                let row_mark = arena.mark();
+                let heap = constraints::HeapTuple::Stored(layout_known.then_some(position));
+                let result = crate::sql::query::index_key_calls::with_key_row(rowid, || {
+                    check_index_tuple_sizes(storage, &definition, values, only, heap, txid, arena)
+                })
+                .and_then(|()| check(rowid, schema, values));
+                // SAFETY: validation returns only an owned error or success; key
+                // values and parsed expressions are consumed before returning.
+                unsafe { arena.rewind_to(row_mark) };
+                result
+            };
         let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
         let mut rows = 0u64;
         let mut row_bytes = 0u64;
         let mut packing = crate::storage::heap_layout::HeapPacking::new();
-        let mut pack = |bytes: &[u8], values: &[Datum]| -> Result<(), SqlError> {
+        let mut pack = |bytes: &[u8], values: &[Datum]| -> Result<(u64, usize), SqlError> {
             let schema = &schema[..definition.n_columns];
             packing.add(crate::storage::heap_layout::stored_tuple_length(
                 bytes, values, schema,
             )?);
-            Ok(())
+            Ok(packing.position())
         };
         // A sequential scan's order: saved rows, then resident rows.
         scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
@@ -75514,7 +75623,6 @@ fn scan_index_rows(
                         &crate::storage::SpilledValues { values, .. },
                     ) => values,
                 };
-                validate_values(spilled.rowid, values)?;
                 // A PAX row's encoding holds every column of a full scan.
                 let bytes = match spilled.representation {
                     crate::storage::SpilledRowRepresentation::Encoded(bytes)
@@ -75522,7 +75630,8 @@ fn scan_index_rows(
                         &crate::storage::SpilledValues { encoded: bytes, .. },
                     ) => bytes,
                 };
-                pack(bytes, values)?;
+                let position = pack(bytes, values)?;
+                validate_values(spilled.rowid, values, position)?;
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(bytes.len() as u64);
             }
@@ -75532,8 +75641,8 @@ fn scan_index_rows(
             storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, schema, &mut values)?;
-                validate_values(rowid, &values[..definition.n_columns])?;
-                pack(bytes, &values[..definition.n_columns])?;
+                let position = pack(bytes, &values[..definition.n_columns])?;
+                validate_values(rowid, &values[..definition.n_columns], position)?;
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(bytes.len() as u64);
                 Ok(())
@@ -75558,7 +75667,23 @@ fn scan_index_rows(
             .min(u64::from(u32::MAX)) as u32;
         statistics.analyzed_generation = scan.publication_generation(storage, table_index)?;
         Ok(statistics)
-    })();
+    })()
+    .inspect_err(|error| {
+        // A btree entry too long names its row's heap position only when
+        // every row the table ever had is present.
+        if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED
+            && error.message.as_str().starts_with("index row size ")
+            && heap_layout_known(storage, table_index, txid, None)
+            && let Some(diagnostic) = crate::sql::eval::take_diagnostic()
+        {
+            let known = pack_stored_rows(storage, table_index, txid, arena)
+                .is_ok_and(|(_, rows)| heap_layout_known(storage, table_index, txid, Some(rows)));
+            crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+                detail: if known { diagnostic.detail } else { None },
+                ..diagnostic
+            });
+        }
+    });
     // SAFETY: the retained scan and callbacks have ended. Validation publishes
     // no references; the caller's SQL and catalog state precede the mark.
     unsafe { arena.rewind_to(mark) };
@@ -82888,6 +83013,7 @@ fn decode_binary_record<'a>(
     }
     let fields = arena
         .alloc_slice_with(field_count as usize, |_| super::types::RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -84509,10 +84635,6 @@ impl<'o: 'v, 'v, R: ColumnLookup<'v>> ColumnLookup<'v> for ProceduralMergeScope<
         }
     }
 
-    fn record_field_collation(&self, base: &Expr<'v>, field: &str) -> crate::sql::ast::Collation {
-        self.row.record_field_collation(base, field)
-    }
-
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
@@ -84745,6 +84867,7 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
         let first = columns.start;
         let fields = arena
             .alloc_slice_with(columns.len(), |index| RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: self.source_def.columns()[first + index].ctype.oid(),
                 type_mod: self.source_def.columns()[first + index].type_mod,
@@ -84793,6 +84916,7 @@ fn merge_row_fields<'v>(
 ) -> Result<&'v [RecordField<'v>], SqlError> {
     let fields = arena
         .alloc_slice_with(definition.n_columns, |index| RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: definition.columns()[index].ctype.oid(),
             type_mod: definition.columns()[index].type_mod,
@@ -106221,7 +106345,15 @@ fn alter_table_relation(
         };
         // The rebuilt indexes evaluate their keys over the rewritten rows.
         if let Err(error) = rows(true, &mut |_, values, _| {
-            constraints::check_index_tuple_sizes(storage, &new_def, values, None, txn.txid, arena)
+            constraints::check_index_tuple_sizes(
+                storage,
+                &new_def,
+                values,
+                None,
+                constraints::HeapTuple::Stored(None),
+                txn.txid,
+                arena,
+            )
         }) {
             return sql_fail(error);
         }
@@ -111504,6 +111636,7 @@ fn composite_storage_text<'a>(
     let definition = storage.require_row_type_definition(slot, txid)?;
     let physical = arena
         .alloc_slice_with(definition.physical_field_count(), |_| RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -111526,6 +111659,13 @@ fn composite_storage_text<'a>(
                 "composite active layout does not match its catalog definition"
             )
         })?;
+        // The durable composite text keeps its fields as formed.
+        if source.form != crate::storage::StoredForm::Inline {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "storing a composite value that holds a compressed or out-of-line field is not supported"
+            ));
+        }
         *out = *source;
         out.value = composite_persistent_value(out.value, storage, txid, arena)?;
         active_index += 1;
@@ -111668,6 +111808,7 @@ fn coerce_composite_value_inner<'a>(
     }
     let fields = arena
         .alloc_slice_with(input.len(), |_| RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -111764,6 +111905,9 @@ fn coerce_composite_value_inner<'a>(
                 arena,
             )?
         };
+        // A field coerced without change keeps its datum and so its form.
+        out.form =
+            crate::sql::toast::converted_form(&input[index].value, &out.value, input[index].form);
         if field.not_null && matches!(out.value, Datum::Null) {
             return Err(sql_err!(
                 sqlstate::NOT_NULL_VIOLATION,
@@ -111998,6 +112142,7 @@ fn decode_composite_text_inner<'a>(
     let count = parse_record_literal(text, expected, retained, &mut raw_values, arena)?;
     let values = arena
         .alloc_slice_with(definition.active_field_count(), |_| RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,

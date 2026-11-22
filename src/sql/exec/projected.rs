@@ -424,6 +424,9 @@ pub fn projected_value_len(v: &Datum) -> Result<usize, SqlError> {
             }
             for f in *fields {
                 n += length_bytes + f.name.len() + 8 + projected_value_len(&f.value)?;
+                if carried_form(&f.value, Some(&f.form)).is_some() {
+                    n += 1 + STORED_FORM_RECORD;
+                }
             }
             n
         }
@@ -862,7 +865,7 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
                 out[at..at + 4].copy_from_slice(&f.type_oid.to_le_bytes());
                 out[at + 4..at + 8].copy_from_slice(&f.type_mod.to_le_bytes());
                 at += 8;
-                at += write_projected_value(&f.value, &mut out[at..]);
+                at += write_formed_value(&f.value, f.form, &mut out[at..]);
             }
             at
         }
@@ -899,7 +902,7 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
                 out[at..at + 4].copy_from_slice(&f.type_oid.to_le_bytes());
                 out[at + 4..at + 8].copy_from_slice(&f.type_mod.to_le_bytes());
                 at += 8;
-                at += write_projected_value(&f.value, &mut out[at..]);
+                at += write_formed_value(&f.value, f.form, &mut out[at..]);
             }
             at
         }
@@ -1850,6 +1853,7 @@ fn decode_record_tail<'a>(
     cursor += length_bytes;
     let fields = arena
         .alloc_slice_with(n_fields, |_| RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -1870,6 +1874,10 @@ fn decode_record_tail<'a>(
         f.type_oid = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
         f.type_mod = i32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
         cursor += 8;
+        f.form = projected_stored_form_at(bytes, cursor);
+        if bytes[cursor] == STORED_FORM_TAG {
+            cursor += 1 + STORED_FORM_RECORD;
+        }
         let tag = bytes[cursor];
         cursor += 1;
         let (value, size) = decode_projected_value(bytes, tag, cursor);
@@ -1961,6 +1969,7 @@ mod tests {
         for count in [255, 256, crate::sql::exec::MAX_PROJ] {
             let fields = vec![
                 RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "field",
                     type_oid: oid::INT4,
                     type_mod: -1,
@@ -1973,6 +1982,7 @@ mod tests {
                 fields: &fields,
             };
             let nested = [RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "nested",
                 type_oid: oid::RECORD,
                 type_mod: -1,
@@ -2012,6 +2022,64 @@ mod tests {
     }
 
     #[test]
+    fn projected_records_keep_their_fields_toast_forms() {
+        use crate::sql::types::{RecordField, oid};
+        use crate::storage::StoredForm;
+
+        let mut budget = Budget::new(64 << 10);
+        let arena = Arena::new(&mut budget, "projected record forms", 64 << 10).unwrap();
+        let long = "y".repeat(3000);
+        let nested = [RecordField {
+            form: StoredForm::Compressed(44),
+            name: "inner",
+            type_oid: oid::TEXT,
+            type_mod: -1,
+            value: Datum::Text(&long),
+        }];
+        let fields = [
+            RecordField {
+                form: StoredForm::Compressed(126),
+                name: "a",
+                type_oid: oid::TEXT,
+                type_mod: -1,
+                value: Datum::Text(&long),
+            },
+            RecordField {
+                form: StoredForm::Inline,
+                name: "b",
+                type_oid: oid::RECORD,
+                type_mod: -1,
+                value: Datum::Record(&nested),
+            },
+        ];
+        crate::mem::guard::forbid_alloc(|| {
+            let encoded = encode_projected_pub(&[Datum::Record(&fields)], &arena).unwrap();
+            let Datum::Record(decoded) = decode_projected_col_record(encoded, 0, &arena).unwrap()
+            else {
+                panic!("a record decodes as a record");
+            };
+            assert_eq!(decoded, &fields[..]);
+            assert_eq!(decoded[0].form, StoredForm::Compressed(126));
+            let Datum::Record(inner) = decoded[1].value else {
+                panic!("a nested record decodes as a record");
+            };
+            assert_eq!(inner[0].form, StoredForm::Compressed(44));
+            // The forms are not part of the value: the rendered text and the
+            // encoding's comparison ignore them.
+            let plain = [RecordField {
+                form: StoredForm::Inline,
+                ..fields[0]
+            }];
+            let formed = encode_projected_pub(&[Datum::Record(&fields[..1])], &arena).unwrap();
+            let unformed = encode_projected_pub(&[Datum::Record(&plain)], &arena).unwrap();
+            assert_eq!(
+                decode_projected_pub(formed, 0),
+                decode_projected_pub(unformed, 0)
+            );
+        });
+    }
+
+    #[test]
     fn projected_records_preserve_long_field_names_and_reject_unencodable_shapes() {
         use crate::sql::types::{RecordField, oid};
 
@@ -2019,6 +2087,7 @@ mod tests {
         let arena = Arena::new(&mut budget, "projected record names", 64 << 10).unwrap();
         let name = "x".repeat(256);
         let fields = [RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: &name,
             type_oid: oid::TEXT,
             type_mod: -1,
@@ -2033,6 +2102,7 @@ mod tests {
         });
         let too_long = "x".repeat(u16::MAX as usize + 1);
         let fields = [RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: &too_long,
             ..fields[0]
         }];
@@ -2049,6 +2119,7 @@ mod tests {
         );
         let fields = vec![
             RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "x",
                 type_oid: oid::INT4,
                 type_mod: -1,
@@ -2165,12 +2236,14 @@ mod tests {
         let arena = Arena::new(&mut budget, "record projected row", 32 * 1024).unwrap();
         let fields = [
             RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "f1",
                 type_oid: oid::INT4,
                 type_mod: -1,
                 value: Datum::Int4(42),
             },
             RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "f2",
                 type_oid: oid::TEXT,
                 type_mod: -1,

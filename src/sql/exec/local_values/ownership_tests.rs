@@ -56,12 +56,14 @@ fn saved_values_keep_typed_nested_data_after_sources_and_owners_are_recycled() {
         let fields = source
             .alloc_slice_copy(&[
                 RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: source.alloc_str("payload").unwrap(),
                     type_oid: 25,
                     type_mod: -1,
                     value: Datum::Text(text),
                 },
                 RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: source.alloc_str("elements").unwrap(),
                     type_oid: 1007,
                     type_mod: -1,
@@ -71,6 +73,7 @@ fn saved_values_keep_typed_nested_data_after_sources_and_owners_are_recycled() {
                     },
                 },
                 RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "missing",
                     type_oid: 23,
                     type_mod: -1,
@@ -169,6 +172,7 @@ fn saved_values_reuse_capacity_and_preserve_prior_values_after_failed_changes() 
         assert_eq!(kept.read(0, &tiny).unwrap_err().sqlstate, "54000");
         let invalid_name = source.alloc_slice_with(1 << 16, |_| b'x').unwrap();
         let fields = [RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: core::str::from_utf8(invalid_name).unwrap(),
             type_oid: 23,
             type_mod: -1,

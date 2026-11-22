@@ -5220,7 +5220,7 @@ pub enum Datum<'a> {
 }
 
 /// One field of a [`Datum::Record`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct RecordField<'a> {
     pub name: &'a str,
     pub type_oid: i32,
@@ -5228,6 +5228,20 @@ pub struct RecordField<'a> {
     /// tuple descriptors carry it from casts, query columns and row values.
     pub type_mod: i32,
     pub value: Datum<'a>,
+    /// The TOAST form the composite datum holds the value in: a whole-row
+    /// reference or `ROW(...)` over a stored row keeps a compressed value
+    /// compressed (`toast_build_flattened_tuple`). The form is how the
+    /// datum is laid out, not part of its value, so equality ignores it.
+    pub form: crate::storage::StoredForm,
+}
+
+impl PartialEq for RecordField<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.type_oid == other.type_oid
+            && self.type_mod == other.type_mod
+            && self.value == other.value
+    }
 }
 
 impl<'a> Datum<'a> {
@@ -5647,29 +5661,58 @@ impl fmt::Display for Datum<'_> {
 /// Renders one record field for PostgreSQL's `record_out` text form: NULL is
 /// empty (unquoted); everything else is quoted when the rendered text is
 /// empty or contains a delimiter, paren, quote, backslash, or whitespace,
-/// with `"` and `\` doubled inside the quotes.
+/// with `"` and `\` doubled inside the quotes. The value is rendered twice
+/// rather than buffered, so nothing caps how long a field may be.
 pub(crate) fn write_record_field(f: &mut fmt::Formatter<'_>, v: &Datum) -> fmt::Result {
     if v.is_null() {
         return Ok(());
     }
-    let mut buf = crate::util::StackStr::<8192>::default();
-    let _ = write!(buf, "{v}");
-    let text = buf.as_str();
-    let needs_quote = text.is_empty()
-        || text
-            .chars()
-            .any(|c| matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace());
-    if !needs_quote {
-        return f.write_str(text);
+    let mut scan = RecordQuoteScan {
+        empty: true,
+        special: false,
+    };
+    write!(scan, "{v}")?;
+    if !scan.empty && !scan.special {
+        return write!(f, "{v}");
     }
     f.write_char('"')?;
-    for c in text.chars() {
-        if c == '"' || c == '\\' {
-            f.write_char(c)?;
-        }
-        f.write_char(c)?;
-    }
+    write!(DoubleTo(f), "{v}")?;
     f.write_char('"')
+}
+
+/// Whether a record field's rendered text has to be quoted.
+struct RecordQuoteScan {
+    empty: bool,
+    special: bool,
+}
+
+impl fmt::Write for RecordQuoteScan {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if !s.is_empty() {
+            self.empty = false;
+        }
+        if s.chars()
+            .any(|c| matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace())
+        {
+            self.special = true;
+        }
+        Ok(())
+    }
+}
+
+/// Doubles `"` and `\` as it forwards, for a record field being quoted.
+struct DoubleTo<'x, 'y>(&'x mut fmt::Formatter<'y>);
+
+impl fmt::Write for DoubleTo<'_, '_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for c in s.chars() {
+            if c == '"' || c == '\\' {
+                self.0.write_char(c)?;
+            }
+            self.0.write_char(c)?;
+        }
+        Ok(())
+    }
 }
 
 /// Renders one array element, quoting text that would otherwise be ambiguous

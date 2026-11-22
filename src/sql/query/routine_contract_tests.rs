@@ -176,6 +176,7 @@ fn pending_calls_own_nested_arguments_and_types_after_scratch_release_and_arena_
                 let text = scratch.alloc_str("saved nested value").unwrap();
                 let fields = scratch
                     .alloc_slice_copy(&[super::super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name,
                         type_oid: super::super::types::oid::TEXT,
                         type_mod: -1,
@@ -317,6 +318,7 @@ fn completed_invocations_keep_values_after_the_body_source_is_released() {
             let text = body.alloc_str("only the saved result owns this").unwrap();
             let fields = body
                 .alloc_slice_copy(&[super::super::types::RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name,
                     type_oid: super::super::types::oid::TEXT,
                     type_mod: -1,

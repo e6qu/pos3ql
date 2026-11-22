@@ -3220,12 +3220,14 @@ mod tests {
     fn binary_record_uses_field_oids_and_binary_field_values() {
         let fields = [
             RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "id",
                 type_oid: oid::INT4,
                 type_mod: -1,
                 value: Datum::Int4(42),
             },
             RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "note",
                 type_oid: oid::TEXT,
                 type_mod: -1,
@@ -3387,6 +3389,7 @@ mod tests {
     #[test]
     fn internal_char_record_text_preserves_the_raw_field_byte() {
         let fields = [RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "kind",
             type_oid: oid::CHAR,
             type_mod: -1,
@@ -3408,6 +3411,7 @@ mod tests {
     #[test]
     fn record_text_doubles_quotes_and_backslashes() {
         let fields = [RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "value",
             type_oid: oid::TEXT,
             type_mod: -1,

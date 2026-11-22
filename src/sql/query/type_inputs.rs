@@ -125,10 +125,6 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.row.whole_row_is_scalar(table)
     }
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> ast::Collation {
-        crate::sql::exec::record_field_metadata(base, field, self.columns)
-            .map_or(ast::Collation::None, |meta| meta.collation)
-    }
 }
 
 pub(crate) fn capture_contextual_type_inputs(

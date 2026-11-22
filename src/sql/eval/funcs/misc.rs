@@ -226,10 +226,20 @@ pub(crate) fn dispatch<'a>(
                     if let Some(base) = expansion {
                         let expanded =
                             super::super::record_star_expand(base, arena, params, row, hooks)?;
+                        // A relation's expanded columns are the stored datums.
+                        let relation = crate::sql::toast::whole_row_relation(base, row);
                         for field in expanded {
                             let name = stack_format!(12, "f{}", fields.len() + 1);
+                            let form = match relation {
+                                Some(table) if crate::sql::toast::may_be_toasted(&field.value) => {
+                                    row.stored_form(Some(table), field.name)?
+                                        .unwrap_or(crate::storage::StoredForm::Inline)
+                                }
+                                _ => field.form,
+                            };
                             fields
                                 .push(RecordField {
+                                    form,
                                     name: arena
                                         .alloc_str(name.as_str())
                                         .map_err(|_| arena_full())?,
@@ -244,8 +254,11 @@ pub(crate) fn dispatch<'a>(
                         let type_oid =
                             expression_type_identity(arg, row, hooks)?.record_field_oid();
                         let name = stack_format!(12, "f{}", fields.len() + 1);
+                        // `heap_form_tuple` keeps a stored datum's form.
+                        let form = crate::sql::toast::passed_form(arg, row, &value)?;
                         fields
                             .push(RecordField {
+                                form,
                                 name: arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
                                 type_oid,
                                 type_mod: super::super::expression_type_mod(arg, row),
@@ -254,7 +267,23 @@ pub(crate) fn dispatch<'a>(
                             .map_err(|_| arena_full())?;
                     }
                 }
-                Ok(Datum::Record(fields.as_slice()))
+                // A row holding a value saved out of line is flattened
+                // (`toast_flatten_tuple_to_datum`): every compressed or
+                // out-of-line value is decompressed in line.
+                let fields = fields.as_slice();
+                if fields
+                    .iter()
+                    .any(|field| matches!(field.form, crate::storage::StoredForm::External { .. }))
+                {
+                    let flattened = arena
+                        .alloc_slice_with(fields.len(), |at| RecordField {
+                            form: crate::storage::StoredForm::Inline,
+                            ..fields[at]
+                        })
+                        .map_err(|_| arena_full())?;
+                    return Ok(Datum::Record(flattened));
+                }
+                Ok(Datum::Record(fields))
             }
             crate::sql::parser::ROWS_NOT_DISTINCT => {
                 arity(2)?;

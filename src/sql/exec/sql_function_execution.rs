@@ -281,6 +281,7 @@ impl SqlResult {
                     }
                     let fields = arena
                         .alloc_slice_with(values.len(), |index| crate::sql::types::RecordField {
+                            form: crate::storage::StoredForm::Inline,
                             name: "",
                             type_oid: values[index].type_oid(),
                             type_mod: -1,

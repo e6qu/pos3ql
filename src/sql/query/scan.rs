@@ -5506,11 +5506,6 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         }
     }
 
-    fn record_field_collation(&self, base: &Expr<'v>, field: &str) -> crate::sql::ast::Collation {
-        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.scope))
-            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
-    }
-
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
@@ -5568,6 +5563,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     ) -> Result<Option<&'v [crate::sql::types::RecordField<'v>]>, SqlError> {
         if let Some(alias) = self.scope.using_alias(table) {
             let mut fields = [crate::sql::types::RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: 0,
                 type_mod: -1,
@@ -5596,6 +5592,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         // catalog (its lifetime is unrelated to the row's `'v`).
         let cols = self.scope.source_columns(source);
         let mut fields = [crate::sql::types::RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -5627,6 +5624,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         let columns = self.scope.source_columns(source);
         let fields = arena
             .alloc_slice_with(source.n_columns, |index| crate::sql::types::RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: columns[index].ctype.oid(),
                 type_mod: columns[index].type_mod,
@@ -5998,18 +5996,6 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
                 Err(_) => crate::sql::ast::Collation::None,
             },
         )
-    }
-
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
-        let inner = self.inner.record_field_collation(base, field);
-        if inner != crate::sql::ast::Collation::None {
-            inner
-        } else {
-            self.outer
-                .map_or(crate::sql::ast::Collation::None, |outer| {
-                    outer.record_field_collation(base, field)
-                })
-        }
     }
 
     /// Forwarded like the rest: a wrapper that answered this from the trait
@@ -7004,14 +6990,13 @@ pub(super) fn hash_join_keys<'a>(
 /// are non-volatile, read only their own relation and compare without a
 /// collation (`check_hashjoinable`).
 fn hash_join_expression_keys<'a>(
-    storage: &Storage,
-    scope: &QueryScope<'a>,
+    columns: &super::CatalogScopeCols<'_, 'a, '_, '_>,
     on: Option<&'a Expr<'a>>,
     where_clause: Option<&'a Expr<'a>>,
     probe_t: usize,
     build_t: usize,
-    txid: u32,
 ) -> [Option<(&'a Expr<'a>, &'a Expr<'a>)>; 8] {
+    let (scope, storage, txid) = (columns.scope, columns.storage, columns.txid);
     let mut found = [None; 8];
     let mut count = 0;
     for source in [on, where_clause].into_iter().flatten() {
@@ -7053,7 +7038,7 @@ fn hash_join_expression_keys<'a>(
                 continue;
             }
             let side_type = |side: &Expr<'_>| {
-                super::infer_scope_type(side, scope)
+                super::infer_scope_type(side, scope, storage, txid, columns.arena)
                     .ok()
                     .and_then(|(oid, _)| ColType::from_oid(oid))
             };
@@ -7675,17 +7660,17 @@ pub(crate) fn select_hash_join_plan<'a>(
         .expect("hash keys have a collation");
     }
     if expression_keys {
-        for (probe, build) in hash_join_expression_keys(
-            storage,
+        let columns = super::CatalogScopeCols {
             scope,
-            on,
-            keyed_where,
-            probe_table,
-            build_table,
+            outer: None,
+            storage,
             txid,
-        )
-        .into_iter()
-        .flatten()
+            arena,
+        };
+        for (probe, build) in
+            hash_join_expression_keys(&columns, on, keyed_where, probe_table, build_table)
+                .into_iter()
+                .flatten()
         {
             if key_count == keys.len() {
                 break;
@@ -9568,6 +9553,8 @@ fn scan_source_mode<'a>(
             Some(reorder_qual(
                 fold_null(simplified, scope, arena)?,
                 scope,
+                storage,
+                txid,
                 arena,
             )?)
         }
@@ -9578,7 +9565,13 @@ fn scan_source_mode<'a>(
         security_plans[0] = lead_row_security(
             security_plans[0],
             where_clause,
-            &super::ScopeCols(scope),
+            &super::CatalogScopeCols {
+                scope,
+                outer: None,
+                storage,
+                txid,
+                arena,
+            },
             storage,
             txid,
             arena,

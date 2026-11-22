@@ -11,6 +11,7 @@
 //! keeps an unchanged out-of-line value, and an extended (compressed)
 //! value is never compressed again, though it may still move out of line.
 
+use crate::sql::eval::sqlstate::UNDEFINED_COLUMN;
 use crate::sql::type_layouts::PhysicalLayout;
 
 /// `SizeofHeapTupleHeader`.
@@ -524,17 +525,28 @@ fn source_of<'a>(
     use crate::sql::ast::Expr;
     use crate::sql::types::Datum;
     let column = |qualifier: Option<&str>, name: &str| {
-        if !same_datum(&row.lookup(qualifier, name)?, value) {
-            return Ok(None);
-        }
-        // A whole-row reference forms a new composite datum.
-        Ok(Some(
-            if matches!(value, Datum::Record(_) | Datum::Composite { .. }) {
-                Source::Fresh
-            } else {
-                Source::Stored
-            },
-        ))
+        let read = match row.lookup(qualifier, name) {
+            Ok(read) => read,
+            // A bare relation name is a whole-row reference, which forms a
+            // new composite datum.
+            Err(error) if qualifier.is_none() && error.sqlstate == UNDEFINED_COLUMN => {
+                return Ok(Some(Source::Fresh));
+            }
+            Err(error) => return Err(error),
+        };
+        // A composite read from a stored row is the stored datum; one a
+        // query formed (a whole row, `ROW(...)`) it passes on as formed.
+        Ok(match (read, value) {
+            (Datum::CompositeText { slot, .. }, Datum::Composite { slot: given, .. })
+                if slot == *given =>
+            {
+                Some(Source::Stored)
+            }
+            (Datum::Record(_) | Datum::Composite { .. }, _) if same_datum(&read, value) => {
+                Some(Source::Fresh)
+            }
+            _ => same_datum(&read, value).then_some(Source::Stored),
+        })
     };
     let branches = |branches: &mut dyn Iterator<Item = &Expr<'_>>| {
         let mut found = None;
@@ -594,7 +606,111 @@ fn source_of<'a>(
         }
         Expr::OuterAggregate { call, .. } => source_of(call, row, value),
         Expr::Subquery(query) if subquery_may_pass(query) => Ok(Some(Source::Unknown)),
+        // A field of `ROW(...)` is its argument (`eval_const_expressions`
+        // drops the `FieldSelect`); any other composite holds its fields as
+        // tuple forming packed them.
+        Expr::Field { base, field } => {
+            if let Some(table) = whole_row_relation(base, row) {
+                return column(Some(table), field);
+            }
+            match row_argument(base, field) {
+                Some(argument) => source_of(argument, row, value),
+                None => Ok(Some(Source::Stored)),
+            }
+        }
         _ => Ok(Some(Source::Fresh)),
+    }
+}
+
+/// The relation `base` names as a whole-row reference (`t.*` or a bare
+/// relation name): its field is the relation's column.
+pub(crate) fn whole_row_relation<'e>(
+    base: &'e crate::sql::ast::Expr<'_>,
+    row: &dyn crate::sql::eval::ColumnLookup<'_>,
+) -> Option<&'e str> {
+    use crate::sql::ast::Expr;
+    match base {
+        Expr::WholeRow(table) => Some(table),
+        Expr::Column {
+            qualifier: None,
+            name,
+        } if row
+            .lookup(None, name)
+            .is_err_and(|error| error.sqlstate == UNDEFINED_COLUMN) =>
+        {
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
+/// The argument of the row constructor `base` that its field `field` (`f1`,
+/// `f2`, ...) reads; `None` when `base` is no row constructor or the field
+/// is not one of its plain arguments.
+fn row_argument<'e, 'x>(
+    base: &'e crate::sql::ast::Expr<'x>,
+    field: &str,
+) -> Option<&'e crate::sql::ast::Expr<'x>> {
+    use crate::sql::ast::Expr;
+    let Expr::Call { args, .. } = base else {
+        return None;
+    };
+    if !base.is_row_constructor()
+        || args
+            .iter()
+            .any(|arg| matches!(arg, Expr::WholeRow(_) | Expr::Field { field: "*", .. }))
+    {
+        return None;
+    }
+    let digits = field.strip_prefix('f')?;
+    if digits.starts_with('0') {
+        return None;
+    }
+    let position = digits
+        .parse::<usize>()
+        .ok()
+        .filter(|position| *position >= 1)?;
+    args.get(position - 1).copied()
+}
+
+/// The TOAST form the composite `base` holds its field `field` in, when
+/// that field's datum is `value`: `None` when the field does not hold it.
+fn field_form<'a>(
+    base: &crate::sql::ast::Expr<'_>,
+    field: &str,
+    row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    value: &crate::sql::types::Datum<'_>,
+) -> Result<Option<crate::storage::rowenc::StoredForm>, crate::sql::eval::SqlError> {
+    use crate::sql::ast::Expr;
+    use crate::sql::types::Datum;
+    use crate::storage::rowenc::StoredForm;
+    // A field of a whole-row reference is the relation's column.
+    if let Some(table) = whole_row_relation(base, row) {
+        return Ok(Some(
+            row.stored_form(Some(table), field)?
+                .unwrap_or(StoredForm::Inline),
+        ));
+    }
+    match base {
+        Expr::Column { qualifier, name } => match row.lookup(*qualifier, name)? {
+            Datum::Record(fields) | Datum::Composite { fields, .. } => Ok(fields
+                .iter()
+                .find(|candidate| candidate.name == field && same_datum(&candidate.value, value))
+                .map(|candidate| candidate.form)),
+            // A stored composite's fields are as tuple forming gave them.
+            Datum::CompositeText { .. } => Ok(Some(StoredForm::Inline)),
+            _ => Ok(Some(StoredForm::Unmodelled)),
+        },
+        _ => match row_argument(base, field) {
+            // `eval_const_expressions` reads the argument itself.
+            Some(argument) => branch_form(argument, row, value),
+            // A function's composite result holds values it formed; a
+            // composite any other expression passes on is not modelled.
+            None if matches!(base, Expr::Call { .. }) && !base.is_row_constructor() => {
+                Ok(Some(StoredForm::Inline))
+            }
+            None => Ok(Some(StoredForm::Unmodelled)),
+        },
     }
 }
 
@@ -719,7 +835,14 @@ fn given_form<'a>(
         }))
     };
     let column = |qualifier: Option<&str>, name: &str| {
-        let read = row.lookup(qualifier, name)?;
+        let read = match row.lookup(qualifier, name) {
+            Ok(read) => read,
+            // A whole-row reference forms its composite datum anew.
+            Err(error) if qualifier.is_none() && error.sqlstate == UNDEFINED_COLUMN => {
+                return formed(StoredForm::Inline);
+            }
+            Err(error) => return Err(error),
+        };
         if !same_datum(&read, value) {
             return Ok(None);
         }
@@ -807,6 +930,10 @@ fn given_form<'a>(
         }
         Expr::OuterAggregate { call, .. } => given_form(call, row, value),
         Expr::Subquery(query) if subquery_may_pass(query) => formed(StoredForm::Unmodelled),
+        Expr::Field { base, field } => Ok(field_form(base, field, row, value)?.map(|form| Given {
+            form,
+            identical: false,
+        })),
         _ => formed(StoredForm::Inline),
     }
 }
@@ -926,6 +1053,34 @@ fn may_compress(bytes: &[u8]) -> bool {
     covered.iter().filter(|&&covered| covered).count() >= 15
 }
 
+/// How `toast_compress_datum` treats a value of `payload` data bytes.
+pub(crate) enum Compression {
+    /// Compressed: the datum's `VARSIZE`.
+    Compressed(usize),
+    /// pglz keeps no result short enough.
+    Incompressible,
+    /// The bytes pglz reads of the value are not modelled.
+    Unknown,
+}
+
+/// [`Compression`] of `value` under pglz, the default
+/// `default_toast_compression`.
+pub(crate) fn pglz_compression(
+    value: &crate::sql::types::Datum<'_>,
+    payload: usize,
+    arena: &crate::mem::arena::Arena,
+) -> Result<Compression, crate::sql::eval::SqlError> {
+    let Some(bytes) = pglz_input(value, arena)? else {
+        return Ok(Compression::Unknown);
+    };
+    Ok(match crate::sql::pglz::compressed_size(bytes) {
+        Some(length) if length + COMPRESSED_HEADER < payload.saturating_sub(2) => {
+            Compression::Compressed(length + COMPRESSED_HEADER)
+        }
+        _ => Compression::Incompressible,
+    })
+}
+
 /// The bytes pglz reads of `value` as PostgreSQL stores it: the data of the
 /// types pos3ql holds byte for byte, or formed into `scratch` for a tsvector,
 /// path or polygon. `None` for a type whose stored data is not modelled.
@@ -991,6 +1146,13 @@ pub(crate) fn row_forms_as(
     use crate::storage::rowenc::{StoredForm, carries_stored_form};
     let forms = &mut forms[..values.len()];
     forms.fill(StoredForm::Inline);
+    // The row encoding keeps a composite value's fields as formed.
+    if values.iter().any(holds_toasted_field) {
+        return Err(crate::sql_err!(
+            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+            "storing a composite value that holds a compressed or out-of-line field is not supported"
+        ));
+    }
     // A row that cannot reach the threshold even with four-byte headers and
     // full alignment, and keeps no stored form, stays in line.
     if carried.count == 0 {
@@ -1100,6 +1262,19 @@ pub(crate) fn row_forms_as(
         *form = toasted;
     }
     Ok(())
+}
+
+/// Whether the composite `value`, or one nested in it, holds a field in a
+/// form other than as tuple forming gives it.
+fn holds_toasted_field(value: &crate::sql::types::Datum<'_>) -> bool {
+    use crate::sql::types::Datum;
+    match value {
+        Datum::Record(fields) | Datum::Composite { fields, .. } => fields.iter().any(|field| {
+            field.form != crate::storage::rowenc::StoredForm::Inline
+                || holds_toasted_field(&field.value)
+        }),
+        _ => false,
+    }
 }
 
 /// `ToastTupleContext` of one row.

@@ -847,8 +847,9 @@ as PostgreSQL. A larger table's sample is random, as PostgreSQL's is, so its
 figures vary between runs. `ALTER TABLE ... ALTER COLUMN ... SET STATISTICS`
 and `default_statistics_target` set how many values are kept; a target of 0
 leaves the column's statistics as they are, and an empty table keeps its
-earlier statistics. Limits: a value PostgreSQL would compress counts at its
-uncompressed width in `avg_width`; ranges, multiranges, `tsvector`, and
+earlier statistics. `avg_width` counts each value as stored: a compressed
+value at its compressed size and a value saved out of line at its 18-byte
+TOAST pointer. Limits: ranges, multiranges, `tsvector`, and
 types without a default ordering keep only `null_frac`, `avg_width` and an
 approximate `n_distinct`; array element statistics (`most_common_elems`) are
 not gathered.

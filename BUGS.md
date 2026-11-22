@@ -1,7 +1,7 @@
 # Blocked defects
 
 One known defect cannot be repaired within the runtime rules (reviewed
-2026-11-21).
+2026-11-22).
 
 Fix reproducible defects, including incidental ones, in the PR that finds them.
 Unfinished work belongs in [PLAN.md](PLAN.md). Add a row here only with a

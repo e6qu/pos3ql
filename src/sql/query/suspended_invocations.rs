@@ -214,12 +214,14 @@ mod ownership_tests {
                     let text = scratch.alloc_str("completed value").unwrap();
                     let fields = [
                         super::super::super::types::RecordField {
+                            form: crate::storage::StoredForm::Inline,
                             name: "nullable_domain",
                             type_oid: 123456,
                             type_mod: -1,
                             value: Datum::Null,
                         },
                         super::super::super::types::RecordField {
+                            form: crate::storage::StoredForm::Inline,
                             name: "payload",
                             type_oid: super::super::super::types::oid::TEXT,
                             type_mod: -1,

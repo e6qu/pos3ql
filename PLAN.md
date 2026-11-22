@@ -250,11 +250,18 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   nested loops (inner, left, semi and anti), `Materialize` nodes and scans
   already runs as a retained reader's pull nodes (`ModeledPull`): a stream
   or cursor reads it a row at a time and resumes each storage wait where it
-  stopped. The join search plans in the statement's memory and the reader
-  keeps only the chosen plan and its nodes' records (about 41 KB for an
-  analyzed table joined with itself, which a stream's estimate counts
-  exactly); no node holds a `Storage` or `Arena` reference between calls,
-  and a scan captures its index's statistics counter for each read. A
+  stopped, at every node kind (`pull_join_waits`). The join search and its
+  analysis (join tree, conditions, classes, statistics, candidate paths)
+  run in the statement's memory; the reader keeps the chosen plan, each
+  relation's scan and its nodes' records (about 18 KB for an analyzed
+  table joined with itself, which a stream's estimate counts exactly). No
+  node keeps a `Storage` or `Arena` argument between calls, and a scan
+  captures its index's statistics counter for each read. A reader opens
+  with a `Storage` borrow its type does not carry, so the compiler rejects
+  a node or scope that keeps one: a scope records each table's OID and
+  whether it has descendants, and a view's row type, as it resolves them,
+  and a record field's collation is typed against the evaluating call's
+  catalog. A
   `Materialize` keeps its rows, with their stored forms, in
   `plan_build_bytes` leases. Still needed: hash, merge, `Memoize` and
   `Unique` pull nodes, `EXPLAIN ANALYZE` counters on the pull nodes, a
@@ -472,25 +479,36 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   subquery passes on (PostgreSQL keeps its one-byte header). The result of
   a user-defined function is taken as formed anew, though PostgreSQL may
   return a stored datum it read.
-- [ ] PL/pgSQL forms as PostgreSQL 18.6 keeps them: a variable or record
-  field filled by `SELECT INTO`, `FOR` or `FETCH` holds its value formed
-  anew (detoasted, four-byte header: `pg_column_size` of a stored `'short'`
-  is 9, pos3ql reports 6 today), while the record as a whole keeps the
-  stored tuple; `v := NEW.t` keeps `NEW.t`'s form; `NEW` and `OLD` fields
-  hold the stored forms (`NEW` of a `BEFORE` trigger the forms the new row
-  passes on). pos3ql refuses such a variable's `pg_column_size` once it may
-  be toasted (`0A000`). The forms must survive a suspended routine's saved
-  values.
-- [ ] A whole-row reference or `ROW(...)` over a stored row keeps its
-  compressed values compressed (`toast_build_flattened_tuple`); its
-  `pg_column_size` counts them uncompressed today. `ANALYZE`'s `avg_width`
-  of a compressed or out-of-line column counts the formed width.
-- [ ] A `tsquery` nested more than 64 operators deep (`to_tsquery` of 65
-  `&`-joined words) fails with `54000`; PostgreSQL bounds it only by
-  `max_stack_depth`.
-- [ ] A btree index entry wider than 2704 bytes after `index_form_tuple`
-  compresses it fails with `index row size ... exceeds btree version 4
-  maximum` in PostgreSQL; pos3ql indexes it.
+- [ ] PL/pgSQL forms as PostgreSQL 18.6 keeps them (measured 2026-11-22): a
+  variable filled by `:=`, `SELECT INTO`, `FOR` or `FETCH`, `NEW` and `OLD`
+  fields and a record's fields hold the datum as passed (`datumTransfer`):
+  a stored `'short'` reads 6, a compressed value its compressed size, an
+  out-of-line one its saved size (a record field read in an expression is
+  fetched in line, the record as a whole holds its stored tuple). A value an
+  expression forms keeps its four-byte header: `y := 'lit'` reads 7,
+  `z := v || ''` 9 and `v := (SELECT s ...)` 9, where pos3ql reports the
+  packed 4, 6 and 6 today; a value TOAST may have stored otherwise is
+  refused (`0A000`). Needs a form slot beside each local, carried through
+  scope construction, `SavedValues` and trigger rows.
+- [ ] Composite forms not carried yet: storing a composite value that holds
+  a compressed or out-of-line field (`0A000`; PostgreSQL stores the datum as
+  formed), the one-byte header a short composite gets when a sort or a
+  materialized CTE forms it into a tuple, and a derived table's whole-row
+  output PostgreSQL pulls up into the outer query (a field of it reads the
+  stored column there). A whole-row reference, `ROW(...)` and a field of
+  either already keep their values' stored forms (`987`).
+- [ ] A short value a subquery PostgreSQL does not materialize passes on
+  (`(SELECT a || '' x ... LIMIT 5) s`, a subquery without `FROM`) keeps its
+  four-byte header; `pg_column_size` reports the packed one-byte form today.
+- [ ] A heap position (`ctid`) model for the `index row size ... exceeds
+  btree version 4 maximum 2704` error (`989`): its DETAIL names the row's
+  tuple only while the table has had rows inserted and none updated,
+  deleted, rolled back or vacuumed since its statistics were counted
+  (PostgreSQL leaves those tuples in place), and not for a row `ALTER TABLE`
+  rewrites; an index build names the first oversized row in scan order,
+  where PostgreSQL names the first in key order. A value under 511 bytes
+  passed on compressed is sized as formed (PostgreSQL indexes the
+  compressed datum as it is).
 - [ ] Hash aggregates inherit `aset.c`'s recycled executor and transition
   contexts after a session's hash aggregate under `work_mem` below 1MB
   (`0A000` from the next statement on while the bucket array is within 8 kB
@@ -515,7 +533,7 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   index-only scans (`idx_tup_fetch`), and partition index scans read only
   for their order.
 - [ ] Range and multirange histograms; `compute_distinct_stats` for types
-  without an ordering; widths of compressed values; the binary form of a
+  without an ordering; the binary form of a
   composite value inside a statistics array (sent as text today).
 - [ ] Hash value types without a PostgreSQL size (arrays, `jsonb`, ranges,
   records) in a `Hash` node report pos3ql's bytes.

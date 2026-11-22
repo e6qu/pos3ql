@@ -3398,41 +3398,44 @@ pub(crate) fn dispatch<'a>(
                 let stored =
                     crate::sql::query::postgres_memory::stored(Some(&sizing), hint, &value)
                         .ok_or_else(unsized_value)?;
-                // A cast to the operand's own type, without a modifier, is
-                // no function call: the column reaches the function as is.
-                let mut operand = args[0];
-                while let crate::sql::ast::Expr::Cast {
-                    operand: inner,
-                    type_mod: -1,
-                    ..
-                } = operand
-                {
-                    let same = matches!(
-                        (
-                            super::super::expression_type_identity(operand, row, hooks)?,
-                            super::super::expression_type_identity(inner, row, hooks)?,
-                        ),
-                        (
-                            super::super::ExpressionTypeIdentity::Known(outer),
-                            super::super::ExpressionTypeIdentity::Known(source),
-                        ) if outer == source
-                    );
-                    if !same {
-                        break;
-                    }
-                    operand = inner;
-                }
-                // A whole-row reference forms a new composite datum.
-                let column = matches!(operand, crate::sql::ast::Expr::Column { .. })
-                    && !matches!(value, Datum::Record(_) | Datum::Composite { .. });
                 let layout = stored.layout;
+                // A grouped query's output reads its grouping keys.
+                let grouping_key = crate::sql::toast::GroupingKey(value);
+                let source: &dyn ColumnLookup<'a> = if hooks.group.is_some() {
+                    &grouping_key
+                } else {
+                    row
+                };
+                // `toast_datum_size`: a stored datum TOAST compressed or saved
+                // out of line has that size.
+                match crate::sql::toast::passed_form(args[0], source, &value)? {
+                    crate::storage::rowenc::StoredForm::Compressed(size)
+                    | crate::storage::rowenc::StoredForm::External { saved: size, .. } => {
+                        return Ok(Datum::Int4(size as i32));
+                    }
+                    crate::storage::rowenc::StoredForm::Unmodelled => {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "pg_column_size of a value whose TOAST form is not modelled is not supported"
+                        ));
+                    }
+                    crate::storage::rowenc::StoredForm::Inline => {}
+                }
                 let size = if layout.length > 0 {
                     layout.length as usize
                 } else if layout.length == -1 {
-                    if column && stored.payload > 2000 {
-                        return Err(unsized_value());
-                    }
-                    if column && layout.storage != b'p' && stored.payload < 127 {
+                    // Tuple forming gives a short value of a type it may
+                    // pack a one-byte header, which the stored datum keeps.
+                    let packs = layout.storage != b'p' && stored.payload < 127;
+                    let stored_datum = packs
+                        && crate::sql::toast::reads_stored_datum(args[0], source, &value)?
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "pg_column_size of a value an aggregate, window function or subquery may pass on from a stored row is not supported"
+                                )
+                            })?;
+                    if stored_datum {
                         stored.payload + 1
                     } else {
                         stored.payload + 4

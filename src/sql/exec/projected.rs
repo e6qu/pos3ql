@@ -10,28 +10,113 @@ use crate::mem::arena::Arena;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::Datum;
 use crate::sql_err;
+use crate::storage::rowenc::StoredForm;
 
 /// Tagged, order-preserving-for-equality encoding of a projected row:
 /// per value, a tag byte plus a fixed or length-prefixed payload.
 pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'a [u8], SqlError> {
-    let len = projected_row_len(values)?;
+    encode_projected_formed(values, &[], arena)
+}
+
+/// [`encode_projected_pub`] of values passed on from stored rows in
+/// `forms` (`Inline` past its end): each value keeps the TOAST form it was
+/// stored in, as PostgreSQL passes the stored datum on unchanged.
+pub(crate) fn encode_projected_formed<'a>(
+    values: &[Datum],
+    forms: &[StoredForm],
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let len = projected_row_len_formed(values, forms)?;
     let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "projected row exceeds the statement arena"
         )
     })?;
-    encode_projected_into(values, out)?;
+    encode_projected_formed_into(values, forms, out)?;
     Ok(&*out)
+}
+
+/// The tag of a value that carries the TOAST form of the stored datum it
+/// was read from: a [`STORED_FORM_RECORD`]-byte form record, then the value
+/// with its own tag. Every reader decodes the value through
+/// [`decode_projected_value`], so equality, ordering, hashing and grouping
+/// never see the form.
+const STORED_FORM_TAG: u8 = 60;
+/// A form kind byte and its `u32` size.
+const STORED_FORM_RECORD: usize = 5;
+
+fn form_record(form: StoredForm) -> [u8; STORED_FORM_RECORD] {
+    let (kind, size) = match form {
+        StoredForm::Inline => unreachable!("an inline value carries no form record"),
+        StoredForm::Compressed(size) => (1, size),
+        StoredForm::External {
+            saved,
+            compressed: false,
+        } => (2, saved),
+        StoredForm::External {
+            saved,
+            compressed: true,
+        } => (3, saved),
+        StoredForm::Unmodelled => (4, 0),
+    };
+    let mut record = [kind, 0, 0, 0, 0];
+    record[1..].copy_from_slice(&size.to_le_bytes());
+    record
+}
+
+/// The form a projected value whose tag is at `tag_at` carries.
+pub(crate) fn projected_stored_form_at(bytes: &[u8], tag_at: usize) -> StoredForm {
+    if bytes[tag_at] != STORED_FORM_TAG {
+        return StoredForm::Inline;
+    }
+    let record = &bytes[tag_at + 1..tag_at + 1 + STORED_FORM_RECORD];
+    let size = u32::from_le_bytes(record[1..].try_into().expect("form size"));
+    match record[0] {
+        1 => StoredForm::Compressed(size),
+        2 => StoredForm::External {
+            saved: size,
+            compressed: false,
+        },
+        3 => StoredForm::External {
+            saved: size,
+            compressed: true,
+        },
+        4 => StoredForm::Unmodelled,
+        kind => unreachable!("projected form kind {kind} was never encoded"),
+    }
+}
+
+/// The form column `col` of a projected row carries.
+pub(crate) fn projected_stored_form(bytes: &[u8], col: usize) -> StoredForm {
+    projected_stored_form_at(bytes, ProjectedValue::column_tag_at(bytes, col))
+}
+
+/// The forms of a projected row's columns into `forms`.
+pub(crate) fn projected_stored_forms(bytes: &[u8], forms: &mut [StoredForm]) {
+    let mut at = 2usize;
+    for form in forms.iter_mut().take(projected_row_width(bytes)) {
+        *form = projected_stored_form_at(bytes, at);
+        at += 1 + decode_projected_value(bytes, bytes[at], at + 1).1;
+    }
+}
+
+/// Whether `form` is carried in a projected row: only a value TOAST can
+/// store out of the form `heap_form_tuple` gives it.
+fn carried_form(value: &Datum, form: Option<&StoredForm>) -> Option<StoredForm> {
+    form.copied()
+        .filter(|form| *form != StoredForm::Inline)
+        .filter(|_| crate::storage::rowenc::carries_stored_form(value))
 }
 
 /// Encodes state that must survive front rewinds used to retry resumable
 /// execution. The statement reset still reclaims it as a unit.
 pub(crate) fn encode_projected_persistent_pub<'a>(
     values: &[Datum],
+    forms: &[StoredForm],
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
-    let len = projected_row_len(values)?;
+    let len = projected_row_len_formed(values, forms)?;
     let out = arena
         .alloc_persistent_slice_with(len, |_| 0u8)
         .map_err(|_| {
@@ -40,7 +125,7 @@ pub(crate) fn encode_projected_persistent_pub<'a>(
                 "mutable routine arguments exceed statement memory"
             )
         })?;
-    encode_projected_into(values, out)?;
+    encode_projected_formed_into(values, forms, out)?;
     Ok(&*out)
 }
 
@@ -148,7 +233,7 @@ pub(crate) fn unpack_projected_rows<'a>(
 /// Exact byte length of a projected row whose values are read by index.
 pub(crate) fn projected_row_len_by<'a>(
     count: usize,
-    mut value_at: impl FnMut(usize) -> Datum<'a>,
+    mut value_at: impl FnMut(usize) -> Result<(Datum<'a>, StoredForm), SqlError>,
 ) -> Result<usize, SqlError> {
     let count_u16 = u16::try_from(count).map_err(|_| {
         sql_err!(
@@ -158,8 +243,10 @@ pub(crate) fn projected_row_len_by<'a>(
     })?;
     let mut len = size_of_val(&count_u16);
     for index in 0..count {
+        let (value, form) = value_at(index)?;
+        let form = carried_form(&value, Some(&form)).map_or(0, |_| 1 + STORED_FORM_RECORD);
         len = len
-            .checked_add(projected_value_len(&value_at(index))?)
+            .checked_add(projected_value_len(&value)? + form)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -170,10 +257,11 @@ pub(crate) fn projected_row_len_by<'a>(
     Ok(len)
 }
 
-/// Writes an indexed projected row into caller-owned external-run storage.
+/// Writes an indexed projected row, each value with the stored form it
+/// carries, into caller-owned external-run storage.
 pub(crate) fn encode_projected_by_into<'a>(
     count: usize,
-    mut value_at: impl FnMut(usize) -> Datum<'a>,
+    mut value_at: impl FnMut(usize) -> Result<(Datum<'a>, StoredForm), SqlError>,
     out: &mut [u8],
 ) -> Result<usize, SqlError> {
     let len = projected_row_len_by(count, &mut value_at)?;
@@ -189,14 +277,34 @@ pub(crate) fn encode_projected_by_into<'a>(
     out[..2].copy_from_slice(&count_u16.to_le_bytes());
     let mut at = 2usize;
     for index in 0..count {
-        at += write_projected_value(&value_at(index), &mut out[at..]);
+        let (value, form) = value_at(index)?;
+        at += write_formed_value(&value, form, &mut out[at..]);
     }
     debug_assert_eq!(at, len);
     Ok(at)
 }
 
+/// Writes `value` with the form record it carries, if any.
+fn write_formed_value(value: &Datum, form: StoredForm, out: &mut [u8]) -> usize {
+    let mut at = 0;
+    if let Some(form) = carried_form(value, Some(&form)) {
+        out[0] = STORED_FORM_TAG;
+        out[1..=STORED_FORM_RECORD].copy_from_slice(&form_record(form));
+        at = 1 + STORED_FORM_RECORD;
+    }
+    at + write_projected_value(value, &mut out[at..])
+}
+
 /// Exact byte length needed by [`encode_projected_into`].
 pub(crate) fn projected_row_len(values: &[Datum]) -> Result<usize, SqlError> {
+    projected_row_len_formed(values, &[])
+}
+
+/// [`projected_row_len`] of values carrying `forms`.
+pub(crate) fn projected_row_len_formed(
+    values: &[Datum],
+    forms: &[StoredForm],
+) -> Result<usize, SqlError> {
     let count = u16::try_from(values.len()).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -204,13 +312,16 @@ pub(crate) fn projected_row_len(values: &[Datum]) -> Result<usize, SqlError> {
         )
     })?;
     let mut len = size_of_val(&count);
-    for v in values {
-        len = len.checked_add(projected_value_len(v)?).ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "projected row is too large"
-            )
-        })?;
+    for (index, v) in values.iter().enumerate() {
+        let form = carried_form(v, forms.get(index)).map_or(0, |_| 1 + STORED_FORM_RECORD);
+        len = len
+            .checked_add(projected_value_len(v)? + form)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "projected row is too large"
+                )
+            })?;
     }
     Ok(len)
 }
@@ -221,7 +332,16 @@ pub(crate) fn projected_row_len(values: &[Datum]) -> Result<usize, SqlError> {
 /// representations cannot drift. `out` may be larger than necessary; the
 /// returned length names the initialized prefix.
 pub(crate) fn encode_projected_into(values: &[Datum], out: &mut [u8]) -> Result<usize, SqlError> {
-    let len = projected_row_len(values)?;
+    encode_projected_formed_into(values, &[], out)
+}
+
+/// [`encode_projected_into`] of values carrying `forms`.
+pub(crate) fn encode_projected_formed_into(
+    values: &[Datum],
+    forms: &[StoredForm],
+    out: &mut [u8],
+) -> Result<usize, SqlError> {
+    let len = projected_row_len_formed(values, forms)?;
     if out.len() < len {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -233,8 +353,9 @@ pub(crate) fn encode_projected_into(values: &[Datum], out: &mut [u8]) -> Result<
     let count = u16::try_from(values.len()).expect("projected_row_len checked the count");
     out[..2].copy_from_slice(&count.to_le_bytes());
     let mut at = 2usize;
-    for v in values {
-        at += write_projected_value(v, &mut out[at..]);
+    for (index, v) in values.iter().enumerate() {
+        let form = forms.get(index).copied().unwrap_or(StoredForm::Inline);
+        at += write_formed_value(v, form, &mut out[at..]);
     }
     debug_assert_eq!(at, len);
     Ok(at)
@@ -495,7 +616,7 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             5 + str_value.len()
         }
         Datum::Text(str_value) => {
-            out[0] = 5;
+            out[0] = PROJECTED_TEXT_TAG;
             out[1..5].copy_from_slice(&(str_value.len() as u32).to_le_bytes());
             out[5..5 + str_value.len()].copy_from_slice(str_value.as_bytes());
             5 + str_value.len()
@@ -801,9 +922,37 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
 /// payload length. This is the one place the projected encoding's tag
 /// sizes live: a second, hand-written copy in the sort path drifted from
 /// it and panicked the server on every tag it had not been taught.
+/// The tag of an encoded `text` value: a little-endian `u32` length, then
+/// its UTF-8 bytes.
+pub(crate) const PROJECTED_TEXT_TAG: u8 = 5;
+
+/// The encoded length of the value tagged `tag` at `at`, the size
+/// [`decode_projected_value`] returns, read without decoding fixed-width
+/// values or text.
+pub(crate) fn projected_value_size(bytes: &[u8], tag: u8, at: usize) -> usize {
+    let size = match tag {
+        0 | 36 => 0,
+        1 | 40 => 1,
+        2 | 35 | 48 => 4,
+        47 => 6,
+        41 | 44 | 46 => 8,
+        PROJECTED_TEXT_TAG => {
+            4 + u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+        }
+        _ => return decode_projected_value(bytes, tag, at).1,
+    };
+    debug_assert_eq!(size, decode_projected_value(bytes, tag, at).1);
+    size
+}
+
 pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, usize) {
     match tag {
         0 => (Datum::Null, 0),
+        STORED_FORM_TAG => {
+            let inner = at + STORED_FORM_RECORD;
+            let (value, size) = decode_projected_value(bytes, bytes[inner], inner + 1);
+            (value, STORED_FORM_RECORD + 1 + size)
+        }
         36 => (Datum::PgDdlCommand, 0),
         50 => {
             let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
@@ -884,7 +1033,7 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             ))),
             4,
         ),
-        5 => {
+        PROJECTED_TEXT_TAG => {
             let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             (
                 Datum::Text(
@@ -1279,14 +1428,8 @@ pub(crate) fn compare_projected_prefix(
 ) -> Result<core::cmp::Ordering, SqlError> {
     let (mut ia, mut ib) = (2usize, 2usize);
     for _ in 0..width {
-        let left = ProjectedValue {
-            bytes: a,
-            tag_at: ia,
-        };
-        let right = ProjectedValue {
-            bytes: b,
-            tag_at: ib,
-        };
+        let left = ProjectedValue::at(a, ia);
+        let right = ProjectedValue::at(b, ib);
         let ord = match (left.is_null(), right.is_null()) {
             (true, true) => core::cmp::Ordering::Equal,
             (true, false) => core::cmp::Ordering::Greater,
@@ -1340,12 +1483,43 @@ pub(crate) struct ProjectedValue<'a> {
 impl<'a> ProjectedValue<'a> {
     /// Column `col` of an encoded row.
     pub(crate) fn column(bytes: &'a [u8], col: usize) -> Self {
+        Self::at(bytes, Self::column_tag_at(bytes, col))
+    }
+
+    /// The tag position of column `col`, before any form record.
+    fn column_tag_at(bytes: &[u8], col: usize) -> usize {
         let mut at = 2usize;
         for _ in 0..col {
             let tag = bytes[at];
-            at += 1 + decode_projected_value(bytes, tag, at + 1).1;
+            at += 1 + projected_value_size(bytes, tag, at + 1);
         }
-        Self { bytes, tag_at: at }
+        at
+    }
+
+    /// The value whose tag, or form record, is at `tag_at` (such as a
+    /// [`Self::offset`]): the value's own tag, past the form record it may
+    /// carry.
+    pub(crate) fn at(bytes: &'a [u8], tag_at: usize) -> Self {
+        let tag_at = if bytes[tag_at] == STORED_FORM_TAG {
+            tag_at + 1 + STORED_FORM_RECORD
+        } else {
+            tag_at
+        };
+        Self { bytes, tag_at }
+    }
+
+    /// Where this value starts in its row, for [`Self::at`].
+    pub(crate) fn offset(self) -> usize {
+        self.tag_at
+    }
+
+    /// The column after this one, which the row must have.
+    pub(crate) fn next(self) -> Self {
+        let tag = self.bytes[self.tag_at];
+        Self::at(
+            self.bytes,
+            self.tag_at + 1 + projected_value_size(self.bytes, tag, self.tag_at + 1),
+        )
     }
 
     /// The value as the arena-free decode returns it.
@@ -1411,12 +1585,9 @@ impl<'a> Iterator for ProjectedFields<'a> {
             .expect("projected record name was encoded from valid UTF-8");
         let type_at = name_at + name_len;
         let type_oid = i32::from_le_bytes(self.bytes[type_at..type_at + 4].try_into().unwrap());
-        let value = ProjectedValue {
-            bytes: self.bytes,
-            tag_at: type_at + 8,
-        };
-        let tag = self.bytes[value.tag_at];
-        self.at = value.tag_at + 1 + decode_projected_value(self.bytes, tag, value.tag_at + 1).1;
+        let value = ProjectedValue::at(self.bytes, type_at + 8);
+        let tag = self.bytes[type_at + 8];
+        self.at = type_at + 9 + decode_projected_value(self.bytes, tag, type_at + 9).1;
         Some((name, type_oid, value))
     }
 }
@@ -1925,7 +2096,7 @@ mod tests {
         let arena = Arena::new(&mut budget, "persistent projected row", 2048).unwrap();
         let mark = arena.mark();
         let encoded =
-            encode_projected_persistent_pub(&[Datum::Text("persistent")], &arena).unwrap();
+            encode_projected_persistent_pub(&[Datum::Text("persistent")], &[], &arena).unwrap();
         let _scratch = arena.alloc_slice_with(512, |_| 0xa5u8).unwrap();
         unsafe { arena.rewind_to(mark) };
         let _overwrite = arena.alloc_slice_with(1024, |_| 0x5au8).unwrap();

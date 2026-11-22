@@ -152,6 +152,11 @@ enum ColdRequest {
     /// table: the stream runs it once, before its first row, waiting on its
     /// reads like any build.
     Subquery,
+    /// A simple Query of an analyzed table joined with itself by a
+    /// condition no hash or merge join applies: PostgreSQL's nested loop
+    /// over a `Materialize` of the inner scan, run by its pull nodes, whose
+    /// scans resume each wait where it stopped.
+    NestLoopQuery,
 }
 
 #[test]
@@ -278,6 +283,14 @@ fn derived_self_joins_merge_and_stream() {
 }
 
 #[test]
+fn modeled_nested_loops_stream_cold_tables() {
+    cold_result_stream(
+        "result-stream-cold-nest-loop-query",
+        ColdRequest::NestLoopQuery,
+    );
+}
+
+#[test]
 fn uncorrelated_subqueries_run_once_before_the_stream() {
     cold_result_stream("result-stream-cold-subquery", ColdRequest::Subquery);
 }
@@ -340,6 +353,9 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         insert.push_str("')");
     }
     session.success(&mut engine, &insert, false);
+    if request == ColdRequest::NestLoopQuery {
+        session.success(&mut engine, "ANALYZE cold_orders", false);
+    }
     assert!(engine.checkpoint().unwrap());
     drop((session, engine));
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -427,6 +443,10 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             ColdRequest::RightJoin => paged_request(
                 "SELECT b.id, b.code FROM cold_orders a RIGHT JOIN cold_orders b ON a.id = b.id",
                 50,
+            ),
+            ColdRequest::NestLoopQuery => query(
+                "SELECT a.id, a.code FROM cold_orders a \
+                 JOIN cold_orders b ON a.id <= b.id AND a.id >= b.id",
             ),
             ColdRequest::Copy => query("COPY cold_orders TO STDOUT"),
             ColdRequest::Distinct => paged_request(
@@ -556,7 +576,8 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         | ColdRequest::GroupedQuery
         | ColdRequest::SpooledJoin
         | ColdRequest::CteTwice
-        | ColdRequest::DerivedSelfJoin => {
+        | ColdRequest::DerivedSelfJoin
+        | ColdRequest::NestLoopQuery => {
             assert_eq!(kinds.iter().filter(|kind| **kind == b'T').count(), 1);
             assert_eq!(response[kinds.len() - 2].1, b"SELECT 320\0");
         }

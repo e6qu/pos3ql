@@ -17,6 +17,7 @@ use core::cmp::Ordering;
 use crate::mem::arena::{Arena, ArenaList};
 use crate::mem::lease_pool::{LeaseError, MutableSlice};
 use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::exec::ProjectedValue;
 use crate::sql::pg_qsort::{self, HeapOffer};
 use crate::sql_err;
 
@@ -115,14 +116,27 @@ struct Heap<'a> {
     order: &'a mut [u32],
     count: usize,
     entries: &'a mut [(u32, u32)],
+    /// Each entry's row's charge.
+    charges: &'a mut [usize],
     rows: HeapRows,
     charge: usize,
+    /// Where the top row's sort keys start in it.
+    top_keys: usize,
+}
+
+impl Heap<'_> {
+    fn locate_top_keys(&mut self, keys_column: usize) {
+        let top = self.rows.row(self.entries, self.order[0]);
+        self.top_keys = ProjectedValue::column(top, keys_column).offset();
+    }
 }
 
 pub(super) struct BoundedSort<'t, 'a> {
     tuples: &'t SortTuples,
     source: SizeSource<'t>,
     bound: usize,
+    /// The column of a row where its sort keys start.
+    keys_column: usize,
     model: Option<TuplesortModel>,
     /// The first row read, which decides how the sort copies rows.
     first: Option<&'a [u8]>,
@@ -133,11 +147,13 @@ pub(super) struct BoundedSort<'t, 'a> {
 }
 
 impl<'t, 'a> BoundedSort<'t, 'a> {
-    /// A sort keeping the `bound` first rows, `bound` at least one.
+    /// A sort keeping the `bound` first rows, `bound` at least one, of
+    /// rows whose sort keys start at column `keys_column`.
     pub(super) fn new(
         tuples: &'t SortTuples,
         source: SizeSource<'t>,
         bound: usize,
+        keys_column: usize,
         arena: &'a Arena,
     ) -> Self {
         debug_assert!(bound > 0, "a limit of no rows reads nothing");
@@ -145,12 +161,26 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
             tuples,
             source,
             bound,
+            keys_column,
             model: None,
             first: None,
             early: ArenaList::new_persistent(arena),
             heap: None,
             arena,
         }
+    }
+
+    /// The formed heap's greatest row's first sort key. A row not less than it is one
+    /// [`Self::push`] would discard, and stays one as later rows replace
+    /// the top, which only ever decreases; once the heap forms, a discarded
+    /// row changes nothing the sort reports (`model.space` reads only the
+    /// heap's charge), so the caller may drop such a row without pushing it.
+    pub(super) fn top(&self) -> Option<ProjectedValue<'_>> {
+        let heap = self.heap.as_ref()?;
+        Some(ProjectedValue::at(
+            heap.rows.row(heap.entries, heap.order[0]),
+            heap.top_keys,
+        ))
     }
 
     /// Whether the heap formed, so a row passed to [`Self::push`] may be
@@ -170,7 +200,9 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
         let model = self
             .model
             .get_or_insert_with(|| self.tuples.model(Some(first), Some(self.bound)));
-        self.tuples.push(self.source, model, Some(first), row)?;
+        let (_, chunk) = self
+            .tuples
+            .push_charged(self.source, model, Some(first), row)?;
         let bounded = model.bounded();
         let Some(heap) = self.heap.as_mut() else {
             self.early.push(row).map_err(|_| arena_full())?;
@@ -180,14 +212,15 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
             return Ok(());
         };
         // `bounded_heap_charge` for a row past the heap's forming.
-        let chunk = self.tuples.chunk(self.source, first, row);
         heap.charge += chunk;
         let Heap {
             order,
             count,
             entries,
+            charges,
             rows,
             charge,
+            top_keys,
         } = heap;
         let incoming = u32::MAX;
         let mut by_id = |left: u32, right: u32| {
@@ -204,14 +237,15 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
             HeapOffer::Insert => unreachable!("a formed heap is full"),
             HeapOffer::Discard => *charge -= chunk,
             HeapOffer::ReplaceTop(top) => {
-                *charge -= self
-                    .tuples
-                    .chunk(self.source, first, rows.row(entries, top));
+                *charge -= charges[top as usize];
+                charges[top as usize] = chunk;
                 rows.store(entries, top, row)?;
                 let mut by_id = |left: u32, right: u32| {
                     compare(rows.row(entries, left), rows.row(entries, right))
                 };
                 pg_qsort::bounded_heap_replace_top(&mut order[..*count], top, &mut by_id)?;
+                let top = rows.row(entries, order[0]);
+                *top_keys = ProjectedValue::column(top, self.keys_column).offset();
             }
         }
         Ok(())
@@ -259,18 +293,28 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
             .arena
             .alloc_persistent_slice_with(self.bound, |_| (0u32, 0u32))
             .map_err(|_| arena_full())?;
+        let charges = self
+            .arena
+            .alloc_persistent_slice_with(self.bound, |_| 0usize)
+            .map_err(|_| arena_full())?;
         for (position, at) in order.iter_mut().enumerate().take(count) {
-            rows.store(entries, position as u32, early[*at as usize])?;
+            let row = early[*at as usize];
+            rows.store(entries, position as u32, row)?;
+            charges[position] = self.tuples.chunk(self.source, first, row);
             *at = position as u32;
         }
         rows.garbage = 0;
-        self.heap = Some(Heap {
+        let mut heap = Heap {
             order,
             count,
             entries,
+            charges,
             rows,
             charge,
-        });
+            top_keys: 0,
+        };
+        heap.locate_top_keys(self.keys_column);
+        self.heap = Some(heap);
         Ok(())
     }
 
@@ -297,6 +341,7 @@ impl<'t, 'a> BoundedSort<'t, 'a> {
             entries,
             rows,
             charge,
+            ..
         } = heap;
         let order = &mut order[..count];
         pg_qsort::sort_bounded_heap(order, &mut |left, right| {

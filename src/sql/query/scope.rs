@@ -523,6 +523,9 @@ enum ScopeDefinition<'a> {
     },
     Retained {
         table: usize,
+        image: crate::storage::DefinitionImageId,
+        /// The retained definition's column count, read on every row.
+        n_columns: usize,
         names: &'a [&'a str],
     },
 }
@@ -543,11 +546,25 @@ impl<'a> QueryDefinitions<'a> {
                     .retained_relation(image)
                     .expect("scope retains its catalog definition"),
             ),
-            ScopeDefinition::Retained { table, .. } => Some(RelationDefinition::from_definition(
-                self.images
-                    .retained_definition(table, self.transaction)
-                    .expect("scope retains its registered definition"),
+            ScopeDefinition::Retained { image, .. } => Some(RelationDefinition::from_definition(
+                self.images.retained_table(image),
             )),
+        }
+    }
+
+    /// A retained table's column count, without reading its image.
+    fn retained_columns(&self, index: usize) -> Option<usize> {
+        match self.sources.get(index).copied().flatten()? {
+            ScopeDefinition::Retained { n_columns, .. } => Some(n_columns),
+            _ => None,
+        }
+    }
+
+    /// `get(index)?.n_columns`, read without a retained table's image.
+    pub(crate) fn n_columns(&self, index: usize) -> Option<usize> {
+        match self.retained_columns(index) {
+            Some(n_columns) => Some(n_columns),
+            None => Some(self.get(index)?.n_columns),
         }
     }
 
@@ -555,17 +572,20 @@ impl<'a> QueryDefinitions<'a> {
         match self.sources.get(index).copied().flatten()? {
             ScopeDefinition::Synthetic {
                 table: Some(table), ..
-            }
-            | ScopeDefinition::Retained { table, .. } => {
-                self.images.retained_definition(table, self.transaction)
-            }
+            } => self.images.retained_definition(table, self.transaction),
+            ScopeDefinition::Retained { image, .. } => Some(self.images.retained_table(image)),
             ScopeDefinition::Relation { .. } => None,
             ScopeDefinition::Synthetic { table: None, .. } => None,
         }
     }
 
-    fn retain(&self, storage: &Storage, table: usize) -> Result<&TableDef, SqlError> {
-        self.images.definition(storage, table, self.transaction)
+    fn retain(
+        &self,
+        storage: &Storage,
+        table: usize,
+    ) -> Result<(crate::storage::DefinitionImageId, &TableDef), SqlError> {
+        let image = self.images.retain_table(storage, table, self.transaction)?;
+        Ok((image, self.images.retained_table(image)))
     }
 
     fn set_arena(&mut self, index: usize, definition: RelationDefinition<'a>) {
@@ -1007,6 +1027,17 @@ fn left_items<'s, 'd>(
 }
 
 impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
+            return left_items(self).stored_form(qualifier, name);
+        }
+        self.answer(qualifier, name, self.target().stored_form(qualifier, name))
+    }
+
     fn suggest_columns(
         &self,
         suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
@@ -1234,6 +1265,16 @@ pub(crate) struct OuterColumnTypes<'s, 'row>(pub(crate) &'s dyn ColumnLookup<'ro
 pub(crate) struct ResolverColumns<'s>(pub(crate) &'s dyn crate::sql::exec::ColTypeResolver);
 
 impl<'a> ColumnLookup<'a> for ResolverColumns<'_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.0.resolve(qualifier, name).map(|_| Datum::Null)
     }
@@ -1274,6 +1315,16 @@ impl<'a> ColumnLookup<'a> for ResolverColumns<'_> {
 }
 
 impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn suggest_columns(
         &self,
         suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
@@ -1340,6 +1391,16 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn suggest_columns(
         &self,
         suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
@@ -2660,31 +2721,28 @@ impl<'d> QueryScope<'d> {
         let _block = super::instrument::enter(super::instrument::Segment::Derived(
             u16::try_from(position).unwrap_or(u16::MAX),
         ));
-        let select_rows =
-            |emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>| match order {
-                super::group::RowOrder::Observed => {
-                    select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
-                }
-                super::group::RowOrder::Unobserved => {
-                    super::group::with_unobserved_order(sub, || {
-                        select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
-                    })
-                }
-            };
+        let select_rows = |emit: &mut crate::sql::query::RowSink<'_>| match order {
+            super::group::RowOrder::Observed => {
+                select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
+            }
+            super::group::RowOrder::Unobserved => super::group::with_unobserved_order(sub, || {
+                select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
+            }),
+        };
         if storage.spill_attached() {
             // A stable all-equal sort is an insertion-order spool. Resetting
             // one leased producer cannot disturb a nested child's producer.
             let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
             let mut sorter = storage.external_sorter()?;
             sorter.reset();
-            select_rows(&mut |values| {
+            select_rows(&mut |values, forms| {
                 storage
                     .with_block_store(|blocks| {
                         sorter.push_projected_by(
                             storage,
                             blocks,
                             values.len(),
-                            |column| values[column],
+                            |column| Ok((values[column], forms[column])),
                             &mut compare,
                         )
                     })
@@ -2701,8 +2759,8 @@ impl<'d> QueryScope<'d> {
             let mut store: *mut &[u8] = core::ptr::null_mut();
             let mut len = 0usize;
             let mut cap = 0usize;
-            select_rows(&mut |values| {
-                let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
+            select_rows(&mut |values, forms| {
+                let encoded = crate::sql::exec::encode_projected_formed(values, forms, arena)?;
                 if len == cap {
                     let new_cap = if cap == 0 { 8 } else { cap * 2 };
                     let fresh: &mut [&[u8]] = arena
@@ -3345,7 +3403,7 @@ impl<'d> QueryScope<'d> {
                 tref.schema.unwrap_or(tref.table),
             ));
         };
-        let stored_def = self.defs.retain(storage, slot)?;
+        let (image, stored_def) = self.defs.retain(storage, slot)?;
         let source_scope = self
             .type_sources
             .as_ref()
@@ -3431,7 +3489,7 @@ impl<'d> QueryScope<'d> {
                     .iter()
                     .flatten()
                     .find_map(|source| match source {
-                        ScopeDefinition::Retained { table, names } if *table == slot => {
+                        ScopeDefinition::Retained { table, names, .. } if *table == slot => {
                             Some(*names)
                         }
                         _ => None,
@@ -3450,7 +3508,12 @@ impl<'d> QueryScope<'d> {
                         &*names
                     }
                 };
-                ScopeDefinition::Retained { table: slot, names }
+                ScopeDefinition::Retained {
+                    table: slot,
+                    image,
+                    n_columns: stored_def.n_columns,
+                    names,
+                }
             }
         };
         self.defs.sources[self.n] = Some(source);
@@ -4040,6 +4103,26 @@ impl<'d> QueryScope<'d> {
         }
     }
 
+    /// `SELECT *` as each table's column count in order, when no `USING` or
+    /// `NATURAL` merge reorders it: [`Self::star_entries`] lists every
+    /// column of each table in turn.
+    pub(crate) fn star_tables(&self) -> Option<impl Iterator<Item = (usize, usize)> + '_> {
+        (self.n_output == 0)
+            .then(|| (0..self.n).map(|t| (t, self.defs.n_columns(t).expect("resolved"))))
+    }
+
+    /// Every `SELECT *` output column in order, reading each relation's
+    /// definition once.
+    pub(crate) fn star_entries(&self) -> impl Iterator<Item = ResolvedColumn> + '_ {
+        let outputs = self.output[..self.n_output].iter().copied();
+        let tables = if self.n_output > 0 { 0 } else { self.n };
+        let tables = (0..tables).flat_map(move |t| {
+            let columns = self.defs.n_columns(t).expect("resolved");
+            (0..columns).map(move |c| ResolvedColumn::Table(t, c))
+        });
+        outputs.chain(tables)
+    }
+
     /// The i-th `SELECT *` output column.
     pub fn star_entry(&self, i: usize) -> ResolvedColumn {
         if self.n_output > 0 {
@@ -4047,7 +4130,7 @@ impl<'d> QueryScope<'d> {
         }
         let mut k = i;
         for t in 0..self.n {
-            let n_cols = self.defs.get(t).expect("resolved").n_columns;
+            let n_cols = self.defs.n_columns(t).expect("resolved");
             if k < n_cols {
                 return ResolvedColumn::Table(t, k);
             }
@@ -4697,6 +4780,10 @@ impl<'d> QueryScope<'d> {
     /// Width of an entry in flat (table-by-table) row layouts: its visible
     /// columns, plus the member columns of a parenthesized join.
     pub(crate) fn stored_width(&self, table: usize) -> usize {
+        // A retained table's definition lists exactly its columns.
+        if let Some(n_columns) = self.defs.retained_columns(table) {
+            return n_columns;
+        }
         let definition = self.defs.get(table).expect("resolved");
         if self.members.iter().any(|member| member.table == table) {
             definition.columns.len()
@@ -4844,12 +4931,14 @@ mod tests {
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage.create_table(definition("original", 1)).unwrap();
+        let images = storage.table_definition_images();
+        let image = images.retain_table(&storage, table, 0).unwrap();
         let mut sources = [Some(ScopeDefinition::Retained {
             table,
+            image,
+            n_columns: 1,
             names: &["c0"],
         })];
-        let images = storage.table_definition_images();
-        images.definition(&storage, table, 0).unwrap();
         let definitions = QueryDefinitions {
             sources: &mut sources,
             images,

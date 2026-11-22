@@ -310,33 +310,14 @@ fn analyze_mcv_list(
 }
 
 /// The bytes of a variable-length value's data as PostgreSQL stores it,
-/// without the length header. Text, `bytea`, `inet`, `cidr` and `numeric`
-/// (base-10000 digits after a two-byte short or four-byte long header) are
-/// exact;
-/// other types count their row encoding's payload.
+/// without the length header: the payload PostgreSQL's memory model sizes,
+/// else an array's element data, else the row encoding's payload.
 pub(crate) fn raw_value_length(value: &Datum<'_>) -> usize {
+    if let Some(payload) = crate::sql::query::postgres_memory::varlena_payload(None, value) {
+        return payload;
+    }
     match value {
-        Datum::Text(text) | Datum::Bpchar(text) => text.len(),
-        Datum::Bytea(bytes) => bytes.len(),
-        // `inet_struct`: the family and mask length bytes, then the
-        // address's own bytes (`SET_INET_VARSIZE`).
-        Datum::Inet(address) | Datum::Cidr(address) => 2 + address.addr_len(),
-        Datum::Numeric(number) => {
-            if number.is_special() {
-                2
-            } else {
-                let short = number.dscale <= 63 && (-64..=63).contains(&number.weight);
-                (if short { 2 } else { 4 }) + 2 * number.ndigits()
-            }
-        }
         Datum::Array { element, raw } => array_data_length(*element, raw),
-        Datum::TsVector(text) => tsvector_data_length(text.as_str()),
-        // PostgreSQL's binary `jsonb`, range and multirange images, not
-        // their text.
-        Datum::Json { jsonb: true, .. } | Datum::Range { .. } | Datum::Multirange { .. } => {
-            crate::sql::query::postgres_memory::varlena_payload(None, value)
-                .expect("a jsonb, range or multirange image has a size")
-        }
         other => {
             crate::storage::rowenc::encoded_len(core::slice::from_ref(other)).saturating_sub(3)
         }

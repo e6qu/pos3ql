@@ -11,6 +11,7 @@ use crate::pg::respond::{Responder, ResultFmt};
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
+use crate::storage::StoredForm;
 use crate::storage::{ColumnMeta, Storage, TableDef};
 
 use super::ast::{
@@ -79,6 +80,8 @@ pub(crate) use scan::Chained;
 #[cfg(test)]
 pub(crate) use scan::JOIN_CANDIDATES;
 pub use scan::JoinRow;
+#[cfg(test)]
+pub(crate) use scan::PathScan;
 pub(crate) use scan::predicate_is_implied;
 pub(crate) use scan::select_hash_join_plan;
 pub(crate) use scan::{
@@ -3950,7 +3953,7 @@ pub(crate) fn execute_routine_query<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     recycling: bool,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    emit: &mut crate::sql::query::RowSink<'_>,
 ) -> Result<(), SqlError> {
     execute_routine_query_under(
         query, storage, txid, arena, params, recycling, None, None, emit,
@@ -3971,7 +3974,7 @@ pub(crate) fn execute_bound_routine_query<'a>(
     params: &[Datum<'a>],
     recycling: bool,
     sequences: Option<&dyn SequenceAccess>,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    emit: &mut crate::sql::query::RowSink<'_>,
 ) -> Result<(), SqlError> {
     if routine.body_kind == crate::storage::RoutineBodyKind::String {
         return execute_routine_query_under(
@@ -4138,7 +4141,7 @@ pub(crate) fn execute_routine_query_under<'a>(
         crate::storage::PathContext,
         crate::storage::StoredQueryDependencyView<'a>,
     )>,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    emit: &mut crate::sql::query::RowSink<'_>,
 ) -> Result<(), SqlError> {
     // Nested SQL owns its input frames; row recycling must not reclaim a
     // caller's frames while that caller is still preparing its arguments.
@@ -4392,6 +4395,26 @@ pub(crate) fn execute_index_comparison<'a>(
     Ok(comparison.cmp(&0))
 }
 
+/// The result of operator call `schema.name` over `arguments` a built-in
+/// operator gives: one of `pg_catalog`'s geometric or prefix operators by
+/// any search path, or another `pg_catalog` operator named so.
+pub(crate) fn builtin_operator_call_result(
+    schema: Option<&str>,
+    name: &str,
+    arguments: &[i32],
+) -> Option<ColType> {
+    let catalog = schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"));
+    if catalog && let Some(ctype) = super::eval::funcs::geometry::operator_result(name, arguments) {
+        return Some(ctype);
+    }
+    if (arguments.len() == 1 && catalog)
+        || schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+    {
+        return builtin_operator_result(name, arguments);
+    }
+    None
+}
+
 pub(crate) fn builtin_operator_result(name: &str, arguments: &[i32]) -> Option<ColType> {
     if let Some(result) = super::eval::funcs::geometry::operator_result(name, arguments) {
         return Some(result);
@@ -4401,6 +4424,16 @@ pub(crate) fn builtin_operator_result(name: &str, arguments: &[i32]) -> Option<C
         .any(|oid| matches!(ColType::from_oid(*oid), Some(ColType::Geometry(_))))
     {
         return None;
+    }
+    if let [operand] = *arguments {
+        // `!!` is the one built-in prefix operator the parser leaves as an
+        // operator call: `tsquery_not`.
+        return (name == "!!"
+            && matches!(
+                operand,
+                crate::sql::types::oid::TSQUERY | crate::sql::types::oid::UNKNOWN
+            ))
+        .then_some(ColType::TsQuery);
     }
     if arguments.len() != 2 {
         return None;
@@ -5641,7 +5674,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         &parameters[..arguments.len()],
                         true,
                         sequences,
-                        &mut |_| Ok(()),
+                        &mut |_, _| Ok(()),
                     )?;
                 }
                 frame.statement.set(function_program.preceding.len() + 1);
@@ -5677,7 +5710,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                             &parameters[..arguments.len()],
                             true,
                             sequences,
-                            &mut |_| Ok(()),
+                            &mut |_, _| Ok(()),
                         )?;
                         return Ok(Some(Datum::Text("")));
                     }
@@ -5696,7 +5729,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     &parameters[..arguments.len()],
                     true,
                     sequences,
-                    &mut |values| {
+                    &mut |values, _| {
                         if result.is_none() {
                             result = Some(result_shape.capture(
                                 values,
@@ -6207,7 +6240,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             arena,
             &[],
             false,
-            &mut |row| {
+            &mut |row, _| {
                 // PostgreSQL checks the result description after executing
                 // the query, including when it returns no rows.
                 if !valid || row.iter().any(Datum::is_null) {
@@ -7457,16 +7490,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             if !(1..=2).contains(&argument_type_oids.len()) {
                 return None;
             }
-            if schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-                && let Some(ctype) =
-                    super::eval::funcs::geometry::operator_result(operator, argument_type_oids)
+            if let Some(ctype) = builtin_operator_call_result(schema, operator, argument_type_oids)
             {
                 return Some(ctype.oid());
-            }
-            if argument_type_oids.len() == 2
-                && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-            {
-                return builtin_operator_result(operator, argument_type_oids).map(ColType::oid);
             }
             let (left_oid, right_oid) = if argument_type_oids.len() == 1 {
                 (None, Some(argument_type_oids[0]))
@@ -12145,6 +12171,7 @@ fn window_row<'r, 'a>(
         values: scan::JoinRowValues::Flat {
             values: flat,
             offsets: offs,
+            forms: None,
         },
         rowids: &[],
         visible: scope.n,
@@ -15401,6 +15428,7 @@ pub(crate) fn select_query_resumable<'a>(
                         row_hooks
                     };
                     let mut projected = [Datum::Null; MAX_PROJ];
+                    let mut forms = [StoredForm::Inline; MAX_PROJ];
                     let n = project_row(
                         statement.items,
                         &scope,
@@ -15409,6 +15437,7 @@ pub(crate) fn select_query_resumable<'a>(
                         params,
                         use_hooks,
                         &mut projected,
+                        &mut forms,
                         None,
                     )?;
                     match emit_data_row(storage, txid, arena, responder, &projected[..n]) {
@@ -16404,19 +16433,26 @@ pub(crate) fn constant_select_resumable<'a>(
     sql_ok()
 }
 
+/// A consumer of result rows: each row's values and the stored form each
+/// keeps.
+pub(crate) type RowSink<'s> =
+    dyn for<'row> FnMut(&[Datum<'row>], &[StoredForm]) -> Result<(), SqlError> + 's;
+
+/// [`RowSink`] that answers whether to keep reading rows.
+pub(crate) type RowEmitter<'s> =
+    dyn for<'row> FnMut(&[Datum<'row>], &[StoredForm]) -> Result<bool, SqlError> + 's;
+
 /// Stop the producer immediately after the requested number of completed
 /// rows. The local flag identifies this consumer's private completion only.
 pub(crate) fn consume_query_rows(
     limit: core::num::NonZeroU64,
-    evaluate: impl FnOnce(
-        &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
-    ) -> Result<(), SqlError>,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    evaluate: impl FnOnce(&mut crate::sql::query::RowSink<'_>) -> Result<(), SqlError>,
+    emit: &mut crate::sql::query::RowSink<'_>,
 ) -> Result<(), SqlError> {
     let mut remaining = limit.get();
     let mut completed = false;
-    let result = evaluate(&mut |values| {
-        emit(values)?;
+    let result = evaluate(&mut |values, forms| {
+        emit(values, forms)?;
         remaining -= 1;
         if remaining == 0 {
             completed = true;
@@ -16447,7 +16483,7 @@ pub fn select_into_rows<'a>(
     params: &[Datum<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
     seq: Option<&dyn SequenceAccess>,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    emit: &mut crate::sql::query::RowSink<'_>,
 ) -> Result<(), SqlError> {
     select_into_rows_mode(
         storage, txid, statement, arena, params, outer, seq, false, emit,
@@ -16480,7 +16516,7 @@ pub(super) fn select_into_rows_recycling<'a>(
     params: &[Datum<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
     seq: Option<&dyn SequenceAccess>,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    emit: &mut crate::sql::query::RowSink<'_>,
 ) -> Result<(), SqlError> {
     select_into_rows_mode(
         storage, txid, statement, arena, params, outer, seq, true, emit,
@@ -16552,7 +16588,7 @@ fn select_into_rows_mode<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     seq: Option<&dyn SequenceAccess>,
     recycle_rows: bool,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    emit: &mut crate::sql::query::RowSink<'_>,
 ) -> Result<(), SqlError> {
     let statement = expand_select_record_calls(statement, storage, txid, arena, outer)?;
     let statement = pullup::pull_up_subqueries(statement, storage, txid, arena, outer)?;
@@ -16669,15 +16705,17 @@ fn select_into_rows_mode<'a>(
             }
         }
         let mut vals = [Datum::Null; MAX_PROJ];
+        let mut forms = [StoredForm::Inline; MAX_PROJ];
         let below_limit = stages.below_limit();
         below_limit.rows(start as u64);
         for row in &rows[start..end] {
             below_limit.row();
             stages.limit.row();
-            for (c, slot) in vals[..n].iter_mut().enumerate() {
+            for (c, (slot, form)) in vals[..n].iter_mut().zip(forms.iter_mut()).enumerate() {
                 *slot = super::exec::decode_projected_col_record(row, c, arena)?;
+                *form = super::exec::projected_stored_form(row, c);
             }
-            emit(&vals[..n])?;
+            emit(&vals[..n], &forms[..n])?;
         }
         return Ok(());
     }
@@ -16838,11 +16876,13 @@ fn select_into_rows_mode<'a>(
                 return Ok(());
             }
             let mut vals = [Datum::Null; MAX_PROJ];
+            let mut forms = [StoredForm::Inline; MAX_PROJ];
             let mut n = 0;
             for item in statement.items {
                 match item {
                     SelectItem::Expr { expression, .. } => {
                         vals[n] = eval_full(expression, arena, params, &row, &agg_hooks)?;
+                        forms[n] = crate::sql::toast::passed_form(expression, &row, &vals[n])?;
                         n += 1;
                     }
                     SelectItem::RecordStar(base) => {
@@ -16862,7 +16902,7 @@ fn select_into_rows_mode<'a>(
                 }
             }
             stages.limit.row();
-            emit(&vals[..n])?;
+            emit(&vals[..n], &forms[..n])?;
             return Ok(());
         };
         let scope = QueryScope::resolve_exec_outer(
@@ -16958,7 +16998,9 @@ fn select_into_rows_mode<'a>(
             for (i, slot) in out.iter_mut().take(width).enumerate() {
                 *slot = super::exec::decode_projected_col_record(row, i, arena)?;
             }
-            emit(&out[..width])?;
+            let mut forms = [StoredForm::Inline; MAX_PROJ];
+            grouped_forms(statement.items, &out[..width], &mut forms)?;
+            emit(&out[..width], &forms[..width])?;
         }
         return Ok(());
     }
@@ -17053,11 +17095,13 @@ fn select_into_rows_mode<'a>(
                 hooks
             };
             let mut vals = [Datum::Null; MAX_PROJ];
+            let mut forms = [StoredForm::Inline; MAX_PROJ];
             let mut n = 0;
             for item in statement.items {
                 match item {
                     SelectItem::Expr { expression, .. } => {
                         vals[n] = eval_full(expression, arena, params, &cols, &khooks)?;
+                        forms[n] = crate::sql::toast::passed_form(expression, &cols, &vals[n])?;
                         n += 1;
                     }
                     SelectItem::RecordStar(base) => {
@@ -17078,7 +17122,7 @@ fn select_into_rows_mode<'a>(
             }
             if produced >= offset {
                 stages.limit.row();
-                emit(&vals[..n])?;
+                emit(&vals[..n], &forms[..n])?;
             }
             produced = produced.saturating_add(1);
             if produced >= offset.saturating_add(limit) {
@@ -17272,8 +17316,8 @@ fn select_into_rows_mode<'a>(
                 outer,
                 limit,
                 offset,
-                &mut |values| {
-                    emit(values)?;
+                &mut |values, forms| {
+                    emit(values, forms)?;
                     Ok(true)
                 },
             )?;
@@ -17285,6 +17329,7 @@ fn select_into_rows_mode<'a>(
             rows = rows.distinct(storage, txid, arena)?;
         }
         let proj_rows = rows.rows;
+        let proj_forms = rows.forms;
         let count = proj_rows.len();
         let order = rows.ordered(
             storage,
@@ -17298,7 +17343,7 @@ fn select_into_rows_mode<'a>(
         let start = (offset as usize).min(count);
         let n = ((count - start) as u64).min(limit) as usize;
         for &i in &order[start..start + n] {
-            emit(proj_rows[i])?;
+            emit(proj_rows[i], proj_forms[i])?;
         }
         return Ok(());
     }
@@ -17324,8 +17369,8 @@ fn select_into_rows_mode<'a>(
                 outer,
                 limit,
                 offset,
-                &mut |values, _rowids| {
-                    emit(values)?;
+                &mut |values, forms, _rowids| {
+                    emit(values, forms)?;
                     Ok(true)
                 },
             )?;
@@ -17373,8 +17418,8 @@ fn select_into_rows_mode<'a>(
             limit,
             offset,
             &stages,
-            &mut |values| {
-                emit(values)?;
+            &mut |values, forms| {
+                emit(values, forms)?;
                 Ok(true)
             },
         )?;
@@ -17427,6 +17472,7 @@ fn select_into_rows_mode<'a>(
             srf::ProjectSet::single()
         };
         if !project_set.any && srf_call.is_none() {
+            let mut forms = [StoredForm::Inline; MAX_PROJ];
             let n = project_row(
                 statement.items,
                 &scope,
@@ -17435,11 +17481,12 @@ fn select_into_rows_mode<'a>(
                 params,
                 row_hooks,
                 &mut projected,
+                &mut forms,
                 outer,
             )?;
             if produced >= offset {
                 stages.limit.row();
-                emit(&projected[..n])?;
+                emit(&projected[..n], &forms[..n])?;
             }
             produced = produced.saturating_add(1);
         } else {
@@ -17449,6 +17496,7 @@ fn select_into_rows_mode<'a>(
                     project_sets: Some(project_set.values),
                     ..*row_hooks
                 };
+                let mut forms = [StoredForm::Inline; MAX_PROJ];
                 let n = project_row(
                     statement.items,
                     &scope,
@@ -17457,11 +17505,12 @@ fn select_into_rows_mode<'a>(
                     params,
                     &srf_hooks,
                     &mut projected,
+                    &mut forms,
                     outer,
                 )?;
                 if produced >= offset {
                     stages.limit.row();
-                    emit(&projected[..n])?;
+                    emit(&projected[..n], &forms[..n])?;
                 }
                 produced = produced.saturating_add(1);
                 if produced >= stop_after {
@@ -17540,11 +17589,15 @@ fn project_row<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     out: &mut [Datum<'a>; MAX_PROJ],
+    // The TOAST form each output keeps (`toast::passed_form`).
+    forms: &mut [StoredForm; MAX_PROJ],
     // Enclosing query's row when this is a correlated subquery's body, so an
     // outer column in the select list resolves after this row's own.
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<usize, SqlError> {
-    project_row_skipping(items, None, scope, row, arena, params, hooks, out, outer)
+    project_row_skipping(
+        items, None, scope, row, arena, params, hooks, out, forms, outer,
+    )
 }
 
 /// [`project_row`], with `skip` marking items whose evaluation is deferred
@@ -17559,6 +17612,7 @@ fn project_row_skipping<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     out: &mut [Datum<'a>; MAX_PROJ],
+    forms: &mut [StoredForm; MAX_PROJ],
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<usize, SqlError> {
     // Star expansion reads this query's tables directly; only expressions may
@@ -17575,39 +17629,12 @@ fn project_row_skipping<'a>(
                 ));
             }
             out[n] = Datum::Null;
+            forms[n] = StoredForm::Inline;
             n += 1;
             continue;
         }
         match item {
             SelectItem::TableWildcard(q) => {
-                let value_of = |entry| match entry {
-                    ResolvedColumn::Table(t, c) => {
-                        let values = row.table_values(t).expect("bound");
-                        if values.is_empty() {
-                            Datum::Null
-                        } else {
-                            values[c]
-                        }
-                    }
-                    ResolvedColumn::Merged(m) => {
-                        let merged = &scope.merged[m];
-                        merged
-                            .parts
-                            .iter()
-                            .map(|&(t, c)| {
-                                let values = row.table_values(t).expect("bound");
-                                if values.is_empty() {
-                                    Datum::Null
-                                } else {
-                                    values[c]
-                                }
-                            })
-                            .find(|value| !value.is_null())
-                            .unwrap_or(Datum::Null)
-                    }
-                    // A star never expands to a system column.
-                    ResolvedColumn::TableOid(t) => row.table_oid(t).unwrap_or(Datum::Null),
-                };
                 for index in 0..scope.qualified_star_columns(q)? {
                     if n == MAX_PROJ {
                         return Err(sql_err!(
@@ -17615,39 +17642,42 @@ fn project_row_skipping<'a>(
                             "target lists can have at most 1664 entries"
                         ));
                     }
-                    out[n] = value_of(scope.qualified_star_entry(q, index)?);
+                    (out[n], forms[n]) =
+                        star_value(scope, row, scope.qualified_star_entry(q, index)?)?;
                     n += 1;
                 }
             }
             SelectItem::Wildcard(_) => {
-                let value_of = |t: usize, c: usize| {
-                    let vals = row.table_values(t).expect("bound");
-                    if vals.is_empty() {
-                        Datum::Null
-                    } else {
-                        vals[c]
+                if let Some(tables) = scope.star_tables() {
+                    for (t, columns) in tables {
+                        if n + columns > MAX_PROJ {
+                            return Err(sql_err!(
+                                sqlstate::TOO_MANY_COLUMNS,
+                                "target lists can have at most 1664 entries"
+                            ));
+                        }
+                        let vals = row.table_values(t).expect("bound");
+                        if vals.is_empty() {
+                            out[n..n + columns].fill(Datum::Null);
+                            forms[n..n + columns].fill(StoredForm::Inline);
+                        } else {
+                            out[n..n + columns].copy_from_slice(&vals[..columns]);
+                            for (c, form) in forms[n..n + columns].iter_mut().enumerate() {
+                                *form = row.column_form(t, c)?.unwrap_or(StoredForm::Inline);
+                            }
+                        }
+                        n += columns;
                     }
-                };
-                for k in 0..scope.star_columns() {
+                    continue;
+                }
+                for entry in scope.star_entries() {
                     if n == MAX_PROJ {
                         return Err(sql_err!(
                             sqlstate::TOO_MANY_COLUMNS,
                             "target lists can have at most 1664 entries"
                         ));
                     }
-                    out[n] = match scope.star_entry(k) {
-                        ResolvedColumn::Table(t, c) => value_of(t, c),
-                        // Merged USING/NATURAL column: first non-null side.
-                        ResolvedColumn::Merged(m) => {
-                            let mc = &scope.merged[m];
-                            mc.parts
-                                .iter()
-                                .map(|&(t, c)| value_of(t, c))
-                                .find(|v| !v.is_null())
-                                .unwrap_or(Datum::Null)
-                        }
-                        ResolvedColumn::TableOid(t) => row.table_oid(t).unwrap_or(Datum::Null),
-                    };
+                    (out[n], forms[n]) = star_value(scope, row, entry)?;
                     n += 1;
                 }
             }
@@ -17661,6 +17691,8 @@ fn project_row_skipping<'a>(
                         ));
                     }
                     out[n] = field.value;
+                    // A record's fields are formed with the record.
+                    forms[n] = StoredForm::Inline;
                     n += 1;
                 }
             }
@@ -17672,12 +17704,79 @@ fn project_row_skipping<'a>(
                     ));
                 }
                 out[n] = eval_full(expression, arena, params, &chained, hooks)?;
+                forms[n] = crate::sql::toast::passed_form(expression, &chained, &out[n])?;
                 n += 1;
             }
         }
     }
     materialize_composite_outputs(&mut out[..n], arena, hooks)?;
     Ok(n)
+}
+
+/// The stored forms a grouped query's output row `values` keeps, into
+/// `forms` ([`crate::sql::toast::grouped_form`]).
+fn grouped_forms(
+    items: &[SelectItem<'_>],
+    values: &[Datum<'_>],
+    forms: &mut [StoredForm; MAX_PROJ],
+) -> Result<(), SqlError> {
+    let mut at = 0;
+    for item in items {
+        if at >= values.len() {
+            break;
+        }
+        if let SelectItem::Expr { expression, .. } = item {
+            forms[at] = crate::sql::toast::grouped_form(expression, &values[at])?;
+            at += 1;
+            continue;
+        }
+        // A star or record expansion reads whole grouping keys.
+        let width = match item {
+            SelectItem::Expr { .. } => unreachable!("handled above"),
+            _ => values.len() - at,
+        };
+        for value in &values[at..at + width] {
+            forms[at] = crate::sql::toast::unknown_form(value).unwrap_or(StoredForm::Inline);
+            at += 1;
+        }
+    }
+    Ok(())
+}
+
+/// A star's column `entry` of `row` and the stored form it keeps. A merged
+/// `USING` column is its first non-null side; a star never expands to a
+/// system column.
+fn star_value<'a>(
+    scope: &QueryScope,
+    row: &JoinRow<'_, 'a, '_>,
+    entry: ResolvedColumn,
+) -> Result<(Datum<'a>, StoredForm), SqlError> {
+    let value_of = |table: usize, column: usize| -> Result<(Datum<'a>, StoredForm), SqlError> {
+        let values = row.table_values(table).expect("bound");
+        if values.is_empty() {
+            return Ok((Datum::Null, StoredForm::Inline));
+        }
+        let form = row
+            .column_form(table, column)?
+            .unwrap_or(StoredForm::Inline);
+        Ok((values[column], form))
+    };
+    match entry {
+        ResolvedColumn::Table(table, column) => value_of(table, column),
+        ResolvedColumn::Merged(merged) => {
+            for &(table, column) in scope.merged[merged].parts {
+                let (value, form) = value_of(table, column)?;
+                if !value.is_null() {
+                    return Ok((value, form));
+                }
+            }
+            Ok((Datum::Null, StoredForm::Inline))
+        }
+        ResolvedColumn::TableOid(table) => Ok((
+            row.table_oid(table).unwrap_or(Datum::Null),
+            StoredForm::Inline,
+        )),
+    }
 }
 
 /// Result rows must retain the structural composite value through the final
@@ -17693,6 +17792,13 @@ fn materialize_composite_outputs<'a>(
         return Ok(());
     };
     for value in values {
+        // Only enums, arrays and stored composites change.
+        if !matches!(
+            value,
+            Datum::Enum { .. } | Datum::Array { .. } | Datum::CompositeText { .. }
+        ) {
+            continue;
+        }
         *value = super::eval::materialize_enum_values(*value, Some(catalog), arena)?;
         *value = match *value {
             Datum::CompositeText {
@@ -19453,21 +19559,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
             if !(1..=2).contains(&arguments.len()) {
                 return None;
             }
-            if schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-                && let Some(ctype) =
-                    super::eval::funcs::geometry::operator_result(operator, arguments)
-            {
-                return Some(super::exec::StaticTypeMeta {
-                    type_oid: ctype.oid(),
-                    ctype,
-                    type_mod: -1,
-                    collation: super::ast::Collation::None,
-                });
-            }
-            if arguments.len() == 2
-                && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-            {
-                let ctype = builtin_operator_result(operator, arguments)?;
+            if let Some(ctype) = builtin_operator_call_result(schema, operator, arguments) {
                 return Some(super::exec::StaticTypeMeta {
                     type_oid: ctype.oid(),
                     ctype,
@@ -20241,6 +20333,7 @@ impl<'a> ReturningJoin<'a> {
             values: scan::JoinRowValues::Flat {
                 values,
                 offsets: self.offsets,
+                forms: None,
             },
             rowids: self.rowids,
             visible: self.scope.n,

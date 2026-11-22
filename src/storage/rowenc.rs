@@ -90,9 +90,123 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
     n
 }
 
+/// How a heap tuple stores one value after PostgreSQL's TOAST
+/// (`heap_toast_insert_or_update`). A row records it for each value not
+/// formed in line, so the form stays as stored through later reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredForm {
+    /// As `heap_form_tuple` formed it.
+    Inline,
+    /// pglz-compressed in line: the datum's `VARSIZE`.
+    Compressed(u32),
+    /// Saved in the TOAST relation: the bytes saved and whether they are
+    /// compressed.
+    External { saved: u32, compressed: bool },
+    /// Compressed by a method, or from bytes, the model does not size.
+    Unmodelled,
+}
+
+impl StoredForm {
+    /// The form a value keeps when it is stored in another relation:
+    /// `toast_tuple_init` fetches an out-of-line value back in line
+    /// (`detoast_external_attr`), still compressed if it was.
+    pub(crate) const fn fetched(self) -> Self {
+        match self {
+            Self::External {
+                saved,
+                compressed: true,
+            } => Self::Compressed(saved),
+            Self::External {
+                compressed: false, ..
+            } => Self::Inline,
+            other => other,
+        }
+    }
+}
+
+/// Bit 31 of a value's length word marks a [`StoredForm`] record after its
+/// payload: a kind byte and a `u32` size.
+const STORED_FORM_FLAG: u32 = 0x8000_0000;
+const STORED_FORM_BYTES: usize = 5;
+
+/// A value's payload length and the bytes of the form record after it.
+fn varlena_length(word: &[u8]) -> (usize, usize) {
+    let word = u32::from_le_bytes(word.try_into().expect("a four-byte length word"));
+    (
+        (word & !STORED_FORM_FLAG) as usize,
+        if word & STORED_FORM_FLAG != 0 {
+            STORED_FORM_BYTES
+        } else {
+            0
+        },
+    )
+}
+
+/// Whether `value`'s encoding begins with the length word a form record
+/// hangs off: the types PostgreSQL stores as varlenas that TOAST can
+/// compress or move out of line. A `tsquery` (`typstorage` plain) is
+/// always stored as `heap_form_tuple` forms it.
+pub(crate) const fn carries_stored_form(value: &Datum<'_>) -> bool {
+    matches!(
+        value,
+        Datum::Text(_)
+            | Datum::Bpchar(_)
+            | Datum::Json { .. }
+            | Datum::Xml(_)
+            | Datum::JsonPath(_)
+            | Datum::Range { .. }
+            | Datum::Multirange { .. }
+            | Datum::Geometry { .. }
+            | Datum::TsVector(_)
+            | Datum::Bit { .. }
+            | Datum::Array { .. }
+            | Datum::Bytea(_)
+    )
+}
+
+/// Whether a column of type `column` stores values that can carry a form.
+pub(crate) const fn column_carries_stored_form(column: ColType) -> bool {
+    matches!(
+        column,
+        ColType::Text
+            | ColType::Refcursor
+            | ColType::Varchar
+            | ColType::Bpchar
+            | ColType::Json
+            | ColType::Jsonb
+            | ColType::Xml
+            | ColType::Jsonpath
+            | ColType::TsVector
+            | ColType::Range(_)
+            | ColType::Multirange(_)
+            | ColType::Geometry(_)
+            | ColType::Bit { .. }
+            | ColType::Array(_)
+            | ColType::Bytea
+    )
+}
+
+/// [`encoded_len`] of a row whose values carry `forms` (`Inline` past its
+/// end).
+pub(crate) fn encoded_len_with_forms(values: &[Datum], forms: &[StoredForm]) -> usize {
+    encoded_len(values)
+        + forms
+            .iter()
+            .filter(|form| **form != StoredForm::Inline)
+            .count()
+            * STORED_FORM_BYTES
+}
+
 /// Encodes into `out`, which must be exactly `encoded_len` bytes.
 pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
-    debug_assert_eq!(out.len(), encoded_len(values));
+    encode_with_forms(values, &[], out);
+}
+
+/// [`encode`] of values stored in `forms`, whose length is
+/// [`encoded_len_with_forms`]. Only a value [`carries_stored_form`] has a
+/// form other than `Inline`.
+pub(crate) fn encode_with_forms(values: &[Datum], forms: &[StoredForm], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), encoded_len_with_forms(values, forms));
     let n = values.len();
     out[..2].copy_from_slice(&(n as u16).to_le_bytes());
     let bitmap_len = n.div_ceil(8);
@@ -332,8 +446,131 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
             }
             Datum::Null => unreachable!(),
         }
+        let mut take = take;
+        if let Some(form) = forms
+            .get(i)
+            .copied()
+            .filter(|form| *form != StoredForm::Inline)
+        {
+            assert!(carries_stored_form(v), "a stored form needs a length word");
+            let word = u32::from_le_bytes(rest[..4].try_into().expect("length word"));
+            rest[..4].copy_from_slice(&(word | STORED_FORM_FLAG).to_le_bytes());
+            let (kind, size) = match form {
+                StoredForm::Inline => unreachable!("filtered"),
+                StoredForm::Compressed(size) => (1, size),
+                StoredForm::External {
+                    saved,
+                    compressed: false,
+                } => (2, saved),
+                StoredForm::External {
+                    saved,
+                    compressed: true,
+                } => (3, saved),
+                StoredForm::Unmodelled => (4, 0),
+            };
+            rest[take] = kind;
+            rest[take + 1..take + STORED_FORM_BYTES].copy_from_slice(&size.to_le_bytes());
+            take += STORED_FORM_BYTES;
+        }
         rest = &mut rest[take..];
     }
+}
+
+/// The number of columns the encoded row `bytes` holds.
+pub(crate) fn encoded_column_count(bytes: &[u8]) -> Result<usize, SqlError> {
+    bytes
+        .get(..2)
+        .map(|count| u16::from_le_bytes([count[0], count[1]]) as usize)
+        .ok_or_else(|| sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt row encoding"))
+}
+
+/// The stored form of column `column` of the encoded row `bytes`, whose
+/// leading columns have types `schema`.
+pub(crate) fn stored_form(
+    bytes: &[u8],
+    schema: &[ColType],
+    column: usize,
+) -> Result<StoredForm, SqlError> {
+    let corrupt = || sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt row encoding");
+    let count = encoded_column_count(bytes)?;
+    if count < schema.len() || column >= schema.len() {
+        return Err(corrupt());
+    }
+    let bitmap_len = count.div_ceil(8);
+    let bitmap = bytes.get(2..2 + bitmap_len).ok_or_else(corrupt)?;
+    let mut at = 2 + bitmap_len;
+    for (index, &ctype) in schema.iter().enumerate().take(column + 1) {
+        if bitmap[index / 8] & (1 << (index % 8)) != 0 {
+            if index == column {
+                return Ok(StoredForm::Inline);
+            }
+            continue;
+        }
+        let rest = bytes.get(at..).ok_or_else(corrupt)?;
+        let length = encoded_value_len(rest, ctype)?;
+        if index == column {
+            return form_record(&rest[..length], ctype);
+        }
+        at += length;
+    }
+    unreachable!("the loop reaches column {column}")
+}
+
+/// The form an encoded value of type `ctype`, `value` bytes long, records.
+fn form_record(value: &[u8], ctype: ColType) -> Result<StoredForm, SqlError> {
+    if !column_carries_stored_form(ctype)
+        || value.len() < STORED_FORM_BYTES + 4
+        || u32::from_le_bytes(value[..4].try_into().expect("length word")) & STORED_FORM_FLAG == 0
+    {
+        return Ok(StoredForm::Inline);
+    }
+    let record = &value[value.len() - STORED_FORM_BYTES..];
+    let size = u32::from_le_bytes(record[1..].try_into().expect("form size"));
+    Ok(match record[0] {
+        1 => StoredForm::Compressed(size),
+        2 => StoredForm::External {
+            saved: size,
+            compressed: false,
+        },
+        3 => StoredForm::External {
+            saved: size,
+            compressed: true,
+        },
+        4 => StoredForm::Unmodelled,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "corrupt row encoding"
+            ));
+        }
+    })
+}
+
+/// The stored form of each column of the encoded row `bytes` into `forms`.
+pub(crate) fn stored_forms(
+    bytes: &[u8],
+    schema: &[ColType],
+    forms: &mut [StoredForm],
+) -> Result<(), SqlError> {
+    let corrupt = || sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt row encoding");
+    let count = encoded_column_count(bytes)?;
+    if count != schema.len() || forms.len() < count {
+        return Err(corrupt());
+    }
+    let bitmap_len = count.div_ceil(8);
+    let bitmap = bytes.get(2..2 + bitmap_len).ok_or_else(corrupt)?;
+    let mut at = 2 + bitmap_len;
+    for column in 0..count {
+        forms[column] = StoredForm::Inline;
+        if bitmap[column / 8] & (1 << (column % 8)) != 0 {
+            continue;
+        }
+        let rest = bytes.get(at..).ok_or_else(corrupt)?;
+        let length = encoded_value_len(rest, schema[column])?;
+        forms[column] = form_record(&rest[..length], schema[column])?;
+        at += length;
+    }
+    Ok(())
 }
 
 /// Splits a canonical stored row into its physical column payloads.  The
@@ -432,7 +669,8 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Bytea
         | ColType::PgNodeTree => {
             let length = bytes.get(..4).ok_or_else(corrupt)?;
-            Some(4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+            let (length, form_bytes) = varlena_length(length);
+            Some(4 + length + form_bytes)
         }
         ColType::Regtype => {
             let length = bytes.get(4..8).ok_or_else(corrupt)?;
@@ -453,11 +691,11 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         }
         ColType::Array(_) | ColType::Bit { .. } => {
             let length = bytes.get(..4).ok_or_else(corrupt)?;
-            let payload = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+            let (payload, form_bytes) = varlena_length(length);
             if payload == 0 {
                 return Err(corrupt());
             }
-            Some(4 + payload)
+            Some(4 + payload + form_bytes)
         }
         ColType::Enum(_) => {
             let length = bytes.get(8..12).ok_or_else(corrupt)?;
@@ -768,10 +1006,10 @@ pub(crate) fn decode<'a>(
             | ColType::Bpchar
             | ColType::Name => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                let (len, form_bytes) = varlena_length(b);
                 at += 4;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
-                at += len;
+                at += len + form_bytes;
                 let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 // A char(n) value is stored blank-padded, and in PostgreSQL the
                 // padding is part of the value — `max(c)` returns it padded
@@ -813,19 +1051,19 @@ pub(crate) fn decode<'a>(
             }
             ColType::Array(element) => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let payload = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                let (payload, form_bytes) = varlena_length(b);
                 at += 4;
                 // Skip the element-type code byte; the schema is authoritative.
                 let raw = bytes.get(at + 1..at + payload).ok_or_else(corrupt)?;
-                at += payload;
+                at += payload + form_bytes;
                 out[i] = Datum::Array { element, raw };
             }
             ColType::Json | ColType::Jsonb => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                let (len, form_bytes) = varlena_length(b);
                 at += 4;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
-                at += len;
+                at += len + form_bytes;
                 let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = Datum::Json {
                     text: s,
@@ -834,26 +1072,26 @@ pub(crate) fn decode<'a>(
             }
             ColType::Xml => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                let (len, form_bytes) = varlena_length(b);
                 at += 4;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
-                at += len;
+                at += len + form_bytes;
                 out[i] = Datum::Xml(core::str::from_utf8(raw).map_err(|_| corrupt())?);
             }
             ColType::Jsonpath => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                let (len, form_bytes) = varlena_length(b);
                 at += 4;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
-                at += len;
+                at += len + form_bytes;
                 out[i] = Datum::JsonPath(core::str::from_utf8(raw).map_err(|_| corrupt())?);
             }
             ColType::TsVector | ColType::TsQuery => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                let (len, form_bytes) = varlena_length(b);
                 at += 4;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
-                at += len;
+                at += len + form_bytes;
                 let text = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = if matches!(schema[i], ColType::TsVector) {
                     Datum::TsVector(crate::sql::full_text::restore_vector(text))
@@ -863,28 +1101,28 @@ pub(crate) fn decode<'a>(
             }
             ColType::Range(kind) => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                let (len, form_bytes) = varlena_length(b);
                 at += 4;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
-                at += len;
+                at += len + form_bytes;
                 let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = Datum::Range { text: s, kind };
             }
             ColType::Multirange(kind) => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                let (len, form_bytes) = varlena_length(b);
                 at += 4;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
-                at += len;
+                at += len + form_bytes;
                 let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = Datum::Multirange { text: s, kind };
             }
             ColType::Geometry(kind) => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                let (len, form_bytes) = varlena_length(b);
                 at += 4;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
-                at += len;
+                at += len + form_bytes;
                 let text = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = Datum::Geometry { kind, text };
             }
@@ -893,7 +1131,7 @@ pub(crate) fn decode<'a>(
             ColType::Record => return Err(corrupt()),
             ColType::Bit { varying } => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let payload = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                let (payload, form_bytes) = varlena_length(b);
                 at += 4;
                 if payload == 0 {
                     return Err(corrupt());
@@ -901,7 +1139,7 @@ pub(crate) fn decode<'a>(
                 // First payload byte is the stored varying flag; the schema is
                 // authoritative for the column's declared type, so ignore it.
                 let raw = bytes.get(at + 1..at + payload).ok_or_else(corrupt)?;
-                at += payload;
+                at += payload + form_bytes;
                 let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = Datum::Bit { bits: s, varying };
             }
@@ -952,10 +1190,10 @@ pub(crate) fn decode<'a>(
             }
             ColType::Bytea => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                let (len, form_bytes) = varlena_length(b);
                 at += 4;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
-                at += len;
+                at += len + form_bytes;
                 out[i] = Datum::Bytea(raw);
             }
             ColType::Numeric => {

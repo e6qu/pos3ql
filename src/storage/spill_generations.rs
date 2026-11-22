@@ -3710,7 +3710,12 @@ mod tests {
             let reader = if is_old { &mut old } else { &mut current };
             arena.reset();
             let row = crate::mem::guard::forbid_alloc(|| {
-                reader.next(&mut buffers, &metadata, &arena, None)
+                reader.next(
+                    crate::storage::CursorScratch::Reader(&mut buffers),
+                    &metadata,
+                    &arena,
+                    None,
+                )
             })
             .unwrap()
             .unwrap();
@@ -3720,19 +3725,32 @@ mod tests {
                 SpilledRowRepresentation::Encoded(bytes) => {
                     crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values).unwrap()
                 }
-                SpilledRowRepresentation::Values(source) => values.copy_from_slice(source),
+                SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                    values: source,
+                    ..
+                }) => values.copy_from_slice(source),
             }
             assert_eq!(values, [Datum::Int4(expected_value)]);
         }
         assert!(
-            crate::mem::guard::forbid_alloc(|| current.next(&mut buffers, &metadata, &arena, None))
-                .unwrap()
-                .is_none()
+            crate::mem::guard::forbid_alloc(|| current.next(
+                crate::storage::CursorScratch::Reader(&mut buffers),
+                &metadata,
+                &arena,
+                None
+            ))
+            .unwrap()
+            .is_none()
         );
         assert!(
-            crate::mem::guard::forbid_alloc(|| old.next(&mut buffers, &metadata, &arena, None))
-                .unwrap()
-                .is_none()
+            crate::mem::guard::forbid_alloc(|| old.next(
+                crate::storage::CursorScratch::Reader(&mut buffers),
+                &metadata,
+                &arena,
+                None
+            ))
+            .unwrap()
+            .is_none()
         );
         old.close();
         current.close();
@@ -4269,7 +4287,9 @@ mod tests {
                                     )?;
                                     &decoded[..]
                                 }
-                                super::super::SpilledRowRepresentation::Values(values) => values,
+                                super::super::SpilledRowRepresentation::Values(
+                                    &crate::storage::SpilledValues { values, .. },
+                                ) => values,
                             };
                             assert_eq!(
                                 (row.rowid, values[0]),
@@ -4509,9 +4529,9 @@ mod tests {
                                         )?;
                                         &decoded[..]
                                     }
-                                    super::super::SpilledRowRepresentation::Values(values) => {
-                                        values
-                                    }
+                                    super::super::SpilledRowRepresentation::Values(
+                                        &crate::storage::SpilledValues { values, .. },
+                                    ) => values,
                                 };
                                 assert_eq!(
                                     (row.rowid, values[0]),
@@ -5082,7 +5102,9 @@ mod tests {
                                 )?;
                                 assert_eq!(values, [expected]);
                             }
-                            super::super::SpilledRowRepresentation::Values(values) => {
+                            super::super::SpilledRowRepresentation::Values(
+                                &crate::storage::SpilledValues { values, .. },
+                            ) => {
                                 assert_eq!(values, [expected])
                             }
                         }
@@ -5859,7 +5881,9 @@ mod tests {
                                         )?;
                                         &decoded[..relation.n_columns]
                                     }
-                                    SpilledRowRepresentation::Values(values) => values,
+                                    SpilledRowRepresentation::Values(
+                                        &crate::storage::SpilledValues { values, .. },
+                                    ) => values,
                                 };
                                 assert_eq!(values, [Datum::Int4(41)]);
                                 count += 1;

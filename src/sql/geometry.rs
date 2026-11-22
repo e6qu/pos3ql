@@ -478,6 +478,56 @@ pub(crate) fn components(
     Ok(result)
 }
 
+/// The data a stored path or polygon holds after its varlena header
+/// (`PATH`, `POLYGON` in `geo_decls.h`), written into `arena`: a path's point
+/// count, closed flag and zero padding, or a polygon's point count and
+/// bounding box (`make_bound_box`), then each point. `None` for another kind.
+pub(crate) fn stored_data<'a>(
+    kind: GeometryKind,
+    text: &str,
+    arena: &'a Arena,
+) -> Result<Option<&'a [u8]>, SqlError> {
+    let header = match kind {
+        GeometryKind::Path => 12,
+        GeometryKind::Polygon => 36,
+        _ => return Ok(None),
+    };
+    let (values, closed) = component_count(kind, text)?;
+    let out = arena
+        .alloc_slice_with(header + 8 * values, |_| 0u8)
+        .map_err(|_| value_too_wide(kind))?;
+    let points = values / 2;
+    out[..4].copy_from_slice(&(points as i32).to_ne_bytes());
+    // `float8_lt` orders NaN above every number.
+    let less = |a: f64, b: f64| !a.is_nan() && (b.is_nan() || a < b);
+    let (mut low, mut high) = ([0.0f64; 2], [0.0f64; 2]);
+    let mut at = header;
+    visit_values(kind, text, |value| {
+        let axis = (at - header) / 8 % 2;
+        if at - header < 16 {
+            (low[axis], high[axis]) = (value, value);
+        }
+        if less(value, low[axis]) {
+            low[axis] = value;
+        }
+        if less(high[axis], value) {
+            high[axis] = value;
+        }
+        out[at..at + 8].copy_from_slice(&value.to_ne_bytes());
+        at += 8;
+        Ok(())
+    })?;
+    match kind {
+        GeometryKind::Path => out[4..8].copy_from_slice(&i32::from(closed).to_ne_bytes()),
+        _ => {
+            for (slot, value) in [high[0], high[1], low[0], low[1]].into_iter().enumerate() {
+                out[4 + 8 * slot..12 + 8 * slot].copy_from_slice(&value.to_ne_bytes());
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
 pub(crate) fn component_count(kind: GeometryKind, text: &str) -> Result<(usize, bool), SqlError> {
     visit_values(kind, text, |_| Ok(()))
 }

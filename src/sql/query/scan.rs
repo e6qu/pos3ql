@@ -20,7 +20,8 @@ use crate::sql::eval::{
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::storage::{
-    ColumnSet, MAX_COLUMNS, MAX_INDEX_COLS, PolicyCommandKind, Storage, TableDef, rowenc,
+    ColumnSet, MAX_COLUMNS, MAX_INDEX_COLS, PolicyCommandKind, Storage, StoredForm, TableDef,
+    rowenc,
 };
 use crate::util::StackStr;
 
@@ -34,6 +35,9 @@ use super::{
     MAX_OPTIMIZED_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full, check_timeout, instrument,
     reorder_qual, simplify_qual, where_passes,
 };
+
+mod path_node;
+pub(crate) use path_node::PathScan;
 
 #[derive(Clone, Copy)]
 struct TableSamplePlan {
@@ -667,6 +671,16 @@ pub(crate) fn row_security_passes<'a>(
 }
 
 impl<'a> ColumnLookup<'a> for NoColumns {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn is_empty_scope(&self) -> bool {
         true
     }
@@ -687,7 +701,7 @@ pub(super) fn latest_locked_source<'a>(
     slot: usize,
     rowid: u64,
     arena: &'a Arena,
-) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+) -> Result<Option<BoundRow<'a>>, SqlError> {
     let Some(state) = storage.row_state(slot, rowid)? else {
         return Ok(None);
     };
@@ -708,10 +722,17 @@ pub(super) fn latest_locked_source<'a>(
     let values = arena
         .alloc_slice_with(logical.n_columns, |_| Datum::Null)
         .map_err(|_| arena_full())?;
-    crate::storage::RelationColumnMap::new(logical, physical, arena)?
-        .project(&physical_values[..physical.n_columns], values);
+    let mapping = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
+    mapping.project(&physical_values[..physical.n_columns], values);
     refresh_catalog_object_names(storage, txid, values, arena)?;
-    Ok(Some(values))
+    let forms = member_forms(
+        &schema[..physical.n_columns],
+        mapping,
+        Some(bytes),
+        logical.n_columns,
+        arena,
+    )?;
+    Ok(Some(BoundRow::Values { values, forms }))
 }
 
 /// The SELECT row-security policy a stored source's scan applies.
@@ -844,6 +865,17 @@ mod tests {
         use crate::sql::types::Datum;
         struct Unknown;
         impl<'a> ColumnLookup<'a> for Unknown {
+            fn stored_form(
+                &self,
+                qualifier: Option<&str>,
+                name: &str,
+            ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError>
+            {
+                // A lookup of names and types, with no stored values.
+                let _ = (qualifier, name);
+                Ok(None)
+            }
+
             fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
                 panic!("scope classification must not read values");
             }
@@ -888,6 +920,17 @@ mod tests {
         use crate::sql::types::{ColType, Datum};
         struct Scope(bool);
         impl<'a> ColumnLookup<'a> for Scope {
+            fn stored_form(
+                &self,
+                qualifier: Option<&str>,
+                name: &str,
+            ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError>
+            {
+                // A lookup of names and types, with no stored values.
+                let _ = (qualifier, name);
+                Ok(None)
+            }
+
             fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
                 if self.col_type(qualifier, name).is_some() {
                     Ok(Datum::Int4(7))
@@ -908,6 +951,17 @@ mod tests {
         }
         struct Hidden;
         impl<'a> ColumnLookup<'a> for Hidden {
+            fn stored_form(
+                &self,
+                qualifier: Option<&str>,
+                name: &str,
+            ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError>
+            {
+                // A lookup of names and types, with no stored values.
+                let _ = (qualifier, name);
+                Ok(None)
+            }
+
             fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
                 panic!("column typing must not read values");
             }
@@ -1104,7 +1158,8 @@ struct IndexKeyCandidate {
 
 pub(crate) struct IndexedCandidates<'a> {
     table: usize,
-    statistics: crate::storage::IndexStatisticsCapture<'a>,
+    /// The index's statistics counter, captured again for each use.
+    statistics: crate::storage::IndexStatisticsTicket,
     scan_executed: bool,
     index_entries: usize,
     preserves_order: bool,
@@ -1117,9 +1172,6 @@ pub(crate) struct IndexedCandidates<'a> {
     payload_mask: ColumnSet,
     keys: Option<&'a [IndexKeyCandidate]>,
     encoded_keys: &'a [u8],
-    /// The candidates hold every row the chosen path's index conditions
-    /// reach, so `EXPLAIN ANALYZE` counts the path over them.
-    reaches_path: bool,
 }
 
 /// The `AND` of an index or index-only scan's index conditions, or of a
@@ -1163,8 +1215,17 @@ impl<'a> IndexedCandidates<'a> {
         }
     }
 
-    pub(crate) fn statistics(&self) -> &crate::storage::IndexStatisticsCapture<'a> {
-        &self.statistics
+    /// The index's statistics counter, captured for a use.
+    pub(crate) fn statistics<'s>(
+        &self,
+        storage: &'s Storage,
+    ) -> Result<crate::storage::IndexStatisticsCapture<'s>, SqlError> {
+        storage.recapture_index_statistics(self.statistics)
+    }
+
+    /// The index's statistics counter, which a scan keeps between reads.
+    pub(crate) fn statistics_ticket(&self) -> crate::storage::IndexStatisticsTicket {
+        self.statistics
     }
 
     pub(crate) const fn scan_executed(&self) -> bool {
@@ -1198,7 +1259,31 @@ impl<'a> IndexedCandidates<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum BoundRow<'a> {
     Encoded(&'a [u8]),
-    Values(&'a [Datum<'a>]),
+    /// Decoded columns and where their stored forms come from.
+    Values {
+        values: &'a [Datum<'a>],
+        forms: RowForms<'a>,
+    },
+}
+
+/// A partition tree's row: its values and its stored bytes.
+type TreeRow<'a> = (&'a mut [Datum<'a>], &'a [u8]);
+
+/// Where the TOAST forms of a bound row's decoded values come from.
+#[derive(Clone, Copy)]
+pub(crate) enum RowForms<'a> {
+    /// Values the statement formed, or a source that stores no rows: no
+    /// value has a stored form.
+    Fresh,
+    /// The table encoding of the row's leading columns, which records each
+    /// stored value's form.
+    Encoded(&'a [u8]),
+    /// Each value's form, aligned with the values.
+    Listed(&'a [crate::storage::StoredForm]),
+    /// A stored row read through a path that does not keep its forms, such
+    /// as an index-only scan: a value TOAST may have stored compressed or
+    /// out of line has a form the model does not know.
+    Unknown,
 }
 
 /// Fixed physical-column demand for every base table in one source scan.
@@ -3887,7 +3972,7 @@ pub(crate) fn dml_index_access_plan<'a>(
     reason = "the outer row a join's scan reads its keys from is explicit"
 )]
 fn indexed_candidates<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     where_clause: Option<&'a Expr<'a>>,
@@ -4092,7 +4177,7 @@ fn ranked_knn_offer(
 
 #[allow(clippy::too_many_arguments)]
 fn ranked_knn_candidates<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     table: usize,
     slot: usize,
     txid: u32,
@@ -4116,7 +4201,9 @@ fn ranked_knn_candidates<'a>(
     if !storage.value_binding_durable_complete(slot, plan.binding) {
         return Ok(None);
     }
-    let statistics = storage.capture_index_statistics(txid, slot, ordered.index_oid)?;
+    let statistics = storage
+        .capture_index_statistics(txid, slot, ordered.index_oid)?
+        .ticket();
     if window == 0 {
         return Ok(Some(IndexedCandidates {
             table,
@@ -4133,7 +4220,6 @@ fn ranked_knn_candidates<'a>(
             payload_mask: storage.value_binding_include_mask(slot, plan.binding),
             keys: Some(&[]),
             encoded_keys: &[],
-            reaches_path: false,
         }));
     }
     let origin_bounds = crate::sql::geometry::index_bounds(origin)?;
@@ -4318,13 +4404,12 @@ fn ranked_knn_candidates<'a>(
         payload_mask: storage.value_binding_include_mask(slot, plan.binding),
         keys: Some(keys),
         encoded_keys: encoded,
-        reaches_path: false,
     }))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn indexed_candidates_for_plan<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     table: usize,
     slot: usize,
     definition: &TableDef,
@@ -4338,7 +4423,9 @@ fn indexed_candidates_for_plan<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
     let index_oid = ordered_plan.map_or(plan.index_oid, |ordered| ordered.index_oid);
-    let statistics = storage.capture_index_statistics(txid, slot, index_oid)?;
+    let statistics = storage
+        .capture_index_statistics(txid, slot, index_oid)?
+        .ticket();
     if !plan.chosen_for_scan(storage, slot, definition, txid, ordered_plan.is_some()) {
         return Ok(None);
     }
@@ -4379,7 +4466,6 @@ fn indexed_candidates_for_plan<'a>(
                     payload_mask: storage.value_binding_include_mask(slot, plan.binding),
                     keys: None,
                     encoded_keys: &[],
-                    reaches_path: false,
                 }));
             }
             if is_inclusion_operator(constraint.operator) {
@@ -4934,7 +5020,6 @@ fn indexed_candidates_for_plan<'a>(
         payload_mask: storage.value_binding_include_mask(slot, plan.binding),
         keys: ordered_keys,
         encoded_keys: retained_key_bytes,
-        reaches_path: false,
     }))
 }
 
@@ -5021,6 +5106,9 @@ pub(crate) enum JoinRowValues<'s, 'v> {
     Flat {
         values: &'s [Datum<'v>],
         offsets: &'s [usize],
+        /// Each value's stored form, aligned with `values`; `None` when the
+        /// row's producer does not keep them, as [`RowForms::Unknown`].
+        forms: Option<&'s [crate::storage::StoredForm]>,
     },
 }
 
@@ -5092,22 +5180,24 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
                         let width = if self.scope.derived[table].is_some() {
                             crate::sql::exec::projected_row_width(bytes)
                         } else {
-                            self.scope.defs.get(table).expect("resolved").n_columns
+                            self.scope.defs.n_columns(table).expect("resolved")
                         };
                         let start = buffer_offsets[position];
                         Some(&buffers[start..start + width])
                     }
-                    Some(BoundRow::Values(values)) if self.scope.stores_rows(table) => {
+                    Some(BoundRow::Values { values, .. }) if self.scope.stores_rows(table) => {
                         // A leaf of an inheritance tree carries its oid past
                         // the relation's columns.
-                        let width = self.scope.defs.get(table).expect("resolved").n_columns;
+                        let width = self.scope.defs.n_columns(table).expect("resolved");
                         Some(&values[..width.min(values.len())])
                     }
-                    Some(BoundRow::Values(values)) => Some(values),
+                    Some(BoundRow::Values { values, .. }) => Some(values),
                     None => Some(&[]),
                 }
             }
-            JoinRowValues::Flat { values, offsets } => {
+            JoinRowValues::Flat {
+                values, offsets, ..
+            } => {
                 let start = *offsets.get(table)?;
                 let width = self.scope.stored_width(table);
                 Some(&values[start..start + width])
@@ -5117,6 +5207,79 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
 }
 
 impl<'v> JoinRow<'_, 'v, '_> {
+    /// The TOAST form column `column` of FROM item `table` holds in this
+    /// row: `None` for a value the statement formed, or a NULL.
+    pub(crate) fn column_form(
+        &self,
+        table: usize,
+        column: usize,
+    ) -> Result<Option<crate::storage::StoredForm>, SqlError> {
+        let Some(value) = self
+            .table_values(table)
+            .and_then(|values| values.get(column).copied())
+        else {
+            return Ok(None);
+        };
+        if !rowenc::carries_stored_form(&value) {
+            return Ok(None);
+        }
+        let unknown = || {
+            if crate::sql::toast::may_be_toasted(&value) {
+                StoredForm::Unmodelled
+            } else {
+                StoredForm::Inline
+            }
+        };
+        let form = match self.values {
+            JoinRowValues::Flat {
+                offsets,
+                forms: Some(forms),
+                ..
+            } => offsets
+                .get(table)
+                .and_then(|offset| forms.get(offset + column).copied())
+                .unwrap_or(StoredForm::Inline),
+            JoinRowValues::Flat { forms: None, .. } => unknown(),
+            JoinRowValues::Bound { bound, .. } => match bound[table] {
+                None => StoredForm::Inline,
+                Some(BoundRow::Encoded(bytes)) if self.scope.derived[table].is_some() => {
+                    crate::sql::exec::projected_stored_form(bytes, column)
+                }
+                Some(BoundRow::Encoded(bytes)) => self.encoded_form(table, bytes, column)?,
+                Some(BoundRow::Values { forms, .. }) => match forms {
+                    RowForms::Fresh => StoredForm::Inline,
+                    RowForms::Encoded(bytes) => self.encoded_form(table, bytes, column)?,
+                    RowForms::Listed(forms) => {
+                        forms.get(column).copied().unwrap_or(StoredForm::Inline)
+                    }
+                    RowForms::Unknown => unknown(),
+                },
+            },
+        };
+        Ok((form != StoredForm::Inline).then_some(form))
+    }
+
+    /// The form column `column` holds in `bytes`, the table encoding of the
+    /// leading columns of stored FROM item `table`.
+    fn encoded_form(
+        &self,
+        table: usize,
+        bytes: &[u8],
+        column: usize,
+    ) -> Result<crate::storage::StoredForm, SqlError> {
+        let definition = self.scope.defs.get(table).expect("resolved");
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        definition.schema(&mut schema);
+        let width = rowenc::encoded_column_count(bytes)?.min(definition.n_columns);
+        if column >= width {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a stored row's encoding lacks a column the query reads"
+            ));
+        }
+        rowenc::stored_form(bytes, &schema[..width], column)
+    }
+
     /// The `tableoid` of a stored table's current row: the leaf of an
     /// inheritance tree it was read from, or the table itself. Null for an
     /// outer join's null-extended row.
@@ -5137,14 +5300,18 @@ impl<'v> JoinRow<'_, 'v, '_> {
                 if !order[..count].contains(&table) {
                     return Err(missing());
                 }
-                let width = self.scope.defs.get(table).expect("resolved").n_columns;
+                let width = self.scope.defs.n_columns(table).expect("resolved");
                 match bound[table] {
                     None => Ok(Datum::Null),
-                    Some(BoundRow::Values(values)) if values.len() > width => Ok(values[width]),
+                    Some(BoundRow::Values { values, .. }) if values.len() > width => {
+                        Ok(values[width])
+                    }
                     Some(_) => self.scope.relation_oid(table),
                 }
             }
-            JoinRowValues::Flat { values, offsets } => {
+            JoinRowValues::Flat {
+                values, offsets, ..
+            } => {
                 offsets.get(table).ok_or_else(missing)?;
                 // A window row keeps each item's leaf oid after its columns.
                 let total = self.scope.stored_columns();
@@ -5276,9 +5443,33 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         }
     }
 
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, SqlError> {
+        match self.visible_column(qualifier, name)? {
+            ResolvedColumn::Table(table, column) => self.column_form(table, column),
+            // A merged `USING` column is its first non-null side's datum.
+            ResolvedColumn::Merged(merged) => {
+                for &(table, column) in self.scope.merged[merged].parts {
+                    let present = self
+                        .table_values(table)
+                        .and_then(|values| values.get(column))
+                        .is_some_and(|value| !value.is_null());
+                    if present {
+                        return self.column_form(table, column);
+                    }
+                }
+                Ok(None)
+            }
+            ResolvedColumn::TableOid(_) => Ok(None),
+        }
+    }
+
     fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'v>, SqlError> {
         let table = self.scope.source(qualifier)?.table;
-        let visible = self.scope.defs.get(table).expect("resolved").n_columns;
+        let visible = self.scope.defs.n_columns(table).expect("resolved");
         self.table_values(table)
             .and_then(|values| values.get(visible + index))
             .copied()
@@ -5672,6 +5863,27 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             .map_err(|error| self.suggested(q, name, error))
     }
 
+    fn stored_form(
+        &self,
+        q: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, SqlError> {
+        let saved = crate::sql::error_position::save_pending();
+        let inner = self.inner.lookup_unsuggested(q, name).is_ok();
+        crate::sql::error_position::restore_pending(saved);
+        if inner {
+            if self.inner_column_wins(q, name) {
+                return self.inner.stored_form(q, name);
+            }
+        } else if q.is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) {
+            return Ok(None);
+        }
+        match self.outer {
+            Some(outer) => outer.stored_form(q, name),
+            None => Ok(None),
+        }
+    }
+
     fn lookup_unsuggested(&self, q: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         let saved = crate::sql::error_position::save_pending();
         match self.inner.lookup_unsuggested(q, name) {
@@ -5853,8 +6065,8 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
             params,
             Some(outer),
             base_hooks.sequences,
-            &mut |vals| {
-                let enc = crate::sql::exec::encode_projected_pub(vals, arena)?;
+            &mut |vals, forms| {
+                let enc = crate::sql::exec::encode_projected_formed(vals, forms, arena)?;
                 if len == cap {
                     let new_cap = if cap == 0 { 8 } else { cap * 2 };
                     let fresh: &mut [&[u8]] = arena
@@ -5990,7 +6202,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
                             storage,
                             blocks,
                             width,
-                            |column| values[column],
+                            |column| Ok((values[column], StoredForm::Inline)),
                             &mut compare,
                         )
                     })
@@ -6071,7 +6283,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
                             storage,
                             blocks,
                             width,
-                            |column| values[column],
+                            |column| Ok((values[column], StoredForm::Inline)),
                             &mut compare,
                         )
                     })
@@ -6170,14 +6382,14 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
         params,
         Some(outer),
         base_hooks.sequences,
-        &mut |values| {
+        &mut |values, forms| {
             storage
                 .with_block_store(|blocks| {
                     sorter.push_projected_by(
                         storage,
                         blocks,
                         values.len(),
-                        |column| values[column],
+                        |column| Ok((values[column], forms[column])),
                         &mut compare,
                     )
                 })
@@ -6353,11 +6565,14 @@ fn record_external_match(
                 blocks,
                 2,
                 |column| {
-                    if column == 0 {
-                        Datum::Int4(depth as i32)
-                    } else {
-                        Datum::Int8((index ^ (1u64 << 63)) as i64)
-                    }
+                    Ok((
+                        if column == 0 {
+                            Datum::Int4(depth as i32)
+                        } else {
+                            Datum::Int8((index ^ (1u64 << 63)) as i64)
+                        },
+                        StoredForm::Inline,
+                    ))
                 },
                 &mut compare,
             )
@@ -6494,46 +6709,6 @@ pub(super) fn scan_source_with_pax_columns<'a>(
         pax_demand,
         None,
         true,
-        None,
-        f,
-    )
-}
-
-/// The scan of one relation by `planned`, the path the running query's
-/// shape describes (a join's base relation, [`super::join_exec`]), planned
-/// once for every rescan: pos3ql's own lookups of an outer row's key never
-/// replace that path, whose order and counts are PostgreSQL's.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn scan_described_path<'a>(
-    storage: &'a Storage,
-    scope: &QueryScope<'a>,
-    from: &'a FromClause<'a>,
-    txid: u32,
-    where_clause: Option<&'a Expr<'a>>,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    hooks: &EvalHooks<'_, 'a>,
-    outer: Option<&dyn ColumnLookup<'a>>,
-    pax_demand: PaxReadDemand,
-    planned: super::index_paths::ScanPath<'a>,
-    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
-) -> Result<(), SqlError> {
-    scan_source_mode(
-        storage,
-        scope,
-        from,
-        txid,
-        where_clause,
-        arena,
-        params,
-        hooks,
-        outer,
-        false,
-        None,
-        pax_demand,
-        None,
-        false,
-        Some(planned),
         f,
     )
 }
@@ -6569,7 +6744,6 @@ pub(super) fn scan_source_recycling_with_pax_columns<'a>(
         pax_demand,
         None,
         true,
-        None,
         f,
     )
 }
@@ -6606,7 +6780,6 @@ pub(super) fn scan_source_recycling_retaining_match_with_pax_columns<'a>(
         pax_demand,
         None,
         true,
-        None,
         f,
     )
 }
@@ -6645,7 +6818,6 @@ pub(super) fn scan_source_recycling_with_indexed_candidates<'a>(
         pax_demand,
         Some(indexed),
         false,
-        None,
         f,
     )
 }
@@ -8041,66 +8213,47 @@ struct ChosenScanCounts {
     visible_pages: u64,
 }
 
-thread_local! {
-    static CHOSEN_SCAN: core::cell::Cell<Option<ChosenScanCounts>> =
-        const { core::cell::Cell::new(None) };
+/// What the leaf of one scan of a single relation counts and stops by: the
+/// chosen path's counts of the rows it reaches, and the rows a `LIMIT`
+/// still takes from an ordered scan. Each scan holds its own, so a scan a
+/// row's evaluation runs inside it neither sees nor changes them.
+struct ScanLeaf {
+    counts: core::cell::Cell<Option<ChosenScanCounts>>,
+    stop_after: core::cell::Cell<Option<u64>>,
 }
 
-thread_local! {
-    /// The rows a `LIMIT` still takes from the running ordered scan.
-    static STOP_AFTER: core::cell::Cell<Option<(usize, u64)>> =
-        const { core::cell::Cell::new(None) };
-}
-
-/// Restores the enclosing scan's row limit when an ordered scan ends.
-struct StopAfterScope(Option<(usize, u64)>);
-
-impl StopAfterScope {
-    /// The scan of the table in `slot` stops after `rows` rows.
-    fn enter(slot: usize, rows: Option<u64>) -> Self {
-        let limit = rows.filter(|&rows| rows > 0).map(|rows| (slot, rows));
-        Self(STOP_AFTER.with(|stop| stop.replace(limit)))
-    }
-}
-
-/// Whether the ordered scan of the table in `slot` has returned the last
-/// row its `LIMIT` takes, counting the one just returned.
-fn limit_reached(slot: usize) -> bool {
-    STOP_AFTER.with(|stop| match stop.get() {
-        Some((owner, 1)) if owner == slot => true,
-        Some((owner, rows)) if owner == slot => {
-            stop.set(Some((owner, rows - 1)));
-            false
+impl ScanLeaf {
+    const fn new() -> Self {
+        Self {
+            counts: core::cell::Cell::new(None),
+            stop_after: core::cell::Cell::new(None),
         }
-        _ => false,
-    })
-}
-
-impl Drop for StopAfterScope {
-    fn drop(&mut self) {
-        STOP_AFTER.with(|stop| stop.set(self.0));
     }
-}
 
-/// Restores the enclosing scan's counts when a scan of one relation ends.
-struct ChosenScanScope(Option<ChosenScanCounts>);
-
-impl ChosenScanScope {
-    fn enter(counts: Option<ChosenScanCounts>) -> Self {
-        Self(CHOSEN_SCAN.with(|chosen| chosen.replace(counts)))
+    /// The ordered scan stops after `rows` rows.
+    fn stop_after(&self, rows: Option<u64>) {
+        self.stop_after.set(rows.filter(|&rows| rows > 0));
     }
-}
 
-impl Drop for ChosenScanScope {
-    fn drop(&mut self) {
-        CHOSEN_SCAN.with(|chosen| chosen.set(self.0));
+    /// Whether the ordered scan has returned the last row its `LIMIT`
+    /// takes, counting the one just returned.
+    fn limit_reached(&self) -> bool {
+        match self.stop_after.get() {
+            Some(1) => true,
+            Some(rows) => {
+                self.stop_after.set(Some(rows - 1));
+                false
+            }
+            None => false,
+        }
     }
 }
 
 /// Whether the row the leaf of a one-relation scan checks is one the
-/// chosen path's index conditions reach, counting what the path reads for
-/// it.
-fn chosen_scan_reaches<'a>(
+/// chosen path whose counts are `counts` reaches, counting what the path
+/// reads for it.
+fn chosen_path_reaches<'a>(
+    counts: Option<ChosenScanCounts>,
     rowid: Option<u64>,
     passed: bool,
     arena: &'a Arena,
@@ -8108,7 +8261,7 @@ fn chosen_scan_reaches<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<bool, SqlError> {
-    let Some(counts) = CHOSEN_SCAN.with(core::cell::Cell::get) else {
+    let Some(counts) = counts else {
         return Ok(true);
     };
     // SAFETY: the conditions and the tree are the scan's own, in its arena;
@@ -8443,7 +8596,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
                     storage.record_relation_scan(
                         txid,
                         leaf,
-                        Some(access.statistics()),
+                        Some(&access.statistics(storage)?),
                         access.index_entries,
                         observed_at,
                     )?;
@@ -8457,7 +8610,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
                     &member_scope,
                     arena,
                 )?;
-                return Ok((rows, Some(access.statistics)));
+                return Ok((rows, Some(access.statistics(storage)?)));
             }
             let rows = member_rows_in_order(storage, txid, leaf, path, None, &member_scope, arena)?;
             return Ok((rows, None));
@@ -8478,7 +8631,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
             .alloc_slice_with(rows.len() * count, |_| Datum::Null)
             .map_err(|_| arena_full())?;
         for (at, &rowid) in rows.iter().enumerate() {
-            if let Some(values) = self.row(member, rowid)? {
+            if let Some((values, _)) = self.row(member, rowid)? {
                 for (key_at, key) in self.order.iter().enumerate() {
                     if let OrderKey::Column { column, .. } = key {
                         keys[at * count + key_at] = values[*column];
@@ -8491,11 +8644,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
 
     /// The row `rowid` of `member`, decoded into the tree's columns with the
     /// member's oid after them.
-    fn row(
-        &self,
-        member: &TreeMember<'a>,
-        rowid: u64,
-    ) -> Result<Option<&'a mut [Datum<'a>]>, SqlError> {
+    fn row(&self, member: &TreeMember<'a>, rowid: u64) -> Result<Option<TreeRow<'a>>, SqlError> {
         let storage = self.storage;
         let Some(state) = storage.row_state(member.leaf, rowid)? else {
             return Ok(None);
@@ -8515,7 +8664,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
             .mapping
             .project(&physical[..member.schema.len()], &mut values[..columns]);
         values[columns] = member.leaf_oid;
-        Ok(Some(values))
+        Ok(Some((values, bytes)))
     }
 
     /// The encoded length of the row `rowid` of `member`.
@@ -8535,7 +8684,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
     /// Whether `rowid` of `member` passes the scan's conditions, counted as
     /// the member's scan counts the rows its path reaches.
     fn passes(&self, member: &TreeMember<'a>, rowid: u64) -> Result<Option<bool>, SqlError> {
-        let Some(values) = self.row(member, rowid)? else {
+        let Some((values, _)) = self.row(member, rowid)? else {
             return Ok(None);
         };
         let row = crate::sql::exec::RowCtx {
@@ -8557,8 +8706,8 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
             }
             None => true,
         };
-        let _chosen_scope = ChosenScanScope::enter(member.counts);
-        if chosen_scan_reaches(
+        if chosen_path_reaches(
+            member.counts,
             Some(rowid),
             passed,
             self.arena,
@@ -8653,7 +8802,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
                 member.head = at;
                 return Ok(Some(at));
             }
-            let Some(values) = self.row(member, member.rows[at])? else {
+            let Some((values, _)) = self.row(member, member.rows[at])? else {
                 continue;
             };
             let row = crate::sql::exec::RowCtx {
@@ -8679,8 +8828,8 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
                 member.head = at;
                 return Ok(Some(at));
             }
-            let _chosen_scope = ChosenScanScope::enter(member.counts);
-            if chosen_scan_reaches(
+            if chosen_path_reaches(
+                member.counts,
                 Some(member.rows[at]),
                 false,
                 self.arena,
@@ -8701,7 +8850,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
             return Ok(());
         }
         let rowid = member.rows[member.head];
-        let Some(values) = self.row(member, rowid)? else {
+        let Some((values, _)) = self.row(member, rowid)? else {
             return Ok(());
         };
         let row = crate::sql::exec::RowCtx {
@@ -8714,8 +8863,8 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
             inner: &row,
             outer: self.outer,
         };
-        let _chosen_scope = ChosenScanScope::enter(member.counts);
-        chosen_scan_reaches(
+        chosen_path_reaches(
+            member.counts,
             Some(rowid),
             true,
             self.arena,
@@ -9046,12 +9195,38 @@ fn sort_by_index_key<'a>(
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let slot = scope.slots[0];
+    let order = index_key_permutation(storage, scope, txid, path, rows.len(), arena, |position| {
+        let row = rows[position].expect("row snapshots are initialized");
+        storage.row_bytes(slot, row.rowid(), row.read()?, arena)
+    })?;
+    let original = arena
+        .alloc_slice_with(rows.len(), |position| rows[position])
+        .map_err(|_| arena_full())?;
+    for (position, &from) in order.iter().enumerate() {
+        rows[position] = original[from];
+    }
+    Ok(())
+}
+
+/// The order in which the index scan of `path` reads `count` rows given in
+/// row identity order, `row` reading each one's bytes: by the index keys in
+/// the index's order, equal keys by identity.
+fn index_key_permutation<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    txid: u32,
+    path: &super::index_paths::ScanPath<'a>,
+    count: usize,
+    arena: &'a Arena,
+    mut row: impl FnMut(usize) -> Result<&'a [u8], SqlError>,
+) -> Result<&'a [usize], SqlError> {
+    let slot = scope.slots[0];
     let definition = scope.defs.stored(0).expect("a chosen path scans a table");
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     let n_columns = definition.schema(&mut schema);
     let width = path.keys.len();
     let values = arena
-        .alloc_slice_with(rows.len() * width, |_| Datum::Null)
+        .alloc_slice_with(count * width, |_| Datum::Null)
         .map_err(|_| arena_full())?;
     let reader = super::index_paths::KeyReader::new(
         storage,
@@ -9061,9 +9236,8 @@ fn sort_by_index_key<'a>(
         path.keys,
         arena,
     )?;
-    for (position, row) in rows.iter().enumerate() {
-        let row = row.expect("row snapshots are initialized");
-        let bytes = storage.row_bytes(slot, row.rowid(), row.read()?, arena)?;
+    for position in 0..count {
+        let bytes = row(position)?;
         let mut decoded = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
         for at in 0..width {
@@ -9078,7 +9252,7 @@ fn sort_by_index_key<'a>(
             )?;
         }
     }
-    let order = index_key_order(
+    index_key_order(
         storage,
         txid,
         definition,
@@ -9087,14 +9261,7 @@ fn sort_by_index_key<'a>(
         path.deduplicated,
         values,
         arena,
-    )?;
-    let original = arena
-        .alloc_slice_with(rows.len(), |position| rows[position])
-        .map_err(|_| arena_full())?;
-    for (position, &from) in order.iter().enumerate() {
-        rows[position] = original[from];
-    }
-    Ok(())
+    )
 }
 
 /// The order in which an index scan of the index `keys` (read `backward`
@@ -9188,27 +9355,32 @@ pub(super) fn heap_pages_of_rows<'a>(
         .map_err(|_| arena_full())?;
     let mut packing = crate::storage::heap_layout::HeapPacking::new();
     let mut filled = 0usize;
-    let mut place = |rowid: u64, values: &[Datum<'_>]| {
-        let page = packing.add(crate::storage::heap_layout::tuple_length(values, schema));
+    let mut place = |rowid: u64, bytes: &[u8], values: &[Datum<'_>]| -> Result<(), SqlError> {
+        let page = packing.add(crate::storage::heap_layout::stored_tuple_length(
+            bytes, values, schema,
+        )?);
         if filled < pages.len() {
             pages[filled] = (rowid, page);
             free[page as usize] = u16::try_from(packing.free()).unwrap_or(u16::MAX);
             filled += 1;
         }
+        Ok(())
     };
     let scan = storage.captured_row_scan_in(slot, txid, arena)?;
     // A sequential scan's order: saved rows, then resident rows.
     scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
         for row in batch {
             let mut values = [Datum::Null; MAX_COLUMNS];
-            let values = match row.representation {
+            let (bytes, values) = match row.representation {
                 crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                     rowenc::decode(bytes, schema, &mut values)?;
-                    &values[..n_columns]
+                    (bytes, &values[..n_columns])
                 }
-                crate::storage::SpilledRowRepresentation::Values(values) => values,
+                crate::storage::SpilledRowRepresentation::Values(
+                    &crate::storage::SpilledValues { values, encoded },
+                ) => (encoded, values),
             };
-            place(row.rowid, values);
+            place(row.rowid, bytes, values)?;
         }
         Ok(core::ops::ControlFlow::Continue(()))
     })?;
@@ -9216,8 +9388,7 @@ pub(super) fn heap_pages_of_rows<'a>(
         storage.with_row_bytes(slot, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut values)?;
-            place(rowid, &values[..n_columns]);
-            Ok(())
+            place(rowid, bytes, &values[..n_columns])
         })?;
         Ok(core::ops::ControlFlow::Continue(()))
     })?;
@@ -9262,7 +9433,6 @@ fn scan_source_mode<'a>(
     pax_demand: PaxReadDemand,
     indexed_override: Option<&IndexedCandidates<'a>>,
     automatic_index: bool,
-    planned: Option<super::index_paths::ScanPath<'a>>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     // A parenthesized join whose query waits is read only by the join
@@ -9278,6 +9448,7 @@ fn scan_source_mode<'a>(
     if !one_time_filter_passes(where_clause, scope, arena, params, hooks, outer)? {
         return Ok(());
     }
+    let leaf = ScanLeaf::new();
     let sample_plans = arena
         .alloc_slice_with(scope.n, |_| None::<TableSamplePlan>)
         .map_err(|_| arena_full())?;
@@ -9361,11 +9532,19 @@ fn scan_source_mode<'a>(
         retain_match: Option<&core::cell::Cell<bool>>,
         operation: impl FnOnce() -> R,
     ) -> R {
-        let mark = enabled.then(|| arena.mark());
+        recycled_from(arena, arena.mark(), enabled, retain_match, operation)
+    }
+
+    /// As [`recycled`], releasing everything allocated since `mark`.
+    fn recycled_from<R>(
+        arena: &Arena,
+        mark: crate::mem::arena::ArenaMark,
+        enabled: bool,
+        retain_match: Option<&core::cell::Cell<bool>>,
+        operation: impl FnOnce() -> R,
+    ) -> R {
         let result = operation();
-        if let Some(mark) = mark
-            && !retain_match.is_some_and(core::cell::Cell::get)
-        {
+        if enabled && !retain_match.is_some_and(core::cell::Cell::get) {
             // SAFETY: recycling callers consume their source row inside
             // `operation`; no reference into its arena suffix is observed
             // after this point.
@@ -9453,7 +9632,7 @@ fn scan_source_mode<'a>(
                         refresh_catalog_object_names(storage, txid, buffer, arena)?;
                     }
                 }
-                Some(BoundRow::Values(_)) | None => {}
+                Some(BoundRow::Values { .. }) | None => {}
             }
         }
         Ok(JoinRow {
@@ -9484,7 +9663,7 @@ fn scan_source_mode<'a>(
                 }
             }
             BoundRow::Encoded(bytes) => rowenc::decode(bytes, schema, output)?,
-            BoundRow::Values(values) => {
+            BoundRow::Values { values, .. } => {
                 if values.len() > output.len() {
                     return Err(arena_full());
                 }
@@ -9794,8 +9973,17 @@ fn scan_source_mode<'a>(
                             storage.record_relation_tuple_read(txid, build_slot, None)?;
                             // Rows not yet in column blocks arrive encoded.
                             match spilled.representation {
-                                crate::storage::SpilledRowRepresentation::Values(values) => {
-                                    insert(Some(spilled.rowid), BoundRow::Values(values), values)?;
+                                crate::storage::SpilledRowRepresentation::Values(
+                                    &crate::storage::SpilledValues { values, encoded },
+                                ) => {
+                                    insert(
+                                        Some(spilled.rowid),
+                                        BoundRow::Values {
+                                            values,
+                                            forms: RowForms::Encoded(encoded),
+                                        },
+                                        values,
+                                    )?;
                                 }
                                 crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                                     let mut decoded = [Datum::Null; MAX_COLUMNS];
@@ -9904,9 +10092,12 @@ fn scan_source_mode<'a>(
                 scan.for_each_spilled_row_batch(arena, recycle_rows, Some(demand), &mut |rows| {
                     for spilled in rows {
                         let row = match spilled.representation {
-                            crate::storage::SpilledRowRepresentation::Values(values) => {
-                                BoundRow::Values(values)
-                            }
+                            crate::storage::SpilledRowRepresentation::Values(
+                                &crate::storage::SpilledValues { values, encoded },
+                            ) => BoundRow::Values {
+                                values,
+                                forms: RowForms::Encoded(encoded),
+                            },
                             crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                                 BoundRow::Encoded(bytes)
                             }
@@ -10185,17 +10376,27 @@ fn scan_source_mode<'a>(
                 for spilled in rows {
                     storage.record_relation_tuple_read(txid, probe_slot, None)?;
                     // Rows not yet in column blocks arrive encoded.
-                    let values = match spilled.representation {
-                        crate::storage::SpilledRowRepresentation::Values(values) => values,
+                    let probe = match spilled.representation {
+                        crate::storage::SpilledRowRepresentation::Values(
+                            &crate::storage::SpilledValues { values, encoded },
+                        ) => BoundRow::Values {
+                            values,
+                            forms: RowForms::Encoded(encoded),
+                        },
                         crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                             let mut decoded = [Datum::Null; MAX_COLUMNS];
                             rowenc::decode(bytes, probe_schema, &mut decoded)?;
-                            &*arena
-                                .alloc_slice_copy(&decoded[..probe_schema.len()])
-                                .map_err(|_| arena_full())?
+                            BoundRow::Values {
+                                values: &*arena
+                                    .alloc_slice_copy(&decoded[..probe_schema.len()])
+                                    .map_err(|_| arena_full())?,
+                                forms: RowForms::Encoded(
+                                    &*arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?,
+                                ),
+                            }
                         }
                     };
-                    if !visit_probe(Some(spilled.rowid), BoundRow::Values(values))? {
+                    if !visit_probe(Some(spilled.rowid), probe)? {
                         stopped = true;
                         return Ok(ControlFlow::Break(()));
                     }
@@ -10630,7 +10831,7 @@ fn scan_source_mode<'a>(
         recycle_rows: bool,
         retain_match: Option<&core::cell::Cell<bool>>,
         pax_demand: PaxReadDemand,
-        planned: Option<super::index_paths::ScanPath<'a>>,
+        leaf: &ScanLeaf,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
@@ -10650,7 +10851,15 @@ fn scan_source_mode<'a>(
                 let chained_row = Chained { inner: &row, outer };
                 if !where_passes(w, arena, params, &chained_row, hooks)? {
                     if scope.n != 1
-                        || chosen_scan_reaches(rowid, false, arena, params, &chained_row, hooks)?
+                        || chosen_path_reaches(
+                            leaf.counts.get(),
+                            rowid,
+                            false,
+                            arena,
+                            params,
+                            &chained_row,
+                            hooks,
+                        )?
                     {
                         count_leaf(depth_nodes, false);
                     }
@@ -10659,12 +10868,20 @@ fn scan_source_mode<'a>(
             }
             if scope.n == 1 {
                 let chained_row = Chained { inner: &row, outer };
-                chosen_scan_reaches(rowid, true, arena, params, &chained_row, hooks)?;
+                chosen_path_reaches(
+                    leaf.counts.get(),
+                    rowid,
+                    true,
+                    arena,
+                    params,
+                    &chained_row,
+                    hooks,
+                )?;
             }
             count_leaf(depth_nodes, true);
             let keep = f(&row)?;
             // An ordered scan under a `LIMIT` ends with the limit's rows.
-            let stop = scope.n == 1 && limit_reached(scope.slots[0]);
+            let stop = scope.n == 1 && leaf.limit_reached();
             return Ok(keep && !stop);
         }
         // One execution of this depth's scan, or of the materialized copy a
@@ -10773,7 +10990,7 @@ fn scan_source_mode<'a>(
                                 recycle_rows,
                                 retain_match,
                                 pax_demand,
-                                planned,
+                                leaf,
                                 f,
                             )?,
                         );
@@ -10810,7 +11027,7 @@ fn scan_source_mode<'a>(
                         recycle_rows,
                         retain_match,
                         pax_demand,
-                        planned,
+                        leaf,
                         f,
                     )
                     .map(|keep| filter_join_resumed(depth + 1, keep))
@@ -10838,8 +11055,11 @@ fn scan_source_mode<'a>(
                                                 bytes,
                                             ) => BoundRow::Encoded(bytes),
                                             crate::storage::SpilledRowRepresentation::Values(
+                                                &crate::storage::SpilledValues { values, encoded },
+                                            ) => BoundRow::Values {
                                                 values,
-                                            ) => BoundRow::Values(values),
+                                                forms: RowForms::Encoded(encoded),
+                                            },
                                         },
                                         Some(spilled.rowid)
                                     )
@@ -11194,11 +11414,12 @@ fn scan_source_mode<'a>(
                 else {
                     return Ok::<Option<bool>, SqlError>(None);
                 };
+                let statistics = access.statistics(storage)?;
                 if access.scan_executed {
                     storage.record_relation_scan(
                         txid,
                         slot,
-                        Some(access.statistics()),
+                        Some(&statistics),
                         access.index_entries,
                         crate::sql::datetime::now_micros(),
                     )?;
@@ -11211,7 +11432,7 @@ fn scan_source_mode<'a>(
                     let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
                         continue;
                     };
-                    storage.record_relation_tuple_read(txid, slot, Some(access.statistics()))?;
+                    storage.record_relation_tuple_read(txid, slot, Some(&statistics))?;
                     let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                         let bytes = storage.row_bytes(slot, rowid, home, arena)?;
                         visit_candidate!(index, BoundRow::Encoded(bytes), Some(rowid))
@@ -11297,7 +11518,7 @@ fn scan_source_mode<'a>(
                         None
                     };
                     if let Some(tree) = tree {
-                        let _stop_after = StopAfterScope::enter(slot, tree.stop_after);
+                        leaf.stop_after(tree.stop_after);
                         let scan = TreeScan::new(
                             storage,
                             txid,
@@ -11360,24 +11581,31 @@ fn scan_source_mode<'a>(
                                         member.node
                                     },
                                 );
-                                let _chosen_scope = ChosenScanScope::enter(if sorted {
-                                    None
-                                } else {
-                                    member.counts
-                                });
+                                leaf.counts.set(if sorted { None } else { member.counts });
                                 let this = index;
                                 index += 1;
                                 recycled(arena, recycle_rows, retain_match, || {
-                                    let Some(values) = scan.row(&member, rowid)? else {
+                                    let Some((values, bytes)) = scan.row(&member, rowid)? else {
                                         return Ok(true);
                                     };
+                                    let forms = member_forms(
+                                        member.schema,
+                                        member.mapping,
+                                        Some(bytes),
+                                        logical.n_columns,
+                                        arena,
+                                    )?;
                                     refresh_catalog_object_names(
                                         storage,
                                         txid,
                                         &mut values[..logical.n_columns],
                                         arena,
                                     )?;
-                                    visit_candidate!(this, BoundRow::Values(values), Some(rowid))
+                                    visit_candidate!(
+                                        this,
+                                        BoundRow::Values { values, forms },
+                                        Some(rowid)
+                                    )
                                 })?
                             }};
                         }
@@ -11488,8 +11716,12 @@ fn scan_source_mode<'a>(
                             crate::storage::RelationColumnMap::new(logical, physical, arena)?;
                         let leaf_oid =
                             Datum::Oid(crate::sql::catalog::user_table_oid(storage, leaf) as u32);
+                        let mut physical_schema = [ColType::Bool; MAX_COLUMNS];
+                        physical.schema(&mut physical_schema);
+                        let physical_schema = &physical_schema[..physical.n_columns];
                         let mut visit = |rowid: Option<u64>,
-                                         physical_values: &[Datum<'a>]|
+                                         physical_values: &[Datum<'a>],
+                                         encoded: Option<&[u8]>|
                          -> Result<bool, SqlError> {
                             check_timeout()?;
                             if !foreign {
@@ -11511,7 +11743,14 @@ fn scan_source_mode<'a>(
                                     &mut values[..logical.n_columns],
                                     arena,
                                 )?;
-                                visit_candidate!(this, BoundRow::Values(values), rowid)
+                                let forms = member_forms(
+                                    physical_schema,
+                                    mapping,
+                                    encoded,
+                                    logical.n_columns,
+                                    arena,
+                                )?;
+                                visit_candidate!(this, BoundRow::Values { values, forms }, rowid)
                             })
                         };
                         // A foreign member ships the restrictions it can to
@@ -11565,12 +11804,8 @@ fn scan_source_mode<'a>(
                     && hashed.is_none()
                     && (!ordered_access || instrument::active())
                 {
-                    match (
-                        planned,
-                        super::index_paths::running_query(slot, where_clause),
-                    ) {
-                        (Some(path), _) => Some(path),
-                        (None, Some((shape, needed))) => super::index_paths::scan_path(
+                    match super::index_paths::running_query(slot, where_clause) {
+                        Some((shape, needed)) => super::index_paths::scan_path(
                             storage,
                             scope,
                             txid,
@@ -11581,15 +11816,13 @@ fn scan_source_mode<'a>(
                             shape,
                         )?
                         .chosen(),
-                        (None, None) => None,
+                        None => None,
                     }
                 } else {
                     None
                 };
                 let chosen = described.filter(|_| !ordered_access);
-                let access = access.filter(|access| {
-                    chosen.is_none() || !instrument::active() || access.reaches_path
-                });
+                let access = access.filter(|_| chosen.is_none() || !instrument::active());
                 let candidates = access.map(|access| access.rowids).or(hashed);
                 let index_order = match chosen {
                     Some(path) => path.kind != super::index_paths::ScanKind::Seq,
@@ -11606,12 +11839,11 @@ fn scan_source_mode<'a>(
                             | super::index_paths::ScanKind::IndexOnly
                     )
                 });
-                let _stop_after =
-                    StopAfterScope::enter(slot, chosen.and_then(|path| path.stop_after));
+                leaf.stop_after(chosen.and_then(|path| path.stop_after));
                 let _bitmap_loop;
                 let _tree_loops;
                 let counted = chosen.or(described);
-                let _chosen_scope = match counted {
+                leaf.counts.set(match counted {
                     Some(path) if instrument::active() => {
                         use super::index_paths::ScanKind;
                         let bitmap = if path.kind == ScanKind::Bitmap {
@@ -11633,7 +11865,7 @@ fn scan_source_mode<'a>(
                             })
                             .map_err(|_| arena_full())?;
                         _tree_loops = instrument::Loops::start(tree_nodes);
-                        Some(ChosenScanScope::enter(Some(chosen_scan_counts(
+                        Some(chosen_scan_counts(
                             storage,
                             txid,
                             slot,
@@ -11646,10 +11878,10 @@ fn scan_source_mode<'a>(
                                 &[]
                             },
                             arena,
-                        )?)))
+                        )?)
                     }
-                    _ => Some(ChosenScanScope::enter(None)),
-                };
+                    _ => None,
+                });
                 // Saved rows stream in physical order unless the chosen path
                 // orders several rows otherwise.
                 if candidates.is_none()
@@ -11659,11 +11891,14 @@ fn scan_source_mode<'a>(
                     visit_sequential_physical_rows!(slot);
                     break 'scanned;
                 }
+                let statistics = access
+                    .map(|access| access.statistics(storage))
+                    .transpose()?;
                 if hashed.is_none() && access.is_none_or(|access| access.scan_executed) {
                     storage.record_relation_scan(
                         txid,
                         slot,
-                        access.map(|access| access.statistics()),
+                        statistics.as_ref(),
                         access.map_or(0, |access| access.index_entries),
                         crate::sql::datetime::now_micros(),
                     )?;
@@ -11733,7 +11968,16 @@ fn scan_source_mode<'a>(
                                 }
                             }
                             refresh_catalog_object_names(storage, txid, values, arena)?;
-                            visit_candidate!(this, BoundRow::Values(values), Some(candidate.rowid))
+                            // An index-only scan returns the index tuple's datums,
+                            // which `index_form_tuple` forms anew.
+                            visit_candidate!(
+                                this,
+                                BoundRow::Values {
+                                    values,
+                                    forms: RowForms::Unknown,
+                                },
+                                Some(candidate.rowid)
+                            )
                         })?;
                         if !keep_scanning {
                             return Ok(false);
@@ -11745,23 +11989,23 @@ fn scan_source_mode<'a>(
                 // and fetch one row at a time so LIMIT can stop before unrelated
                 // object-resident table rows are point-read.
                 if let Some(access) = access.filter(|access| access.preserves_order) {
-                    for (this, &rowid) in access.rowids.iter().enumerate() {
-                        check_timeout()?;
-                        let Some(state) = storage.row_state(slot, rowid)? else {
-                            continue;
+                    let mut cursor = crate::storage::CandidateCursor::open(storage, slot, txid);
+                    let candidates = crate::storage::Candidates::Rowids(access.rowids);
+                    loop {
+                        // A recycled row's bytes go with it.
+                        let mark = arena.mark();
+                        let Some(row) = cursor.next(storage, arena, candidates)? else {
+                            break;
                         };
-                        let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
-                            continue;
-                        };
-                        storage.record_relation_tuple_read(
-                            txid,
-                            slot,
-                            Some(access.statistics()),
-                        )?;
-                        let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
-                            let bytes = storage.row_bytes(slot, rowid, home, arena)?;
-                            visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
-                        })?;
+                        storage.record_relation_tuple_read(txid, slot, statistics.as_ref())?;
+                        let keep_scanning =
+                            recycled_from(arena, mark, recycle_rows, retain_match, || {
+                                visit_candidate!(
+                                    row.position,
+                                    BoundRow::Encoded(row.bytes),
+                                    Some(row.rowid)
+                                )
+                            })?;
                         if !keep_scanning {
                             return Ok(false);
                         }
@@ -11825,22 +12069,24 @@ fn scan_source_mode<'a>(
                         });
                     }
                 }
-                for (this, row) in ordered[..fill].iter().copied().flatten().enumerate() {
-                    let rowid = row.rowid();
-                    let home = row.read()?;
-                    check_timeout()?;
+                let mut cursor = crate::storage::CandidateCursor::open(storage, slot, txid);
+                let candidates = crate::storage::Candidates::Selected(&ordered[..fill]);
+                loop {
+                    let mark = arena.mark();
+                    let Some(row) = cursor.next(storage, arena, candidates)? else {
+                        break;
+                    };
                     if hashed.is_none() {
-                        storage.record_relation_tuple_read(
-                            txid,
-                            slot,
-                            access.map(|access| access.statistics()),
-                        )?;
+                        storage.record_relation_tuple_read(txid, slot, statistics.as_ref())?;
                     }
-                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
-                        let bytes =
-                            storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?;
-                        visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
-                    })?;
+                    let keep_scanning =
+                        recycled_from(arena, mark, recycle_rows, retain_match, || {
+                            visit_candidate!(
+                                row.position,
+                                BoundRow::Encoded(row.bytes),
+                                Some(row.rowid)
+                            )
+                        })?;
                     if !keep_scanning {
                         return Ok(false);
                     }
@@ -11890,7 +12136,7 @@ fn scan_source_mode<'a>(
                     recycle_rows,
                     retain_match,
                     pax_demand,
-                    planned,
+                    leaf,
                     f,
                 )?,
             ) {
@@ -12081,43 +12327,6 @@ fn scan_source_mode<'a>(
 
     let automatic_indexed = if sample_plans.iter().any(Option::is_some) {
         None
-    } else if let Some(path) = planned {
-        // A join's described scan reads only the rows an index finds for
-        // its outer row's keys, a superset its conditions filter, in the
-        // order its path gives them. `EXPLAIN ANALYZE` counts the path's
-        // own reads: it reads the rows an index finds for the path's own
-        // index conditions, every row they reach among them.
-        if instrument::active() {
-            match path_index_conditions(&path, arena)? {
-                Some(conditions) => indexed_candidates(
-                    storage,
-                    scope,
-                    txid,
-                    Some(conditions),
-                    arena,
-                    params,
-                    hooks,
-                    outer,
-                )?
-                .map(|candidates| IndexedCandidates {
-                    reaches_path: true,
-                    ..candidates.unordered()
-                }),
-                None => None,
-            }
-        } else {
-            indexed_candidates(
-                storage,
-                scope,
-                txid,
-                where_clause,
-                arena,
-                params,
-                hooks,
-                outer,
-            )?
-            .map(IndexedCandidates::unordered)
-        }
     } else if automatic_index {
         indexed_candidates(
             storage,
@@ -12305,7 +12514,7 @@ fn scan_source_mode<'a>(
                     params,
                     hooks,
                     None,
-                    &mut |_, _| {
+                    &mut |_, _, _| {
                         total += 1;
                         Ok(true)
                     },
@@ -12407,7 +12616,7 @@ fn scan_source_mode<'a>(
             recycle_rows,
             retain_match,
             pax_demand,
-            planned,
+            &leaf,
             f,
         )?;
     }
@@ -12530,7 +12739,7 @@ fn scan_source_mode<'a>(
                     recycle_rows,
                     retain_match,
                     pax_demand,
-                    planned,
+                    &leaf,
                     f,
                 )
             };
@@ -12540,6 +12749,9 @@ fn scan_source_mode<'a>(
                 for &(leaf, first) in members {
                     let physical = definitions.definition(storage, leaf, txid)?;
                     let mapping = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
+                    let mut physical_schema = [ColType::Bool; MAX_COLUMNS];
+                    physical.schema(&mut physical_schema);
+                    let physical_schema = &physical_schema[..physical.n_columns];
                     let leaf_oid =
                         Datum::Oid(crate::sql::catalog::user_table_oid(storage, leaf) as u32);
                     let mut ordinal = first;
@@ -12553,7 +12765,7 @@ fn scan_source_mode<'a>(
                         params,
                         hooks,
                         None,
-                        &mut |rowid, physical_values| {
+                        &mut |rowid, physical_values, encoded| {
                             check_timeout()?;
                             let this = ordinal;
                             ordinal += 1;
@@ -12590,7 +12802,14 @@ fn scan_source_mode<'a>(
                                     &mut values[..logical.n_columns],
                                     arena,
                                 )?;
-                                emit_unmatched(BoundRow::Values(values), rowid, f)
+                                let forms = member_forms(
+                                    physical_schema,
+                                    mapping,
+                                    encoded,
+                                    logical.n_columns,
+                                    arena,
+                                )?;
+                                emit_unmatched(BoundRow::Values { values, forms }, rowid, f)
                             })
                         },
                     )?;
@@ -12714,8 +12933,11 @@ fn scan_source_mode<'a>(
                                             bytes,
                                         ) => BoundRow::Encoded(bytes),
                                         crate::storage::SpilledRowRepresentation::Values(
+                                            &crate::storage::SpilledValues { values, encoded },
+                                        ) => BoundRow::Values {
                                             values,
-                                        ) => BoundRow::Values(values),
+                                            forms: RowForms::Encoded(encoded),
+                                        },
                                     },
                                     Some(spilled.rowid),
                                     f,
@@ -12793,8 +13015,39 @@ fn scan_source_mode<'a>(
     Ok(())
 }
 
-/// A visitor of a member's rows: each row's identity and own columns.
-type MemberRowVisitor<'v, 'a> = dyn FnMut(Option<u64>, &[Datum<'a>]) -> Result<bool, SqlError> + 'v;
+/// The stored forms of a stored row's logical columns: its physical table
+/// encoding `encoded`, which records them, mapped through `mapping`. A
+/// foreign member's row (no encoding) holds values its server formed.
+fn member_forms<'a>(
+    schema: &[ColType],
+    mapping: crate::storage::RelationColumnMap<'_>,
+    encoded: Option<&[u8]>,
+    logical_columns: usize,
+    arena: &'a Arena,
+) -> Result<RowForms<'a>, SqlError> {
+    let Some(bytes) = encoded else {
+        return Ok(RowForms::Fresh);
+    };
+    let mut physical_forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+    let physical_forms = &mut physical_forms[..schema.len()];
+    rowenc::stored_forms(bytes, schema, physical_forms)?;
+    if physical_forms
+        .iter()
+        .all(|form| *form == crate::storage::StoredForm::Inline)
+    {
+        return Ok(RowForms::Fresh);
+    }
+    let forms = arena
+        .alloc_slice_with(logical_columns, |_| crate::storage::StoredForm::Inline)
+        .map_err(|_| arena_full())?;
+    mapping.project(physical_forms, forms);
+    Ok(RowForms::Listed(forms))
+}
+
+/// A member row's visitor: its identity, values and the table encoding that
+/// records its values' stored forms (none for a foreign member's row).
+type MemberRowVisitor<'v, 'a> =
+    dyn FnMut(Option<u64>, &[Datum<'a>], Option<&[u8]>) -> Result<bool, SqlError> + 'v;
 
 /// Visits each row of `leaf`, a member of an expanded FROM item, with its
 /// identity (none for a foreign member's, which come from its server as a
@@ -12833,7 +13086,7 @@ fn for_each_member_row<'a>(
             &mut |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 let width = crate::sql::exec::decode_projected_row_into(bytes, arena, &mut values)?;
-                visit(None, &values[..width])
+                visit(None, &values[..width], None)
             },
         );
     }
@@ -12846,14 +13099,16 @@ fn for_each_member_row<'a>(
     scan.for_each_spilled_row_batch(arena, recycle_rows, None, &mut |rows| {
         for row in rows {
             let mut decoded = [Datum::Null; MAX_COLUMNS];
-            let values = match row.representation {
+            let (values, encoded) = match row.representation {
                 crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                     rowenc::decode(bytes, schema, &mut decoded)?;
-                    &decoded[..physical.n_columns]
+                    (&decoded[..physical.n_columns], bytes)
                 }
-                crate::storage::SpilledRowRepresentation::Values(values) => values,
+                crate::storage::SpilledRowRepresentation::Values(
+                    &crate::storage::SpilledValues { values, encoded },
+                ) => (values, encoded),
             };
-            if !visit(Some(row.rowid), values)? {
+            if !visit(Some(row.rowid), values, Some(encoded))? {
                 aborted = true;
                 return Ok(core::ops::ControlFlow::Break(()));
             }
@@ -12867,7 +13122,7 @@ fn for_each_member_row<'a>(
         let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
         let mut values = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, schema, &mut values)?;
-        if !visit(Some(rowid), &values[..physical.n_columns])? {
+        if !visit(Some(rowid), &values[..physical.n_columns], Some(bytes))? {
             return Ok(core::ops::ControlFlow::Break(()));
         }
         Ok(core::ops::ControlFlow::Continue(()))

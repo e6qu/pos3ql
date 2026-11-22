@@ -559,6 +559,19 @@ impl TableDefinitionImages {
         table: usize,
         transaction: u32,
     ) -> Result<&'a TableDef, SqlError> {
+        let image = self.retain_table(storage, table, transaction)?;
+        Ok(self.retained_table(image))
+    }
+
+    /// Retains `table`'s definition as of `transaction` in this owner,
+    /// naming the image [`Self::retained_table`] reads without a chain walk.
+    #[cfg_attr(test, track_caller)]
+    pub(crate) fn retain_table(
+        &self,
+        storage: &Storage,
+        table: usize,
+        transaction: u32,
+    ) -> Result<DefinitionImageId, SqlError> {
         if !Arc::ptr_eq(&self.pool, &storage.table_definition_images) {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -571,7 +584,7 @@ impl TableDefinitionImages {
             // SAFETY: this owner retains every cell in its immutable chain.
             // Adding a new head never modifies a previously captured image.
             let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
-            if let ImagePayload::Table { source, definition } = &image.payload
+            if let ImagePayload::Table { source, .. } = &image.payload
                 && source.table == table
                 && source.transaction == transaction
             {
@@ -583,7 +596,11 @@ impl TableDefinitionImages {
                         "table identity changed while its definition image was retained"
                     ));
                 }
-                return Ok(definition);
+                return Ok(DefinitionImageId {
+                    pool: self.pool.identity,
+                    index,
+                    serial: image.serial,
+                });
             }
             slot = image.next;
         }
@@ -603,15 +620,21 @@ impl TableDefinitionImages {
                 definition: (*definition).clone(),
             },
         );
-        let target = self.pool.cells[captured.index].image.get().cast::<Image>();
         self.head.set(Some(captured.index));
-        // SAFETY: every field is initialized and this owner now retains the
-        // immutable image. The reference cannot outlive the owner's borrow.
-        let image = unsafe { &*target };
-        let ImagePayload::Table { definition, .. } = &image.payload else {
-            unreachable!("table capture installs a physical table payload");
+        Ok(captured)
+    }
+
+    /// The table definition [`Self::retain_table`] of this owner named.
+    pub(crate) fn retained_table(&self, image: DefinitionImageId) -> &TableDef {
+        assert_eq!(image.pool, self.pool.identity, "image of another pool");
+        // SAFETY: `retain_table` of this owner named the cell, which the
+        // owner's chain keeps occupied and immutable until Drop.
+        let stored = unsafe { (*self.pool.cells[image.index].image.get()).assume_init_ref() };
+        assert_eq!(stored.serial, image.serial, "image released by its owner");
+        let ImagePayload::Table { definition, .. } = &stored.payload else {
+            unreachable!("a retained table image holds a physical table payload");
         };
-        Ok(definition)
+        definition
     }
 }
 

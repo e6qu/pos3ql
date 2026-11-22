@@ -860,21 +860,9 @@ impl ColTypeResolver for CatalogCols<'_> {
             if !(1..=2).contains(&arguments.len()) {
                 return None;
             }
-            if schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-                && let Some(ctype) =
-                    crate::sql::eval::funcs::geometry::operator_result(operator, arguments)
+            if let Some(ctype) =
+                crate::sql::query::builtin_operator_call_result(schema, operator, arguments)
             {
-                return Some(StaticTypeMeta {
-                    type_oid: ctype.oid(),
-                    ctype,
-                    type_mod: -1,
-                    collation: crate::sql::ast::Collation::None,
-                });
-            }
-            if arguments.len() == 2
-                && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-            {
-                let ctype = crate::sql::query::builtin_operator_result(operator, arguments)?;
                 return Some(StaticTypeMeta {
                     type_oid: ctype.oid(),
                     ctype,
@@ -4473,6 +4461,16 @@ impl ColTypeResolver for NoCols {
 struct NoColumnLookup;
 
 impl<'a> ColumnLookup<'a> for NoColumnLookup {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn is_empty_scope(&self) -> bool {
         true
     }
@@ -4538,6 +4536,16 @@ impl ColTypeResolver for DefCols<'_> {
 }
 
 impl<'a> ColumnLookup<'a> for DefCols<'_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn whole_row_field_metadata(
         &self,
         table: &str,
@@ -4679,6 +4687,16 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn whole_row_field_metadata(
         &self,
         table: &str,
@@ -5873,6 +5891,22 @@ fn infer_type_unpositioned(
             infer_type_res(right, columns)?.0,
             columns,
         );
+    }
+    // A built-in prefix operator's result needs no catalog.
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::SqlSyntax,
+        name,
+        args: [operand],
+        ..
+    } = expression
+        && let Some((schema, symbol)) = crate::sql::ast::catalog_operator_call(name)
+        && let Some(ctype) = crate::sql::query::builtin_operator_call_result(
+            schema,
+            symbol,
+            &[infer_type_res(operand, columns)?.0],
+        )
+    {
+        return Ok((ctype.oid(), ctype.typlen()));
     }
     if let Some(result) = routine_result_metadata(expression, columns) {
         return Ok((result.type_oid, result.ctype.typlen()));

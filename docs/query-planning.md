@@ -275,10 +275,18 @@ plan path from a pool reserved at startup (`54000` naming the pool when a
 plan needs more), each exposing its current row as per-relation slots that
 stay valid until its next advance, so no row grows the statement arena.
 Sort runs `tuplesort.c`'s port, HashAggregate drives `hashagg.rs`, and
-`EXPLAIN ANALYZE` counters live in the node records. Its scan node needs
-every scan path to resume mid-scan; today only sequential heap scans
-(`RowCursor`) do, while index, bitmap, function and `LATERAL` scans run
-to completion through callbacks.
+`EXPLAIN ANALYZE` counters live in the node records. Its scan node
+already reads a join's base relations: one record per plan path in a
+`plan_build_bytes` lease (`54000` naming the pool when it is full), which
+resumes mid-scan after a storage wait: sequential heap scans through
+`RowCursor`, and index, index-only and bitmap scans through
+`CandidateCursor`, which keeps its place in the path's candidates and
+reads each row under the snapshot captured when it opened. A rescan finds
+the candidates for the new outer row in the node's own storage, which grows
+to at most twice the most candidates one execution found; a row the scan's
+condition rejects releases its bytes. Built-in set-returning functions
+advance one row at a time (`FunctionRows`); a `LATERAL` subquery will run as
+a subtree of the same plan.
 
 ## Sorting, hashing and memory figures
 
@@ -291,8 +299,10 @@ merge`), `Memory` and `Disk` (8,176-byte tape blocks, `906`; `476`, `820`).
 A sort under a limit takes its rows as they arrive (`980`): once it forms
 its bounded heap it keeps only the rows the limit returns, in two
 `plan_build_bytes` leases (`54000` naming the setting when they fill), so
-`ORDER BY ... LIMIT n` over a join of any size holds `n` rows. A sort
-without a limit holds every row in the statement arena.
+`ORDER BY ... LIMIT n` over a join of any size holds `n` rows; a row whose
+sort keys are not less than the heap's greatest row's is dropped before it
+is encoded, as PostgreSQL frees it. A sort without a limit holds every row
+in the statement arena.
 Values are charged at PostgreSQL's sizes, including `jsonb`
 (`convertToJsonb`), arrays, records, ranges, multiranges, `tsquery` and
 `jsonpath`; `pg_column_size` reports the same (`919`). A value with no size

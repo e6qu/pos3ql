@@ -3538,6 +3538,16 @@ impl<'storage> DependencyTypes<'_, '_, 'storage> {
 }
 
 impl<'a> crate::sql::eval::ColumnLookup<'a> for DependencyTypes<'_, '_, '_> {
+    fn stored_form(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        // A lookup of names and types, with no stored values.
+        let _ = (qualifier, name);
+        Ok(None)
+    }
+
     fn whole_row_field_metadata(
         &self,
         table: &str,

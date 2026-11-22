@@ -61,7 +61,8 @@ impl<'a> TransitionCapture<'a> {
         values: &[Datum<'_>],
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
-        let row = encode_projected_persistent_pub(values, arena)?;
+        // Transition table readers do not keep stored forms.
+        let row = encode_projected_persistent_pub(values, &[], arena)?;
         self.old
             .push(row)
             .map_err(|_| super::super::query::arena_full_pub())
@@ -72,7 +73,8 @@ impl<'a> TransitionCapture<'a> {
         values: &[Datum<'_>],
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
-        let row = encode_projected_persistent_pub(values, arena)?;
+        // Transition table readers do not keep stored forms.
+        let row = encode_projected_persistent_pub(values, &[], arena)?;
         self.new
             .push(row)
             .map_err(|_| super::super::query::arena_full_pub())

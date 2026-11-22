@@ -76,6 +76,8 @@ impl<'a> ScanNode<'a> {
         let pending = self.pending.as_ref().expect("prepared statement row");
         let mut values = [Datum::Null; MAX_COLUMNS];
         pending.decode(scope, &mut values)?;
+        let mut forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+        pending.stored_forms(scope, 0, &mut forms)?;
         let rowids = [match &pending.row {
             RetainedRow::Physical(row) => Some(row.rowid),
             RetainedRow::Saved { rowid, .. } => *rowid,
@@ -87,6 +89,7 @@ impl<'a> ScanNode<'a> {
             values: scan::JoinRowValues::Flat {
                 values: &values,
                 offsets: &[0],
+                forms: Some(&forms),
             },
             rowids: &rowids,
             visible: scope.n,
@@ -103,6 +106,8 @@ pub(super) enum PlanNode<'a> {
     Scan(ScanNode<'a>),
     /// Nested-loop and hash join levels, each over its own scan.
     Join(join::JoinState<'a>),
+    /// The plan PostgreSQL's join search chose, run by its pull nodes.
+    Modeled(super::super::join_exec::ModeledPull<'a>),
     /// A WHERE condition: run by the driver on each returned row when
     /// `by_driver`, else as a sort or grouping reads its input.
     Filter {
@@ -174,7 +179,10 @@ impl<'a> PlanTree<'a> {
         bounds: RowBounds<'a>,
         eliminated: bool,
     ) -> Result<Self, SqlError> {
-        debug_assert!(matches!(leaf, PlanNode::Scan(_) | PlanNode::Join(_)));
+        debug_assert!(matches!(
+            leaf,
+            PlanNode::Scan(_) | PlanNode::Join(_) | PlanNode::Modeled(_)
+        ));
         debug_assert!(matches!(
             above,
             None | Some(PlanNode::Sort(_) | PlanNode::Group(_))
@@ -252,6 +260,13 @@ impl<'a> PlanTree<'a> {
         }
     }
 
+    pub(super) fn modeled(&self) -> Option<&super::super::join_exec::ModeledPull<'a>> {
+        match self.leaf() {
+            PlanNode::Modeled(modeled) => Some(modeled),
+            _ => None,
+        }
+    }
+
     pub(super) fn sort(&self) -> Option<&sort::SortState<'a>> {
         self.nodes().iter().find_map(|node| match node {
             PlanNode::Sort(sort) => Some(sort),
@@ -307,6 +322,7 @@ impl<'a> PlanTree<'a> {
         self.nodes().iter().any(|node| match node {
             PlanNode::Scan(scan) => scan.pending.is_some(),
             PlanNode::Join(join) => join.has_pending(),
+            PlanNode::Modeled(modeled) => modeled.has_pending(),
             PlanNode::Sort(sort) => sort.has_current(),
             PlanNode::Group(group) => group.has_current(),
             PlanNode::Filter { .. } | PlanNode::Project(_) | PlanNode::Limit { .. } => false,
@@ -382,6 +398,7 @@ impl<'a> PlanTree<'a> {
                 start_generator_source(&mut scan.source, storage, txid, state_arena, params)
             }
             PlanNode::Join(join) => join.start_generators(storage, txid, state_arena, params),
+            PlanNode::Modeled(_) => Ok(()),
             _ => unreachable!("plan leaf is a scan or join"),
         }
     }
@@ -410,6 +427,7 @@ fn close_leaf(node: &mut PlanNode<'_>) {
     match node {
         PlanNode::Scan(scan) => scan.source.close(),
         PlanNode::Join(join) => join.close(),
+        PlanNode::Modeled(modeled) => modeled.close(),
         _ => unreachable!("plan leaf is a scan or join"),
     }
 }
@@ -543,6 +561,25 @@ fn advance<'a>(
             }
             Ok(ready)
         }
+        PlanNode::Modeled(modeled) => {
+            if !start_leaf(state, None, pull)? {
+                return Ok(false);
+            }
+            let ready = modeled.prepare_row(
+                pull.storage,
+                pull.scope,
+                pull.state_arena,
+                pull.buffers,
+                pull.work,
+            )?;
+            if !ready {
+                *state = ReaderState::Complete;
+                if !keep_finished {
+                    modeled.close();
+                }
+            }
+            Ok(ready)
+        }
         PlanNode::Filter {
             by_driver: true, ..
         } => advance(below, state, keep_finished, pull),
@@ -666,6 +703,7 @@ fn with_row<'work, 'a, R>(
     match node {
         PlanNode::Scan(scan) => scan.with_row(scope, each),
         PlanNode::Join(join) => join.with_row(scope, work, scope.n, each),
+        PlanNode::Modeled(modeled) => modeled.with_row(scope, each),
         PlanNode::Sort(sort) if sort.has_current() => sort.with_input_row(scope, work, each),
         PlanNode::Group(_) => Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
@@ -683,6 +721,7 @@ fn release(nodes: &mut [PlanNode<'_>], state_arena: &Arena) {
     match node {
         PlanNode::Scan(scan) => scan.release(state_arena),
         PlanNode::Join(join) => join.finish_row(state_arena),
+        PlanNode::Modeled(modeled) => modeled.finish_row(),
         PlanNode::Sort(sort) => sort.finish_row(),
         PlanNode::Group(group) => group.finish_row(),
         PlanNode::Filter { .. } | PlanNode::Project(_) | PlanNode::Limit { .. } => {
@@ -722,6 +761,11 @@ fn rewind(
         }
         PlanNode::Join(join) => {
             join.rewind(state_arena)?;
+            *state = ReaderState::Reading;
+            Ok(())
+        }
+        PlanNode::Modeled(modeled) => {
+            modeled.rewind(state_arena)?;
             *state = ReaderState::Reading;
             Ok(())
         }

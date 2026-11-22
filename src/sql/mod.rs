@@ -59,6 +59,7 @@ pub mod numeric;
 mod param_types;
 pub mod parser;
 pub(crate) mod pg_qsort;
+pub(crate) mod pglz;
 pub(crate) mod plan_invalidations;
 mod planner_inputs;
 mod plpgsql_inputs;
@@ -90,6 +91,7 @@ pub mod timezone;
 mod timezone_abbreviation_data;
 mod timezone_data;
 pub mod to_char;
+pub(crate) mod toast;
 pub mod trigger_events;
 pub(crate) mod two_phase;
 pub mod txn;
@@ -18964,7 +18966,7 @@ impl Engine {
                         Ok(values) => values,
                         Err(error) => return Ok(Err(error)),
                     };
-                    for value in values {
+                    for value in values.0 {
                         if projected.len() == MAX_PROJ {
                             return Ok(Err(sql_err!(
                                 sqlstate::TOO_MANY_COLUMNS,
@@ -22396,7 +22398,7 @@ impl Engine {
                                         &completed[..declared.argument_count],
                                         false,
                                         Some(&sequence),
-                                        &mut |values| store_output(values),
+                                        &mut |values, _| store_output(values),
                                     )
                                 }) {
                                     return Ok(Err(error));
@@ -28301,6 +28303,7 @@ impl Engine {
                                 txid,
                                 &mut capture,
                                 query::RetainedUse::Cursor,
+                                work,
                             )
                         };
                         match prepared {

@@ -480,8 +480,14 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
     loop {
         advance(&mut engine);
         let prior = engine.replace_read_owner(Some(query_owner));
-        let result =
-            crate::mem::guard::forbid_alloc(|| cursor.next(&mut buffers, &state, &output, None));
+        let result = crate::mem::guard::forbid_alloc(|| {
+            cursor.next(
+                crate::storage::CursorScratch::Reader(&mut buffers),
+                &state,
+                &output,
+                None,
+            )
+        });
         let _ = engine.replace_read_owner(prior);
         match result {
             Ok(Some(row)) => {
@@ -498,7 +504,10 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
                         .unwrap();
                         &decoded[..]
                     }
-                    SpilledRowRepresentation::Values(values) => values,
+                    SpilledRowRepresentation::Values(&crate::storage::SpilledValues {
+                        values,
+                        ..
+                    }) => values,
                 };
                 assert_eq!(values[0], Datum::Int4((count + 1) as i32));
                 let Datum::Text(code) = values[1] else {
@@ -564,7 +573,12 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
                     for _ in 0..3 {
                         let prior = engine.replace_read_owner(Some(query_owner));
                         let waiting = crate::mem::guard::forbid_alloc(|| {
-                            cursor.next(&mut buffers, &state, &output, None)
+                            cursor.next(
+                                crate::storage::CursorScratch::Reader(&mut buffers),
+                                &state,
+                                &output,
+                                None,
+                            )
                         });
                         let _ = engine.replace_read_owner(prior);
                         assert_eq!(waiting.err().unwrap().sqlstate, sqlstate::INTERNAL_IO_WAIT);

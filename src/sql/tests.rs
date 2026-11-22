@@ -17,6 +17,7 @@ mod builtin_argument_binding;
 mod builtin_routine_changes;
 mod builtin_routine_comments;
 mod cache_space_waits;
+mod candidate_cursor_waits;
 mod canonical_sequences;
 mod cast_and_operator_class_descriptions;
 mod catalog_capture_selection;
@@ -5453,7 +5454,9 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
                     crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)?;
                     &decoded[..]
                 }
-                crate::storage::SpilledRowRepresentation::Values(values) => values,
+                crate::storage::SpilledRowRepresentation::Values(
+                    &crate::storage::SpilledValues { values, .. },
+                ) => values,
             };
             let Datum::Int4(value) = decoded[0] else {
                 panic!("integer fixture")
@@ -11141,6 +11144,48 @@ fn full_text_values_use_statement_memory_beyond_former_inline_limits() {
 }
 
 #[test]
+fn checkpointed_rows_sort_distinct_with_their_stored_forms() {
+    // Rows read back from checkpointed objects carry their values' stored
+    // forms into a materialized sort; a sort with no ORDER BY keys reads
+    // its keys from the end of each row.
+    let mut config = test_config("checkpointed-distinct-forms");
+    config.memtable_bytes = 256 << 10;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("checkpointed-distinct-forms-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE c1 (k int, v int); CREATE TABLE c2 (k int, w int, t text); \
+         INSERT INTO c1 VALUES (1,10),(1,20),(2,30),(2,40),(3,50); \
+         INSERT INTO c2 SELECT k, w, repeat(md5(k::text), 100) \
+           FROM (VALUES (1,100),(2,15),(3,60),(3,5)) v(k, w);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(engine.checkpoint().unwrap());
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT k, v FROM c1 WHERE v > ALL (SELECT DISTINCT w FROM c2 WHERE c2.k = c1.k) \
+           ORDER BY k, v; \
+         SELECT DISTINCT k, pg_column_size(t) FROM c2 ORDER BY k;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["2|30", "2|40", "1|82", "2|82", "3|82"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn wide_full_text_values_survive_indexes_checkpoint_and_object_cold_recovery() {
     use core::fmt::Write as _;
 
@@ -11151,7 +11196,9 @@ fn wide_full_text_values_survive_indexes_checkpoint_and_object_cold_recovery() {
         }
         write!(vector, "word{index:04}:1,2,3,4").unwrap();
     }
-    let mut query_terms = (0..300)
+    // A tsquery has plain storage: 300 terms would make the row too big
+    // for a heap page, as in PostgreSQL.
+    let mut query_terms = (0..100)
         .map(|index| format!("word{index:04}"))
         .collect::<Vec<_>>();
     while query_terms.len() > 1 {
@@ -11204,7 +11251,7 @@ fn wide_full_text_values_survive_indexes_checkpoint_and_object_cold_recovery() {
     );
     assert_eq!(
         data_rows(&output),
-        ["1|600|599|t"],
+        ["1|600|199|t"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -18351,6 +18398,57 @@ fn ordered_catalog_query_recycles_correlated_subquery_scratch() {
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(data_rows(&output).len(), 14, "{text}");
+}
+
+#[test]
+fn toast_forms_the_executor_does_not_carry_fail_where_they_are_observed() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE toasted (id integer, a text, b text); \
+         INSERT INTO toasted VALUES (1, repeat('y', 1500), repeat('y', 1500)); \
+         CREATE TABLE copied (a text); \
+         SELECT pg_column_size(a), pg_column_size(b) FROM toasted",
+    );
+    // The first value is stored compressed, the second as formed.
+    assert_eq!(
+        data_rows(&setup),
+        ["28|1504"],
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for sql in [
+        "SELECT pg_column_size(max(a)) FROM toasted",
+        "SELECT pg_column_size((SELECT a FROM toasted))",
+        "SELECT pg_column_size(a) FROM toasted GROUP BY a",
+    ] {
+        assert_eq!(
+            error_sqlstates(&run_with(&mut engine, &mut budget, sql)),
+            ["0A000"],
+            "{sql}"
+        );
+    }
+    // A grouped value the statement may pass on is stored in a form the
+    // model does not know: reading its size or the table's pages fails.
+    let stored = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO copied SELECT a FROM toasted GROUP BY a; \
+         INSERT INTO copied SELECT b || '' FROM toasted",
+    );
+    assert!(
+        error_sqlstates(&stored).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&stored)
+    );
+    for sql in ["SELECT pg_column_size(a) FROM copied", "ANALYZE copied"] {
+        assert_eq!(
+            error_sqlstates(&run_with(&mut engine, &mut budget, sql)),
+            ["0A000"],
+            "{sql}"
+        );
+    }
 }
 
 fn test_engine() -> (Engine, Budget) {
@@ -82948,7 +83046,9 @@ fn retained_sst_next(
                     )?;
                     &decoded[..]
                 }
-                crate::storage::SpilledRowRepresentation::Values(values) => values,
+                crate::storage::SpilledRowRepresentation::Values(
+                    &crate::storage::SpilledValues { values, .. },
+                ) => values,
             };
             let crate::sql::types::Datum::Int4(value) = values[0] else {
                 panic!("retained schema changed")
@@ -103044,6 +103144,7 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
 }
 
 mod engine_triggers;
+mod path_scan_waits;
 mod relation_input_granularity;
 mod row_progress;
 

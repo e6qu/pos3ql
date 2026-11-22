@@ -489,9 +489,26 @@ const LAYOUTS: &[(i32, PhysicalLayout)] = &[
     (12357, PhysicalLayout { length: -1, by_value: false, alignment: b'd', storage: b'x' }),
 ];
 
+/// One past the largest OID in [`LAYOUTS`].
+const OID_LIMIT: usize = LAYOUTS[LAYOUTS.len() - 1].0 as usize + 1;
+
+/// Each OID's position in [`LAYOUTS`] plus one, or zero for an OID it lacks,
+/// so a lookup is one index rather than a search on every sized value.
+static POSITIONS: [u16; OID_LIMIT] = {
+    let mut positions = [0u16; OID_LIMIT];
+    let mut at = 0;
+    while at < LAYOUTS.len() {
+        assert!(
+            at == 0 || LAYOUTS[at - 1].0 < LAYOUTS[at].0,
+            "LAYOUTS sorted by OID"
+        );
+        positions[LAYOUTS[at].0 as usize] = at as u16 + 1;
+        at += 1;
+    }
+    positions
+};
+
 pub(crate) fn builtin(oid: i32) -> Option<PhysicalLayout> {
-    LAYOUTS
-        .binary_search_by_key(&oid, |(oid, _)| *oid)
-        .ok()
-        .map(|position| LAYOUTS[position].1)
+    let position = *POSITIONS.get(usize::try_from(oid).ok()?)?;
+    (position != 0).then(|| LAYOUTS[usize::from(position) - 1].1)
 }

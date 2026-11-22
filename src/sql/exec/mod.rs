@@ -86570,6 +86570,7 @@ fn merge_source<'a>(
         locking: &[],
         written: crate::sql::ast::WrittenQuery::PLAIN,
         minmax_subquery: None,
+        cursor_fraction: crate::sql::ast::CursorFraction::ALL,
     };
     // Keep temporary source descriptions by value. Retaining full copies here
     // would consume the fixed statement arena before selecting source rows.

@@ -14,8 +14,9 @@ lists the limits.
 
 SQL runs on one CPU worker per server. Object-store requests overlap, and
 transactions can share one durable upload. For example, a cached invoice can be
-read while another connection waits for storage. Performance and failover on
-separate machines have not yet been measured.
+read while another connection waits for storage. Speed and cost on separate
+machines have not been measured yet; that
+[baseline](PLAN.md#measure-a-first-deployment-baseline) is the next milestone.
 
 See [what works today](docs/implemented-baseline.md) and the
 [roadmap](PLAN.md), whose [finish line](PLAN.md#the-finish-line) defines when

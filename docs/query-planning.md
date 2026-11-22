@@ -265,28 +265,44 @@ statistics (`631`, `651`-`653`): a hash join building on the smaller relation,
 or a nested loop over a `Materialize` without an equality; a join keeping both
 sides without an equality fails as PostgreSQL's full join does (`0A000`).
 
-### Pull-based join executor (planned)
+### Pull-based join executor
 
-The search's plan runs in `join_exec.rs`, which pushes each joined row
-through a callback; the retained executor (`retained/`) pulls rows and
-resumes after a storage wait but runs only nested-loop and hash levels in
-FROM order. The planned single executor replaces both: one node record per
-plan path from a pool reserved at startup (`54000` naming the pool when a
-plan needs more), each exposing its current row as per-relation slots that
-stay valid until its next advance, so no row grows the statement arena.
-Sort runs `tuplesort.c`'s port, HashAggregate drives `hashagg.rs`, and
-`EXPLAIN ANALYZE` counters live in the node records. Its scan node
-already reads a join's base relations: one record per plan path in a
-`plan_build_bytes` lease (`54000` naming the pool when it is full), which
-resumes mid-scan after a storage wait: sequential heap scans through
-`RowCursor`, and index, index-only and bitmap scans through
-`CandidateCursor`, which keeps its place in the path's candidates and
-reads each row under the snapshot captured when it opened. A rescan finds
-the candidates for the new outer row in the node's own storage, which grows
-to at most twice the most candidates one execution found; a row the scan's
-condition rejects releases its bytes. Built-in set-returning functions
-advance one row at a time (`FunctionRows`); a `LATERAL` subquery will run as
-a subtree of the same plan.
+A plan the search chooses runs as **pull nodes** when it holds only scans,
+nested loops (inner, left, semi and anti), hash joins over keys of hashable
+types (every join type) and `Materialize` (`src/sql/query/join_exec/pull.rs`).
+A result stream or cursor then reads it a row at a time, and a storage wait
+at any node returns to the reader with every node's position kept, so the
+same call resumes without counting a row twice (`pull_join_waits`). Each
+node's record lives in one `plan_build_bytes` lease per plan path (`54000`
+naming the pool when it is full); the reader keeps the chosen plan, each
+relation's scan and these records (about 18 KB for an analyzed table joined
+with itself, which a stream's estimate counts exactly), while the search and
+its analysis run in the statement's memory.
+
+- A scan node holds its sequential cursor or its index path's candidates,
+  its filter, the chosen path's counts and its `LIMIT` stop, and reads each
+  row under the snapshot captured when it opened. A rescan finds the
+  candidates for the new outer row in the node's own storage, which grows to
+  at most twice the most candidates one execution found.
+- A `Materialize` keeps its input's rows, with their stored forms, encoded in
+  `plan_build_bytes` leases and reads them again at each rescan.
+- A hash join keeps its table there too: inner rows and the outer rows it
+  saves to later batches are encoded in its store, and its skew buckets,
+  chunks, batch files and match flags are leased lists, so its buckets and
+  batches grow as `ExecHashJoin`'s do. A batch's saved outer rows hold only
+  the query's relations and are read in place (`979`); a one-batch table is
+  probed again at a rescan.
+- No node keeps a `Storage` or `Arena` reference between calls: each call
+  passes them, and a reader's type does not carry the storage borrow, so the
+  compiler rejects a node that would keep one.
+
+A plan with a merge join, `Memoize` or `Unique` node, or a hash join over
+keys without a ported hash function, runs in the general executor
+(`join_exec.rs`), which pushes each joined row through a callback; a storage
+wait there restarts the statement. Joins outside the search run in the
+retained reader's own nested-loop and hash levels, in FROM order, up to eight
+items. [PLAN.md](../PLAN.md#pause-and-resume-every-query-path) lists the work
+that moves every plan onto pull nodes.
 
 ## Sorting, hashing and memory figures
 

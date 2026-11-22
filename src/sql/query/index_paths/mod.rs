@@ -2206,6 +2206,8 @@ pub(crate) struct QueryShape<'a> {
     pub(crate) order: [OrderKey; MAX_ORDER_KEYS],
     pub(crate) order_len: usize,
     pub(crate) limit: Option<(Option<f64>, f64)>,
+    /// The share of the rows a cursor over the query plans for.
+    pub(crate) cursor: crate::sql::ast::CursorFraction,
     /// The scan may stop once the limit has its rows: no row lock or later
     /// filter can drop one of them.
     pub(crate) stop_at_limit: bool,
@@ -2408,6 +2410,7 @@ impl Default for QueryShape<'_> {
             order: [OrderKey::Expression; MAX_ORDER_KEYS],
             order_len: 0,
             limit: None,
+            cursor: crate::sql::ast::CursorFraction::ALL,
             stop_at_limit: false,
             unmodeled: None,
             target: false,
@@ -2500,12 +2503,15 @@ pub(crate) fn query_shape<'a>(
     scope: &QueryScope<'a>,
     items: &'a [crate::sql::ast::SelectItem<'a>],
     order_by: &'a [crate::sql::ast::OrderBy<'a>],
-    limit: Option<&'a Expr<'a>>,
-    offset: Option<&'a Expr<'a>>,
+    (limit, offset): (Option<&'a Expr<'a>>, Option<&'a Expr<'a>>),
+    cursor: crate::sql::ast::CursorFraction,
     params: &[Datum<'a>],
     arena: &'a Arena,
 ) -> Result<QueryShape<'a>, SqlError> {
-    let mut shape = QueryShape::default();
+    let mut shape = QueryShape {
+        cursor,
+        ..QueryShape::default()
+    };
     let variables = if order_by.is_empty() {
         None
     } else {
@@ -2589,6 +2595,20 @@ pub(crate) fn query_shape<'a>(
 
 /// A `LIMIT`'s rows, if any, and its `OFFSET`'s, when either is present.
 pub(crate) type LimitEstimate = Option<(Option<f64>, f64)>;
+
+/// `root->tuple_fraction` (`preprocess_limit`): a cursor's fraction of the
+/// rows, unless a `LIMIT` gives their absolute number (at least one, plus
+/// the `OFFSET`). An `OFFSET` alone leaves a cursor's fraction as it is.
+/// More than 0 makes every relation keep its fastest-starting paths.
+pub(crate) fn root_tuple_fraction(
+    cursor: crate::sql::ast::CursorFraction,
+    limit: LimitEstimate,
+) -> f64 {
+    match limit {
+        Some((Some(count), offset)) => count.max(1.0) + offset.max(0.0),
+        _ => cursor.value(),
+    }
+}
 
 /// A query's `LIMIT` and `OFFSET` as the planner estimates them
 /// (`preprocess_limit`): `Some(None)` without either, `None` when one is

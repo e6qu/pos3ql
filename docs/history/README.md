@@ -46,3 +46,14 @@ Related pull requests:
 - [PR #623](https://github.com/e6qu/pos3ql/pull/623): retained-reader
   qualification and fixes that keep metadata-only ALTER from rewriting rows
   while still enforcing uniqueness; its CI covers PRs #620–#622.
+
+## Roadmap before the baseline-first reorder
+
+Revision `44a6cdee6d7237e17b6858be233a1f41445e9d52` (PR #786), before the
+roadmap put the deployment baseline first:
+[PLAN.md](https://github.com/e6qu/pos3ql/blob/44a6cdee6d7237e17b6858be233a1f41445e9d52/PLAN.md).
+Its checked items record finished work: full join merged keys (`975`), self-join removal
+(`976`), single-table `LATERAL` subqueries with `Memoize` (`977`),
+`max_join_relations` (`978`), batched hash join outer rows (`979`), bounded
+`ORDER BY ... LIMIT` over large joins (`980`), and TOAST stored forms through
+query values, PL/pgSQL variables and routine parameters (`966`-`992`).

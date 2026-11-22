@@ -88,8 +88,10 @@ rather than raising the limits.
 
 When several worktrees or agents share one machine, run each heavy job
 (compile, test suite, differential phase, generated-query loop) through
-`tools/heavy-lock.sh <command>`. The wrapper holds a host-wide lock, so heavy
-jobs run one after another instead of at once.
+`tools/heavy-lock.sh <command>`. The wrapper holds a host-wide lock that
+waiting jobs take in arrival order (a ticket queue), so heavy jobs run one
+after another and none is overtaken; a dead holder's lock or ticket is
+reclaimed.
 
 A focused regression on a suitable runner:
 

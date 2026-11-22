@@ -1,0 +1,111 @@
+-- A declared cursor plans for cursor_tuple_fraction of its rows
+-- (CURSOR_OPT_FAST_PLAN): the path cheapest for that share of the rows
+-- wins, so a join may hash its other side and an ordered query may read an
+-- index instead of sorting. 1 plans for every row and 0 for the fastest
+-- start. EXPLAIN DECLARE shows the cursor's plan, under a Materialize when
+-- a scrollable cursor's nodes cannot run backward.
+CREATE TABLE fo (id int, k int, pad text);
+CREATE TABLE fi (k int, w text);
+INSERT INTO fo SELECT g, CASE WHEN g % 3 = 0 THEN 7 ELSE g % 900 END, repeat('o', 40) FROM generate_series(1, 3000) g;
+INSERT INTO fi SELECT g % 1200, 'w' || g || repeat('i', 60) FROM generate_series(1, 2400) g;
+ANALYZE fo, fi;
+SET work_mem = '64kB';
+EXPLAIN (COSTS OFF) SELECT fo.id, left(fi.w, 8) FROM fo JOIN fi ON fi.k = fo.k WHERE fo.id < 40;
+EXPLAIN (COSTS OFF) DECLARE c CURSOR FOR SELECT fo.id, left(fi.w, 8) FROM fo JOIN fi ON fi.k = fo.k WHERE fo.id < 40;
+EXPLAIN DECLARE c SCROLL CURSOR FOR SELECT fo.id, left(fi.w, 8) FROM fo JOIN fi ON fi.k = fo.k WHERE fo.id < 40;
+BEGIN;
+DECLARE c SCROLL CURSOR FOR SELECT fo.id, left(fi.w, 8) FROM fo JOIN fi ON fi.k = fo.k WHERE fo.id < 40;
+FETCH 6 FROM c;
+FETCH BACKWARD 3 FROM c;
+FETCH ABSOLUTE 2 FROM c;
+FETCH LAST FROM c;
+COMMIT;
+RESET work_mem;
+EXPLAIN (VERBOSE, COSTS OFF) DECLARE c SCROLL CURSOR FOR SELECT fo.id, fi.w FROM fo JOIN fi ON fi.k = fo.k;
+SET cursor_tuple_fraction = 0;
+EXPLAIN (COSTS OFF) DECLARE c CURSOR FOR SELECT fo.id FROM fo JOIN fi ON fi.k = fo.k;
+RESET cursor_tuple_fraction;
+DROP TABLE fo, fi;
+CREATE TABLE fs (id int PRIMARY KEY, v int, pad text);
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1, 50) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(51, 100) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(101, 150) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(151, 200) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(201, 250) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(251, 300) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(301, 350) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(351, 400) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(401, 450) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(451, 500) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(501, 550) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(551, 600) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(601, 650) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(651, 700) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(701, 750) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(751, 800) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(801, 850) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(851, 900) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(901, 950) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(951, 1000) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1001, 1050) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1051, 1100) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1101, 1150) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1151, 1200) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1201, 1250) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1251, 1300) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1301, 1350) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1351, 1400) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1401, 1450) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1451, 1500) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1501, 1550) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1551, 1600) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1601, 1650) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1651, 1700) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1701, 1750) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1751, 1800) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1801, 1850) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1851, 1900) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1901, 1950) g;
+INSERT INTO fs SELECT g, (g * 7919) % 2000, repeat(md5(g::text), 56) FROM generate_series(1951, 2000) g;
+CREATE INDEX fs_v ON fs (v);
+ANALYZE fs;
+EXPLAIN (COSTS OFF) SELECT id, v FROM fs ORDER BY v;
+EXPLAIN DECLARE c CURSOR FOR SELECT id, v FROM fs ORDER BY v;
+EXPLAIN DECLARE c SCROLL CURSOR FOR SELECT id, v FROM fs ORDER BY v;
+EXPLAIN DECLARE c SCROLL CURSOR FOR SELECT id, v FROM fs ORDER BY v LIMIT 10;
+EXPLAIN (COSTS OFF) DECLARE c NO SCROLL CURSOR FOR SELECT id, v FROM fs WHERE v < 100 ORDER BY v DESC;
+BEGIN;
+DECLARE c CURSOR FOR SELECT id, v FROM fs ORDER BY v, id;
+FETCH 5 FROM c;
+MOVE 1000 FROM c;
+FETCH 3 FROM c;
+COMMIT;
+SET cursor_tuple_fraction = 1.0;
+EXPLAIN (COSTS OFF) DECLARE c CURSOR FOR SELECT id, v FROM fs ORDER BY v;
+SET cursor_tuple_fraction = 0;
+EXPLAIN (COSTS OFF) DECLARE c CURSOR FOR SELECT id, v FROM fs ORDER BY v;
+SET cursor_tuple_fraction = 0.5;
+EXPLAIN (COSTS OFF) DECLARE c CURSOR FOR SELECT id, v FROM fs ORDER BY v;
+EXPLAIN (COSTS OFF) DECLARE c CURSOR FOR SELECT id, v FROM fs ORDER BY v OFFSET 1500;
+EXPLAIN (COSTS OFF) DECLARE c CURSOR FOR SELECT id, v FROM fs ORDER BY v LIMIT 1500;
+RESET cursor_tuple_fraction;
+EXPLAIN (COSTS OFF) DECLARE c SCROLL CURSOR FOR SELECT * FROM fs WHERE id = 5;
+EXPLAIN (COSTS OFF) DECLARE c SCROLL CURSOR FOR VALUES (1), (2);
+EXPLAIN (COSTS OFF) DECLARE c SCROLL CURSOR FOR SELECT 1;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) DECLARE c CURSOR FOR SELECT id, v FROM fs WHERE v < 3 ORDER BY v;
+DO $$
+DECLARE
+  r record;
+  n int := 0;
+  cur CURSOR FOR SELECT id, v FROM fs ORDER BY v;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN NOT FOUND OR n = 3;
+    RAISE NOTICE 'row % %', r.id, r.v;
+    n := n + 1;
+  END LOOP;
+  CLOSE cur;
+END $$;
+DROP TABLE fs;

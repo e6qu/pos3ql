@@ -269,9 +269,9 @@ sides without an equality fails as PostgreSQL's full join does (`0A000`).
 
 A plan the search chooses runs as **pull nodes**: scans, nested loops
 (inner, left, semi and anti), hash joins and merge joins (every join type),
-`Materialize`, `Memoize` and `Unique` (`src/sql/query/join_exec/pull.rs`).
-Only a plan scanning a `LATERAL` item runs in the general executor. A result
-stream or cursor reads a pulled plan a row at a time, and a storage wait
+`Materialize`, `Memoize`, `Unique` and the scan of a `LATERAL` item
+(`src/sql/query/join_exec/pull.rs`). A result stream or cursor reads a
+plan without a `LATERAL` item a row at a time, and a storage wait
 at any node returns to the reader with every node's position kept, so the
 same call resumes without counting a row twice (`pull_join_waits`). Each
 node's record lives in one `plan_build_bytes` lease per plan path (`54000`
@@ -279,6 +279,22 @@ naming the pool when it is full); the reader keeps the chosen plan, each
 relation's scan and these records (about 18 KB for an analyzed table joined
 with itself, which a stream's estimate counts exactly), while the search and
 its analysis run in the statement's memory.
+
+The general executor (any other statement, `EXPLAIN ANALYZE` among them)
+reads the same nodes. Its consumers keep the rows they are passed, so no
+row is released there: stored rows stay bound as they were read rather
+than encoded, nodes keep their stores and hash tables in the statement's
+memory instead of `plan_build_bytes` leases (so a plan of 130 joined
+relations needs no lease per node), only the paths the plan runs get a
+record, a `Materialize` reads its input only as far as a loop
+fetches (`ExecMaterial`), and a `LATERAL` item runs its subquery whole for
+each outer row. Under `EXPLAIN ANALYZE` each node counts its loops, rows
+and the rows its join conditions remove; a loop opens at a node's first
+read and closes when it ends, is rescanned or the statement stops reading.
+A `Hash` counts its builds and tables, a merge join's sorts and its
+`Materialize` count what each execution fetched, and a `Memoize` reports
+its hits, misses, evictions and memory (`1000`). A storage wait in the
+general executor restarts the statement.
 
 - A scan node holds its sequential cursor or its index path's candidates,
   its filter, the chosen path's counts and its `LIMIT` stop, and reads each
@@ -316,12 +332,12 @@ its analysis run in the statement's memory.
   compiler rejects a node that would keep one.
 
 Every join the model plans has keys whose type `datum_hash` hashes: a join
-clause over any other type is outside the model. A statement the retained
-reader does not hold (`EXPLAIN ANALYZE` among them) still runs the plan in
-the general executor (`join_exec.rs`), which pushes each joined row through a
-callback; a storage wait there restarts the statement. Joins outside the
-search run in the retained reader's own nested-loop and hash levels, in FROM
-order, up to eight items. [PLAN.md](../PLAN.md#pause-and-resume-every-query-path) lists the work
+clause over any other type is outside the model. `EXPLAIN ANALYZE` of a
+semi join whose inner relation is made unique (`Unique` or `HashAggregate`)
+fails with `0A000`, as does one whose `LATERAL` subquery its join stops
+reading early. Joins outside the search run in the retained reader's own
+nested-loop and hash levels, in FROM order, up to eight items.
+[PLAN.md](../PLAN.md#pause-and-resume-every-query-path) lists the work
 that moves every plan onto pull nodes.
 
 ## Sorting, hashing and memory figures

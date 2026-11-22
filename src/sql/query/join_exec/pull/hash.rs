@@ -79,18 +79,13 @@ pub(super) struct Candidate {
     place: usize,
 }
 
-fn table_full(error: LeaseError) -> SqlError {
-    crate::sql_err!(
-        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        "a join's hash table exceeds plan_build_bytes: {}",
-        error
-    )
-    .plan_build_exhausted()
+fn table_full(error: ListError) -> SqlError {
+    error.into_sql("a join's hash table's rows")
 }
 
 /// Inserts `value` at `position`, moving the entries from there one on.
 fn insert_at<T: Copy>(
-    list: &mut MutableSlice<T>,
+    list: &mut NodeList<'_, T>,
     position: usize,
     value: T,
 ) -> Result<(), SqlError> {
@@ -101,8 +96,10 @@ fn insert_at<T: Copy>(
 }
 
 /// PostgreSQL's hash table of a join of several batches.
-pub(super) struct BatchStore {
+pub(super) struct BatchStore<'a> {
     pub(super) buckets: u32,
+    /// `nbuckets_original`, as `EXPLAIN ANALYZE` reports it.
+    original_buckets: u32,
     /// `nbuckets_optimal`, which a one-batch build grows.
     optimal_buckets: u32,
     pub(super) batches: u32,
@@ -118,27 +115,28 @@ pub(super) struct BatchStore {
     skew_length: u32,
     skew_used: usize,
     skew_allowed: usize,
-    skew: MutableSlice<SkewSlot>,
-    skew_rows: MutableSlice<SkewRow>,
+    skew: NodeList<'a, SkewSlot>,
+    skew_rows: NodeList<'a, SkewRow>,
     /// The chunk list, head first.
-    chunks: MutableSlice<Chunk>,
+    chunks: NodeList<'a, Chunk>,
     next_chunk: u32,
-    memory: MutableSlice<Kept>,
+    memory: NodeList<'a, Kept>,
     prepends: u64,
     /// The later batches' rows, each side's in the order it was saved.
-    files: MutableSlice<Saved>,
+    files: NodeList<'a, Saved>,
     /// `memory` ordered by hash, newest prepend first, once loaded.
-    index: MutableSlice<u32>,
+    index: NodeList<'a, u32>,
 }
 
-impl BatchStore {
+impl<'a> BatchStore<'a> {
     pub(super) fn new(
-        pool: &Arc<LeasePool>,
+        space: &Space<'a>,
         sizing: crate::sql::query::index_paths::joins::HashSizing,
     ) -> Result<Self, SqlError> {
         let space_allowed = sizing.space_allowed as usize;
         Ok(Self {
             buckets: sizing.buckets,
+            original_buckets: sizing.buckets,
             optimal_buckets: sizing.buckets,
             batches: sizing.batches,
             original_batches: sizing.batches,
@@ -153,15 +151,31 @@ impl BatchStore {
             skew_length: 0,
             skew_used: 0,
             skew_allowed: space_allowed * 2 / 100,
-            skew: pool.lease(0).map_err(table_full)?,
-            skew_rows: pool.lease(0).map_err(table_full)?,
-            chunks: pool.lease(0).map_err(table_full)?,
+            skew: space.list().map_err(table_full)?,
+            skew_rows: space.list().map_err(table_full)?,
+            chunks: space.list().map_err(table_full)?,
             next_chunk: 0,
-            memory: pool.lease(0).map_err(table_full)?,
+            memory: space.list().map_err(table_full)?,
             prepends: 0,
-            files: pool.lease(0).map_err(table_full)?,
-            index: pool.lease(0).map_err(table_full)?,
+            files: space.list().map_err(table_full)?,
+            index: space.list().map_err(table_full)?,
         })
+    }
+
+    /// The table's figures `EXPLAIN ANALYZE` reports on its `Hash` node.
+    pub(super) fn figures(&self) -> crate::sql::query::instrument::HashTable {
+        crate::sql::query::instrument::HashTable {
+            tuples: self.total as u64,
+            tuple_bytes: None,
+            own_bytes: 0,
+            batches: Some(crate::sql::query::instrument::HashBatches {
+                buckets: self.buckets,
+                original_buckets: self.original_buckets,
+                batches: self.batches,
+                original_batches: self.original_batches,
+                peak: self.peak,
+            }),
+        }
     }
 
     /// `ExecHashGetBucketAndBatch`'s batch.
@@ -330,10 +344,9 @@ impl BatchStore {
     /// Orders the rows in memory as a walk of the chunks reads them: chunks
     /// in list order, each one's rows in place order.
     fn order_walk(&mut self) -> Result<(), SqlError> {
-        let mut position = self
-            .memory
-            .pool()
-            .lease::<u32>(self.next_chunk as usize)
+        let mut position = self.memory.sibling::<u32>().map_err(table_full)?;
+        position
+            .reserve_exact(self.next_chunk as usize)
             .map_err(table_full)?;
         for _ in 0..self.next_chunk {
             position.push_reserved(u32::MAX).map_err(table_full)?;
@@ -361,7 +374,7 @@ impl BatchStore {
         self.batches *= 2;
         self.buckets = self.optimal_buckets;
         self.order_walk()?;
-        let fresh = self.memory.pool().lease(0).map_err(table_full)?;
+        let fresh = self.memory.sibling().map_err(table_full)?;
         let walk = core::mem::replace(&mut self.memory, fresh);
         self.chunks.clear();
         let (mut in_memory, mut freed) = (0usize, 0usize);
@@ -520,14 +533,11 @@ impl BatchStore {
     /// The rows no outer row matched, as `ExecScanHashTableForUnmatched`
     /// walks them: each bucket's chain in bucket order, then, in batch 0,
     /// each skew bucket's. Their handles are written to `out`.
-    pub(super) fn unmatched(&self, out: &mut MutableSlice<u32>) -> Result<(), SqlError> {
+    pub(super) fn unmatched(&self, out: &mut NodeList<'_, u32>) -> Result<(), SqlError> {
         out.clear();
         let rows = self.memory.as_slice();
-        let mut order = self
-            .memory
-            .pool()
-            .lease::<u32>(rows.len())
-            .map_err(table_full)?;
+        let mut order = self.memory.sibling::<u32>().map_err(table_full)?;
+        order.reserve_exact(rows.len()).map_err(table_full)?;
         for at in 0..rows.len() {
             order.push_reserved(at as u32).map_err(table_full)?;
         }
@@ -598,12 +608,12 @@ impl BatchStore {
     pub(super) fn load(
         &mut self,
         batch: u32,
-        outer: &mut MutableSlice<Saved>,
+        outer: &mut NodeList<'_, Saved>,
     ) -> Result<(), SqlError> {
         self.current = batch;
         self.reset();
         outer.clear();
-        let mut inner = self.files.pool().lease::<Hashed>(0).map_err(table_full)?;
+        let mut inner = self.files.sibling::<Hashed>().map_err(table_full)?;
         let mut kept = 0;
         for at in 0..self.files.len() {
             let saved = self.files.as_slice()[at];
@@ -624,7 +634,7 @@ impl BatchStore {
     }
 }
 
-impl SkewBuckets for BatchStore {
+impl SkewBuckets for BatchStore<'_> {
     fn enable_skew(&mut self, length: u32, space: usize) {
         self.skew_enabled = true;
         self.skew_length = length;

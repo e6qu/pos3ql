@@ -350,10 +350,10 @@ rejects a node or scope that would keep one. A reader keeps only its
 subqueries' cached values, and a data change's subqueries run through the
 storage of the catalog evaluating them.
 
-**Joins.** A plan PostgreSQL's join search chose runs as pull nodes unless
-it scans a `LATERAL` item;
-[query planning](query-planning.md#pull-based-join-executor) describes them
-and which statements still run plans in the general executor. Other
+**Joins.** A plan PostgreSQL's join search chose runs as pull nodes, which
+the general executor reads too; a retained reader holds one unless it scans
+a `LATERAL` item.
+[Query planning](query-planning.md#pull-based-join-executor) describes them. Other
 joins of up to eight FROM items (tables, generator calls or `VALUES` lists)
 read through the retained reader's own levels, in the general executor's
 order (FROM order, or its cost order for a cross join):
@@ -498,7 +498,7 @@ statement arena and cannot pause after its first byte.
 |---|---|---|
 | Scan (table, literal list, generator calls, FROM-less row) | Read position and current row | Stream or cursor allocation |
 | Filter, projection, `LIMIT`/`OFFSET` | Condition, items, remaining counts | Node record |
-| Join-search pull nodes | See [query planning](query-planning.md#pull-based-join-executor) | `plan_build_bytes` |
+| Join-search pull nodes | See [query planning](query-planning.md#pull-based-join-executor) | `plan_build_bytes` for a stream or cursor; the statement's memory in the general executor |
 | Retained nested-loop join (inner, cross, `LEFT`; `RIGHT` and `FULL` of two items) | Each level's row bytes, position and matched flag; a flag per right row for `RIGHT`/`FULL` | Stream or cursor allocation; right-row flags in `plan_build_bytes` |
 | Retained hash join (two tables, every join type) | Build rows, entries and bucket heads; a match flag per entry when the build side is preserved | `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
 | Grouping and plain `DISTINCT` | Each group's key, states and held values; or every input row's keys and columns, then each group's results | `plan_build_bytes` |

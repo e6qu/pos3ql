@@ -33,8 +33,8 @@ pub(super) struct MergeRecord<'a> {
     phase: Phase,
     /// The outer input's rows when a sort orders them; an input in merge
     /// order is read from its path.
-    outer_sorted: Option<OrderedRows>,
-    inner: OrderedRows,
+    outer_sorted: Option<OrderedRows<'a>>,
+    inner: OrderedRows<'a>,
     /// Whether an outer row is current (`mj_OuterTupleSlot`), and a sorted
     /// outer input's next row.
     outer_current: bool,
@@ -55,11 +55,43 @@ pub(super) struct MergeRecord<'a> {
     /// row with NULLs for one side returns.
     outer_row: &'a mut [Option<BaseRow<'a>>],
     inner_row: &'a mut [Option<BaseRow<'a>>],
+    counts: Counts<'a>,
+    /// Under `EXPLAIN ANALYZE`, the inner index scan the join reads whole
+    /// but counts as far as it fetched: its node and the pages it counts,
+    /// or `None` for an inner input in order the join cannot count so.
+    in_part: Option<Option<(instrument::Node, Option<LazyPages<'a>>)>>,
+}
+
+/// What one execution of a merge join fetched from the inputs it keeps in
+/// its store, which `EXPLAIN ANALYZE` counts when the execution ends.
+struct Counts<'a> {
+    outer_fetches: usize,
+    inner_fetches: usize,
+    /// The most inner rows any fetch reached.
+    inner_reached: usize,
+    /// The inner input was fetched from.
+    inner_opened: bool,
+    /// The tuplestore of a `Materialize` over the inner input, replayed
+    /// over each inner row's `t_len` in fetch order.
+    material: Option<(
+        crate::sql::query::material_store::MaterialStore,
+        NodeList<'a, usize>,
+    )>,
+}
+
+impl Counts<'_> {
+    const NONE: Self = Self {
+        outer_fetches: 0,
+        inner_fetches: 0,
+        inner_reached: 0,
+        inner_opened: false,
+        material: None,
+    };
 }
 
 impl<'a> MergeRecord<'a> {
     pub(super) fn new(
-        pool: &Arc<LeasePool>,
+        space: &Space<'a>,
         (outer_width, outer_sorted): (usize, bool),
         inner_width: usize,
         relations: usize,
@@ -68,9 +100,9 @@ impl<'a> MergeRecord<'a> {
         Ok(Self {
             phase: Phase::InitializeOuter,
             outer_sorted: outer_sorted
-                .then(|| OrderedRows::new(pool, outer_width))
+                .then(|| OrderedRows::new(space, outer_width))
                 .transpose()?,
-            inner: OrderedRows::new(pool, inner_width)?,
+            inner: OrderedRows::new(space, inner_width)?,
             outer_current: false,
             outer_next: 0,
             inner_at: None,
@@ -87,7 +119,81 @@ impl<'a> MergeRecord<'a> {
             inner_row: arena
                 .alloc_slice_with(relations, |_| None)
                 .map_err(|_| arena_full())?,
+            counts: Counts::NONE,
+            in_part: None,
         })
+    }
+
+    /// Counts the inner input `inner`, an index scan the join reads whole
+    /// into its store, as far as each execution fetched it, as the scan
+    /// PostgreSQL reads in part counts.
+    pub(super) fn count_inner_in_part(
+        &mut self,
+        cx: JoinContext<'_, 'a>,
+        block: instrument::BlockId,
+        inner: u32,
+    ) -> Result<(), SqlError> {
+        self.in_part = Some(match cx.model.plan.path(inner).kind {
+            PathKind::Scan { rel, path } if cx.counts_lazily(usize::from(rel), path)? => {
+                let rel = usize::from(rel);
+                let _block = instrument::enter_block(block.child(scan_segment(rel)));
+                let buffers = instrument::buffers_counted();
+                let pages = cx.lazy_pages(rel, path, buffers)?;
+                let pages = (buffers || pages.visible.is_some()).then_some(pages);
+                Some((instrument::node(instrument::Role::Scan(0)), pages))
+            }
+            _ => None,
+        });
+        Ok(())
+    }
+
+    /// Counts what the execution ending fetched from the inputs the join
+    /// keeps (`EXPLAIN ANALYZE`): a sort returns each row the join fetched,
+    /// a `Materialize` too while its input returns each row once.
+    pub(super) fn count_execution(&mut self, model: &ModeledJoin<'_>, id: u32, nodes: &PathNodes) {
+        let counts = core::mem::replace(&mut self.counts, Counts::NONE);
+        let PathKind::MergeJoin {
+            materialize_inner,
+            inner_sort,
+            ..
+        } = model.plan.path(id).kind
+        else {
+            unreachable!("a merge join's path");
+        };
+        if self.outer_sorted.is_some() {
+            let _sort = nodes.sides[0].start();
+            nodes.sides[0].rows(counts.outer_fetches as u64);
+        }
+        if !counts.inner_opened {
+            return;
+        }
+        let read = if materialize_inner {
+            let _material = nodes.material.start();
+            nodes.material.rows(counts.inner_fetches as u64);
+            // Its tuplestore holds the rows it read from its input that the
+            // mark still needs.
+            nodes.material.store_opened();
+            if let Some((store, _)) = counts.material {
+                nodes.material.stored_space(false, store.finish());
+            }
+            counts.inner_reached
+        } else {
+            counts.inner_fetches
+        };
+        if !inner_sort.as_slice().is_empty() {
+            let _sort = nodes.sides[1].start();
+            nodes.sides[1].rows(read as u64);
+        } else if let Some(Some((node, pages))) = self.in_part {
+            let inner = &self.inner;
+            count_read_in_part(
+                node,
+                pages,
+                read,
+                inner.order.as_slice()[..read.min(inner.len())]
+                    .iter()
+                    .map(|&row| inner.store.entries.as_slice()[row as usize * inner.width].rowid),
+            );
+        }
     }
 
     /// `ExecReScanMergeJoin`: the join starts again; a sorted input whose
@@ -106,6 +212,7 @@ impl<'a> MergeRecord<'a> {
         self.outer_mark = None;
         self.inner_mark = None;
         self.inner_loaded = None;
+        self.counts = Counts::NONE;
         // A store whose input was not read to its end is read again too.
         let outer_cleared = match &mut self.outer_sorted {
             Some(outer) if reread_outer || !outer.filled => {
@@ -142,6 +249,8 @@ pub(super) struct MergeJoin<'k> {
     pub(super) other_quals: &'k ClauseList,
     pub(super) single_match: bool,
     pub(super) skip_mark_restore: bool,
+    /// A `Materialize` lies over the inner input.
+    pub(super) materialize_inner: bool,
     /// Bit `i` for merge clause `i`.
     pub(super) descending: u32,
     pub(super) nulls_first: u32,
@@ -204,6 +313,7 @@ impl<'a> Step<'_, '_, 'a> {
                     self.bind_outer(id, join);
                     self.bind_inner(id, join, inner_at)?;
                     if !cx.equal(self.bound, join.join_quals)? {
+                        self.nodes[id as usize].rows.join_filtered();
                         continue;
                     }
                     let record = merge_record(self.records, id);
@@ -222,6 +332,7 @@ impl<'a> Step<'_, '_, 'a> {
                     if cx.equal(self.bound, join.other_quals)? {
                         return Ok(true);
                     }
+                    self.nodes[id as usize].rows.filtered();
                 }
                 Phase::NextInner => {
                     if fill_inner && !record.matched_inner {
@@ -288,6 +399,9 @@ impl<'a> Step<'_, '_, 'a> {
                                 // mark.
                                 record.inner_at = Some(marked);
                                 record.inner_next = marked + 1;
+                                if let Some((store, _)) = record.counts.material.as_mut() {
+                                    store.restore();
+                                }
                             }
                             record.phase = Phase::JoinTuples;
                         }
@@ -318,6 +432,11 @@ impl<'a> Step<'_, '_, 'a> {
                         Ordering::Equal => {
                             let record = merge_record(self.records, id);
                             record.marked = record.inner_at;
+                            if !join.skip_mark_restore
+                                && let Some((store, lengths)) = record.counts.material.as_mut()
+                            {
+                                store.mark(lengths.as_slice());
+                            }
                             Phase::JoinTuples
                         }
                         Ordering::Less => Phase::SkipOuterAdvance,
@@ -403,15 +522,23 @@ impl<'a> Step<'_, '_, 'a> {
             if !outer.arranged {
                 let (members, flags, count) = cx.sort_members(&join.outer_sort, outer_relids);
                 let keys = (&members[..count], &flags[..count]);
+                let mut space = None;
                 outer.arrange(cx, keys.0, join.outer, |rows, sizes| {
                     cx.sort_order(join.outer, rows, sizes, keys)
-                        .map(|(order, _)| order)
+                        .map(|(order, sorted)| {
+                            space = Some(sorted);
+                            order
+                        })
                 })?;
+                if let Some(space) = space {
+                    self.nodes[id as usize].sides[0].sorted(space);
+                }
             }
             if record.outer_next < outer.len() {
-                Step::release(cx.arena, &mut record.outer_mark);
+                Step::release(cx.arena, self.keep, &mut record.outer_mark);
                 outer.load(record.outer_next, cx, self.bound)?;
                 record.outer_next += 1;
+                record.counts.outer_fetches += 1;
                 true
             } else {
                 false
@@ -434,7 +561,23 @@ impl<'a> Step<'_, '_, 'a> {
     fn fetch_inner(&mut self, id: u32, join: &MergeJoin<'_>) -> Result<MergeEval, SqlError> {
         let cx = self.cx;
         let inner_relids = cx.model.plan.path(join.inner).relids;
-        self.fill(id, join.inner, |record| merge_record_rows(record, false))?;
+        let record = merge_record(self.records, id);
+        record.counts.inner_opened = true;
+        // An input counted as far as fetched is read whole uncounted.
+        let in_part = match record.in_part {
+            Some(None) => {
+                return Err(crate::sql_err!(
+                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN ANALYZE of a merge join over an input in order without a sort is not supported"
+                ));
+            }
+            Some(Some(_)) => true,
+            None => false,
+        };
+        {
+            let _suspended = in_part.then(instrument::suspend);
+            self.fill(id, join.inner, |record| merge_record_rows(record, false))?;
+        }
         let record = merge_record(self.records, id);
         if !record.inner.arranged {
             if join.inner_sort.as_slice().is_empty() {
@@ -442,23 +585,48 @@ impl<'a> Step<'_, '_, 'a> {
             } else {
                 let (members, flags, count) = cx.sort_members(&join.inner_sort, inner_relids);
                 let keys = (&members[..count], &flags[..count]);
+                let mut space = None;
                 record
                     .inner
                     .arrange(cx, keys.0, join.inner, |rows, sizes| {
                         cx.sort_order(join.inner, rows, sizes, keys)
-                            .map(|(order, _)| order)
+                            .map(|(order, sorted)| {
+                                space = Some(sorted);
+                                order
+                            })
                     })?;
+                if let Some(space) = space {
+                    self.nodes[id as usize].sides[1].sorted(space);
+                }
             }
         }
-        if record.inner_next < record.inner.len() {
+        if join.materialize_inner && instrument::active() && record.counts.material.is_none() {
+            let lengths = record.inner.lengths(cx, join.inner)?;
+            record.counts.material = Some((
+                crate::sql::query::material_store::MaterialStore::new(),
+                lengths,
+            ));
+        }
+        let fetched = if record.inner_next < record.inner.len() {
             let at = record.inner_next;
             record.inner_at = Some(at);
             record.inner_next += 1;
-            self.bind_inner(id, join, at)?;
-            Ok(self.eval(join, false))
+            record.counts.inner_fetches += 1;
+            record.counts.inner_reached = record.counts.inner_reached.max(record.inner_next);
+            Some(at)
         } else {
             record.inner_at = None;
-            Ok(MergeEval::EndOfJoin)
+            None
+        };
+        if let Some((store, lengths)) = record.counts.material.as_mut() {
+            store.next(lengths.as_slice())?;
+        }
+        match fetched {
+            Some(at) => {
+                self.bind_inner(id, join, at)?;
+                Ok(self.eval(join, false))
+            }
+            None => Ok(MergeEval::EndOfJoin),
         }
     }
 
@@ -475,7 +643,7 @@ impl<'a> Step<'_, '_, 'a> {
         let relids = cx.model.plan.path(join.inner).relids;
         let record = merge_record(self.records, id);
         if record.inner_loaded != Some(at) {
-            Step::release(cx.arena, &mut record.inner_mark);
+            Step::release(cx.arena, self.keep, &mut record.inner_mark);
             record.inner_loaded = None;
             record.inner.load(at, cx, self.bound)?;
             cx.bind(record.inner_row, self.bound, relids);
@@ -574,7 +742,17 @@ impl<'a> Step<'_, '_, 'a> {
         self.bind_outer(id, join);
         self.cx
             .null_extend(self.bound, self.cx.model.plan.path(join.inner).relids);
-        self.cx.equal(self.bound, join.other_quals)
+        self.filled(id, join)
+    }
+
+    /// Whether a row with NULLs for one side passes the join's filters,
+    /// counting one they remove.
+    fn filled(&mut self, id: u32, join: &MergeJoin<'_>) -> Result<bool, SqlError> {
+        let passes = self.cx.equal(self.bound, join.other_quals)?;
+        if !passes {
+            self.nodes[id as usize].rows.filtered();
+        }
+        Ok(passes)
     }
 
     /// `MJFillInner`: the current inner row with NULLs for the outer
@@ -586,12 +764,12 @@ impl<'a> Step<'_, '_, 'a> {
         self.bind_inner(id, join, at)?;
         self.cx
             .null_extend(self.bound, self.cx.model.plan.path(join.outer).relids);
-        self.cx.equal(self.bound, join.other_quals)
+        self.filled(id, join)
     }
 }
 
 /// A merge join's sorted outer rows, or its inner rows.
-fn merge_record_rows<'r>(record: &'r mut Record<'_>, outer: bool) -> &'r mut OrderedRows {
+fn merge_record_rows<'r, 'a>(record: &'r mut Record<'a>, outer: bool) -> &'r mut OrderedRows<'a> {
     let Record::MergeJoin(record) = record else {
         unreachable!("a merge join's record");
     };

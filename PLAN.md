@@ -160,18 +160,25 @@ the pull executor.
 
 **Finish the pull executor (in progress), in this order:**
 
-1. [ ] Every plan the join search makes pulls but one scanning a `LATERAL`
-   item: merge join, `Memoize` and `Unique` pull nodes run beside the
-   others (`997`), and a hash join's keys always have a ported hash
-   function, since the model plans joins only over such types. Still open:
-   `EXPLAIN ANALYZE` counters live in the pull nodes, and a pulled-up
-   subquery's join reads as a retained reader.
-2. [ ] The general executor runs the same nodes. Delete the push-based
-   `Runner` in `join_exec.rs`, the retained reader's `JoinState` levels and
-   `MAX_RETAINED_SOURCES` (the eight-item limit on retained joins).
+1. [x] Every plan the join search makes pulls: merge join, `Memoize` and
+   `Unique` pull nodes run beside the others (`997`), and a hash join's
+   keys always have a ported hash function, since the model plans joins
+   only over such types. `EXPLAIN ANALYZE` counters live in the pull nodes
+   (`1000`). Still open: a semi join's unique-ified relation (`Unique`,
+   `HashAggregate`) under `EXPLAIN ANALYZE` fails with `0A000`, and a
+   pulled-up subquery's join reads as a retained reader.
+2. [ ] The general executor runs the same nodes and the push-based `Runner`
+   is gone (`LATERAL` items included, their subquery run whole per outer
+   row). Its nodes keep their stores in the statement's memory, not a
+   `plan_build_bytes` lease each, so joins of 33 and 130 relations run
+   (`972`, `978`). Still open: the retained reader's `JoinState` levels and
+   `MAX_RETAINED_SOURCES` (the eight-item limit on retained joins) serve
+   joins outside the search, chiefly of never-analyzed tables, so they go
+   with step 5.
 3. [ ] Sort on the `tuplesort` port, `HashAggregate` on `hashagg.rs` and
-   `LATERAL` bodies run as subtrees of the same plan. `ORDER BY` without a
-   limit over a join larger than the statement arena then sorts in runs over
+   `LATERAL` bodies run as subtrees a retained reader holds (it holds no
+   plan scanning a `LATERAL` item today). `ORDER BY` without a limit over a
+   join larger than the statement arena then sorts in runs over
    `plan_build_bytes` leases (`54000` today).
 4. [x] A declared cursor (`DECLARE`, PL/pgSQL `OPEN`) plans for
    `cursor_tuple_fraction` of its rows (`CURSOR_OPT_FAST_PLAN`, `995`), and

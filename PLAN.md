@@ -479,17 +479,21 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   subquery passes on (PostgreSQL keeps its one-byte header). The result of
   a user-defined function is taken as formed anew, though PostgreSQL may
   return a stored datum it read.
-- [ ] PL/pgSQL forms as PostgreSQL 18.6 keeps them (measured 2026-11-22): a
-  variable filled by `:=`, `SELECT INTO`, `FOR` or `FETCH`, `NEW` and `OLD`
-  fields and a record's fields hold the datum as passed (`datumTransfer`):
-  a stored `'short'` reads 6, a compressed value its compressed size, an
-  out-of-line one its saved size (a record field read in an expression is
-  fetched in line, the record as a whole holds its stored tuple). A value an
-  expression forms keeps its four-byte header: `y := 'lit'` reads 7,
-  `z := v || ''` 9 and `v := (SELECT s ...)` 9, where pos3ql reports the
-  packed 4, 6 and 6 today; a value TOAST may have stored otherwise is
-  refused (`0A000`). Needs a form slot beside each local, carried through
-  scope construction, `SavedValues` and trigger rows.
+- [x] PL/pgSQL variables keep the datum they are given (`datumTransfer`):
+  each variable's slot records how it holds its value. A simple
+  expression's result keeps the header the expression gave it (`y := 'lit'`
+  reads 7, `z := v || ''` 9), a copy of a variable keeps that variable's
+  form, and a query's result (`SELECT INTO`, an expression with a subquery,
+  a `FOR` or `FETCH` row, a procedure's outputs) is read from a result
+  tuple, which packs a short value (`SELECT 'lit' INTO a` reads 4) and
+  keeps a stored value's TOAST form when the query carries it (`SELECT big
+  INTO w` reads 44); a record keeps its fields' forms (`992`).
+- [ ] PL/pgSQL forms not carried yet: a parameter's (the caller's
+  expression is not traced: a short value is taken as packed, a longer one
+  is `0A000`), a long value a `FOR` or `FETCH` row or a `RETURNS TABLE`
+  query passes on, and `NEW` and `OLD` columns TOAST may store otherwise
+  (`0A000`; PostgreSQL reads a `BEFORE` trigger's `NEW` as formed, 3004,
+  and an `AFTER` trigger's as stored, 44).
 - [ ] Composite forms not carried yet: the one-byte header a short
   composite gets when a sort or a materialized CTE forms it into a tuple, a
   derived table's whole-row output PostgreSQL pulls up into the outer query

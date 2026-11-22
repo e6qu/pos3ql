@@ -240,6 +240,15 @@ pub(crate) fn may_be_toasted(value: &crate::sql::types::Datum<'_>) -> bool {
             .is_none_or(|payload| payload >= 24)
 }
 
+/// Whether `after` is the very datum `before` (a conversion that left the
+/// value as it was), not a copy formed anew.
+pub(crate) fn same_datum_identity(
+    before: &crate::sql::types::Datum<'_>,
+    after: &crate::sql::types::Datum<'_>,
+) -> bool {
+    datum_identity(before).is_some_and(|identity| Some(identity) == datum_identity(after))
+}
+
 /// The bytes a datum of a type TOAST can store compressed or out of line
 /// borrows: its identity. A datum passed on unchanged keeps it; a value
 /// formed anew borrows other bytes.
@@ -535,6 +544,9 @@ fn source_of<'a>(
             }
             Err(error) => return Err(error),
         };
+        if row.holds_formed_datum(qualifier, name) {
+            return Ok(same_datum(&read, value).then_some(Source::Fresh));
+        }
         // A composite read from a stored row is the stored datum; one a
         // query formed (a whole row, `ROW(...)`) it passes on as formed.
         Ok(match (read, value) {

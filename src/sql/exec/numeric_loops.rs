@@ -107,7 +107,7 @@ impl<'a> NumericLoopFrames<'a> {
         // Inactive values cannot retain references into a completed body's
         // temporary arena suffix. The scope owns both of its buffer ranges.
         workspace.locals.fill(empty_plpgsql_local());
-        workspace.values.fill(Datum::Null);
+        workspace.values.fill(LocalSlot::NULL);
         self.active -= 1;
         self.slots[depth] = Some(workspace);
     }

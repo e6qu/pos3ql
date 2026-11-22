@@ -832,10 +832,10 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
     fn scope<'s>(
         &'s mut self,
         locals: &'s [TriggerLocalDecl],
-        values: &'s mut [Datum<'a>],
+        values: &'s mut [LocalSlot<'a>],
     ) -> (
         &'s [TriggerLocalDecl],
-        &'s mut [Datum<'a>],
+        &'s mut [LocalSlot<'a>],
         Option<CaughtDiagnostic<'s>>,
     ) {
         let diagnostic = self.state.diagnostics.current();
@@ -897,7 +897,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
         context: &mut TriggerExecContext<'_, 'a, '_>,
         frame: Frame<FrameResource<'a>>,
         locals: &[TriggerLocalDecl],
-        values: &mut [Datum<'a>],
+        values: &mut [LocalSlot<'a>],
         status: &mut TriggerExecutionStatus<'a>,
         success: bool,
     ) {
@@ -906,7 +906,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
             FrameResource::Numeric { workspace },
             PlpgsqlExecHost::Routine { cursors, .. },
         ) = (frame.continuation, &frame.resource, &mut context.host)
-            && let Datum::Text(portal) = workspace.values[scope.portal]
+            && let Datum::Text(portal) = workspace.values[scope.portal].value
         {
             cursors.close_pinned(portal);
         }
@@ -917,7 +917,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
         &mut self,
         frame: Frame<FrameResource<'a>>,
         locals: &[TriggerLocalDecl],
-        values: &mut [Datum<'a>],
+        values: &mut [LocalSlot<'a>],
         status: &mut TriggerExecutionStatus<'a>,
         success: bool,
     ) {
@@ -943,7 +943,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
                             open.variable.names(local)
                         })
                 {
-                    parent_values[variable] = Datum::Null;
+                    parent_values[variable] = LocalSlot::NULL;
                 }
                 status.numeric_frames.restore(workspace);
                 if success {
@@ -997,7 +997,7 @@ pub(super) fn start_numeric_loop<'syntax, 'a>(
     reverse: bool,
     counter_scope: PlpgsqlScope,
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
+    values: &[LocalSlot<'a>],
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<Step<'syntax, 'a>, SqlError> {
     if if reverse {
@@ -1026,7 +1026,7 @@ pub(super) fn start_numeric_loop<'syntax, 'a>(
         ..empty_plpgsql_local()
     };
     workspace.values[..target].copy_from_slice(&values[..target]);
-    workspace.values[target] = Datum::Int4(lower);
+    workspace.values[target] = LocalSlot::formed(Datum::Int4(lower));
     Ok(Step::Enter(FrameEntry::new(
         program.block,
         EntryState::Numeric {
@@ -1049,7 +1049,7 @@ pub(super) fn start_scope_block<'syntax, 'a>(
     program: TriggerNestedBlock<'syntax>,
     scope: PlpgsqlScope,
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
+    values: &[LocalSlot<'a>],
     storage: &Storage,
     txid: u32,
     status: &mut TriggerExecutionStatus<'a>,
@@ -1075,7 +1075,7 @@ pub(super) fn start_scope_block<'syntax, 'a>(
         }
     }
     workspace.values[..base].copy_from_slice(values);
-    workspace.values[base..count].fill(Datum::Null);
+    workspace.values[base..count].fill(LocalSlot::NULL);
     Ok(Step::Enter(FrameEntry::new(
         program.block,
         EntryState::Scope {
@@ -1097,7 +1097,7 @@ pub(super) fn start_row_loop<'syntax, 'a>(
     rows: super::loop_rows::LoopRows,
     query_source: bool,
     locals: &[TriggerLocalDecl],
-    values: &mut [Datum<'a>],
+    values: &mut [LocalSlot<'a>],
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<Step<'syntax, 'a>, SqlError> {
     if rows.is_empty() {
@@ -1137,7 +1137,7 @@ pub(super) fn start_row_loop<'syntax, 'a>(
 fn assign_loop_row<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
-    values: &mut [Datum<'a>],
+    values: &mut [LocalSlot<'a>],
     program: TriggerFor<'_>,
     value: Datum<'a>,
     width: Option<usize>,
@@ -1151,7 +1151,8 @@ fn assign_loop_row<'a>(
                 check_multi_assignment(context.responder, 1, width)
             })?;
         }
-        return assign_trigger_local(context, locals, values, program.target, value);
+        let assigned = super::result_tuple_slot(value, crate::storage::StoredForm::Inline);
+        return assign_trigger_local(context, locals, values, program.target, assigned);
     }
     let value = match value {
         Datum::CompositeText {
@@ -1183,7 +1184,9 @@ fn assign_loop_row<'a>(
         })?;
     }
     for (index, target) in program.row_targets.iter().enumerate() {
-        let field = fields.get(index).map_or(Datum::Null, |field| field.value);
+        let field = fields.get(index).map_or(LocalSlot::NULL, |field| {
+            super::result_tuple_slot(field.value, field.form)
+        });
         assign_trigger_local(context, locals, values, *target, field)?;
     }
     Ok(())
@@ -1195,7 +1198,7 @@ pub(super) fn start_cursor_loop<'syntax, 'a>(
     program: TriggerFor<'syntax>,
     loop_scope: PlpgsqlScope,
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
+    values: &[LocalSlot<'a>],
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<Step<'syntax, 'a>, SqlError> {
     // The record is a new variable even when it shadows one of the same
@@ -1229,7 +1232,7 @@ pub(super) fn start_cursor_loop<'syntax, 'a>(
             locals[index]
         };
     }
-    workspace.values[..count].fill(Datum::Null);
+    workspace.values[..count].fill(LocalSlot::NULL);
     workspace.values[..locals.len()].copy_from_slice(&values[..locals.len()]);
     Ok(Step::Enter(FrameEntry::new(
         program.block,
@@ -1287,7 +1290,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
         invocation: TriggerInvocation<'a>,
         transition: TriggerTransition<'_, '_, 'a>,
         program: &CompiledProgram<'a>,
-        seeded: &[Datum<'a>],
+        seeded: &[LocalSlot<'a>],
     ) -> Result<(), SqlError> {
         if self.initialization == execution_frame::Initialization::Complete {
             return Ok(());
@@ -1311,7 +1314,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
         invocation: TriggerInvocation<'a>,
         transition: TriggerTransition<'_, '_, 'a>,
         program: &CompiledProgram<'a>,
-        seeded: &[Datum<'a>],
+        seeded: &[LocalSlot<'a>],
     ) -> Result<(), SqlError> {
         use execution_frame::Initialization;
         let frames = self
@@ -1351,7 +1354,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                 let value = if let Some(value) = seeded.get(index).copied() {
                     Some(value)
                 } else {
-                    self.values[index] = Datum::Null;
+                    self.values[index] = LocalSlot::NULL;
                     if index < declaration_start {
                         None
                     } else if let Some(initial) =
@@ -1364,17 +1367,21 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             invocation,
                             transition: &transition,
                         };
-                        Some(initialize_phase(
+                        let value = initialize_phase(
                             &mut self.status,
                             context,
                             |context, continuation| {
                                 eval_procedural_expression(context, initial, &scope, continuation)
                             },
-                        )?)
+                        )?;
+                        Some(LocalSlot {
+                            value,
+                            form: super::assigned_local_form(initial, &scope, &value)?,
+                        })
                     } else {
                         // A declared domain can reject its implicit NULL just
                         // as it rejects an explicitly supplied initial value.
-                        Some(Datum::Null)
+                        Some(LocalSlot::NULL)
                     }
                 };
                 let Some(value) = value else {
@@ -1386,8 +1393,9 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                 self.values[index] = value;
                 self.initialization = Initialization::Coerce(index);
             }
-            let value = self.values[index];
-            self.values[index] =
+            let slot = self.values[index];
+            let value = slot.value;
+            let converted =
                 initialize_phase(&mut self.status, context, |context, continuation| {
                     let txid = context.txn.txid;
                     let arena = context.arena;
@@ -1395,6 +1403,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                         coerce_plpgsql_local(local, value, storage, txid, arena, sequences)
                     })
                 })?;
+            self.values[index] = slot.converted(converted);
             self.initialization = Initialization::Value(index + 1);
         }
     }
@@ -1642,16 +1651,21 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                                     invocation,
                                     transition: &transition,
                                 };
-                                initialize_phase(status, context, |context, continuation| {
-                                    eval_procedural_expression(
-                                        context,
-                                        initial,
-                                        &scope,
-                                        continuation,
-                                    )
-                                })?
+                                let value =
+                                    initialize_phase(status, context, |context, continuation| {
+                                        eval_procedural_expression(
+                                            context,
+                                            initial,
+                                            &scope,
+                                            continuation,
+                                        )
+                                    })?;
+                                LocalSlot {
+                                    value,
+                                    form: super::assigned_local_form(initial, &scope, &value)?,
+                                }
                             }
-                            None => Datum::Null,
+                            None => LocalSlot::NULL,
                         };
                         workspace.values[index] = value;
                         position.converting = true;
@@ -1662,22 +1676,21 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                     else {
                         unreachable!("scope frame resource")
                     };
-                    let (local, value) = (workspace.locals[index], workspace.values[index]);
-                    workspace.values[index] =
-                        initialize_phase(status, context, |context, continuation| {
-                            let txid = context.txn.txid;
-                            let arena = context.arena;
-                            execute_procedural_query(
-                                context,
-                                false,
-                                continuation,
-                                |storage, sequences| {
-                                    coerce_plpgsql_local(
-                                        local, value, storage, txid, arena, sequences,
-                                    )
-                                },
-                            )
-                        })?;
+                    let (local, slot) = (workspace.locals[index], workspace.values[index]);
+                    let value = slot.value;
+                    let converted = initialize_phase(status, context, |context, continuation| {
+                        let txid = context.txn.txid;
+                        let arena = context.arena;
+                        execute_procedural_query(
+                            context,
+                            false,
+                            continuation,
+                            |storage, sequences| {
+                                coerce_plpgsql_local(local, value, storage, txid, arena, sequences)
+                            },
+                        )
+                    })?;
+                    workspace.values[index] = slot.converted(converted);
                     position.converting = false;
                     position.initialized += 1;
                     frames.last_mut().continuation = Continuation::Scope(position);
@@ -1784,7 +1797,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             else {
                                 unreachable!("numeric frame resource")
                             };
-                            workspace.values[target] = Datum::Int4(next);
+                            workspace.values[target] = LocalSlot::formed(Datum::Int4(next));
                         } else {
                             let frame = frames.pop();
                             frames.finish_in(context, frame, locals, values, status, true);
@@ -1850,7 +1863,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             )?;
                             let (scope, scope_values, exception) = frames.scope(locals, values);
                             let variable = trigger_local_index(scope, open.variable)?;
-                            let reset = scope_values[variable].is_null();
+                            let reset = scope_values[variable].value.is_null();
                             execute_trigger_step(
                                 context,
                                 definition,
@@ -1864,7 +1877,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                                 status,
                                 exception,
                             )?;
-                            let Datum::Text(portal) = scope_values[variable] else {
+                            let Datum::Text(portal) = scope_values[variable].value else {
                                 return Err(sql_err!(
                                     sqlstate::INTERNAL_ERROR,
                                     "cursor FOR loop opened no portal"
@@ -1873,7 +1886,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             if let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host {
                                 cursors.pin(portal)?;
                             }
-                            scope_values[state.portal] = Datum::Text(portal);
+                            scope_values[state.portal] = LocalSlot::formed(Datum::Text(portal));
                             let Continuation::Cursor(state) = &mut frames.last_mut().continuation
                             else {
                                 unreachable!("cursor loop frame")

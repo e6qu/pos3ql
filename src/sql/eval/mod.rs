@@ -1000,6 +1000,10 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for EnclosingRow<'_, 'a> {
         self.0.stored_form(qualifier, name)
     }
 
+    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.0.holds_formed_datum(qualifier, name)
+    }
+
     fn resolve_column_type_unsuggested(
         &self,
         qualifier: Option<&str>,
@@ -1112,10 +1116,12 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for RoutineVariables<'_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
-        // This row does not keep its values' stored forms.
-        Ok(crate::sql::toast::unknown_form(
-            &self.lookup(qualifier, name)?,
-        ))
+        self.lookup(qualifier, name)?;
+        self.0.stored_form(qualifier, name)
+    }
+
+    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.names(qualifier, name) && self.0.holds_formed_datum(qualifier, name)
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'b>, SqlError> {
@@ -1206,6 +1212,13 @@ pub trait ColumnLookup<'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, SqlError>;
+
+    /// Whether the column holds a datum an expression formed, with the
+    /// four-byte varlena header it gave it, rather than one read from a
+    /// tuple: a PL/pgSQL variable a simple expression assigned.
+    fn holds_formed_datum(&self, _qualifier: Option<&str>, _name: &str) -> bool {
+        false
+    }
 
     /// [`Self::lookup`] for a caller that may still find the column in an
     /// enclosing scope: a missing column's spelling suggestion is left to the

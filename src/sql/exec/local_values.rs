@@ -202,10 +202,55 @@ impl ExpressionProgress {
     }
 }
 
+/// How a PL/pgSQL variable holds its datum, which `pg_column_size` reads.
+/// PL/pgSQL keeps the datum it is given (`datumTransfer`): a simple
+/// expression's result as the expression formed it, and a query's result as
+/// SPI's result tuple holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalForm {
+    /// Formed by an expression: a four-byte varlena header, uncompressed.
+    Formed,
+    /// Read from a tuple: a short value packed, a stored datum in the TOAST
+    /// form it was stored in.
+    Stored(StoredForm),
+    /// Passed in by a caller whose expression is not traced: a short value
+    /// is taken as packed and a longer one as not modelled.
+    Passed,
+}
+
+/// A PL/pgSQL variable's value and how it holds it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalSlot<'a> {
+    pub(crate) value: Datum<'a>,
+    pub(crate) form: LocalForm,
+}
+
+impl<'a> LocalSlot<'a> {
+    pub(crate) const NULL: Self = Self {
+        value: Datum::Null,
+        form: LocalForm::Formed,
+    };
+
+    pub(crate) const fn formed(value: Datum<'a>) -> Self {
+        Self {
+            value,
+            form: LocalForm::Formed,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'a> PartialEq<Datum<'a>> for LocalSlot<'_> {
+    fn eq(&self, other: &Datum<'a>) -> bool {
+        self.value == *other
+    }
+}
+
 /// Active slots may borrow workspace payloads; suspension saves those bytes and
-/// clears every reference while keeping the original slot reservation.
+/// clears every reference while keeping the original slot reservation and
+/// each variable's form.
 pub(super) struct LocalValues<'a> {
-    slots: MutableSlice<Datum<'a>>,
+    slots: MutableSlice<LocalSlot<'a>>,
     saved: SavedValues,
 }
 
@@ -226,11 +271,20 @@ impl<'a> LocalValues<'a> {
     }
 
     pub(super) fn capture(&mut self) -> Result<(), SqlError> {
-        self.saved.replace(&self.slots)
+        let slots = &self.slots;
+        self.saved
+            .replace_indexed(slots.len(), |index| slots[index].value)
     }
 
     pub(super) fn restore(&mut self, output: &'a Arena) -> Result<(), SqlError> {
-        self.saved.restore(&mut self.slots, output)
+        let values = self.saved.decode(output)?;
+        if values.len() != self.slots.len() {
+            return Err(layout_changed());
+        }
+        for (slot, value) in self.slots.iter_mut().zip(values.iter()) {
+            slot.value = *value;
+        }
+        Ok(())
     }
 
     pub(super) fn discard_saved(&mut self) {
@@ -240,16 +294,22 @@ impl<'a> LocalValues<'a> {
     pub(super) fn suspend(self) -> LocalValues<'static> {
         assert_eq!(self.saved.width, Some(self.slots.len()));
         LocalValues {
-            slots: self.slots.map_in_place(|_| Datum::Null),
+            slots: self.slots.map_in_place(|slot| LocalSlot {
+                value: Datum::Null,
+                form: slot.form,
+            }),
             saved: self.saved,
         }
     }
 
     pub(super) fn suspend_unused(mut self) -> LocalValues<'static> {
-        assert!(self.slots.iter().all(Datum::is_null));
+        assert!(self.slots.iter().all(|slot| slot.value.is_null()));
         self.saved.clear();
         LocalValues {
-            slots: self.slots.map_in_place(|_| Datum::Null),
+            slots: self.slots.map_in_place(|slot| LocalSlot {
+                value: Datum::Null,
+                form: slot.form,
+            }),
             saved: self.saved,
         }
     }
@@ -259,7 +319,10 @@ impl LocalValues<'static> {
     pub(super) fn rebind_saved<'out>(self) -> LocalValues<'out> {
         assert_eq!(self.saved.width, Some(self.slots.len()));
         LocalValues {
-            slots: self.slots.map_in_place(|_| Datum::Null),
+            slots: self.slots.map_in_place(|slot| LocalSlot {
+                value: Datum::Null,
+                form: slot.form,
+            }),
             saved: self.saved,
         }
     }
@@ -267,14 +330,17 @@ impl LocalValues<'static> {
     pub(super) fn rebind_unused<'out>(self) -> LocalValues<'out> {
         assert!(self.saved.width.is_none());
         LocalValues {
-            slots: self.slots.map_in_place(|_| Datum::Null),
+            slots: self.slots.map_in_place(|slot| LocalSlot {
+                value: Datum::Null,
+                form: slot.form,
+            }),
             saved: self.saved,
         }
     }
 }
 
 impl<'a> core::ops::Deref for LocalValues<'a> {
-    type Target = [Datum<'a>];
+    type Target = [LocalSlot<'a>];
     fn deref(&self) -> &Self::Target {
         &self.slots
     }

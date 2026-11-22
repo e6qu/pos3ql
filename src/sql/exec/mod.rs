@@ -1845,6 +1845,7 @@ mod control_flow;
 mod diagnostics;
 mod execution_frame;
 mod local_values;
+pub(crate) use local_values::{LocalForm, LocalSlot};
 mod loop_rows;
 mod numeric_loops;
 mod set_rows;
@@ -30011,19 +30012,22 @@ fn declare_routine_parameters(
 fn seed_routine_parameters<'a>(
     parameters: &[RoutineParameterDef],
     inputs: &[Datum<'a>],
-    values: &mut [Datum<'a>],
+    values: &mut [LocalSlot<'a>],
 ) -> Result<usize, SqlError> {
     let count = parameter_variable_count(parameters);
-    values[..count].fill(Datum::Null);
+    values[..count].fill(LocalSlot::NULL);
     let mut input_index = 0usize;
     for (value, parameter) in values.iter_mut().zip(parameters) {
         if parameter.mode.is_input() {
-            *value = inputs.get(input_index).copied().ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "routine inputs do not match its parameters"
-                )
-            })?;
+            *value = LocalSlot {
+                value: inputs.get(input_index).copied().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine inputs do not match its parameters"
+                    )
+                })?,
+                form: LocalForm::Passed,
+            };
             input_index += 1;
         }
     }
@@ -31747,10 +31751,10 @@ fn procedure_seeded_values<'a>(
     routine: &crate::storage::RoutineDef,
     inputs: &'a [Datum<'a>],
     arena: &'a Arena,
-) -> Result<&'a [Datum<'a>], SqlError> {
+) -> Result<&'a [LocalSlot<'a>], SqlError> {
     let seeded = arena
         .alloc_slice_with(parameter_variable_count(routine.parameters()), |_| {
-            Datum::Null
+            LocalSlot::NULL
         })
         .map_err(|_| super::query::arena_full_pub())?;
     seed_routine_parameters(routine.parameters(), inputs, seeded)?;
@@ -31769,7 +31773,7 @@ fn procedure_output_values<'a>(
             continue;
         }
         outputs[output_count] = parameter_slot(&execution.locals, index, parameter)
-            .map_or(Datum::Null, |slot| execution.values[slot]);
+            .map_or(Datum::Null, |slot| execution.values[slot].value);
         output_count += 1;
     }
     output_count
@@ -32360,9 +32364,9 @@ struct PlpgsqlVariable<'a> {
     value: Datum<'a>,
     ctype: ColType,
     user_type: Option<crate::storage::UserTypeName>,
-    /// A special variable PL/pgSQL forms (`FOUND`, `TG_*`, `SQLSTATE`,
-    /// `SQLERRM`), never a datum read from a stored row.
-    formed: bool,
+    /// How the variable holds its datum; a special variable PL/pgSQL forms
+    /// (`FOUND`, `TG_*`, `SQLSTATE`, `SQLERRM`) holds it as formed.
+    form: LocalForm,
 }
 
 impl<'a> PlpgsqlVariable<'a> {
@@ -32379,13 +32383,13 @@ impl<'a> PlpgsqlVariable<'a> {
 /// `record` has none until it is assigned.
 fn plpgsql_row_variable(
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'_>],
+    values: &[LocalSlot<'_>],
     name: &str,
 ) -> Option<crate::sql::eval::RowVariable> {
     use crate::sql::eval::RowVariable;
     let index = plpgsql_slot(locals, |local| local.name.as_str() == name)?;
     let local = locals[index];
-    match values[index] {
+    match values[index].value {
         Datum::Null => match (local.record_shape, local.ctype) {
             (Some(PlpgsqlRecordShape::Table { row_type, .. }), _) => {
                 Some(RowVariable::Declared(row_type))
@@ -32403,7 +32407,7 @@ fn plpgsql_row_variable(
 
 fn plpgsql_variable<'a>(
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
+    values: &[LocalSlot<'a>],
     invocation: TriggerInvocation<'a>,
     found: Option<bool>,
     name: &str,
@@ -32421,15 +32425,15 @@ fn plpgsql_variable<'a>(
             }),
             ctype: ColType::Text,
             user_type: None,
-            formed: true,
+            form: LocalForm::Formed,
         });
     }
     if let Some(index) = local {
         return Some(PlpgsqlVariable {
-            value: values[index],
+            value: values[index].value,
             ctype: locals[index].ctype,
             user_type: locals[index].user_type,
-            formed: false,
+            form: values[index].form,
         });
     }
     if let Some(field) = plpgsql_context_field(invocation.program_kind, name) {
@@ -32437,14 +32441,14 @@ fn plpgsql_variable<'a>(
             value: invocation.value(field),
             ctype: field.ctype(),
             user_type: None,
-            formed: true,
+            form: LocalForm::Formed,
         });
     }
     TriggerStatusVariable::parse(name).map(|_| PlpgsqlVariable {
         value: found.map(Datum::Bool).unwrap_or(Datum::Null),
         ctype: ColType::Bool,
         user_type: None,
-        formed: true,
+        form: LocalForm::Formed,
     })
 }
 
@@ -32484,7 +32488,7 @@ fn plpgsql_record_index(locals: &[TriggerLocalDecl], qualifier: &str) -> Option<
 
 fn plpgsql_labeled_variable<'a>(
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
+    values: &[LocalSlot<'a>],
     invocation: TriggerInvocation<'a>,
     found: Option<bool>,
     qualifier: &str,
@@ -32492,10 +32496,10 @@ fn plpgsql_labeled_variable<'a>(
 ) -> Option<PlpgsqlVariable<'a>> {
     if let Some(index) = plpgsql_labeled_index(locals, qualifier, name) {
         return Some(PlpgsqlVariable {
-            value: values[index],
+            value: values[index].value,
             ctype: locals[index].ctype,
             user_type: locals[index].user_type,
-            formed: false,
+            form: values[index].form,
         });
     }
     // The routine's label also names FOUND and its context variables.
@@ -32510,7 +32514,7 @@ fn plpgsql_labeled_variable<'a>(
 
 struct TriggerLocalScope<'t, 'a> {
     locals: &'t [TriggerLocalDecl],
-    values: &'t [Datum<'a>],
+    values: &'t [LocalSlot<'a>],
     found: Option<bool>,
     invocation: TriggerInvocation<'a>,
     transition: &'t TriggerTransition<'t, 't, 'a>,
@@ -32691,16 +32695,29 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
-        if self
-            .named(qualifier, name)
-            .is_some_and(|variable| variable.formed)
-        {
-            return Ok(None);
+        match self.named(qualifier, name).map(|variable| variable.form) {
+            Some(LocalForm::Formed) => return Ok(None),
+            Some(LocalForm::Stored(form)) => return Ok(Some(form)),
+            Some(LocalForm::Passed) | None => {}
         }
-        // This row does not keep its values' stored forms.
+        // A record variable holds its fields as the row it was given did.
+        let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
+        if let Some(index) = self.record_index(qualifier, name)
+            && let Datum::Record(fields) | Datum::Composite { fields, .. } =
+                self.values[index].value
+            && let Some(field) = fields.iter().find(|field| field.name == name)
+        {
+            return Ok(Some(field.form));
+        }
+        // A parameter or a trigger row's column.
         Ok(crate::sql::toast::unknown_form(
             &self.lookup(qualifier, name)?,
         ))
+    }
+
+    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.named(qualifier, name)
+            .is_some_and(|variable| variable.form == LocalForm::Formed)
     }
 
     fn procedural_variable(
@@ -32712,7 +32729,7 @@ where
         let answers = self.named(qualifier, name).is_some()
             || self
                 .record_index(qualifier, name)
-                .and_then(|index| match self.values[index] {
+                .and_then(|index| match self.values[index].value {
                     Datum::Record(fields) | Datum::Composite { fields, .. } => Some(fields),
                     _ => None,
                 })
@@ -32806,10 +32823,10 @@ where
         let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
         let index = self.record_index(qualifier, name)?;
         PlpgsqlVariable {
-            value: self.values[index],
+            value: self.values[index].value,
             ctype: self.locals[index].ctype,
             user_type: self.locals[index].user_type,
-            formed: false,
+            form: self.values[index].form,
         }
         .record_field(name)
         .map(|field| field.type_oid)
@@ -32826,7 +32843,7 @@ where
         let Some(index) = self.record_index(Some(qualifier), name) else {
             return Ok(());
         };
-        if !self.values[index].is_null() {
+        if !self.values[index].value.is_null() {
             return Ok(());
         }
         let local = self.locals[index];
@@ -32895,7 +32912,7 @@ where
         if let Some(qualifier) = qualifier
             && let Some(index) = self.record_index(Some(qualifier), name)
         {
-            let fields = match self.values[index] {
+            let fields = match self.values[index].value {
                 Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
                 // A row-typed variable that was never assigned reads its
                 // fields as NULL; `check_unassigned_row_field` checks the
@@ -32973,14 +32990,15 @@ where
                 (ctype, _) => ctype,
             })
             .or_else(|| {
-                self.record_index(qualifier, name)
-                    .and_then(|index| match self.values[index] {
+                self.record_index(qualifier, name).and_then(|index| {
+                    match self.values[index].value {
                         Datum::Record(fields) | Datum::Composite { fields, .. } => fields
                             .iter()
                             .find(|field| field.name == name)
                             .and_then(|field| ColType::from_oid(field.type_oid)),
                         _ => None,
-                    })
+                    }
+                })
             })
             .or_else(|| self.transition.col_type(qualifier, name))
     }
@@ -33160,7 +33178,7 @@ fn detached_trigger_datum<'a>(value: Datum<'_>, arena: &'a Arena) -> Result<Datu
 pub(crate) struct TriggerDmlSnapshot<'a> {
     definition: crate::storage::RelationDefinition<'a>,
     locals: &'a [TriggerLocalDecl],
-    values: &'a [Datum<'a>],
+    values: &'a [LocalSlot<'a>],
     invocation: TriggerInvocation<'a>,
     found: Option<bool>,
     old: TriggerRecordValue<'a, 'a>,
@@ -33198,16 +33216,19 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
-        if self
-            .named(qualifier, name)
-            .is_some_and(|variable| variable.formed)
-        {
-            return Ok(None);
+        match self.named(qualifier, name).map(|variable| variable.form) {
+            Some(LocalForm::Formed) => Ok(None),
+            Some(LocalForm::Stored(form)) => Ok(Some(form)),
+            // A parameter, a record field or a trigger row's column.
+            Some(LocalForm::Passed) | None => Ok(crate::sql::toast::unknown_form(
+                &self.lookup(qualifier, name)?,
+            )),
         }
-        // This row does not keep its values' stored forms.
-        Ok(crate::sql::toast::unknown_form(
-            &self.lookup(qualifier, name)?,
-        ))
+    }
+
+    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.named(qualifier, name)
+            .is_some_and(|variable| variable.form == LocalForm::Formed)
     }
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -33322,10 +33343,14 @@ fn snapshot_trigger_dml_scope<'a>(
         .alloc_slice_copy(scope.locals)
         .map_err(|_| super::query::arena_full_pub())?;
     let values = arena
-        .alloc_slice_with(scope.values.len(), |_| Datum::Null)
+        .alloc_slice_with(scope.values.len(), |_| LocalSlot::NULL)
         .map_err(|_| super::query::arena_full_pub())?;
+    // A copy of a variable's datum keeps how the variable holds it.
     for (index, value) in values.iter_mut().enumerate() {
-        *value = detached_trigger_datum(scope.values[index], arena)?;
+        *value = LocalSlot {
+            value: detached_trigger_datum(scope.values[index].value, arena)?,
+            form: scope.values[index].form,
+        };
     }
     let copy_record =
         |record: TriggerRecordValue<'_, 'a>| -> Result<TriggerRecordValue<'a, 'a>, SqlError> {
@@ -37532,7 +37557,7 @@ fn execute_static_rewritten_write<'a>(
     captured: &'a [super::cursor::CursorLocal<'a>],
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     into: Option<PlpgsqlInto<'a>>,
     status: &mut TriggerExecutionStatus<'a>,
     mut progress: Option<&mut RowProgress>,
@@ -38041,11 +38066,11 @@ fn trigger_exception_matches(condition: TriggerExceptionCondition, error: &SqlEr
 fn allocate_plpgsql_local_values<'a>(
     pool: &std::sync::Arc<LeasePool>,
     count: usize,
-) -> Result<MutableSlice<Datum<'a>>, SqlError> {
+) -> Result<MutableSlice<local_values::LocalSlot<'a>>, SqlError> {
     let mut values = pool.lease(count).map_err(control_flow::execution_full)?;
     for _ in 0..count {
         values
-            .push_reserved(Datum::Null)
+            .push_reserved(local_values::LocalSlot::NULL)
             .map_err(control_flow::execution_full)?;
     }
     Ok(values)
@@ -38476,7 +38501,7 @@ fn field_path_expression<'a>(
 fn plpgsql_field_path_assignment<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
+    values: &[LocalSlot<'a>],
     assignment: TriggerLocalAssignment<'a>,
 ) -> Result<TriggerLocalAssignment<'a>, SqlError> {
     let name = assignment.name;
@@ -38552,7 +38577,7 @@ fn plpgsql_field_path_assignment<'a>(
     let storage = context.storage();
     let txid = context.txn.txid;
     let catalog = super::query::storage_catalog(storage, arena, txid);
-    let record_fields = match (values[record], local.ctype) {
+    let record_fields = match (values[record].value, local.ctype) {
         (Datum::Record(fields) | Datum::Composite { fields, .. }, _) => Some(fields),
         (Datum::Null, ColType::Composite(Some(_))) => {
             let type_oid = storage
@@ -38687,13 +38712,67 @@ fn trigger_record_path_assignment<'a>(
     }))
 }
 
+/// How a variable assigned `value`, the result of `expression` over
+/// `scope`, holds it: a simple expression's result as the expression gave
+/// it, and an expression with a subquery, which PL/pgSQL runs as a query,
+/// as its result tuple holds it.
+fn assigned_local_form(
+    expression: &Expr<'_>,
+    scope: &dyn ColumnLookup<'_>,
+    value: &Datum<'_>,
+) -> Result<LocalForm, SqlError> {
+    use crate::sql::toast::{passed_form, reads_stored_datum};
+    if expression.contains_subquery() {
+        return Ok(LocalForm::Stored(passed_form(
+            expression, scope, None, value,
+        )?));
+    }
+    Ok(match reads_stored_datum(expression, scope, value)? {
+        Some(true) => LocalForm::Stored(passed_form(expression, scope, None, value)?),
+        Some(false) => LocalForm::Formed,
+        None => LocalForm::Stored(crate::storage::StoredForm::Unmodelled),
+    })
+}
+
+/// A variable assigned `value`, a column of a query's result row holding it
+/// in `form`: SPI's result tuple packs a short value, and a value TOAST may
+/// store otherwise keeps a form only the row carries.
+fn result_tuple_slot(value: Datum<'_>, form: crate::storage::StoredForm) -> LocalSlot<'_> {
+    let form = match form {
+        crate::storage::StoredForm::Inline => {
+            crate::sql::toast::unknown_form(&value).unwrap_or(crate::storage::StoredForm::Inline)
+        }
+        form => form,
+    };
+    LocalSlot {
+        value,
+        form: LocalForm::Stored(form),
+    }
+}
+
+impl<'a> LocalSlot<'a> {
+    /// This slot after converting its value to `converted`: a conversion
+    /// that formed a new datum holds it as formed.
+    fn converted(self, converted: Datum<'a>) -> Self {
+        Self {
+            value: converted,
+            form: if crate::sql::toast::same_datum_identity(&self.value, &converted) {
+                self.form
+            } else {
+                LocalForm::Formed
+            },
+        }
+    }
+}
+
 fn assign_trigger_local<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
-    values: &mut [Datum<'a>],
+    values: &mut [LocalSlot<'a>],
     target: PlpgsqlVariableName,
-    value: Datum<'a>,
+    assigned: LocalSlot<'a>,
 ) -> Result<(), SqlError> {
+    let value = assigned.value;
     let index = match trigger_local_index(locals, target) {
         Ok(index) => index,
         // `r.f := ...` names field `f` of row variable `r` when no block
@@ -38727,14 +38806,14 @@ fn assign_trigger_local<'a>(
         context.seq_session(),
         context.txn.txid,
     );
-    values[index] = coerce_plpgsql_local(
+    values[index] = assigned.converted(coerce_plpgsql_local(
         locals[index],
         value,
         context.storage(),
         context.txn.txid,
         context.arena,
         &sequences,
-    )?;
+    )?);
     Ok(())
 }
 
@@ -38896,14 +38975,15 @@ fn assign_plpgsql_into_target<'a>(
     definition: crate::storage::RelationDefinition<'_>,
     records: &mut TriggerRows<'_, 'a>,
     locals: &[TriggerLocalDecl],
-    values: &mut [Datum<'a>],
+    values: &mut [LocalSlot<'a>],
     target: PlpgsqlVariableName,
     resolved: PlpgsqlIntoTarget,
-    value: Datum<'a>,
+    assigned: LocalSlot<'a>,
 ) -> Result<(), SqlError> {
+    let value = assigned.value;
     let (record, column) = match resolved {
         PlpgsqlIntoTarget::Local(_) => {
-            return assign_trigger_local(context, locals, values, target, value);
+            return assign_trigger_local(context, locals, values, target, assigned);
         }
         PlpgsqlIntoTarget::TriggerRecord(record) => {
             // A query that returns no row leaves the record's structure.
@@ -38987,7 +39067,7 @@ fn assign_trigger_record_column<'a>(
     definition: crate::storage::RelationDefinition<'_>,
     records: &mut TriggerRows<'_, 'a>,
     locals: &[TriggerLocalDecl],
-    local_values: &[Datum<'a>],
+    local_values: &[LocalSlot<'a>],
     found: Option<bool>,
     invocation: TriggerInvocation<'a>,
     record: TriggerRecordName,
@@ -39433,7 +39513,7 @@ pub(super) fn trigger_record_row<'a>(
 fn assign_trigger_record_field<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
-    values: &mut [Datum<'a>],
+    values: &mut [LocalSlot<'a>],
     record: usize,
     field: SqlName,
     value: Datum<'a>,
@@ -39475,7 +39555,8 @@ fn assign_trigger_record_field<'a>(
             .map(|fields| &*fields)
             .map_err(|_| super::query::arena_full_pub())
     };
-    let current: &[RecordField<'a>] = match (values[record], local.record_shape, local.ctype) {
+    let current: &[RecordField<'a>] = match (values[record].value, local.record_shape, local.ctype)
+    {
         (Datum::Record(fields) | Datum::Composite { fields, .. }, _, _) => fields,
         (Datum::Null, Some(PlpgsqlRecordShape::Table { slot, .. }), _) => {
             let definition = storage.table_def(usize::from(slot), txid);
@@ -39575,7 +39656,7 @@ fn assign_trigger_record_field<'a>(
         locals,
         values,
         PlpgsqlVariableName::qualified(local.label, local.name),
-        Datum::Record(&*fields),
+        LocalSlot::formed(Datum::Record(&*fields)),
     )
 }
 
@@ -39727,7 +39808,7 @@ fn trigger_condition<'a>(
     old: TriggerRecordValue<'_, 'a>,
     new: TriggerRecordValue<'_, 'a>,
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
+    values: &[LocalSlot<'a>],
     found: Option<bool>,
     continuation: Option<&mut Option<super::query::RoutineInvocationState>>,
 ) -> Result<bool, SqlError> {
@@ -40593,7 +40674,7 @@ fn execute_trigger_step<'a>(
     records: &mut TriggerRows<'_, 'a>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     statement: TriggerStatement<'a>,
     child_scope: PlpgsqlScope,
     status: &mut TriggerExecutionStatus<'a>,
@@ -40603,7 +40684,7 @@ fn execute_trigger_step<'a>(
     // `exec_stmt_open` and `exec_stmt_forc` do.
     if let TriggerStatement::CursorOpen(open) = statement
         && let Ok(local) = trigger_local_index(locals, open.variable)
-        && let Datum::Text(name) = local_values[local]
+        && let Datum::Text(name) = local_values[local].value
         && let PlpgsqlExecHost::Routine { cursors, .. } = &context.host
         && cursors.exists(name)
     {
@@ -40740,7 +40821,7 @@ fn execute_trigger_step_in<'a>(
     records: &mut TriggerRows<'_, 'a>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     statement: TriggerStatement<'a>,
     child_scope: PlpgsqlScope,
     status: &mut TriggerExecutionStatus<'a>,
@@ -40998,7 +41079,7 @@ fn execute_trigger_step_in<'a>(
                                     .map_err(|_| super::query::arena_full_pub())?;
                                 for (value, output) in values.iter_mut().zip(status.outputs.iter())
                                 {
-                                    *value = local_values[output.local];
+                                    *value = local_values[output.local].value;
                                 }
                                 values
                             }
@@ -41308,6 +41389,10 @@ fn execute_trigger_step_in<'a>(
                                 },
                             )?
                         };
+                        let assigned = LocalSlot {
+                            value,
+                            form: assigned_local_form(assignment.expression, &scope, &value)?,
+                        };
                         in_procedural_query(
                             statement,
                             crate::sql::error_context::QueryMode::Assignment,
@@ -41318,7 +41403,7 @@ fn execute_trigger_step_in<'a>(
                                     locals,
                                     local_values,
                                     assignment.name,
-                                    value,
+                                    assigned,
                                 )
                                 .map_err(|error| {
                                     // A kept plan resolves the target field
@@ -41367,6 +41452,10 @@ fn execute_trigger_step_in<'a>(
                         &scope,
                         retained_parent.then_some(&mut status.pending_query),
                     )?;
+                    let assigned = LocalSlot {
+                        value,
+                        form: assigned_local_form(assignment.expression, &scope, &value)?,
+                    };
                     if locals.iter().any(|local| assignment.name.names(local)) {
                         if let Datum::Record(fields) | Datum::Composite { fields, .. } = value
                             && let Ok(index) = trigger_local_index(locals, assignment.name)
@@ -41383,7 +41472,7 @@ fn execute_trigger_step_in<'a>(
                             locals,
                             local_values,
                             assignment.name,
-                            value,
+                            assigned,
                         )?;
                     } else if assignment.name.label.is_none()
                         && TriggerStatusVariable::parse(assignment.name.name.as_str()).is_some()
@@ -41412,7 +41501,7 @@ fn execute_trigger_step_in<'a>(
                             locals,
                             local_values,
                             assignment.name,
-                            value,
+                            assigned,
                         )?;
                     }
 
@@ -41448,7 +41537,7 @@ fn execute_trigger_step_in<'a>(
                                 statement.variable.name.as_str()
                             ));
                         }
-                        let assign_name = local_values[local].is_null();
+                        let assign_name = local_values[local].value.is_null();
                         if assign_name && locals[local].constant {
                             return Err(sql_err!(
                                 sqlstate::ERROR_IN_ASSIGNMENT,
@@ -41457,7 +41546,7 @@ fn execute_trigger_step_in<'a>(
                             ));
                         }
                         let generated;
-                        let name = match local_values[local] {
+                        let name = match local_values[local].value {
                             Datum::Text(name) => {
                                 if context.host.cursors().exists(name) {
                                     return Err(sql_err!(
@@ -41730,7 +41819,7 @@ fn execute_trigger_step_in<'a>(
                                 locals,
                                 local_values,
                                 statement.variable,
-                                Datum::Text(name),
+                                LocalSlot::formed(Datum::Text(name)),
                             )?;
                         }
 
@@ -41838,7 +41927,7 @@ fn execute_trigger_step_in<'a>(
                                 statement.variable.name.as_str()
                             ));
                         }
-                        let Datum::Text(name) = local_values[local] else {
+                        let Datum::Text(name) = local_values[local].value else {
                             return Err(sql_err!(
                                 sqlstate::NULL_VALUE_NOT_ALLOWED,
                                 "cursor variable \"{}\" is null",
@@ -42015,7 +42104,10 @@ fn execute_trigger_step_in<'a>(
                                     local_values,
                                     target,
                                     targets[index],
-                                    values[index],
+                                    result_tuple_slot(
+                                        values[index],
+                                        crate::storage::StoredForm::Inline,
+                                    ),
                                 )?;
                             }
                         }
@@ -42047,7 +42139,7 @@ fn execute_trigger_step_in<'a>(
                                     variable.name.as_str()
                                 ));
                             }
-                            let Datum::Text(name) = local_values[local] else {
+                            let Datum::Text(name) = local_values[local].value else {
                                 return Err(sql_err!(
                                     sqlstate::NULL_VALUE_NOT_ALLOWED,
                                     "cursor variable \"{}\" is null",
@@ -42172,7 +42264,7 @@ fn execute_trigger_step_in<'a>(
                     super::guc::PlpgsqlExtraCheck::TooManyRows,
                 )?;
                 let mut source_width = 0usize;
-                let (selected, row_count) = execute_procedural_query(
+                let (selected, selected_forms, row_count) = execute_procedural_query(
                     context,
                     // The main query reads the snapshot its WITH writes ran
                     // under, so it does not see their changes.
@@ -42180,6 +42272,7 @@ fn execute_trigger_step_in<'a>(
                     continuation,
                     |storage, sequence| {
                         let mut selected = [Datum::Null; MAX_COLUMNS];
+                        let mut selected_forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
                         let mut found = false;
                         let mut row_count = 0usize;
                         super::query::consume_query_rows(
@@ -42203,7 +42296,7 @@ fn execute_trigger_step_in<'a>(
                                     emit,
                                 )
                             },
-                            &mut |values, _| {
+                            &mut |values, forms| {
                                 if record_target && values.len() != record_width {
                                     return Err(sql_err!(
                                         sqlstate::INTERNAL_ERROR,
@@ -42223,7 +42316,10 @@ fn execute_trigger_step_in<'a>(
                                             MAX_PROJ];
                                         for (index, value) in values.iter().copied().enumerate() {
                                             row_fields[index] = RecordField {
-                                                form: crate::storage::StoredForm::Inline,
+                                                form: forms
+                                                    .get(index)
+                                                    .copied()
+                                                    .unwrap_or(crate::storage::StoredForm::Inline),
                                                 name: fields[index].0,
                                                 type_oid: fields[index].1,
                                                 type_mod: fields[index].2,
@@ -42237,11 +42333,16 @@ fn execute_trigger_step_in<'a>(
                                     } else {
                                         // Extra columns are ignored and missing
                                         // ones leave their targets NULL.
-                                        for (slot, value) in selected[..statement.targets.len()]
+                                        for (index, (slot, value)) in selected
+                                            [..statement.targets.len()]
                                             .iter_mut()
                                             .zip(values.iter().copied())
+                                            .enumerate()
                                         {
                                             *slot = detached_trigger_datum(value, arena)?;
+                                            if let Some(form) = forms.get(index) {
+                                                selected_forms[index] = *form;
+                                            }
                                         }
                                     }
                                     found = true;
@@ -42262,7 +42363,7 @@ fn execute_trigger_step_in<'a>(
                                 .map_err(|_| super::query::arena_full_pub())?;
                             selected[0] = Datum::Record(empty);
                         }
-                        Ok((selected, row_count))
+                        Ok((selected, selected_forms, row_count))
                     },
                 )?;
                 finish_plpgsql_dml_ctes(context, written, dml_ctes)?;
@@ -42313,7 +42414,7 @@ fn execute_trigger_step_in<'a>(
                             local_values,
                             statement.targets[index],
                             *resolved,
-                            selected[index],
+                            result_tuple_slot(selected[index], selected_forms[index]),
                         )?;
                     }
                     Ok(())
@@ -42882,7 +42983,11 @@ fn execute_trigger_step_in<'a>(
                             locals,
                             local_values,
                             PlpgsqlVariableName::plain(*name),
-                            outputs.values[usize::from(output)],
+                            // A procedure's outputs come back as a tuple.
+                            result_tuple_slot(
+                                outputs.values[usize::from(output)],
+                                crate::storage::StoredForm::Inline,
+                            ),
                         )?;
                     }
                 }
@@ -43188,7 +43293,13 @@ fn execute_trigger_step_in<'a>(
                                 .map_err(|_| super::query::arena_full_pub())?,
                         ),
                     };
-                    assign_trigger_local(context, locals, local_values, assignment.target, value)?;
+                    assign_trigger_local(
+                        context,
+                        locals,
+                        local_values,
+                        assignment.target,
+                        LocalSlot::formed(value),
+                    )?;
                 }
 
                 Ok(None)
@@ -43227,7 +43338,13 @@ fn execute_trigger_step_in<'a>(
                         Some(field) => exception.text(field, context.arena)?.unwrap_or(""),
                         None => "",
                     });
-                    assign_trigger_local(context, locals, local_values, assignment.target, value)?;
+                    assign_trigger_local(
+                        context,
+                        locals,
+                        local_values,
+                        assignment.target,
+                        LocalSlot::formed(value),
+                    )?;
                 }
 
                 Ok(None)
@@ -44765,12 +44882,12 @@ fn cursor_statement_effect<'s, 'a, 'b>(
     invocation: &TriggerInvocation<'a>,
     operation: CursorReceiptOperation,
     changed: &[CursorOutputSlot],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     records: &mut TriggerRows<'_, 'a>,
     status: &mut TriggerExecutionStatus<'a>,
     execute: impl FnOnce(
         &mut TriggerExecContext<'s, 'a, 'b>,
-        &mut [Datum<'a>],
+        &mut [LocalSlot<'a>],
         &mut TriggerRows<'_, 'a>,
         &mut TriggerExecutionStatus<'a>,
         &mut bool,
@@ -44982,16 +45099,19 @@ impl CursorOutputSlot {
 
     fn read<'a>(
         self,
-        local_values: &[Datum<'a>],
+        local_values: &[LocalSlot<'a>],
         records: &mut TriggerRows<'_, 'a>,
     ) -> Result<Datum<'a>, SqlError> {
         match self {
-            Self::Local(index) => local_values.get(index).copied().ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "cursor output local is unavailable"
-                )
-            }),
+            Self::Local(index) => local_values
+                .get(index)
+                .map(|slot| slot.value)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "cursor output local is unavailable"
+                    )
+                }),
             Self::Assigned(name) => Ok(Datum::Bool(records.record_mut(name).row().is_some())),
             Self::Field(name, column) => Ok(records
                 .record_mut(name)
@@ -45002,12 +45122,15 @@ impl CursorOutputSlot {
 
     fn write<'a>(
         self,
-        local_values: &mut [Datum<'a>],
+        local_values: &mut [LocalSlot<'a>],
         records: &mut TriggerRows<'_, 'a>,
         value: Datum<'a>,
     ) -> Result<(), SqlError> {
         match (self, value) {
-            (Self::Local(index), value) => local_values[index] = value,
+            // A fetched row's column, read from the cursor's result tuple.
+            (Self::Local(index), value) => {
+                local_values[index] = result_tuple_slot(value, crate::storage::StoredForm::Inline);
+            }
             (Self::Assigned(_), Datum::Bool(true)) => {}
             (Self::Assigned(name), Datum::Bool(false)) => records.record_mut(name).set_row(None),
             (Self::Field(name, column), value) => records.record_mut(name).set_field(column, value),
@@ -45110,7 +45233,7 @@ fn finish_dynamic_into<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     new_row: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     statement: PlpgsqlDynamicSelectInto<'a>,
     arguments: &[Datum<'a>],
     selected: &[Datum<'a>],
@@ -45171,7 +45294,7 @@ fn finish_dynamic_into<'a>(
                 local_values,
                 target,
                 resolved,
-                value,
+                result_tuple_slot(value, crate::storage::StoredForm::Inline),
             )?;
         }
         Ok(())
@@ -45379,7 +45502,7 @@ fn finish_static_returning<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     targets: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     into: Option<PlpgsqlInto<'a>>,
     returns: bool,
     selected: &[Datum<'a>],
@@ -45413,7 +45536,7 @@ fn store_static_returning<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     targets: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     into: Option<PlpgsqlInto<'a>>,
     returns: bool,
     selected: &[Datum<'a>],
@@ -45466,7 +45589,7 @@ fn store_static_returning<'a>(
             local_values,
             target,
             resolved,
-            value,
+            result_tuple_slot(value, crate::storage::StoredForm::Inline),
         )?;
     }
     Ok(())
@@ -45482,7 +45605,7 @@ fn finish_resumed_static_write<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     targets: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     into: Option<PlpgsqlInto<'a>>,
     returns: bool,
     rows: u64,
@@ -45524,7 +45647,7 @@ fn finish_resumed_static_write<'a>(
 enum StrictParameters<'s, 'a> {
     Variables {
         locals: &'s [TriggerLocalDecl],
-        values: &'s [Datum<'a>],
+        values: &'s [LocalSlot<'a>],
     },
     Arguments(&'s [Datum<'a>]),
 }
@@ -45749,7 +45872,7 @@ fn strict_parameters_detail(
                             item(
                                 &mut detail,
                                 format_args!("{}", local.name.as_str()),
-                                values[index],
+                                values[index].value,
                             )?;
                         }
                     }

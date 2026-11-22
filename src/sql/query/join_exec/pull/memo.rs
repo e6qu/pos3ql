@@ -55,10 +55,10 @@ struct Entry {
 
 /// The cache: the entries, their hash table and the store of their keys
 /// and rows.
-struct Cache {
-    store: MaterialStore,
-    entries: MutableSlice<Entry>,
-    buckets: MutableSlice<u32>,
+struct Cache<'a> {
+    store: MaterialStore<'a>,
+    entries: NodeList<'a, Entry>,
+    buckets: NodeList<'a, u32>,
     /// The least and the most recently used entry.
     oldest: u32,
     newest: u32,
@@ -72,9 +72,11 @@ struct Cache {
 }
 
 /// A `Memoize` node's state between rows.
-pub(super) struct MemoRecord {
+pub(super) struct MemoRecord<'a> {
     status: Status,
-    cache: Option<Cache>,
+    cache: Option<Cache<'a>>,
+    /// Where its cache lives.
+    space: Space<'a>,
     /// The entry being read or filled.
     entry: u32,
     /// The next row of a complete entry a read returns.
@@ -83,11 +85,12 @@ pub(super) struct MemoRecord {
     pub(super) stats: crate::sql::query::instrument::MemoizeStats,
 }
 
-impl MemoRecord {
-    pub(super) fn new() -> Self {
+impl<'a> MemoRecord<'a> {
+    pub(super) fn new(space: Space<'a>) -> Self {
         Self {
             status: Status::Lookup,
             cache: None,
+            space,
             entry: NONE,
             at: 0,
             mark: None,
@@ -103,22 +106,23 @@ impl MemoRecord {
     }
 }
 
-fn memo_record<'r>(records: &'r mut [Record<'_>], id: u32) -> &'r mut MemoRecord {
+fn memo_record<'r, 'a>(records: &'r mut [Record<'a>], id: u32) -> &'r mut MemoRecord<'a> {
     let Record::Memoize(record) = &mut records[id as usize] else {
         unreachable!("a Memoize's record");
     };
     record
 }
 
-impl Cache {
-    fn new(pool: &Arc<LeasePool>) -> Result<Self, SqlError> {
-        let mut buckets = pool.lease::<u32>(64).map_err(store_full)?;
+impl<'a> Cache<'a> {
+    fn new(space: &Space<'a>) -> Result<Self, SqlError> {
+        let mut buckets = space.list::<u32>().map_err(store_full)?;
+        buckets.reserve_exact(64).map_err(store_full)?;
         for _ in 0..64 {
             buckets.push_reserved(NONE).map_err(store_full)?;
         }
         Ok(Self {
-            store: MaterialStore::new(pool)?,
-            entries: pool.lease(0).map_err(store_full)?,
+            store: MaterialStore::new(space)?,
+            entries: space.list().map_err(store_full)?,
             buckets,
             oldest: NONE,
             newest: NONE,
@@ -251,10 +255,12 @@ impl Cache {
     /// them; `filling`'s rows go last, so the rows it stores next follow
     /// them.
     fn compact(&mut self, filling: u32, width: usize) -> Result<(), SqlError> {
-        if self.store.bytes.len() <= 2 * self.live_bytes + COMPACT_SLACK {
+        // Compacting arena lists only takes more of the arena.
+        if !self.store.releases() || self.store.held_bytes() <= 2 * self.live_bytes + COMPACT_SLACK
+        {
             return Ok(());
         }
-        let mut store = MaterialStore::new(self.store.bytes.pool())?;
+        let mut store = MaterialStore::new(&self.store.entries.space())?;
         for pass in [false, true] {
             let mut id = self.oldest;
             while id != NONE {
@@ -330,7 +336,7 @@ impl<'a> Step<'_, '_, 'a> {
                     }
                     let key = &key[..keys.len()];
                     if record.cache.is_none() {
-                        record.cache = Some(Cache::new(cx.storage.plan_build())?);
+                        record.cache = Some(Cache::new(&record.space)?);
                     }
                     let (found, entry) = self.lookup(id, key, keys, binary, limit, width)?;
                     let record = memo_record(self.records, id);
@@ -392,7 +398,7 @@ impl<'a> Step<'_, '_, 'a> {
                         record.status = Status::End;
                         return Ok(false);
                     }
-                    Step::release(cx.arena, &mut record.mark);
+                    Step::release(cx.arena, self.keep, &mut record.mark);
                     let first = entry.first as usize + record.at as usize * width;
                     record.at += 1;
                     cache.store.load(first, width, cx, self.bound)?;

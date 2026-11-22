@@ -3331,6 +3331,10 @@ pub trait CatalogAccess {
 
     /// Runs a selected cast of `value`, held as `form`, which a cast
     /// function is passed unchanged.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a cast runs on a value with its held form, typmod, collation and storage"
+    )]
     fn execute_bound_cast<'a>(
         &self,
         _cast: &BoundCast,

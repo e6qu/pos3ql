@@ -7505,7 +7505,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     "bound support function polymorphic contract does not match its arguments"
                 )
             })?;
-        Ok(self.execute_routine(
+        self.execute_routine(
             slot,
             &routine,
             arguments,
@@ -7514,7 +7514,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             access,
             input_progress::invocation_site(),
             arena,
-        )?)
+        )
     }
 
     fn cast_evaluation(

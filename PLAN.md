@@ -487,13 +487,17 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   a `FOR` or `FETCH` row, a procedure's outputs) is read from a result
   tuple, which packs a short value (`SELECT 'lit' INTO a` reads 4) and
   keeps a stored value's TOAST form when the query carries it (`SELECT big
-  INTO w` reads 44); a record keeps its fields' forms (`992`).
+  INTO w` reads 44); a record keeps its fields' forms. A `FOR` loop over a
+  static or `EXECUTE` query keeps each row's forms in its scalar, record or
+  target-list variables (`FOR v IN SELECT big` reads 44) (`992`).
 - [ ] PL/pgSQL forms not carried yet: a parameter's (the caller's
-  expression is not traced: a short value is taken as packed, a longer one
-  is `0A000`), a long value a `FOR` or `FETCH` row or a `RETURNS TABLE`
-  query passes on, and `NEW` and `OLD` columns TOAST may store otherwise
-  (`0A000`; PostgreSQL reads a `BEFORE` trigger's `NEW` as formed, 3004,
-  and an `AFTER` trigger's as stored, 44).
+  argument expression is not traced through routine input preparation and
+  the saved invocation log: a short value is taken as packed, a longer one
+  is `0A000`), a long value a `FETCH` row or a `RETURNS TABLE` query passes
+  on, and `NEW` and `OLD` columns TOAST may store otherwise (`0A000`;
+  PostgreSQL reads a `BEFORE` trigger's `NEW` as formed, 3004, and an
+  `AFTER` trigger's as stored, 44; the firing path and queued `AFTER`
+  events carry row values without forms).
 - [ ] Composite forms not carried yet: the one-byte header a short
   composite gets when a sort or a materialized CTE forms it into a tuple, a
   derived table's whole-row output PostgreSQL pulls up into the outer query

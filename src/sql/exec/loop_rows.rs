@@ -25,13 +25,18 @@ impl LoopRows {
             .checked_add(2)
             .and_then(|count| count.checked_mul(8))
             .ok_or_else(too_large)?;
-        let mut length = offsets
-            .checked_add(projected_row_len(&[rows.empty])?)
-            .ok_or_else(too_large)?;
-        for value in rows.values {
+        // Each value carries the form its source gave it; the empty row is
+        // NULL.
+        let formed = |index: usize| match index {
+            0 => (rows.empty, crate::storage::StoredForm::Inline),
+            row => (rows.values[row - 1], rows.forms.get(row - 1)),
+        };
+        let encoded_len = |index: usize| projected_row_len_by(1, |_| Ok(formed(index)));
+        let mut length = offsets.checked_add(encoded_len(0)?).ok_or_else(too_large)?;
+        for index in 1..=rows.values.len() {
             super::super::query::check_timeout()?;
             length = length
-                .checked_add(projected_row_len(&[*value])?)
+                .checked_add(encoded_len(index)?)
                 .ok_or_else(too_large)?;
         }
         let mut bytes = pool.lease::<u8>(length).map_err(full)?;
@@ -42,14 +47,15 @@ impl LoopRows {
             bytes.extend_from_slice(&ZEROES[..count]).map_err(full)?;
         }
         let mut position = offsets;
-        for (index, value) in core::iter::once(rows.empty)
-            .chain(rows.values.iter().copied())
-            .enumerate()
-        {
+        for index in 0..=rows.values.len() {
             super::super::query::check_timeout()?;
             bytes[index * 8..(index + 1) * 8].copy_from_slice(&(position as u64).to_le_bytes());
-            let length = projected_row_len(&[value])?;
-            encode_projected_into(&[value], &mut bytes[position..position + length])?;
+            let length = encoded_len(index)?;
+            encode_projected_by_into(
+                1,
+                |_| Ok(formed(index)),
+                &mut bytes[position..position + length],
+            )?;
             position += length;
         }
         bytes[(rows.values.len() + 1) * 8..offsets]
@@ -83,7 +89,13 @@ impl LoopRows {
         self.decode(index + 1, arena)
     }
 
-    fn decode<'a>(&self, index: usize, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    /// The TOAST form row `index`'s value carries.
+    pub(super) fn form(&self, index: usize) -> crate::storage::StoredForm {
+        assert!(index < self.count, "materialized loop row index");
+        projected_stored_form(self.encoded(index + 1), 0)
+    }
+
+    fn encoded(&self, index: usize) -> &[u8] {
         let offset = |index: usize| {
             usize::try_from(u64::from_le_bytes(
                 self.bytes[index * 8..(index + 1) * 8]
@@ -92,8 +104,12 @@ impl LoopRows {
             ))
             .expect("in-process loop row offset")
         };
+        &self.bytes[offset(index)..offset(index + 1)]
+    }
+
+    fn decode<'a>(&self, index: usize, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
         let encoded = arena
-            .alloc_slice_copy(&self.bytes[offset(index)..offset(index + 1)])
+            .alloc_slice_copy(self.encoded(index))
             .map_err(|_| super::super::query::arena_full_pub())?;
         decode_projected_col_record(encoded, 0, arena)
     }

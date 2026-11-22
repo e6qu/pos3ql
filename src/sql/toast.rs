@@ -874,8 +874,9 @@ fn branch_gives<'a>(
     use crate::sql::ast::Expr;
     Ok(match expression {
         // A whole-row reference forms its composite anew.
-        Expr::Column { qualifier, name } => column_datum(row, *qualifier, name)?
-            .is_some_and(|read| same_datum(&read, value)),
+        Expr::Column { qualifier, name } => {
+            column_datum(row, *qualifier, name)?.is_some_and(|read| same_datum(&read, value))
+        }
         Expr::SchemaColumn { table, name, .. } => {
             same_datum(&row.lookup(Some(table), name)?, value)
         }

@@ -39863,10 +39863,40 @@ fn trigger_loop_integer(value: Datum<'_>, arena: &Arena, bound: &str) -> Result<
 
 struct TriggerForRows<'a> {
     values: &'a [Datum<'a>],
+    /// How each value holds its datum.
+    forms: ForRowForms<'a>,
     empty: Datum<'a>,
     /// How many columns a scalar variable's query returns: it takes the
     /// first, and `strict_multi_assignment` reports a mismatch.
     width: usize,
+}
+
+/// The form a query's result row carries for column `index`: a result row
+/// that carries none holds each value as tuple forming gave it.
+fn form_at(carried: &[crate::storage::StoredForm], index: usize) -> crate::storage::StoredForm {
+    carried
+        .get(index)
+        .copied()
+        .unwrap_or(crate::storage::StoredForm::Inline)
+}
+
+/// The TOAST forms of a `FOR` loop's scalar values.
+#[derive(Clone, Copy)]
+enum ForRowForms<'a> {
+    /// The form of each value, read from a query's result tuple.
+    Carried(&'a [crate::storage::StoredForm]),
+    /// Values whose source does not carry their forms: record rows, which
+    /// keep their fields' forms, array elements and returned rows.
+    NotCarried,
+}
+
+impl ForRowForms<'_> {
+    fn get(self, index: usize) -> crate::storage::StoredForm {
+        match self {
+            Self::Carried(forms) => forms[index],
+            Self::NotCarried => crate::storage::StoredForm::Inline,
+        }
+    }
 }
 
 #[expect(
@@ -39887,6 +39917,7 @@ where
     'result: 'query,
 {
     let mut rows = ArenaList::new(result_arena);
+    let mut forms = ArenaList::new(result_arena);
     let mut width = 1;
     super::query::select_into_rows(
         storage,
@@ -39896,18 +39927,23 @@ where
         params,
         Some(scope),
         Some(sequence),
-        &mut |values, _| {
+        &mut |values, carried| {
             // PostgreSQL assigns the first column; others are left over.
             width = values.len();
             let value = detached_trigger_datum(
                 values.first().copied().unwrap_or(Datum::Null),
                 result_arena,
             )?;
-            rows.push(value).map_err(|_| super::query::arena_full_pub())
+            rows.push(value)
+                .map_err(|_| super::query::arena_full_pub())?;
+            forms
+                .push(form_at(carried, 0))
+                .map_err(|_| super::query::arena_full_pub())
         },
     )?;
     Ok(TriggerForRows {
         values: rows.as_slice(),
+        forms: ForRowForms::Carried(forms.as_slice()),
         empty: Datum::Null,
         width,
     })
@@ -39965,7 +40001,8 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
             ));
         }
         let mut rows = ArenaList::new(arena);
-        execute_bound_plpgsql_dynamic_query(context, query, &mut |values, _| {
+        let mut row_forms = ArenaList::new(arena);
+        execute_bound_plpgsql_dynamic_query(context, query, &mut |values, carried| {
             if values.len() != width {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -39982,7 +40019,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 }; MAX_PROJ];
                 for index in 0..width {
                     row_fields[index] = RecordField {
-                        form: crate::storage::StoredForm::Inline,
+                        form: form_at(carried, index),
                         name: fields[index].0,
                         type_oid: fields[index].1,
                         type_mod: fields[index].2,
@@ -39996,6 +40033,9 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
             } else {
                 detached_trigger_datum(values[0], arena)?
             };
+            row_forms
+                .push(form_at(carried, 0))
+                .map_err(|_| super::query::arena_full_pub())?;
             rows.push(value).map_err(|_| super::query::arena_full_pub())
         })?;
         let empty = if record_target && rows.as_slice().is_empty() {
@@ -40014,6 +40054,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
         };
         Ok(TriggerForRows {
             values: rows.as_slice(),
+            forms: ForRowForms::Carried(row_forms.as_slice()),
             empty,
             width: if record_target { 1 } else { width },
         })
@@ -40115,6 +40156,7 @@ fn resume_for_dml_rows<'a>(
     }
     Ok(TriggerForRows {
         values,
+        forms: ForRowForms::NotCarried,
         empty: *empty,
         width: 1,
     })
@@ -40235,6 +40277,7 @@ fn for_dml_rows<'a>(
         }
         Ok(TriggerForRows {
             values: rows.as_slice(),
+            forms: ForRowForms::NotCarried,
             empty,
             width: 1,
         })
@@ -40277,7 +40320,7 @@ where
         params,
         Some(scope),
         Some(sequence),
-        &mut |values, _| {
+        &mut |values, carried| {
             if values.len() != width {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -40293,7 +40336,7 @@ where
             }; MAX_PROJ];
             for index in 0..width {
                 fields[index] = RecordField {
-                    form: crate::storage::StoredForm::Inline,
+                    form: form_at(carried, index),
                     name: result_arena
                         .alloc_str(columns[index].name)
                         .map_err(|_| super::query::arena_full_pub())?,
@@ -40330,6 +40373,7 @@ where
     };
     Ok(TriggerForRows {
         values: rows.as_slice(),
+        forms: ForRowForms::NotCarried,
         empty,
         width: 1,
     })
@@ -44570,6 +44614,7 @@ fn execute_trigger_step_in<'a>(
                                     }
                                     TriggerForRows {
                                         values: &*values,
+                                        forms: ForRowForms::NotCarried,
                                         empty: Datum::Null,
                                         width: 1,
                                     }

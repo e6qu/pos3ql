@@ -1106,7 +1106,15 @@ pub(super) fn start_row_loop<'syntax, 'a>(
             .transpose()?;
         drop(rows);
         if let Some(empty) = empty {
-            assign_loop_row(context, locals, values, program, empty, None)?;
+            assign_loop_row(
+                context,
+                locals,
+                values,
+                program,
+                empty,
+                crate::storage::StoredForm::Inline,
+                None,
+            )?;
         }
         status.set_found(false);
         return Ok(Step::complete());
@@ -1118,6 +1126,7 @@ pub(super) fn start_row_loop<'syntax, 'a>(
         values,
         program,
         value,
+        rows.form(0),
         query_source.then_some(rows.width()),
     )?;
     Ok(Step::Enter(FrameEntry::new(
@@ -1132,14 +1141,16 @@ pub(super) fn start_row_loop<'syntax, 'a>(
 
 /// Assigns one row of a `FOR` loop to its variable, or its columns to a
 /// list of variables in order: missing columns are NULL and extra ones are
-/// ignored, as PostgreSQL's `exec_move_row` assigns them. A query's row,
-/// `width` columns wide, takes the `strict_multi_assignment` check.
+/// ignored, as PostgreSQL's `exec_move_row` assigns them. A scalar `value`
+/// holds its datum in `form`. A query's row, `width` columns wide, takes the
+/// `strict_multi_assignment` check.
 fn assign_loop_row<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
     values: &mut [LocalSlot<'a>],
     program: TriggerFor<'_>,
     value: Datum<'a>,
+    form: crate::storage::StoredForm,
     width: Option<usize>,
 ) -> Result<(), SqlError> {
     if program.row_targets.is_empty() {
@@ -1151,7 +1162,7 @@ fn assign_loop_row<'a>(
                 check_multi_assignment(context.responder, 1, width)
             })?;
         }
-        let assigned = super::result_tuple_slot(value, crate::storage::StoredForm::Inline);
+        let assigned = super::result_tuple_slot(value, form);
         return assign_trigger_local(context, locals, values, program.target, assigned);
     }
     let value = match value {
@@ -1811,6 +1822,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                         };
                         if index + 1 < rows.len() {
                             let value = rows.value(index + 1, context.arena)?;
+                            let form = rows.form(index + 1);
                             let width = rows.width();
                             let TriggerStatement::For(program) =
                                 frames.source_statement(frames.last().source)
@@ -1825,6 +1837,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                                 scope_values,
                                 program,
                                 value,
+                                form,
                                 matches!(
                                     program.source,
                                     TriggerForSource::Query(_)

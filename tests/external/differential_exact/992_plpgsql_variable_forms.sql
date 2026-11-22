@@ -38,3 +38,36 @@ SELECT id, e, forms(id, e)
 FROM pt, unnest(ARRAY['a', 'c', 'd', 'f', 'g', 'i', 'r.s', 'r.big', 'j', 'v',
                       'w', 'y', 'z', 'dflt', 'q', 'copied']) WITH ORDINALITY u(e, n)
 ORDER BY id, n;
+-- A FOR loop's variable holds each row as the query's result tuple holds
+-- it, through a static or an EXECUTE query, a scalar, a record or a list of
+-- targets.
+CREATE FUNCTION for_forms(e text) RETURNS SETOF int LANGUAGE plpgsql AS $$
+DECLARE v text; r record; a text; b text;
+BEGIN
+  IF e = 'scalar' THEN
+    FOR v IN SELECT big FROM pt ORDER BY id LOOP RETURN NEXT pg_column_size(v); END LOOP;
+  ELSIF e = 'short' THEN
+    FOR v IN SELECT s FROM pt ORDER BY id LOOP RETURN NEXT pg_column_size(v); END LOOP;
+  ELSIF e = 'formed' THEN
+    FOR v IN SELECT big || '' FROM pt ORDER BY id LOOP RETURN NEXT pg_column_size(v); END LOOP;
+  ELSIF e = 'record' THEN
+    FOR r IN SELECT s, big FROM pt ORDER BY id LOOP
+      RETURN NEXT pg_column_size(r.big); RETURN NEXT pg_column_size(r.s);
+    END LOOP;
+  ELSIF e = 'targets' THEN
+    FOR a, b IN SELECT s, big FROM pt ORDER BY id LOOP
+      RETURN NEXT pg_column_size(a); RETURN NEXT pg_column_size(b);
+    END LOOP;
+  ELSIF e = 'execute' THEN
+    FOR v IN EXECUTE 'SELECT big FROM pt ORDER BY id' LOOP
+      RETURN NEXT pg_column_size(v);
+    END LOOP;
+  ELSIF e = 'execute record' THEN
+    FOR r IN EXECUTE 'SELECT big FROM pt ORDER BY id' LOOP
+      RETURN NEXT pg_column_size(r.big);
+    END LOOP;
+  END IF;
+END $$;
+SELECT e, for_forms(e)
+FROM unnest(ARRAY['scalar', 'short', 'formed', 'record', 'targets', 'execute',
+                  'execute record']) e;

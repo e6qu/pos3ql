@@ -842,6 +842,7 @@ fn row_loop_resources_release_once_on_pop_and_owner_drop() {
                     &row_pool,
                     TriggerForRows {
                         values: &[Datum::Text("owned row")],
+                        forms: super::super::ForRowForms::NotCarried,
                         empty: Datum::Null,
                         width: 1,
                     },

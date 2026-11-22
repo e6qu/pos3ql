@@ -760,7 +760,6 @@ pub(crate) enum PathKind {
         inner: u32,
         clauses: ClauseList,
         hash: ClauseList,
-        buckets: u32,
         batches: u32,
         /// The inner relation is unique for the join's clauses.
         inner_unique: bool,
@@ -5372,7 +5371,6 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     inner,
                     clauses: restrict,
                     hash,
-                    buckets: sizing.buckets,
                     batches: sizing.batches,
                     inner_unique: inputs.inner_unique,
                 },

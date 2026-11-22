@@ -180,7 +180,7 @@ type FromMatch<'m, 'a> = dyn FnMut(&JoinRow<'_, 'a, '_>, &dyn ColumnLookup<'a>, 
 /// joined row; `full_rows` reads every column of each source instead.
 #[expect(clippy::too_many_arguments, reason = "joined DML scan inputs")]
 pub(super) fn scan_from_matches<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     from: &'a FromClause<'a>,
     txid: u32,
     where_clause: Option<&'a Expr<'a>>,
@@ -214,7 +214,7 @@ pub(super) fn scan_from_matches<'a>(
         subquery_expressions,
         storage,
         txid,
-        None,
+        super::DeferredRuns::Query(storage),
         arena,
         params,
         Some(target),
@@ -275,7 +275,7 @@ pub(super) fn scan_from_matches<'a>(
 /// target row `target`, retained in `retain`'s persistent tail.
 #[expect(clippy::too_many_arguments, reason = "joined DML scan inputs")]
 pub(crate) fn joined_from_match<'a, 'r>(
-    storage: &'a Storage,
+    storage: &Storage,
     from: &'a FromClause<'a>,
     txid: u32,
     where_clause: Option<&'a Expr<'a>>,
@@ -315,7 +315,7 @@ pub(crate) fn joined_from_match<'a, 'r>(
 /// `None` skips the target row.
 #[expect(clippy::too_many_arguments, reason = "joined DML scan inputs")]
 pub(crate) fn recheck_joined_from_match<'a, 'r>(
-    storage: &'a Storage,
+    storage: &Storage,
     from: &'a FromClause<'a>,
     txid: u32,
     where_clause: Option<&'a Expr<'a>>,
@@ -371,7 +371,7 @@ pub(crate) fn recheck_joined_from_match<'a, 'r>(
 /// the FROM items' values for `RETURNING`.
 #[expect(clippy::too_many_arguments, reason = "joined DML scope inputs")]
 pub(crate) fn with_joined_from_row<'a, 'r, R>(
-    storage: &'a Storage,
+    storage: &Storage,
     from: &'a FromClause<'a>,
     txid: u32,
     where_clause: Option<&'a Expr<'a>>,
@@ -425,7 +425,7 @@ pub(super) enum LateralRowRecheck<'a> {
 /// row as read (`as_read`), equals the values the statement read (`read`).
 #[expect(clippy::too_many_arguments, reason = "locked row recheck inputs")]
 pub(super) fn recheck_lateral_select<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     select: &'a crate::sql::ast::Select<'a>,
     arena: &'a Arena,
@@ -623,7 +623,7 @@ impl TargetHashPlan {
 /// Selects the hash join of `target` with `from`, when the SELECT planner
 /// would hash this join of two relations.
 pub(crate) fn target_hash_plan<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     target: crate::sql::ast::QualName<'a>,
     alias: Option<&'a str>,
     from: &'a FromClause<'a>,
@@ -1647,7 +1647,7 @@ pub(crate) struct JoinedWritePairs {
 /// `retain` when given.
 #[expect(clippy::too_many_arguments, reason = "joined DML scan inputs")]
 pub(crate) fn joined_write_pairs<'a, 'r>(
-    storage: &'a Storage,
+    storage: &Storage,
     from: &'a FromClause<'a>,
     txid: u32,
     hash: Option<&'a Expr<'a>>,

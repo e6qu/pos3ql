@@ -451,7 +451,7 @@ impl<'a> SortState<'a> {
     pub(super) fn encode_input<'work>(
         &self,
         scope: &QueryScope<'_>,
-        storage: &'work Storage,
+        storage: &Storage,
         txid: u32,
         row: &scan::JoinRow<'_, 'work, '_>,
         work: &'work Arena,

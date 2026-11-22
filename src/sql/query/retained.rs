@@ -341,8 +341,8 @@ pub(crate) struct RetainedSelect<'a> {
     /// Uncorrelated subqueries, run once before the first row: see
     /// [`statement_sublinks`].
     sublinks: &'a [&'a Expr<'a>],
-    /// Their results, kept in the reader's allocation once run.
-    subqueries: Option<crate::sql::eval::SubqueryValues<'a, 'a>>,
+    /// Their caches, kept in the reader's allocation once run.
+    first_read: Option<super::subquery::FirstReadSubqueries<'a>>,
     /// The statement's `WHERE`, whose conjuncts that read no column run once
     /// before the first row (PostgreSQL's one-time filter).
     one_time: Option<&'a Expr<'a>>,
@@ -1858,7 +1858,7 @@ fn appended_leaves<'a>(
 /// non-volatile and call no routine body, since they run below the
 /// statement driver, where no call can hand off.
 fn branch_admitted<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     leaf: &'a Select<'a>,
     arena: &'a Arena,
@@ -1920,7 +1920,7 @@ fn branch_admitted<'a>(
 /// is not an explicit `UNION ALL` without ORDER BY, WITH or row locks.
 fn appended_select<'a>(
     query: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<&'a Select<'a>>, SqlError> {
@@ -2006,7 +2006,7 @@ fn appended_select<'a>(
 /// simple FROM subqueries pulled up, as the general executor runs it.
 pub(crate) fn stream_query<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<&'a Select<'a>>, SqlError> {
@@ -2026,7 +2026,7 @@ pub(crate) fn stream_query<'a>(
 /// general executor pulls up each query it runs.
 fn pull_up_appended<'a>(
     tree: &'a crate::sql::ast::SetTree<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a crate::sql::ast::SetTree<'a>, SqlError> {
@@ -2763,7 +2763,7 @@ impl<'a> RetainedSelect<'a> {
     /// join plan's nodes are built in a block of `reader_bytes`, the most
     /// a stream's reader holds, to count what they keep.
     pub(crate) fn stream_source(
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         statement: &'a Select<'a>,
         reader_bytes: usize,
@@ -2959,7 +2959,7 @@ impl<'a> RetainedSelect<'a> {
     /// stream: every query streams on its own and runs in place, and their
     /// physical tables together fit one retained join's.
     fn appended_source(
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         statement: &'a Select<'a>,
         leaves: &'a [&'a Select<'a>],
@@ -3795,7 +3795,7 @@ impl<'a> RetainedSelect<'a> {
             saves_scroll_output: false,
             description,
             sublinks,
-            subqueries: None,
+            first_read: None,
             one_time: statement.where_clause,
             filtered_out: false,
         }))
@@ -4110,7 +4110,7 @@ impl<'a> RetainedSelect<'a> {
             saves_scroll_output,
             description,
             sublinks,
-            subqueries: None,
+            first_read: None,
             one_time: statement.where_clause,
             filtered_out: false,
         }))
@@ -4137,13 +4137,12 @@ impl<'a> RetainedSelect<'a> {
         if self.filtered_out {
             return Ok(false);
         }
-        let first = self.subqueries.is_none();
-        if !self.sublinks.is_empty() && self.subqueries.is_none() {
+        let first = self.first_read.is_none();
+        if !self.sublinks.is_empty() && self.first_read.is_none() {
             // Each runs when an expression first reads it, as PostgreSQL's
             // initPlans do, and keeps its value in the reader's allocation.
-            let subqueries =
-                super::subquery::first_read_subqueries(self.sublinks, storage, txid, state_arena)
-                    .map_err(|_| {
+            let first_read = super::subquery::first_read_subqueries(self.sublinks, state_arena)
+                .map_err(|_| {
                     // Like a build that does not fit: the statement runs
                     // spooled, or in the general executor, instead.
                     sql_err!(
@@ -4152,7 +4151,7 @@ impl<'a> RetainedSelect<'a> {
                     )
                     .plan_build_exhausted()
                 })?;
-            self.subqueries = Some(subqueries);
+            self.first_read = Some(first_read);
         }
         // A grouping still returns its one row over no input, so it filters
         // its input row by row instead. A `LIMIT 0` reads no input, so its
@@ -4165,6 +4164,7 @@ impl<'a> RetainedSelect<'a> {
             self.filtered_out = true;
             return Ok(false);
         }
+        let subqueries = self.first_read_values(storage, txid, work)?;
         self.plan.advance(&mut Pull {
             scope: &self.scope,
             storage,
@@ -4174,14 +4174,30 @@ impl<'a> RetainedSelect<'a> {
             buffers,
             work,
             params,
-            subqueries: self.subqueries.as_ref(),
+            subqueries: subqueries.as_ref(),
         })
+    }
+
+    /// The statement's uncorrelated subqueries for one call reading through
+    /// `storage`.
+    fn first_read_values<'h>(
+        &self,
+        storage: &'h Storage,
+        txid: u32,
+        work: &'h Arena,
+    ) -> Result<Option<crate::sql::eval::SubqueryValues<'h, 'a>>, SqlError>
+    where
+        'a: 'h,
+    {
+        self.first_read
+            .map(|first_read| first_read.values(storage, txid, work))
+            .transpose()
     }
 
     /// Evaluates the statement's one-time filter before its first row.
     fn one_time_filter_passes<'w>(
         &'w self,
-        storage: &'w Storage,
+        storage: &Storage,
         txid: u32,
         work: &'w Arena,
         params: &[Datum<'w>],
@@ -4193,9 +4209,10 @@ impl<'a> RetainedSelect<'a> {
             invocations: None,
             statement_arena: None,
         };
+        let subqueries = self.first_read_values(storage, txid, work)?;
         let hooks = EvalHooks {
             catalog: Some(&catalog),
-            subs: self.subqueries.as_ref(),
+            subs: subqueries.as_ref(),
             ..super::super::eval::NO_HOOKS
         };
         super::scan::one_time_filter_passes(self.one_time, &self.scope, work, params, &hooks, None)
@@ -4227,7 +4244,7 @@ impl<'a> RetainedSelect<'a> {
     )]
     pub(crate) fn evaluate_statement_predicate<'work>(
         &'work self,
-        storage: &'work Storage,
+        storage: &Storage,
         txid: u32,
         work: &'work Arena,
         params: &[Datum<'work>],
@@ -4243,10 +4260,11 @@ impl<'a> RetainedSelect<'a> {
                 invocations,
                 statement_arena: Some(frame_arena),
             };
+            let subqueries = self.first_read_values(storage, txid, work)?;
             let hooks = EvalHooks {
                 catalog: Some(&catalog),
                 sequences: sequence,
-                subs: self.subqueries.as_ref(),
+                subs: subqueries.as_ref(),
                 ..super::super::eval::NO_HOOKS
             };
             return grouping.having_passes(&self.scope, work, params, &hooks);
@@ -4262,10 +4280,11 @@ impl<'a> RetainedSelect<'a> {
             invocations,
             statement_arena: Some(frame_arena),
         };
+        let subqueries = self.first_read_values(storage, txid, work)?;
         let hooks = EvalHooks {
             catalog: Some(&catalog),
             sequences: sequence,
-            subs: self.subqueries.as_ref(),
+            subs: subqueries.as_ref(),
             ..super::super::eval::NO_HOOKS
         };
         self.plan.with_row(&self.scope, work, |row| {
@@ -4284,7 +4303,7 @@ impl<'a> RetainedSelect<'a> {
     pub(crate) fn evaluate_statement_item<'work, 'frame>(
         &'work self,
         index: usize,
-        storage: &'work Storage,
+        storage: &Storage,
         txid: u32,
         work: &'work Arena,
         params: &[Datum<'work>],
@@ -4313,10 +4332,11 @@ impl<'a> RetainedSelect<'a> {
                 invocations,
                 statement_arena: Some(frame_arena),
             };
+            let subqueries = self.first_read_values(storage, txid, work)?;
             let hooks = EvalHooks {
                 catalog: Some(&catalog),
                 sequences: sequence,
-                subs: self.subqueries.as_ref(),
+                subs: subqueries.as_ref(),
                 ..super::super::eval::NO_HOOKS
             };
             let (value, form) = grouping.with_group(&self.scope, work, &hooks, |row, hooks| {
@@ -4341,10 +4361,11 @@ impl<'a> RetainedSelect<'a> {
             invocations,
             statement_arena: Some(frame_arena),
         };
+        let subqueries = self.first_read_values(storage, txid, work)?;
         let hooks = EvalHooks {
             catalog: Some(&catalog),
             sequences: sequence,
-            subs: self.subqueries.as_ref(),
+            subs: subqueries.as_ref(),
             ..super::super::eval::NO_HOOKS
         };
         self.plan.with_row(&self.scope, work, |row| {
@@ -4466,7 +4487,7 @@ impl<'a> RetainedSelect<'a> {
     )]
     pub(crate) fn prepare_cursor_row<'work>(
         &mut self,
-        storage: &'work Storage,
+        storage: &Storage,
         txid: u32,
         observed_at: i64,
         state_arena: &'a Arena,

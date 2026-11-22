@@ -1288,7 +1288,7 @@ fn relation_mask(
 /// which the class holds as a constant.
 fn equivalence_clause<'a>(
     conjunct: &'a Expr<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
@@ -1336,7 +1336,7 @@ fn equivalence_clause<'a>(
 fn constant_fixed_key<'a>(
     statement: &Select<'a>,
     key: &Expr<'_>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
@@ -1398,7 +1398,7 @@ fn constant_fixed_key<'a>(
 fn order_restrictions<'a>(
     conjuncts: &mut [&'a Expr<'a>],
     cost: &dyn Fn(&Expr<'_>) -> f64,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
@@ -1737,7 +1737,7 @@ struct JoinQuals<'a> {
 /// the order the joins add them.
 #[allow(clippy::too_many_arguments)]
 fn join_quals<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     relations: &[JoinRelation<'a>],
     order: &[usize],
@@ -2213,7 +2213,7 @@ fn one_time_filter(
 /// cannot be printed.
 #[allow(clippy::too_many_arguments)]
 fn scan_filters<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     relations: &[JoinRelation<'a>],
     own: &mut [&'a Expr<'a>],
@@ -2341,7 +2341,7 @@ fn resolve_relation(
 /// cannot be placed.
 #[allow(clippy::too_many_arguments)]
 fn outer_join_quals<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     relations: &[JoinRelation<'a>],
     joins: &'a [crate::sql::ast::Join<'a>],
@@ -3864,7 +3864,7 @@ fn push_scan(plan: &mut Plan<'_>, mut scan: PlanNode) -> Result<(), SqlError> {
 /// scan serves it, whose estimates the model leaves out, or when the target
 /// is no plain table.
 fn chosen_write_scan<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     target: crate::sql::ast::QualName<'a>,
     alias: Option<&'a str>,
@@ -4584,7 +4584,7 @@ fn grouped_scan_path<'a>(
 /// what the path reads.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(crate) fn grouped_scan_context<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     distinct: bool,
@@ -10326,7 +10326,7 @@ type WindowStages<'e> = (
 /// The scan PostgreSQL's planner chose for a query of one relation with
 /// window functions, carrying the sort and limit above its windows.
 fn windowed_scan_path<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     model: &query::index_paths::join_query::ModeledJoin<'a>,
     arena: &'a Arena,

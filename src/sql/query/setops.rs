@@ -24,7 +24,7 @@ use super::{
 
 #[derive(Clone, Copy)]
 struct ExternalSetContext<'scope, 'a> {
-    storage: &'a Storage,
+    storage: &'scope Storage,
     txid: u32,
     arena: &'a Arena,
     params: &'scope [Datum<'a>],
@@ -39,7 +39,7 @@ struct ExternalSetContext<'scope, 'a> {
 /// are rejected loudly (they flow through `select_into_rows`).
 #[allow(clippy::too_many_arguments)]
 pub fn set_query<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     q: &'a SetQuery<'a>,
     arena: &'a Arena,
@@ -213,7 +213,7 @@ pub fn set_query<'a>(
 /// consumers, and protocol responses cannot drift in their treatment of
 /// CTEs, ordering, limits, or composite values.
 pub(crate) fn set_query_into_rows<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     query: &'a SetQuery<'a>,
     arena: &'a Arena,
@@ -834,7 +834,7 @@ fn external_set_tree<'a>(
     reason = "set-operation execution plumbing"
 )]
 pub(crate) fn external_set_body_into<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     tree: &'a SetTree<'a>,
     order_by: &'a [OrderBy<'a>],
@@ -857,6 +857,8 @@ pub(crate) fn external_set_body_into<'a>(
     };
 
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    // The description reads only the enclosing row's types.
+    let outer_types = outer.map(super::scope::OuterColumnTypes);
     let column_count = describe_set_body(
         storage,
         tree,
@@ -865,7 +867,9 @@ pub(crate) fn external_set_body_into<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Sql,
-        outer,
+        outer_types
+            .as_ref()
+            .map(|types| types as &dyn ColumnLookup<'_>),
     )?;
     require_set_equality_execute(storage, txid, arena, tree, &columns[..column_count])?;
     let mut target = [ColType::Bool; MAX_PROJ];
@@ -991,7 +995,7 @@ pub(crate) fn external_set_body_into<'a>(
 
 #[expect(clippy::too_many_arguments, reason = "set-query execution plumbing")]
 fn external_set_query<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     tree: &'a SetTree<'a>,
     query: &'a SetQuery<'a>,
@@ -1198,7 +1202,7 @@ pub(super) fn collect_set_leaves<'a>(
 /// A `VALUES` list's rows are not branches.
 pub(super) fn visit_set_branches<'a, 'o>(
     tree: &'a SetTree<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'o>>,
@@ -1225,7 +1229,19 @@ where
         if index + 1 < leaves.len() {
             let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
             let mut types = [0; MAX_PROJ];
-            let count = describe_leaf(storage, leaf, txid, &mut columns, arena, &mut types, outer)?;
+            // The description reads only the enclosing row's types.
+            let outer_types = outer.map(super::scope::OuterColumnTypes);
+            let count = describe_leaf(
+                storage,
+                leaf,
+                txid,
+                &mut columns,
+                arena,
+                &mut types,
+                outer_types
+                    .as_ref()
+                    .map(|types| types as &dyn ColumnLookup<'_>),
+            )?;
             branches[index] = earlier_branch(index + 1, &columns[..count], arena)?;
         }
     }
@@ -1322,7 +1338,7 @@ fn at_leaf_column(error: SqlError, leaf: &Select<'_>, column: usize) -> SqlError
 /// (a bare NULL or parameter), which the describe path coerces to text but a
 /// set operation should let adopt another branch's type.
 fn leaf_col_unknown<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     s: &'a Select<'a>,
     c: usize,
     txid: u32,
@@ -1793,7 +1809,7 @@ pub(crate) fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
 )]
 fn eval_set_tree<'a>(
     tree: &'a SetTree<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -2163,7 +2179,7 @@ pub(crate) fn materialize_set_body<'a>(
 }
 
 pub(super) fn materialize_set_body_tied<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     tree: &'a SetTree<'a>,
     arena: &'a Arena,
@@ -2198,7 +2214,7 @@ pub(super) fn materialize_set_body_tied<'a>(
     reason = "set body carries its execution scope"
 )]
 pub(super) fn stream_set_body<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     tree: &'a SetTree<'a>,
     arena: &'a Arena,
@@ -2229,7 +2245,7 @@ pub(super) fn stream_set_body<'a>(
 )]
 fn stream_set_tree<'a>(
     tree: &'a SetTree<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -2341,13 +2357,15 @@ fn stream_set_tree<'a>(
 
 /// The unified column types and collations of a set-operation body.
 fn set_body_columns<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     tree: &'a SetTree<'a>,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(&'a [ColType], &'a [Collation]), SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    // The description reads only the enclosing row's types.
+    let outer_types = outer.map(super::scope::OuterColumnTypes);
     let n = describe_set_body(
         storage,
         tree,
@@ -2356,7 +2374,9 @@ fn set_body_columns<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Sql,
-        outer,
+        outer_types
+            .as_ref()
+            .map(|types| types as &dyn ColumnLookup<'_>),
     )?;
     require_set_equality_execute(storage, txid, arena, tree, &columns[..n])?;
     let mut tgt = [ColType::Bool; MAX_PROJ];
@@ -2387,7 +2407,7 @@ fn set_body_columns<'a>(
 )]
 fn eval_set_leaf<'a>(
     s: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],

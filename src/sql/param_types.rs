@@ -5,7 +5,7 @@ use super::*;
 type CapturedTypeResolver<'a> = &'a dyn Fn(&str) -> Option<i32>;
 
 pub(crate) fn infer<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     statement: &'a Stmt<'a>,
     txid: u32,
     arena: &'a Arena,
@@ -40,7 +40,7 @@ pub(crate) fn infer_declared(
 }
 
 pub(crate) fn infer_resolved<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     statement: &'a Stmt<'a>,
     txid: u32,
     arena: &'a Arena,

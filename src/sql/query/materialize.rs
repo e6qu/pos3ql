@@ -298,7 +298,7 @@ impl ProjectionBuffers<'_> {
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn for_each_materialized_projection<'a>(
     buffers: &mut ProjectionBuffers<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     statement: &'a Select<'a>,
     row: &JoinRow<'_, 'a, '_>,
@@ -306,7 +306,7 @@ fn for_each_materialized_projection<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
-    base: &SubqueryValues<'a, 'a>,
+    base: &SubqueryValues<'_, 'a>,
     where_correlated: &[&'a Expr<'a>],
     order_exprs: &[Option<super::ResolvedSortKey<'a>>; MAX_PROJ],
     n_keys: usize,
@@ -575,7 +575,7 @@ pub(super) struct LockedRowRecheck<'r, 'a> {
     statement: &'a Select<'a>,
     scope: &'r QueryScope<'a>,
     from: &'a FromClause<'a>,
-    base: &'r SubqueryValues<'a, 'a>,
+    base: &'r SubqueryValues<'r, 'a>,
     params: &'r [Datum<'a>],
     hooks: &'r EvalHooks<'r, 'a>,
     outer: Option<&'r dyn ColumnLookup<'a>>,
@@ -601,9 +601,6 @@ pub(crate) fn locked_row_where_passes<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<bool, SqlError> {
-    // SAFETY: Storage outlives this call and stays immutable during it; only
-    // a Boolean escapes, so no value borrowing relation bytes outlives it.
-    let storage: &'a Storage = unsafe { &*(storage as *const Storage) };
     let correlated_subqueries = super::ProceduralSubqueries { storage, txid };
     let hooks = EvalHooks {
         subquery_executor: Some(&correlated_subqueries),
@@ -883,7 +880,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
         scope: &'r QueryScope<'a>,
         from: &'a FromClause<'a>,
         correlated: &'a [&'a Expr<'a>],
-        base: &'r SubqueryValues<'a, 'a>,
+        base: &'r SubqueryValues<'r, 'a>,
         params: &'r [Datum<'a>],
         hooks: &'r EvalHooks<'r, 'a>,
         outer: Option<&'r dyn ColumnLookup<'a>>,
@@ -910,7 +907,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
     /// Locks the sources of materialized `row`.
     pub(super) fn lock(
         &mut self,
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         row: &[u8],
         rowids: &[Option<u64>],
@@ -945,7 +942,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
 
     fn rebuild(
         &mut self,
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         row: &'a [u8],
         rowids: &[Option<u64>],
@@ -2296,7 +2293,7 @@ fn observed_source_columns<'a>(
 /// (`materialized_select`) and the row-source path (`select_into_rows`).
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(crate) fn materialized_rows<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -2305,7 +2302,7 @@ pub(crate) fn materialized_rows<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
+    base: &SubqueryValues<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
     rank_window: Option<usize>,
     lock_window: Option<u64>,
@@ -3258,7 +3255,7 @@ fn decode_source_rowids(
 
 #[expect(clippy::too_many_arguments, reason = "external lock-pass plumbing")]
 fn prelock_external_run<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     reader: &mut crate::sql::external::ExternalRunReader,
     run: crate::sql::external::ExternalRun,
     txid: u32,
@@ -3370,7 +3367,7 @@ fn prelock_external_run<'a>(
 
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(crate) fn external_materialized_into<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -3379,7 +3376,7 @@ pub(crate) fn external_materialized_into<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
+    base: &SubqueryValues<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
     limit: u64,
     offset: u64,
@@ -4042,7 +4039,7 @@ pub(crate) fn external_materialized_into<'a>(
 /// through a hash table that spills as PostgreSQL's does.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(super) fn externally_materialized<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
@@ -4075,7 +4072,7 @@ pub(super) fn externally_materialized<'a>(
 
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn external_materialized_select<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -4084,7 +4081,7 @@ fn external_materialized_select<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
+    base: &SubqueryValues<'_, 'a>,
     limit: u64,
     offset: u64,
     responder: &mut Responder,
@@ -4184,7 +4181,7 @@ pub(crate) fn materialized_stages(limited: bool) -> instrument::Stages {
 /// equal rows would differ.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(crate) fn sorts_modeled_join<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
@@ -4205,7 +4202,7 @@ pub(crate) fn sorts_modeled_join<'a>(
 /// with LIMIT/OFFSET and emit.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(crate) fn materialized_select<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -4214,7 +4211,7 @@ pub(crate) fn materialized_select<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
+    base: &SubqueryValues<'_, 'a>,
     limit: u64,
     offset: u64,
     responder: &mut Responder,
@@ -4302,13 +4299,13 @@ pub(crate) fn materialized_select<'a>(
     reason = "materialized result and locking context"
 )]
 pub(crate) fn materialized_rows_into<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     statement: &'a Select<'a>,
     from: &'a FromClause<'a>,
     correlated: &'a [&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
+    base: &SubqueryValues<'_, 'a>,
     rows: &'a [&'a [u8]],
     width: usize,
     deferred: Option<&PostponedProjection>,

@@ -245,9 +245,10 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   through its scan node (`PathScan`), which holds its sequential cursor or
   its path's candidates, its filter, the chosen path's counts and its
   `LIMIT` stop, and resumes a storage wait without counting twice; the
-  hash, merge, `Memoize` and `Unique` nodes above it still push rows in
+  merge, `Memoize` and `Unique` nodes above it still push rows in
   `join_exec.rs`, whose statement starts again after a wait. A plan of
-  nested loops (inner, left, semi and anti), `Materialize` nodes and scans
+  nested loops (inner, left, semi and anti), hash joins over keys of
+  hashable types (every join type), `Materialize` nodes and scans
   already runs as a retained reader's pull nodes (`ModeledPull`): a stream
   or cursor reads it a row at a time and resumes each storage wait where it
   stopped, at every node kind (`pull_join_waits`). The join search and its
@@ -268,8 +269,13 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   and a record field's collation is typed against the evaluating call's
   catalog. A
   `Materialize` keeps its rows, with their stored forms, in
-  `plan_build_bytes` leases. Still needed: hash, merge, `Memoize` and
-  `Unique` pull nodes, `EXPLAIN ANALYZE` counters on the pull nodes, a
+  `plan_build_bytes` leases. A hash join keeps its table there too: its
+  inner rows and the outer rows it saves to later batches are encoded in
+  its store, and its skew buckets, chunks, batch files and match flags are
+  leased lists, so its buckets and batches grow as the general executor's
+  do and a one-batch table is probed again at a rescan. Still needed: a
+  hash join over keys with no hash function here (a sorted table), merge,
+  `Memoize` and `Unique` pull nodes, `EXPLAIN ANALYZE` counters on the pull nodes, a
   pulled-up subquery's join as a reader, then the general executor running
   the same nodes (deleting its push-based runner). A `LATERAL` subquery's
   rows become a subtree of the same plan.

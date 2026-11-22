@@ -505,7 +505,8 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   (`(v[1]).a`) and the fields of a whole row an aggregate such as `array_agg`
   collects have unmodelled forms (`0A000`); a table row type stored before
   `ALTER TABLE ... DROP COLUMN` keeps the dropped value, whose type the
-  table no longer records, so its size is `0A000`; an array of composites
+  table no longer records: a fixed-width by-value one is sized by the
+  layout the table keeps, any other is `0A000`; an array of composites
   inside a stored composite whose elements hold compressed fields is
   refused (`0A000`), as is binary logical replication of an array of a
   named composite type.

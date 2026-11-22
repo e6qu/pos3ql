@@ -112356,8 +112356,12 @@ pub(crate) fn stored_composite_physical_fields<'a>(
     let mut active = active.iter();
     for (index, (out, field)) in fields.iter_mut().zip(definition.fields()).enumerate() {
         if field.dropped {
-            out.value = match raw_values[index] {
-                Some(raw) => decode_composite_stored_field(
+            out.value = match (raw_values[index], definition.dropped_relation_layout(index)) {
+                (None, _) => Datum::Null,
+                // A relation keeps only a dropped attribute's layout; a
+                // fixed-width value is sized by it alone.
+                (Some(_), Some(layout)) => dropped_attribute_placeholder(layout)?,
+                (Some(raw), None) => decode_composite_stored_field(
                     Datum::Text(raw),
                     field.ctype,
                     encoding,
@@ -112365,7 +112369,6 @@ pub(crate) fn stored_composite_physical_fields<'a>(
                     txid,
                     arena,
                 )?,
-                None => Datum::Null,
             };
             if let Some((_, form)) = text.forms().find(|(path, _)| path.is(&[index])) {
                 out.form = form;
@@ -112375,6 +112378,24 @@ pub(crate) fn stored_composite_physical_fields<'a>(
         }
     }
     Ok(fields)
+}
+
+/// A value of the layout a relation's dropped attribute keeps, standing for
+/// the stored value whose type is gone: a by-value datum of that width and
+/// alignment sizes as the stored one does, whatever it held.
+fn dropped_attribute_placeholder(
+    layout: crate::sql::type_layouts::PhysicalLayout,
+) -> Result<Datum<'static>, SqlError> {
+    match (layout.length, layout.by_value, layout.alignment) {
+        (1, true, b'c') => Ok(Datum::Bool(false)),
+        (2, true, b's') => Ok(Datum::Int2(0)),
+        (4, true, b'i') => Ok(Datum::Int4(0)),
+        (8, true, b'd') => Ok(Datum::Int8(0)),
+        _ => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "sizing a composite that holds the value of a dropped variable-width or by-reference table column is not supported"
+        )),
+    }
 }
 
 /// `value`, a composite, with the field at `path` held in `form`. A field

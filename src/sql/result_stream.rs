@@ -1116,6 +1116,7 @@ impl Engine {
                 Err(error) => return Ok(Err(error)),
             }
             let mut projected = crate::mem::arena::ArenaList::new(frame);
+            let mut projected_forms = crate::mem::arena::ArenaList::new(frame);
             for index in 0..source.items_len() {
                 let values = self.execute_retained_expression(
                     frame,
@@ -1139,10 +1140,15 @@ impl Engine {
                         )
                     },
                 )?;
-                let values = match values {
+                let (values, forms) = match values {
                     Ok(values) => values,
                     Err(error) => return Ok(Err(error)),
                 };
+                for form in forms {
+                    if projected_forms.push(*form).is_err() {
+                        return Ok(Err(eval::arena_full()));
+                    }
+                }
                 for value in values {
                     if projected.len() == MAX_PROJ {
                         return Ok(Err(sql_err!(
@@ -1176,6 +1182,7 @@ impl Engine {
                     frame,
                     responder,
                     projected.as_slice(),
+                    projected_forms.as_slice(),
                 )?,
             };
             match emitted {

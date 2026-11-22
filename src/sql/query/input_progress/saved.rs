@@ -118,6 +118,7 @@ enum OwnedInputState {
     Pending,
     Value {
         bytes: ArenaSliceHandle<u8>,
+        form: crate::sql::toast::DatumForm,
         next_input: usize,
         next_invocation: usize,
         next_call: usize,
@@ -163,6 +164,7 @@ impl OwnedInputFrame {
             InputState::Pending => OwnedInputState::Pending,
             InputState::Value {
                 value,
+                form,
                 next_input,
                 next_invocation,
                 next_call,
@@ -185,6 +187,7 @@ impl OwnedInputFrame {
                 };
                 OwnedInputState::Value {
                     bytes,
+                    form,
                     next_input,
                     next_invocation,
                     next_call,
@@ -218,12 +221,14 @@ impl OwnedInputFrame {
             OwnedInputState::Pending => InputState::Pending,
             OwnedInputState::Value {
                 bytes,
+                form,
                 next_input,
                 next_invocation,
                 next_call,
                 replay,
             } => InputState::Value {
                 value: InputValue::Retained(bytes),
+                form,
                 next_input,
                 next_invocation,
                 next_call,
@@ -292,6 +297,7 @@ mod ownership_tests {
                         },
                         state: InputState::Value {
                             value: InputValue::Evaluated(&datum),
+                            form: crate::sql::toast::DatumForm::Formed,
                             next_input: 7,
                             next_invocation: 3,
                             next_call: 9,
@@ -321,6 +327,7 @@ mod ownership_tests {
                     );
                     let InputState::Value {
                         value: InputValue::Retained(bytes),
+                        form: crate::sql::toast::DatumForm::Formed,
                         next_input,
                         next_invocation,
                         next_call,

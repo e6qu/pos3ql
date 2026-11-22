@@ -3432,6 +3432,12 @@ pub(crate) fn dispatch<'a>(
                     crate::sql::query::postgres_memory::stored(Some(&sizing), hint, &sized)
                         .ok_or_else(unsized_value)?;
                 let layout = stored.layout;
+                if layout.length == -1 && crate::sql::toast::user_defined_call(args[0]) {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "pg_column_size of a user-defined function's result is not supported"
+                    ));
+                }
                 // `toast_datum_size`: a stored datum TOAST compressed or saved
                 // out of line has that size.
                 match crate::sql::toast::passed_form(args[0], source, hooks.catalog, &value)? {

@@ -244,6 +244,7 @@ mod ownership_tests {
                         calls.resolve(
                             &routine,
                             &[Datum::Text(text)],
+                            &[crate::sql::toast::DatumForm::Formed],
                             scratch,
                             scratch,
                             None,

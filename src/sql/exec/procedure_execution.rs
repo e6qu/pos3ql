@@ -5,6 +5,11 @@
 //! in PostgreSQL. Each body statement is its own rollback boundary.
 
 use super::*;
+
+/// Maps a resumed procedure's saved inputs, held as their forms say, to its
+/// parameters' variables.
+type SeedParameters<'s, 'a> =
+    dyn Fn(&'a [Datum<'a>], &[DatumForm]) -> Result<&'a [LocalSlot<'a>], SqlError> + 's;
 use crate::mem::lease_pool::MutableSlice;
 use call_environment::SavedCallEnvironment;
 
@@ -92,6 +97,7 @@ pub(super) fn execute<'a>(
     mut execution: execution_frame::ExecutionFrame<'_, 'a>,
     body: ProcedureBody<'_, 'a>,
     inputs: &[Datum<'a>],
+    forms: &[DatumForm],
     environment: &CallEnvironment,
     timing: super::super::statistics::FunctionTiming,
     retention: &mut Option<SuspendedProcedure>,
@@ -105,7 +111,7 @@ pub(super) fn execute<'a>(
         Err(error) if control_flow::is_execution_wait(&error) && !context.txn.procedure_restart => {
             let storage = context.storage();
             let mut saved_inputs = local_values::SavedValues::new(&storage.row_work)?;
-            saved_inputs.replace(inputs)?;
+            saved_inputs.replace_held(inputs, forms)?;
             let saved_environment =
                 SavedCallEnvironment::capture(environment, &storage.execution_control)?;
             let mut state = storage
@@ -228,7 +234,7 @@ impl SuspendedProcedure {
             &'a [super::super::plpgsql_inputs::Site<'a>],
             super::super::guc::PlpgsqlSettings,
         ) -> Result<TriggerInvocation<'a>, SqlError>,
-        seeded: &dyn Fn(&'a [Datum<'a>]) -> Result<&'a [LocalSlot<'a>], SqlError>,
+        seeded: &SeedParameters<'_, 'a>,
         retention: &mut Option<SuspendedProcedure>,
         finish: &mut dyn FnMut(
             &execution_frame::ExecutionFrame<'_, 'a>,
@@ -271,7 +277,11 @@ impl SuspendedProcedure {
                     Ok(invocation) => invocation,
                     Err(error) => return Err((frame, error)),
                 };
-                let seeded = match seeded(inputs) {
+                let mut forms = [DatumForm::Formed; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                if let Err(error) = state.inputs.held_forms(&mut forms) {
+                    return Err((frame, error));
+                }
+                let seeded = match seeded(inputs, &forms[..inputs.len()]) {
                     Ok(seeded) => seeded,
                     Err(error) => return Err((frame, error)),
                 };

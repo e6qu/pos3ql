@@ -575,7 +575,16 @@ impl SuspendedFunctionState {
             Ok(formal) => formal,
             Err(error) => return Err((frame, error)),
         };
-        let seeded = match seeded_arguments(&self.binding.all_parameters, inputs, arena) {
+        let mut forms = [DatumForm::Formed; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        if let Err(error) = self.binding.inputs.held_forms(&mut forms) {
+            return Err((frame, error));
+        }
+        let seeded = match seeded_arguments(
+            &self.binding.all_parameters,
+            inputs,
+            &forms[..inputs.len()],
+            arena,
+        ) {
             Ok(seeded) => seeded,
             Err(error) => return Err((frame, error)),
         };
@@ -704,12 +713,13 @@ fn run_body<'a>(
 fn seeded_arguments<'a>(
     parameters: &[RoutineParameterDef],
     inputs: &[Datum<'a>],
+    forms: &[DatumForm],
     arena: &'a Arena,
 ) -> Result<&'a [LocalSlot<'a>], SqlError> {
     let seeded = arena
         .alloc_slice_with(parameter_variable_count(parameters), |_| LocalSlot::NULL)
         .map_err(|_| super::super::query::arena_full_pub())?;
-    seed_routine_parameters(parameters, inputs, seeded)?;
+    seed_routine_parameters(parameters, inputs, forms, seeded)?;
     Ok(seeded)
 }
 
@@ -733,6 +743,7 @@ pub(crate) fn execute<'a>(
     routine: &crate::storage::RoutineDef,
     collation: crate::sql::ast::Collation,
     inputs: &[Datum<'a>],
+    forms: &[DatumForm],
     arena: &'a Arena,
     responder: &mut Responder<'_>,
     environment: &CallEnvironment,
@@ -771,7 +782,7 @@ pub(crate) fn execute<'a>(
     let mut seeded =
         allocate_plpgsql_local_values(&engine.storage.execution_control, parameter_variables)?;
     let mut count = declare_routine_parameters(routine, declarations)?;
-    let seeded_count = seed_routine_parameters(routine.parameters(), inputs, &mut seeded)?;
+    let seeded_count = seed_routine_parameters(routine.parameters(), inputs, forms, &mut seeded)?;
     // A `RETURNS TABLE` function's columns are variables too; output
     // parameters already are, and a column definition list's are not.
     let table_columns = if routine
@@ -954,6 +965,7 @@ pub(crate) fn execute<'a>(
                         invocation,
                         collation,
                         inputs,
+                        forms,
                         returns,
                         environment,
                         boundary,
@@ -978,6 +990,7 @@ pub(crate) fn execute<'a>(
                 invocation,
                 collation,
                 inputs,
+                forms,
                 returns,
                 environment,
                 boundary,
@@ -1003,6 +1016,7 @@ fn suspend_call(
     invocation: TriggerInvocation<'_>,
     collation: crate::sql::ast::Collation,
     inputs: &[Datum<'_>],
+    forms: &[DatumForm],
     returns: ReturnBinding,
     environment: &CallEnvironment,
     boundary: super::super::txn::StatementMark,
@@ -1024,7 +1038,7 @@ fn suspend_call(
         .copy_slice(routine.parameters())
         .map_err(control_flow::execution_full)?;
     let mut saved_inputs = local_values::SavedValues::new(&storage.row_work)?;
-    saved_inputs.replace(inputs)?;
+    saved_inputs.replace_held(inputs, forms)?;
     let environment = SavedCallEnvironment::capture(environment, &storage.execution_control)?;
     let progress = super::super::sequence::SavedStatementPosition::capture()?;
     state

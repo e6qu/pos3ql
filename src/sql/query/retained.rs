@@ -1575,7 +1575,7 @@ fn retained_join_scope<'a>(
                     return Ok(None);
                 };
                 Ok(Some(
-                    super::join_exec::pulls(&model)
+                    super::join_exec::pulls(&model, &planned_scope)
                         && model.scope(&planned_scope).n <= MAX_RETAINED_SOURCES
                         && pulled_join_admitted(
                             statement,
@@ -4069,7 +4069,7 @@ impl<'a> RetainedSelect<'a> {
                 else {
                     return Ok(None);
                 };
-                if !super::join_exec::pulls(&model) {
+                if !super::join_exec::pulls(&model, &scope) {
                     return Ok(None);
                 }
                 let modeled = super::join_exec::ModeledPull::new(

@@ -333,7 +333,9 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   `0A000`.
 - [ ] **Index sizes in `pg_class`.** `CREATE INDEX`, `REINDEX`, `VACUUM`,
   `ANALYZE` and `TRUNCATE` count an index's `relpages` and `reltuples` as
-  PostgreSQL 18.6 does, from the btree its build lays out (`996`). Not yet:
+  PostgreSQL 18.6 does, from the btree its build lays out, and `TRUNCATE`
+  resets them in place only for a table created or truncated in the current
+  subtransaction (`996`). Not yet:
   a btree grown by inserts has the pages PostgreSQL's page splits and
   deduplication leave (an index created before 6,000 inserts is costed and
   counted as built, 8.00 below PostgreSQL's full scan); a hash, GIN, GiST,

@@ -3284,6 +3284,10 @@ pub trait CatalogAccess {
     /// rename cannot turn a validated dependency into an unresolved text lookup.
     /// `argument_forms` says how the caller holds each argument, which the
     /// routine is passed unchanged.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a bound support call carries its arguments' values, forms and types"
+    )]
     fn call_routine_oid<'a>(
         &self,
         _oid: i32,

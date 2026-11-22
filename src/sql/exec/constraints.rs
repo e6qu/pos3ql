@@ -399,8 +399,9 @@ pub(super) unsafe fn for_each_validation_row(
 /// candidate input, for evaluating that domain's CHECK predicates.
 struct ValueLookup<'v> {
     value: Datum<'v>,
-    /// The domain's base type, which `VALUE` has.
+    /// The domain's base type and collation, which `VALUE` has.
     ctype: crate::sql::types::ColType,
+    collation: crate::sql::ast::Collation,
 }
 
 impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
@@ -417,6 +418,14 @@ impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
         (qualifier.is_none() && name.eq_ignore_ascii_case("value")).then_some(self.ctype)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        if qualifier.is_none() && name.eq_ignore_ascii_case("value") {
+            self.collation
+        } else {
+            crate::sql::ast::Collation::None
+        }
     }
 
     // `VALUE` is the datum the coercion was given, held in a form this
@@ -672,6 +681,7 @@ pub(crate) fn validate_domain_check<'a>(
     let context = ValueLookup {
         value,
         ctype: domain.base,
+        collation: domain.collation,
     };
     let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {

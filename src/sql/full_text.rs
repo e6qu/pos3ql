@@ -2403,7 +2403,7 @@ fn websearch_to_query<'a>(
                 .is_none_or(|byte| byte.is_ascii_whitespace())
         {
             at += 2;
-            new_group = terms.len() > 0;
+            new_group = !terms.is_empty();
             continue;
         }
         let negated = bytes[at] == b'-';

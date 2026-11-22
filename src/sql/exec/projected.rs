@@ -2072,7 +2072,10 @@ mod tests {
             }];
             let formed = encode_projected_pub(&[Datum::Record(&fields[..1])], &arena).unwrap();
             let unformed = encode_projected_pub(&[Datum::Record(&plain)], &arena).unwrap();
-            assert_eq!(decode_projected_pub(formed, 0), decode_projected_pub(unformed, 0));
+            assert_eq!(
+                decode_projected_pub(formed, 0),
+                decode_projected_pub(unformed, 0)
+            );
         });
     }
 

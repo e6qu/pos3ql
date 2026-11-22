@@ -662,10 +662,14 @@ fn row_argument<'e, 'x>(
     {
         return None;
     }
-    let position = field
-        .strip_prefix('f')
-        .and_then(|digits| digits.parse::<usize>().ok())
-        .filter(|position| *position >= 1 && field[1..].as_bytes()[0] != b'0')?;
+    let digits = field.strip_prefix('f')?;
+    if digits.starts_with('0') {
+        return None;
+    }
+    let position = digits
+        .parse::<usize>()
+        .ok()
+        .filter(|position| *position >= 1)?;
     args.get(position - 1).copied()
 }
 

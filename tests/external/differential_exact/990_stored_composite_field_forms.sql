@@ -30,3 +30,10 @@ CREATE TABLE ns (id int, x named_cw);
 INSERT INTO ns SELECT id, ROW(id, a, b)::named_cw FROM cw;
 ALTER TYPE named_cw DROP ATTRIBUTE b;
 SELECT id, pg_column_size(x), pg_column_size((x).a), (x).a = repeat('a', 3000) FROM ns ORDER BY id;
+-- A table row type keeps a dropped column's value; the table keeps only its
+-- layout, which sizes a fixed-width one.
+CREATE TABLE dropped_row (id int, note text, extra int, w bigint, b bool, s smallint);
+CREATE TABLE dropped_holder (h int, o dropped_row);
+INSERT INTO dropped_holder VALUES (1, ROW(1, 'a', 7, 5, true, 3));
+ALTER TABLE dropped_row DROP COLUMN extra, DROP COLUMN w, DROP COLUMN b, DROP COLUMN s;
+SELECT h, pg_column_size(o), o FROM dropped_holder ORDER BY h;

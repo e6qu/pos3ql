@@ -39923,7 +39923,16 @@ impl Storage {
                 );
             }
             if varlena {
-                let raw = statistics::scalar::raw_value_length(&value);
+                // A composite's fields, and an array's composite elements,
+                // are sized through the catalog.
+                let raw = crate::sql::query::postgres_memory::SizeSource {
+                    storage: self,
+                    txid,
+                }
+                .with(|sizing| {
+                    crate::sql::query::postgres_memory::varlena_payload(Some(sizing), &value)
+                })
+                .unwrap_or_else(|| statistics::scalar::raw_value_length(&value));
                 // `VARSIZE_ANY` of the datum as stored: a compressed value's
                 // compressed size, a value saved out of line its pointer's.
                 total_width += match form {

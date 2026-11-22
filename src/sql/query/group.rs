@@ -1289,8 +1289,9 @@ pub(super) fn hashed_order(
         .alloc_slice_with(keys.len(), |_| 0usize)
         .map_err(|_| arena_full())?;
     // A composite value's fields are sized through the catalog.
+    let catalog = super::storage_catalog(storage, arena, txid);
     let value_sizing = super::postgres_memory::Sizing {
-        catalog: Some((storage, txid)),
+        catalog: Some(&catalog),
         scratch: arena,
     };
     for (length, key) in entry_lens.iter_mut().zip(keys) {

@@ -2100,6 +2100,73 @@ def test_logical_replication_simple_query_mode():
     s.close()
 
 
+def test_pgoutput_composite_tuples_use_current_fields():
+    # A stored composite whose type dropped an attribute and holds an enum
+    # streams as record_out and record_send give it: current fields only,
+    # the enum by label (measured on PostgreSQL 18.6).
+    setup = connect()
+    setup.sendall(startup_payload(0))
+    drain_startup(setup)
+    simple_query(
+        setup,
+        "DROP PUBLICATION IF EXISTS wire_composite_pub; "
+        "DROP TABLE IF EXISTS wire_composite; "
+        "DROP TYPE IF EXISTS wire_composite_row; "
+        "DROP TYPE IF EXISTS wire_composite_mood; "
+        "CREATE TYPE wire_composite_mood AS ENUM ('sad', 'ok', 'happy'); "
+        "CREATE TYPE wire_composite_row AS (m wire_composite_mood, gone int, n text); "
+        "ALTER TYPE wire_composite_row DROP ATTRIBUTE gone; "
+        "CREATE TABLE wire_composite (id int, v wire_composite_row); "
+        "CREATE PUBLICATION wire_composite_pub FOR TABLE wire_composite",
+    )
+    payloads = {}
+    for binary in (False, True):
+        slot = "wire_composite_binary" if binary else "wire_composite_text"
+        stream = connect()
+        stream.sendall(startup_payload(0, parameters=(("replication", "database"),)))
+        drain_startup(stream)
+        simple_query(stream, f"CREATE_REPLICATION_SLOT {slot} LOGICAL pgoutput NOEXPORT_SNAPSHOT")
+        options = "proto_version '1', publication_names 'wire_composite_pub'"
+        if binary:
+            options += ", binary 'true'"
+        stream.sendall(
+            frontend_message(b"Q", f"START_REPLICATION SLOT {slot} LOGICAL 0/0 ({options})".encode() + b"\x00")
+        )
+        kind, payload = read_message(stream)
+        check(f"pgoutput composite stream {slot} enters CopyBoth", kind == b"W", (kind, payload))
+        simple_query(setup, f"INSERT INTO wire_composite VALUES ({int(binary)}, ROW('happy', 'x y'))")
+        for _ in range(128):
+            kind, payload = read_message(stream)
+            if kind == b"d" and len(payload) > 25 and payload[:1] == b"w":
+                if payload[25:26] == b"I":
+                    payloads[binary] = payload[25:]
+                if payload[25:26] == b"C":
+                    stream.sendall(standby_status(struct.unpack("!Q", payload[9:17])[0]))
+                    break
+        stream.close()
+        simple_query(setup, f"SELECT pg_drop_replication_slot('{slot}')")
+    text = payloads.get(False, b"")
+    check(
+        "pgoutput text composite tuple is record_out of the current fields",
+        text.endswith(b"t\x00\x00\x00\x0d(happy,\"x y\")"),
+        text,
+    )
+    binary = payloads.get(True, b"")
+    marker = binary.find(b"\x00\x00\x00\x02", len(binary) - 40)
+    check(
+        "pgoutput binary composite tuple is record_send of the current fields",
+        marker > 0
+        and binary[marker + 8:] == b"\x00\x00\x00\x05happy\x00\x00\x00\x19\x00\x00\x00\x03x y",
+        binary,
+    )
+    simple_query(
+        setup,
+        "DROP PUBLICATION wire_composite_pub; DROP TABLE wire_composite; "
+        "DROP TYPE wire_composite_row; DROP TYPE wire_composite_mood",
+    )
+    setup.close()
+
+
 def test_pgoutput_startup_options_and_default_text_tuples():
     setup = connect()
     setup.sendall(startup_payload(0))

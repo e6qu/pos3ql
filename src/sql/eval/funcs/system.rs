@@ -3402,14 +3402,11 @@ pub(crate) fn dispatch<'a>(
                     super::super::ExpressionTypeIdentity::Known(oid) => Some(oid),
                     super::super::ExpressionTypeIdentity::Unresolved => None,
                 };
+                // A stored composite's fields are sized through the catalog.
                 let sizing = crate::sql::query::postgres_memory::Sizing {
-                    catalog: None,
+                    catalog: hooks.catalog,
                     scratch: arena,
                 };
-                let stored =
-                    crate::sql::query::postgres_memory::stored(Some(&sizing), hint, &value)
-                        .ok_or_else(unsized_value)?;
-                let layout = stored.layout;
                 // A grouped query's output reads its grouping keys.
                 let grouping_key = crate::sql::toast::GroupingKey(value);
                 let source: &dyn ColumnLookup<'a> = if hooks.group.is_some() {
@@ -3417,9 +3414,27 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     row
                 };
+                // A stored composite column is sized as the datum stored,
+                // which keeps a dropped attribute's value.
+                let sized = match (args[0], value) {
+                    (
+                        crate::sql::ast::Expr::Column { qualifier, name },
+                        Datum::Composite { slot, .. },
+                    ) => match source.lookup(*qualifier, name) {
+                        Ok(read @ Datum::CompositeText { slot: stored, .. }) if stored == slot => {
+                            read
+                        }
+                        _ => value,
+                    },
+                    _ => value,
+                };
+                let stored =
+                    crate::sql::query::postgres_memory::stored(Some(&sizing), hint, &sized)
+                        .ok_or_else(unsized_value)?;
+                let layout = stored.layout;
                 // `toast_datum_size`: a stored datum TOAST compressed or saved
                 // out of line has that size.
-                match crate::sql::toast::passed_form(args[0], source, &value)? {
+                match crate::sql::toast::passed_form(args[0], source, hooks.catalog, &value)? {
                     crate::storage::rowenc::StoredForm::Compressed(size)
                     | crate::storage::rowenc::StoredForm::External { saved: size, .. } => {
                         return Ok(Datum::Int4(size as i32));

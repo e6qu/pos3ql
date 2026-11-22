@@ -24431,9 +24431,20 @@ fn validate_trigger_when(
 ) -> Result<(), SqlError> {
     let expression = super::parser::parse_expr(source, arena)?;
     if expression.contains_subquery() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use subquery in trigger WHEN condition"
+        let (positioned, copies) = super::parser::parse_positioned_expression(source, arena)?;
+        let subquery = positioned.first_subquery().unwrap_or(positioned);
+        return Err(crate::sql::error_position::with_analysis_of_parsed(
+            source,
+            Some(copies),
+            || {
+                crate::sql::error_position::at_node(
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot use subquery in trigger WHEN condition"
+                    ),
+                    subquery,
+                )
+            },
         ));
     }
     let mut reference_error = None;
@@ -24944,13 +24955,16 @@ fn execute_plpgsql_call<'a>(
             "too many procedure arguments"
         ));
     }
-    if arguments
+    if let Some(subquery) = arguments
         .iter()
-        .any(|argument| argument.contains_subquery())
+        .find_map(|argument| argument.first_subquery())
     {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use subquery in CALL argument"
+        return Err(crate::sql::error_position::at_node(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot use subquery in CALL argument"
+            ),
+            subquery,
         ));
     }
     let arena = context.arena;
@@ -63099,9 +63113,14 @@ pub fn create_table_as(
     {
         let rows_bytes = computed;
         for bytes in rows_bytes.iter() {
+            // A named composite decodes with its fields and their forms.
+            let mut decoded = [Datum::Null; MAX_COLUMNS];
+            if let Err(error) = projected::decode_projected_row_into(bytes, arena, &mut decoded) {
+                return sql_fail(error);
+            }
             let mut values = [Datum::Null; MAX_COLUMNS];
             for (i, slot) in values.iter_mut().enumerate().take(n_cols) {
-                let v = decode_projected_pub(bytes, i);
+                let v = decoded[i];
                 match coerce_assignment(
                     v,
                     &def.columns()[i],
@@ -63393,9 +63412,14 @@ pub fn refresh_materialized_view(
     }
     let n_cols = def.n_columns;
     for bytes in rows_bytes.iter() {
+        // A named composite decodes with its fields and their forms.
+        let mut decoded = [Datum::Null; MAX_COLUMNS];
+        if let Err(error) = projected::decode_projected_row_into(bytes, arena, &mut decoded) {
+            return sql_fail(error);
+        }
         let mut values = [Datum::Null; MAX_COLUMNS];
         for (i, slot_v) in values.iter_mut().enumerate().take(n_cols) {
-            let v = decode_projected_pub(bytes, i);
+            let v = decoded[i];
             match coerce_assignment(
                 v,
                 &def.columns()[i],
@@ -73238,10 +73262,13 @@ pub fn create_statistics(
                 ExtendedStatisticsKey::Column(table_definition.columns()[column].name)
             }
             StatisticsKey::Expression(expression) => {
-                if expression.expression.contains_subquery() {
-                    return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "cannot use subquery in statistics expression"
+                if let Some(subquery) = expression.expression.first_subquery() {
+                    return sql_fail(crate::sql::error_position::at_node(
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "cannot use subquery in statistics expression"
+                        ),
+                        subquery,
                     ));
                 }
                 if let Err(error) = infer_type_catalog(
@@ -79661,7 +79688,8 @@ impl CopyFilter {
             ));
         }
         // PostgreSQL analyses the condition in the statement's text.
-        crate::sql::error_position::with_analysis(|| validate_copy_predicate(predicate, def))?;
+        let read =
+            crate::sql::error_position::with_analysis(|| validate_copy_predicate(predicate, def))?;
         // The predicate is analysed with the statement, before any data is
         // read: its functions resolve and its literals run their inputs.
         let mark = arena.mark();
@@ -79699,12 +79727,18 @@ impl CopyFilter {
         if let Some(ctype) = crate::sql::eval::static_type_pub(predicate, &row)
             && ctype != ColType::Bool
         {
-            return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "argument of COPY WHERE must be type boolean, not type {}",
-                ctype.name()
-            ));
+            return Err(crate::sql::error_position::with_analysis(|| {
+                crate::sql::error_position::at_expression(
+                    sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "argument of WHERE must be type boolean, not type {}",
+                        ctype.name()
+                    ),
+                    predicate,
+                )
+            }));
         }
+        read.check_generated(def)?;
         let source = statement
             .where_text
             .expect("COPY WHERE AST retains its parsed source");
@@ -79768,7 +79802,7 @@ impl CopyFilter {
             Datum::Null => Ok(false),
             _ => Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
-                "argument of COPY WHERE must be type boolean, not type {}",
+                "argument of WHERE must be type boolean, not type {}",
                 crate::sql::eval::static_type_pub(predicate, &row)
                     .map(ColType::name)
                     .unwrap_or("unknown")
@@ -79777,13 +79811,58 @@ impl CopyFilter {
     }
 }
 
-/// COPY WHERE is a row-local predicate. PostgreSQL rejects both subqueries
-/// and generated columns before accepting any CopyData.
+/// COPY WHERE is a row-local predicate. PostgreSQL's analysis rejects
+/// subqueries, aggregates and window functions as it reaches them, then a
+/// predicate other than boolean, then one reading a generated column, before
+/// accepting any CopyData.
 fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
     expression: &Expr,
     def: &crate::storage::TableDefinition<Definition0>,
+) -> Result<CopyPredicateColumns, SqlError> {
+    let mut columns = CopyPredicateColumns {
+        read: crate::storage::ColumnSet::EMPTY,
+        whole_row: false,
+    };
+    copy_predicate_node(expression, def, &mut columns)?;
+    Ok(columns)
+}
+
+/// The columns a COPY WHERE predicate reads.
+#[derive(Clone, Copy)]
+struct CopyPredicateColumns {
+    read: crate::storage::ColumnSet,
+    whole_row: bool,
+}
+
+impl CopyPredicateColumns {
+    /// `DoCopy`'s check: the first generated column the predicate reads,
+    /// every column for a whole-row reference.
+    fn check_generated<Definition0: crate::storage::DefinitionBacking>(
+        self,
+        def: &crate::storage::TableDefinition<Definition0>,
+    ) -> Result<(), SqlError> {
+        let generated = def.columns().iter().enumerate().find(|(index, column)| {
+            column.default.is_generated() && (self.whole_row || self.read.contains(*index))
+        });
+        match generated {
+            Some((_, column)) => Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "generated columns are not supported in COPY FROM WHERE conditions"
+                ),
+                format_args!("Column \"{}\" is a generated column.", column.name.as_str()),
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
+fn copy_predicate_node<Definition0: crate::storage::DefinitionBacking>(
+    expression: &Expr,
+    def: &crate::storage::TableDefinition<Definition0>,
+    columns: &mut CopyPredicateColumns,
 ) -> Result<(), SqlError> {
-    let column = |qualifier: Option<&str>, name: &str| -> Result<(), SqlError> {
+    let mut column = |qualifier: Option<&str>, name: &str| -> Result<(), SqlError> {
         if let Some(qualifier) = qualifier
             && !crate::sql::eval::qualifier_answers_target(
                 crate::storage::RelationDefinition::from_definition(def),
@@ -79798,6 +79877,11 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
             ));
         }
         let Some(index) = def.column_index(name) else {
+            // A bare table name is the whole row.
+            if qualifier.is_none() && name == def.name.as_str() {
+                columns.whole_row = true;
+                return Ok(());
+            }
             return Err(crate::sql::column_suggestion::missing_relation_column(
                 qualifier,
                 name,
@@ -79805,13 +79889,7 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
                 def.columns(),
             ));
         };
-        if def.columns()[index].default.is_generated() {
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "cannot use generated column \"{}\" in COPY WHERE",
-                name
-            ));
-        }
+        columns.read.insert(index);
         Ok(())
     };
     match expression {
@@ -79838,18 +79916,29 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. }
         | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use subquery in COPY WHERE"
+        | Expr::ArraySubquery(_) => Err(crate::sql::error_position::at_node(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot use subquery in COPY FROM WHERE condition"
+            ),
+            expression,
         )),
-        Expr::Call { over: Some(_), .. } => Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use window function in COPY WHERE"
+        Expr::Call { over: Some(_), .. } => Err(crate::sql::error_position::at_expression(
+            sql_err!(
+                sqlstate::WINDOWING_ERROR,
+                "window functions are not allowed in COPY FROM WHERE conditions"
+            ),
+            expression,
         )),
-        Expr::Call { name, .. } if expression.is_aggregate() => Err(sql_err!(
-            sqlstate::GROUPING_ERROR,
-            "aggregate functions are not allowed in COPY WHERE"
-        )),
+        Expr::Call { .. } if expression.is_aggregate() => {
+            Err(crate::sql::error_position::at_expression(
+                sql_err!(
+                    sqlstate::GROUPING_ERROR,
+                    "aggregate functions are not allowed in COPY FROM WHERE conditions"
+                ),
+                expression,
+            ))
+        }
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::BoundDefault {
@@ -79859,9 +79948,14 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::Field { base: operand, .. }
-        | Expr::RecordFieldIndex { base: operand, .. }
-        | Expr::Subscript { base: operand, .. } => validate_copy_predicate(operand, def),
+        | Expr::RecordFieldIndex { base: operand, .. } => {
+            copy_predicate_node(operand, def, columns)
+        }
         Expr::Binary { left, right, .. }
+        | Expr::Subscript {
+            base: left,
+            index: right,
+        }
         | Expr::Match {
             operand: left,
             pattern: right,
@@ -79872,8 +79966,8 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
             array: right,
             ..
         } => {
-            validate_copy_predicate(left, def)?;
-            validate_copy_predicate(right, def)
+            copy_predicate_node(left, def, columns)?;
+            copy_predicate_node(right, def, columns)
         }
         Expr::Like {
             operand,
@@ -79881,27 +79975,27 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
             escape,
             ..
         } => {
-            validate_copy_predicate(operand, def)?;
-            validate_copy_predicate(pattern, def)?;
+            copy_predicate_node(operand, def, columns)?;
+            copy_predicate_node(pattern, def, columns)?;
             if let Some(escape) = escape {
-                validate_copy_predicate(escape, def)?;
+                copy_predicate_node(escape, def, columns)?;
             }
             Ok(())
         }
         Expr::Slice { base, lower, upper } => {
-            validate_copy_predicate(base, def)?;
+            copy_predicate_node(base, def, columns)?;
             if let Some(lower) = lower {
-                validate_copy_predicate(lower, def)?;
+                copy_predicate_node(lower, def, columns)?;
             }
             if let Some(upper) = upper {
-                validate_copy_predicate(upper, def)?;
+                copy_predicate_node(upper, def, columns)?;
             }
             Ok(())
         }
         Expr::InList { operand, list, .. } => {
-            validate_copy_predicate(operand, def)?;
+            copy_predicate_node(operand, def, columns)?;
             for expression in *list {
-                validate_copy_predicate(expression, def)?;
+                copy_predicate_node(expression, def, columns)?;
             }
             Ok(())
         }
@@ -79912,29 +80006,29 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
             ..
         } => {
             if let Some(operand) = operand {
-                validate_copy_predicate(operand, def)?;
+                copy_predicate_node(operand, def, columns)?;
             }
             for (when, then) in *whens {
-                validate_copy_predicate(when, def)?;
-                validate_copy_predicate(then, def)?;
+                copy_predicate_node(when, def, columns)?;
+                copy_predicate_node(then, def, columns)?;
             }
             if let Some(otherwise) = otherwise {
-                validate_copy_predicate(otherwise, def)?;
+                copy_predicate_node(otherwise, def, columns)?;
             }
             Ok(())
         }
         Expr::Call { args, filter, .. } => {
             for argument in *args {
-                validate_copy_predicate(argument, def)?;
+                copy_predicate_node(argument, def, columns)?;
             }
             if let Some(filter) = filter {
-                validate_copy_predicate(filter, def)?;
+                copy_predicate_node(filter, def, columns)?;
             }
             Ok(())
         }
         Expr::Array(items) => {
             for item in *items {
-                validate_copy_predicate(item, def)?;
+                copy_predicate_node(item, def, columns)?;
             }
             Ok(())
         }
@@ -79948,8 +80042,11 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
         | Expr::BitLit(_)
         | Expr::Param(_)
         | Expr::DefaultMarker
-        | Expr::WholeRow(_)
         | Expr::RecursiveState { .. } => Ok(()),
+        Expr::WholeRow(_) => {
+            columns.whole_row = true;
+            Ok(())
+        }
     }
 }
 
@@ -83295,9 +83392,7 @@ fn decode_binary_array<'a>(
                         ..
                     } => Datum::CompositeText {
                         slot: composite_slot,
-                        physical_fields: storage
-                            .require_row_type_definition(composite_slot, txid)?
-                            .physical_field_count() as u16,
+                        physical_fields: stored_physical_fields(composite_slot, storage, txid)?,
                         text: composite_storage_text(value, composite_slot, storage, txid, arena)?,
                     },
                     value => value,
@@ -83316,16 +83411,8 @@ fn decode_binary_array<'a>(
                 };
                 Datum::CompositeText {
                     slot,
-                    physical_fields: (storage
-                        .require_row_type_definition(slot, txid)?
-                        .physical_field_count() as u16)
-                        | COMPOSITE_MEMBER_IDENTITIES,
-                    text: arena.alloc_str_display(value).map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "composite array element exceeds statement arena"
-                        )
-                    })?,
+                    physical_fields: stored_physical_fields(slot, storage, txid)?,
+                    text: composite_storage_text(value, slot, storage, txid, arena)?,
                 }
             }
             _ => value,
@@ -83919,7 +84006,7 @@ pub(crate) fn binary_field_plan<'a>(
             text,
         } => {
             let decoded =
-                decode_stored_composite_text(text, *slot, *physical_fields, storage, txid, arena)?;
+                decode_stored_composite_text(*text, *slot, *physical_fields, storage, txid, arena)?;
             binary_field_plan(&decoded, storage, txid, arena)
         }
         Datum::Record(fields) | Datum::Composite { fields, .. } => {
@@ -89663,7 +89750,12 @@ fn merge_insert_values<
                 &hooks,
             )?;
             // A source column's datum keeps its stored form.
-            let form = crate::sql::toast::passed_form(expression, source_ctx, &row[targets[i]])?;
+            let form = crate::sql::toast::passed_form(
+                expression,
+                source_ctx,
+                hooks.catalog,
+                &row[targets[i]],
+            )?;
             carried.carry(&row[targets[i]], form, None)?;
             explicit[targets[i]] = true;
         }
@@ -93749,8 +93841,12 @@ where
                     )
                     .and_then(|value| {
                         // A stored datum the row reads keeps its form.
-                        let form =
-                            crate::sql::toast::passed_form(expression, &value_scope, &value)?;
+                        let form = crate::sql::toast::passed_form(
+                            expression,
+                            &value_scope,
+                            hooks.catalog,
+                            &value,
+                        )?;
                         carried.carry(&value, form, None)?;
                         Ok(value)
                     }) {
@@ -106293,8 +106389,9 @@ fn alter_table_relation(
                 }
                 // The rewritten table's columns, not yet installed, decide
                 // the stored forms.
+                let catalog = crate::sql::query::storage_catalog(&*storage, arena, txn.txid);
                 let sizing = crate::sql::query::postgres_memory::Sizing {
-                    catalog: Some((&*storage, txn.txid)),
+                    catalog: Some(&catalog),
                     scratch: arena,
                 };
                 match encode_row_as(
@@ -110306,7 +110403,7 @@ pub(crate) fn encode_table_row<'a>(
         definition.columns(),
         definition.has_toast,
         &crate::sql::query::postgres_memory::Sizing {
-            catalog: Some((storage, txid)),
+            catalog: Some(&crate::sql::query::storage_catalog(storage, arena, txid)),
             scratch: arena,
         },
         values,
@@ -111279,7 +111376,7 @@ fn coerce_column_value<'a>(
                 physical_fields: 0,
                 text,
             } if actual == slot => {
-                decode_retained_composite_text(text, slot, storage, txid, arena, sequences)?
+                decode_retained_composite_text(text, slot, 0, storage, txid, arena, sequences)?
             }
             value @ Datum::CompositeText { slot: actual, .. } if actual == slot => {
                 return Ok(value);
@@ -111301,10 +111398,7 @@ fn coerce_column_value<'a>(
         let text = composite_storage_text(typed, slot, storage, txid, arena)?;
         return Ok(Datum::CompositeText {
             slot,
-            physical_fields: (storage
-                .require_row_type_definition(slot, txid)?
-                .physical_field_count() as u16)
-                | COMPOSITE_MEMBER_IDENTITIES,
+            physical_fields: stored_physical_fields(slot, storage, txid)?,
             text,
         });
     }
@@ -111401,10 +111495,18 @@ pub(crate) fn coerce_routine_argument<'a>(
     match argument.ctype {
         ColType::Composite(slot) => match value {
             Datum::CompositeText {
-                slot: actual, text, ..
-            } if Some(actual) == slot => {
-                decode_retained_composite_text(text, actual, storage, txid, arena, sequences)
-            }
+                slot: actual,
+                physical_fields,
+                text,
+            } if Some(actual) == slot => decode_retained_composite_text(
+                text,
+                actual,
+                physical_fields,
+                storage,
+                txid,
+                arena,
+                sequences,
+            ),
             value => coerce_composite_value(value, slot, storage, txid, arena, sequences),
         },
         ColType::Enum(slot) => coerce_enum_value(value, slot, storage, txid, arena),
@@ -111464,7 +111566,7 @@ fn composite_persistent_value<'a>(
             )
         }
         Datum::Composite { slot, .. } => {
-            Datum::Text(composite_storage_text(value, slot, storage, txid, arena)?)
+            array_member_spelling(composite_storage_text(value, slot, storage, txid, arena)?)?
         }
         Datum::CompositeText {
             slot,
@@ -111473,7 +111575,7 @@ fn composite_persistent_value<'a>(
         } => {
             let value =
                 decode_stored_composite_text(text, slot, physical_fields, storage, txid, arena)?;
-            Datum::Text(composite_storage_text(value, slot, storage, txid, arena)?)
+            array_member_spelling(composite_storage_text(value, slot, storage, txid, arena)?)?
         }
         Datum::Array { element, raw } => {
             let shape = crate::sql::array::shape(raw).expect("array datum invariant");
@@ -111497,6 +111599,20 @@ fn composite_persistent_value<'a>(
         }
         value => value,
     })
+}
+
+/// The text of a composite member of an array a composite holds, which
+/// spells no field forms.
+fn array_member_spelling(
+    spelling: crate::sql::types::CompositeSpelling<'_>,
+) -> Result<Datum<'_>, SqlError> {
+    if spelling.has_forms() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "storing a composite holding an array of composites with compressed fields is not supported"
+        ));
+    }
+    Ok(Datum::Text(spelling.text()))
 }
 
 fn decode_composite_stored_field<'a>(
@@ -111546,7 +111662,7 @@ fn decode_composite_stored_field<'a>(
             )
         }
         ColType::Composite(slot) => decode_stored_composite_text(
-            text,
+            crate::sql::types::CompositeSpelling::plain(text),
             crate::storage::TypeCreation::require(slot)?,
             crate::storage::MAX_COMPOSITE_FIELDS as u16
                 | if encoding == CompositeEncoding::Members {
@@ -111654,13 +111770,14 @@ pub(crate) fn enum_array_from_members<'a>(
 /// Renders a composite in stable physical-attribute order for persistence.
 /// Runtime composites expose active fields only; this boundary reinstates
 /// dropped slots as NULL so a later attribute change cannot shift old data.
+/// The spelling keeps each field's TOAST form, nested composites' included.
 fn composite_storage_text<'a>(
     value: Datum<'a>,
     slot: crate::storage::TypeCreation,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
-) -> Result<&'a str, SqlError> {
+) -> Result<crate::sql::types::CompositeSpelling<'a>, SqlError> {
     let Datum::Composite { fields: active, .. } = value else {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
@@ -111693,15 +111810,35 @@ fn composite_storage_text<'a>(
                 "composite active layout does not match its catalog definition"
             )
         })?;
-        // The durable composite text keeps its fields as formed.
-        if source.form != crate::storage::StoredForm::Inline {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "storing a composite value that holds a compressed or out-of-line field is not supported"
-            ));
-        }
         *out = *source;
-        out.value = composite_persistent_value(out.value, storage, txid, arena)?;
+        out.value = match out.value {
+            // A nested composite keeps its spelling, forms included.
+            Datum::Composite { slot, .. } => Datum::CompositeText {
+                slot,
+                physical_fields: stored_physical_fields(slot, storage, txid)?,
+                text: composite_storage_text(out.value, slot, storage, txid, arena)?,
+            },
+            Datum::CompositeText {
+                slot,
+                physical_fields,
+                text,
+            } => {
+                let value = decode_stored_composite_text(
+                    text,
+                    slot,
+                    physical_fields,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+                Datum::CompositeText {
+                    slot,
+                    physical_fields: stored_physical_fields(slot, storage, txid)?,
+                    text: composite_storage_text(value, slot, storage, txid, arena)?,
+                }
+            }
+            value => composite_persistent_value(value, storage, txid, arena)?,
+        };
         active_index += 1;
     }
     if active_index != active.len() {
@@ -111710,17 +111847,94 @@ fn composite_storage_text<'a>(
             "composite has more active values than its catalog definition"
         ));
     }
-    arena
-        .alloc_str_display(Datum::Composite {
-            slot,
-            fields: physical,
-        })
+    let raw = arena
+        .alloc_str_display(SpelledComposite { slot, physical })
         .map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "composite exceeds statement arena"
             )
-        })
+        })?;
+    Ok(crate::sql::types::CompositeSpelling::parse(raw)
+        .expect("a composite spells well-formed form entries"))
+}
+
+/// The physical field count a composite of type `slot` stores, its enum
+/// leaves holding member identities.
+pub(crate) fn stored_physical_fields(
+    slot: crate::storage::TypeCreation,
+    storage: &Storage,
+    txid: u32,
+) -> Result<u16, SqlError> {
+    Ok((storage
+        .require_row_type_definition(slot, txid)?
+        .physical_field_count() as u16)
+        | COMPOSITE_MEMBER_IDENTITIES)
+}
+
+/// A [`crate::sql::types::CompositeSpelling`] of the composite whose
+/// physical fields are `physical`, nested composites as spellings.
+struct SpelledComposite<'v> {
+    slot: crate::storage::TypeCreation,
+    physical: &'v [RecordField<'v>],
+}
+
+impl core::fmt::Display for SpelledComposite<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::storage::StoredForm;
+        write!(
+            f,
+            "{}",
+            Datum::Composite {
+                slot: self.slot,
+                fields: self.physical,
+            }
+        )?;
+        let mut separated = false;
+        let mut separate = |f: &mut core::fmt::Formatter<'_>| {
+            if core::mem::replace(&mut separated, true) {
+                Ok(())
+            } else {
+                f.write_str("\0")
+            }
+        };
+        for (index, field) in self.physical.iter().enumerate() {
+            match field.form {
+                StoredForm::Inline => {}
+                StoredForm::Compressed(size) => {
+                    separate(f)?;
+                    write!(f, "{index}:c{size};")?;
+                }
+                StoredForm::External {
+                    saved,
+                    compressed: false,
+                } => {
+                    separate(f)?;
+                    write!(f, "{index}:x{saved};")?;
+                }
+                StoredForm::External {
+                    saved,
+                    compressed: true,
+                } => {
+                    separate(f)?;
+                    write!(f, "{index}:X{saved};")?;
+                }
+                StoredForm::Unmodelled => {
+                    separate(f)?;
+                    write!(f, "{index}:u;")?;
+                }
+            }
+            if let Datum::CompositeText { text, .. } = field.value
+                && let Some((_, entries)) = text.raw().split_once('\0')
+            {
+                for entry in entries.split_terminator(';') {
+                    separate(f)?;
+                    write!(f, "{index}.{entry};")?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Converts an anonymous row constructor into one catalog-defined composite.
@@ -111959,25 +112173,32 @@ fn coerce_composite_value_inner<'a>(
 /// leak into type coercion as separate attributes.
 /// Decodes a composite retained in its text form before the type gained
 /// fields: the text may name fewer fields than the type now has.
+/// Decodes a retained composite spelling: with a physical field count, it
+/// lists fields by attribute number, else the type's active fields.
 fn decode_retained_composite_text<'a>(
-    text: &'a str,
+    text: crate::sql::types::CompositeSpelling<'a>,
     slot: crate::storage::TypeCreation,
+    physical_fields: u16,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
-    decode_composite_text_inner(
-        text,
+    let mut value = decode_composite_text_inner(
+        text.text(),
         slot,
         CompositeTextSource::Retained {
-            physical_fields: None,
+            physical_fields: (physical_fields != 0).then_some(physical_fields as usize),
         },
         storage,
         txid,
         arena,
         sequences,
-    )
+    )?;
+    for (path, form) in text.forms() {
+        value = with_field_form(value, path, form, storage, txid, arena)?;
+    }
+    Ok(value)
 }
 
 pub(crate) fn decode_composite_text<'a>(
@@ -112116,24 +112337,132 @@ fn parse_record_literal<'a>(
 }
 
 pub(crate) fn decode_stored_composite_text<'a>(
-    text: &'a str,
+    text: crate::sql::types::CompositeSpelling<'a>,
     slot: crate::storage::TypeCreation,
     physical_fields: u16,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    decode_composite_text_inner(
-        text,
-        slot,
-        CompositeTextSource::Retained {
-            physical_fields: (physical_fields != 0).then_some(physical_fields as usize),
-        },
-        storage,
-        txid,
-        arena,
-        None,
-    )
+    decode_retained_composite_text(text, slot, physical_fields, storage, txid, arena, None)
+}
+
+/// The fields of a stored composite by physical attribute, a dropped
+/// attribute's included as the tuple keeps it: what the datum's stored size
+/// counts. A spelling without a physical layout lists the active fields.
+pub(crate) fn stored_composite_physical_fields<'a>(
+    text: crate::sql::types::CompositeSpelling<'a>,
+    slot: crate::storage::TypeCreation,
+    physical_fields: u16,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [RecordField<'a>], SqlError> {
+    let Datum::Composite { fields: active, .. } =
+        decode_stored_composite_text(text, slot, physical_fields, storage, txid, arena)?
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "catalog materializes named composites"
+        ));
+    };
+    let definition = storage.require_row_type_definition(slot, txid)?;
+    let stored = usize::from(physical_fields & !COMPOSITE_MEMBER_IDENTITIES);
+    if physical_fields == 0 || definition.fields().take(stored).all(|field| !field.dropped) {
+        return Ok(active);
+    }
+    let encoding = if physical_fields & COMPOSITE_MEMBER_IDENTITIES != 0 {
+        CompositeEncoding::Members
+    } else {
+        CompositeEncoding::Legacy
+    };
+    let mut raw_values = [None; crate::storage::MAX_COMPOSITE_FIELDS];
+    let count = parse_record_literal(text.text(), stored, true, &mut raw_values, arena)?;
+    let fields = arena
+        .alloc_slice_with(count, |_| RecordField {
+            form: crate::storage::StoredForm::Inline,
+            name: "",
+            type_oid: 0,
+            type_mod: -1,
+            value: Datum::Null,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut active = active.iter();
+    for (index, (out, field)) in fields.iter_mut().zip(definition.fields()).enumerate() {
+        if field.dropped {
+            out.value = match raw_values[index] {
+                Some(raw) => decode_composite_stored_field(
+                    Datum::Text(raw),
+                    field.ctype,
+                    encoding,
+                    storage,
+                    txid,
+                    arena,
+                )?,
+                None => Datum::Null,
+            };
+            if let Some((_, form)) = text.forms().find(|(path, _)| path.is(&[index])) {
+                out.form = form;
+            }
+        } else if let Some(field) = active.next() {
+            *out = *field;
+        }
+    }
+    Ok(fields)
+}
+
+/// `value`, a composite, with the field at `path` held in `form`. A field
+/// dropped since the composite was stored has no value to hold it.
+fn with_field_form<'a>(
+    value: Datum<'a>,
+    path: crate::sql::types::CompositeFieldPath<'_>,
+    form: crate::storage::StoredForm,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let (slot, fields) = match value {
+        Datum::Composite { slot, fields } => (slot, fields),
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => {
+            let decoded =
+                decode_stored_composite_text(text, slot, physical_fields, storage, txid, arena)?;
+            return with_field_form(decoded, path, form, storage, txid, arena);
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a stored composite field form names a field that is not a composite"
+            ));
+        }
+    };
+    let (physical, nested) = path.split_first();
+    let Some(active) = storage
+        .require_row_type_definition(slot, txid)?
+        .active_fields()
+        .position(|field| usize::from(field.attribute_number) == physical + 1)
+    else {
+        return Ok(value);
+    };
+    let fields = arena
+        .alloc_slice_copy(fields)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let field = fields.get_mut(active).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "composite active layout does not match its catalog definition"
+        )
+    })?;
+    match nested {
+        None => field.form = form,
+        Some(nested) => {
+            field.value = with_field_form(field.value, nested, form, storage, txid, arena)?;
+        }
+    }
+    Ok(Datum::Composite { slot, fields })
 }
 
 /// Where composite text comes from: a client literal names exactly the
@@ -112318,7 +112647,7 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                     physical_fields: 0,
                     text,
                 } if actual == slot => {
-                    decode_retained_composite_text(text, slot, storage, txid, arena, sequences)?
+                    decode_retained_composite_text(text, slot, 0, storage, txid, arena, sequences)?
                 }
                 Datum::CompositeText { slot: actual, .. } if actual == slot => value,
                 Datum::Text(text) => {
@@ -112333,10 +112662,7 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                 value @ Datum::CompositeText { .. } => value,
                 value @ Datum::Composite { .. } => Datum::CompositeText {
                     slot,
-                    physical_fields: (storage
-                        .require_row_type_definition(slot, txid)?
-                        .physical_field_count() as u16)
-                        | COMPOSITE_MEMBER_IDENTITIES,
+                    physical_fields: stored_physical_fields(slot, storage, txid)?,
                     text: composite_storage_text(value, slot, storage, txid, arena)?,
                 },
                 _ => unreachable!("composite coercion returns a composite datum"),

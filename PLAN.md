@@ -488,13 +488,25 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   packed 4, 6 and 6 today; a value TOAST may have stored otherwise is
   refused (`0A000`). Needs a form slot beside each local, carried through
   scope construction, `SavedValues` and trigger rows.
-- [ ] Composite forms not carried yet: storing a composite value that holds
-  a compressed or out-of-line field (`0A000`; PostgreSQL stores the datum as
-  formed), the one-byte header a short composite gets when a sort or a
-  materialized CTE forms it into a tuple, and a derived table's whole-row
-  output PostgreSQL pulls up into the outer query (a field of it reads the
-  stored column there). A whole-row reference, `ROW(...)` and a field of
-  either already keep their values' stored forms (`987`).
+- [ ] Composite forms not carried yet: the one-byte header a short
+  composite gets when a sort or a materialized CTE forms it into a tuple, a
+  derived table's whole-row output PostgreSQL pulls up into the outer query
+  (a field of it reads the stored column there), and a composite column
+  TOAST compresses as a whole: pglz reads the datum's bytes, whose header
+  holds the row type's OID, which pos3ql assigns differently, so its form is
+  unmodelled and `pg_column_size` of it is `0A000`. A whole-row reference,
+  `ROW(...)`, a field of either, and a stored composite with its fields
+  (nested composites and array elements included) keep their stored forms
+  (`987`, `990`). Not yet: a stored composite passed on through a derived
+  table, sort or materialized CTE keeps its packed one-byte header in
+  PostgreSQL (pos3ql reports the four-byte one); a field of an array element
+  (`(v[1]).a`) and the fields of a whole row an aggregate such as `array_agg`
+  collects have unmodelled forms (`0A000`); a table row type stored before
+  `ALTER TABLE ... DROP COLUMN` keeps the dropped value, whose type the
+  table no longer records, so its size is `0A000`; an array of composites
+  inside a stored composite whose elements hold compressed fields is
+  refused (`0A000`), as is binary logical replication of an array of a
+  named composite type.
 - [ ] A short value a subquery PostgreSQL does not materialize passes on
   (`(SELECT a || '' x ... LIMIT 5) s`, a subquery without `FROM`) keeps its
   four-byte header; `pg_column_size` reports the packed one-byte form today.
@@ -538,6 +550,9 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 
 #### Constant folding, literals and positions
 
+- [ ] A PL/pgSQL `CALL` whose argument holds a subquery reports the error
+  with `CONTEXT: SQL statement "CALL ..."`; PostgreSQL positions it in the
+  statement (`QUERY:` with a `LINE` caret) under the `at CALL` context.
 - [ ] Fold aggregate arguments, window specifications, `FROM` subqueries,
   `MERGE` into a view, join conditions inside a parenthesized join and custom
   plan parameters; fold a routine's statement once per session.

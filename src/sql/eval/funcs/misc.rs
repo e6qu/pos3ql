@@ -255,7 +255,7 @@ pub(crate) fn dispatch<'a>(
                             expression_type_identity(arg, row, hooks)?.record_field_oid();
                         let name = stack_format!(12, "f{}", fields.len() + 1);
                         // `heap_form_tuple` keeps a stored datum's form.
-                        let form = crate::sql::toast::passed_form(arg, row, &value)?;
+                        let form = crate::sql::toast::passed_form(arg, row, hooks.catalog, &value)?;
                         fields
                             .push(RecordField {
                                 form,

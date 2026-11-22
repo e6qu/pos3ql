@@ -69,9 +69,9 @@ const fn align_to(offset: usize, alignment: u8) -> usize {
 /// What sizing a value may need beyond the value: the catalog that decodes a
 /// stored named composite and scratch memory for a parse.
 pub(crate) struct Sizing<'s> {
-    /// The storage and transaction whose catalog names a composite type's
-    /// fields; none where only built-in values are sized.
-    pub(crate) catalog: Option<(&'s crate::storage::Storage, u32)>,
+    /// The catalog naming a composite type's fields; none where only
+    /// built-in values are sized.
+    pub(crate) catalog: Option<&'s dyn crate::sql::eval::CatalogAccess>,
     pub(crate) scratch: &'s crate::mem::arena::Arena,
 }
 
@@ -87,8 +87,9 @@ impl SizeSource<'_> {
     /// Runs `size` with the scratch memory the catalog's decoding uses.
     pub(crate) fn with<R>(self, size: impl FnOnce(&Sizing<'_>) -> R) -> R {
         self.storage.with_comparison_scratch(|scratch| {
+            let catalog = super::storage_catalog(self.storage, scratch, self.txid);
             size(&Sizing {
-                catalog: Some((self.storage, self.txid)),
+                catalog: Some(&catalog),
                 scratch,
             })
         })
@@ -242,18 +243,13 @@ pub(crate) fn varlena_payload(sizing: Option<&Sizing<'_>>, value: &Datum<'_>) ->
             text,
         } => {
             let sizing = sizing?;
-            let (storage, txid) = sizing.catalog?;
-            let text = sizing.scratch.alloc_str(text).ok()?;
-            let decoded = crate::sql::exec::decode_stored_composite_text(
-                text,
-                *slot,
-                *physical_fields,
-                storage,
-                txid,
-                sizing.scratch,
-            )
-            .ok()?;
-            varlena_payload(Some(sizing), &decoded)?
+            let text = text.alloc_in(sizing.scratch).ok()?;
+            // The datum keeps a dropped attribute's value as stored.
+            let fields = sizing
+                .catalog?
+                .stored_composite_fields(*slot, *physical_fields, text, sizing.scratch)
+                .ok()?;
+            varlena_payload(Some(sizing), &Datum::Record(fields))?
         }
         Datum::TsVector(vector) => {
             crate::storage::statistics::scalar::tsvector_data_length(vector.as_str())

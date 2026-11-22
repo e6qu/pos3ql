@@ -781,7 +781,7 @@ pub(crate) fn key_hash(
             text,
         } => {
             let decoded = crate::sql::exec::decode_stored_composite_text(
-                text,
+                *text,
                 *slot,
                 *physical_fields,
                 storage,

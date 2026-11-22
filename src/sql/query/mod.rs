@@ -6495,7 +6495,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         &self,
         slot: crate::storage::TypeCreation,
         physical_fields: u16,
-        text: &'a str,
+        text: crate::sql::types::CompositeSpelling<'a>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         super::exec::decode_stored_composite_text(
@@ -6506,6 +6506,42 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             self.txid,
             arena,
         )
+    }
+
+    fn stored_composite_fields<'a>(
+        &self,
+        slot: crate::storage::TypeCreation,
+        physical_fields: u16,
+        text: crate::sql::types::CompositeSpelling<'a>,
+        arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+        super::exec::stored_composite_physical_fields(
+            text,
+            slot,
+            physical_fields,
+            self.storage,
+            self.txid,
+            arena,
+        )
+    }
+
+    fn composite_field(
+        &self,
+        slot: crate::storage::TypeCreation,
+        name: &str,
+    ) -> Result<Option<(usize, Option<crate::storage::TypeCreation>)>, SqlError> {
+        Ok(self
+            .storage
+            .require_row_type_definition(slot, self.txid)?
+            .active_fields()
+            .find(|field| field.name.as_str() == name)
+            .map(|field| {
+                let nested = match field.ctype {
+                    ColType::Composite(nested) => nested,
+                    _ => None,
+                };
+                (usize::from(field.attribute_number) - 1, nested)
+            }))
     }
 
     fn composite_array_element<'a>(
@@ -16887,7 +16923,12 @@ fn select_into_rows_mode<'a>(
                 match item {
                     SelectItem::Expr { expression, .. } => {
                         vals[n] = eval_full(expression, arena, params, &row, &agg_hooks)?;
-                        forms[n] = crate::sql::toast::passed_form(expression, &row, &vals[n])?;
+                        forms[n] = crate::sql::toast::passed_form(
+                            expression,
+                            &row,
+                            agg_hooks.catalog,
+                            &vals[n],
+                        )?;
                         n += 1;
                     }
                     SelectItem::RecordStar(base) => {
@@ -17106,7 +17147,12 @@ fn select_into_rows_mode<'a>(
                 match item {
                     SelectItem::Expr { expression, .. } => {
                         vals[n] = eval_full(expression, arena, params, &cols, &khooks)?;
-                        forms[n] = crate::sql::toast::passed_form(expression, &cols, &vals[n])?;
+                        forms[n] = crate::sql::toast::passed_form(
+                            expression,
+                            &cols,
+                            khooks.catalog,
+                            &vals[n],
+                        )?;
                         n += 1;
                     }
                     SelectItem::RecordStar(base) => {
@@ -17709,7 +17755,8 @@ fn project_row_skipping<'a>(
                     ));
                 }
                 out[n] = eval_full(expression, arena, params, &chained, hooks)?;
-                forms[n] = crate::sql::toast::passed_form(expression, &chained, &out[n])?;
+                forms[n] =
+                    crate::sql::toast::passed_form(expression, &chained, hooks.catalog, &out[n])?;
                 n += 1;
             }
         }

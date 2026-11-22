@@ -1366,7 +1366,7 @@ fn comparable_types(left: ColType, right: ColType) -> bool {
 /// each relation's own conditions estimated together, times each join
 /// condition's estimate; the cost is theirs summed.
 fn and_estimate<'a>(
-    scope: &QueryScope<'a>,
+    scope: &QueryScope<'_>,
     expression: &'a Expr<'a>,
     reader: &RelStatistics<'_, '_, '_>,
     restriction: &dyn Fn(usize, &'a Expr<'a>) -> Result<Option<(f64, f64)>, SqlError>,
@@ -1436,7 +1436,7 @@ fn and_estimate<'a>(
 }
 
 fn join_estimate<'a>(
-    scope: &QueryScope<'a>,
+    scope: &QueryScope<'_>,
     expression: &'a Expr<'a>,
     reader: &RelStatistics<'_, '_, '_>,
     restriction: &dyn Fn(usize, &'a Expr<'a>) -> Result<Option<(f64, f64)>, SqlError>,
@@ -2042,7 +2042,7 @@ fn nested_members<'a>(
 /// parenthesized joins' members) resolved by `scope`, its join tree as
 /// written.
 #[allow(clippy::too_many_arguments)]
-fn modeled_join_over<'a>(
+fn modeled_join_over<'p, 'a: 'p>(
     storage: &'a Storage,
     txid: u32,
     statement: &'a Select<'a>,
@@ -2050,7 +2050,7 @@ fn modeled_join_over<'a>(
     scope: &QueryScope<'a>,
     params: &[Datum<'a>],
     arena: &'a Arena,
-    planning: &Arena,
+    planning: &'p Arena,
 ) -> Result<Option<ModeledJoin<'a>>, SqlError> {
     let statement = flatten_merged_statement(scope, statement, arena)?;
     let n = scope.n;
@@ -2098,7 +2098,7 @@ fn modeled_join_over<'a>(
     if n > max_relations {
         return Err(super::joins::too_many_relations(n, max_relations));
     }
-    let Some(limit) = super::constant_limit(statement.limit, statement.offset, arena)? else {
+    let Some(limit) = super::constant_limit(statement.limit, statement.offset, planning)? else {
         return Ok(None);
     };
     let methods = crate::sql::guc::planner_methods();
@@ -2171,13 +2171,13 @@ fn modeled_join_over<'a>(
         }
     }
     // The output: plain columns and wildcards.
-    let output = per_relation(arena, n, 0u64)?;
+    let output = per_relation(planning, n, 0u64)?;
     // Each relation's columns in the order its target list takes them:
     // the output's first, then those the joins need
     // (`build_base_rel_tlists`, then `add_vars_to_targetlist`).
     let appearance = core::cell::RefCell::new((
-        per_relation(arena, n, [0u8; 64])?,
-        per_relation(arena, n, 0usize)?,
+        per_relation(planning, n, [0u8; 64])?,
+        per_relation(planning, n, 0usize)?,
     ));
     let note = |table: usize, column: usize| {
         let (appearance, appeared) = &mut *appearance.borrow_mut();
@@ -2260,13 +2260,13 @@ fn modeled_join_over<'a>(
                         outer: None,
                         storage,
                         txid,
-                        arena,
+                        arena: planning,
                     };
                     // A window function's value: computed by its window,
                     // which reads its arguments' columns.
                     if matches!(expression, Expr::Call { over: Some(_), .. }) {
                         let Some((entry_width, _)) =
-                            target_entry(storage, txid, scope, expression, arena)
+                            target_entry(storage, txid, scope, expression, planning)
                         else {
                             return Ok(None);
                         };
@@ -2288,7 +2288,7 @@ fn modeled_join_over<'a>(
                         return Ok(None);
                     }
                     let Some((entry_width, cost)) =
-                        target_entry(storage, txid, scope, expression, arena)
+                        target_entry(storage, txid, scope, expression, planning)
                     else {
                         return Ok(None);
                     };
@@ -2331,9 +2331,9 @@ fn modeled_join_over<'a>(
                 outer: None,
                 storage,
                 txid,
-                arena,
+                arena: planning,
             };
-            match super::having_quals(condition, storage, txid, &columns, arena)? {
+            match super::having_quals(condition, storage, txid, &columns, planning)? {
                 Some(quals) => Some(quals),
                 None => {
                     return Ok(None);
@@ -2519,7 +2519,7 @@ fn modeled_join_over<'a>(
                 outer: None,
                 storage,
                 txid,
-                arena,
+                arena: planning,
             };
             if crate::sql::query::expr_has_window(target)
                 || target.contains_subquery()
@@ -2532,7 +2532,7 @@ fn modeled_join_over<'a>(
             if has_aggregate && !(grouped || aggregated) {
                 return Ok(None);
             }
-            let Some((entry_width, cost)) = target_entry(storage, txid, scope, target, arena)
+            let Some((entry_width, cost)) = target_entry(storage, txid, scope, target, planning)
             else {
                 return Ok(None);
             };
@@ -2623,7 +2623,7 @@ fn modeled_join_over<'a>(
     }
     // Each written join's node and its `ON` (a `USING` or `NATURAL` join's
     // implied equalities), in the order `deconstruct_jointree` reads them.
-    let mut chain = ChainBuilder {
+    let mut chain: ChainBuilder<'_, '_, 'a> = ChainBuilder {
         tree: &mut tree,
         next: 0,
         rtindex: 0,
@@ -2687,7 +2687,7 @@ fn modeled_join_over<'a>(
     tree.root = root;
     // The conditions: each join's `ON`, then `WHERE`.
     let qual_capacity = tree.quals.len();
-    let quals = per_relation(planning, qual_capacity + 1, &Expr::Null)?;
+    let quals: &mut [&'a Expr<'a>] = per_relation(planning, qual_capacity + 1, &Expr::Null)?;
     let mut constants = Constants {
         held: per_relation(arena, qual_capacity + 1, (&Expr::Null, ColType::Int4))?,
         count: 0,
@@ -2745,7 +2745,7 @@ fn modeled_join_over<'a>(
         *vars = expressions.get(id).vars;
     }
     tree.expression_parts = expressions.parts;
-    let mut prepared = match join_tree::prepare(&tree, arena) {
+    let mut prepared = match join_tree::prepare(&tree, planning) {
         Ok(prepared) => prepared,
         Err(join_tree::FULL) => return Err(preparation_full()),
         Err(join_tree::ARENA) => return Err(crate::sql::eval::arena_full()),
@@ -2817,6 +2817,7 @@ fn modeled_join_over<'a>(
             // A `LATERAL` subquery is no table scan to merge.
             removed | lateral_relids,
             arena,
+            planning,
         )?
     };
     let quals = &quals[..=tree.qual_count];
@@ -2891,7 +2892,7 @@ fn modeled_join_over<'a>(
     };
     // Each relation's restrictions in the order they reach it
     // (`baserestrictinfo`).
-    let restrictions = per_relation(arena, n, None::<&'a Expr<'a>>)?;
+    let restrictions = per_relation(planning, n, None::<&'a Expr<'a>>)?;
     for placed in prepared.placed() {
         let (table, restriction) = match *placed {
             Placed::Restriction { rel, qual } => (usize::from(rel), quals[usize::from(qual)]),
@@ -2925,7 +2926,7 @@ fn modeled_join_over<'a>(
     // The join clauses, in the order PostgreSQL distributes them; each
     // relation's `joininfo` holds those required above it.
     let costs = Costs::current();
-    let mut clauses = crate::mem::arena::ArenaList::<Clause>::new(arena);
+    let mut clauses = crate::mem::arena::ArenaList::<Clause>::new(planning);
     // The equalities of expressions of several relations with their
     // class's constant, conditions after the query's.
     let mut implied = [&Expr::Null; MAX_JOIN_EXPRESSIONS];
@@ -2998,7 +2999,7 @@ fn modeled_join_over<'a>(
             .map_err(|_| crate::sql::eval::arena_full())?;
     }
     let placed_join_count = clauses.len();
-    let quals = &*arena
+    let quals = &*planning
         .alloc_slice_with(quals.len() + implied_count, |at| {
             match at.checked_sub(quals.len()) {
                 Some(extra) => implied[extra],
@@ -3007,7 +3008,7 @@ fn modeled_join_over<'a>(
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
     // The outer joins that can null each relation (`nulling_relids`).
-    let nulling_relids = per_relation(arena, n, Relids::EMPTY)?;
+    let nulling_relids = per_relation(planning, n, Relids::EMPTY)?;
     for special in &prepared.specials[..prepared.special_count] {
         let nullable = match special.kind {
             super::joins::SpecialKind::Left | super::joins::SpecialKind::Anti => special.syn_right,
@@ -3122,7 +3123,7 @@ fn modeled_join_over<'a>(
                     if class_count == extended.len() {
                         return Err(preparation_full());
                     }
-                    extended[class_count].members = single_member(member, arena)?;
+                    extended[class_count].members = single_member(member, planning)?;
                     class_count += 1;
                     class_count - 1
                 }
@@ -3219,7 +3220,7 @@ fn modeled_join_over<'a>(
                 if class_count == extended.len() {
                     return Err(preparation_full());
                 }
-                extended[class_count].members = single_member(member, arena)?;
+                extended[class_count].members = single_member(member, planning)?;
                 class_count += 1;
                 class_count - 1
             }
@@ -3305,7 +3306,7 @@ fn modeled_join_over<'a>(
             outer: None,
             storage,
             txid,
-            arena,
+            arena: planning,
         };
         let mut calls = crate::mem::arena::ArenaList::new(arena);
         for item in statement.items {
@@ -3405,7 +3406,7 @@ fn modeled_join_over<'a>(
                         if class_count == extended.len() {
                             return Err(preparation_full());
                         }
-                        extended[class_count].members = single_member(member, arena)?;
+                        extended[class_count].members = single_member(member, planning)?;
                         extended[class_count].has_const = false;
                         class_count += 1;
                         class_count - 1
@@ -3495,14 +3496,14 @@ fn modeled_join_over<'a>(
     // The expression members the window clauses sort by, and the columns
     // only they read, which the windows' input does not carry.
     let mut window_expressions = 0u32;
-    let key_only_columns = per_relation(arena, n, 0u64)?;
+    let key_only_columns = per_relation(planning, n, 0u64)?;
     if windowed {
         let columns = crate::sql::query::CatalogScopeCols {
             scope,
             outer: None,
             storage,
             txid,
-            arena,
+            arena: planning,
         };
         let mut win_nodes = crate::mem::arena::ArenaList::new(arena);
         for item in statement.items {
@@ -3604,7 +3605,7 @@ fn modeled_join_over<'a>(
                             if class_count == extended.len() {
                                 return Err(preparation_full());
                             }
-                            extended[class_count].members = single_member(member, arena)?;
+                            extended[class_count].members = single_member(member, planning)?;
                             extended[class_count].has_const = false;
                             class_count += 1;
                             class_count - 1
@@ -3677,7 +3678,7 @@ fn modeled_join_over<'a>(
                         if class_count == extended.len() {
                             return Err(preparation_full());
                         }
-                        extended[class_count].members = single_member(member, arena)?;
+                        extended[class_count].members = single_member(member, planning)?;
                         extended[class_count].has_const = false;
                         class_count += 1;
                         class_count - 1
@@ -3761,14 +3762,15 @@ fn modeled_join_over<'a>(
                 let Expr::Call { args, filter, .. } = node else {
                     return Ok(None);
                 };
-                let Some((entry_width, _)) = target_entry(storage, txid, scope, node, arena) else {
+                let Some((entry_width, _)) = target_entry(storage, txid, scope, node, planning)
+                else {
                     return Ok(None);
                 };
                 window.added_width += entry_width;
                 window.per_row += operator;
                 for &argument in args.iter().chain(filter.iter()) {
                     window.per_row +=
-                        super::super::plan::qual_cost(argument, &columns, storage, txid, arena)
+                        super::super::plan::qual_cost(argument, &columns, storage, txid, planning)
                             / 2.0
                             * operator;
                 }
@@ -3788,7 +3790,7 @@ fn modeled_join_over<'a>(
     } else {
         sort_keys
     };
-    let classes: &[EquivalenceClass] = arena
+    let classes: &[EquivalenceClass] = planning
         .alloc_slice_copy(&extended[..class_count])
         .map_err(|_| crate::sql::eval::arena_full())?;
     // The columns each other condition of two relations compares, each
@@ -3831,7 +3833,7 @@ fn modeled_join_over<'a>(
     // column of each class equated with every other member
     // (`generate_implied_equalities_for_column`).
     let scans = per_relation(
-        arena,
+        planning,
         n,
         JoinScan {
             params: &[],
@@ -3846,10 +3848,10 @@ fn modeled_join_over<'a>(
         },
     )?;
     // Each relation's parameters' conjuncts.
-    let join_conjuncts = per_relation(arena, n, &[][..] as &'a [&'a Expr<'a>])?;
+    let join_conjuncts = per_relation(planning, n, &[][..] as &'a [&'a Expr<'a>])?;
     // The clause each parameter is: an outer join's clause, or `None` for
     // a class's.
-    let param_clause = per_relation(arena, n, &[][..] as &'a [Option<ClauseId>])?;
+    let param_clause = per_relation(planning, n, &[][..] as &'a [Option<ClauseId>])?;
     let mut total_table_pages = 0.0;
     let member_class = |member: Member| {
         classes
@@ -3865,7 +3867,7 @@ fn modeled_join_over<'a>(
             continue;
         }
         let slot = scope.slots[table];
-        let Some(catalog) = super::paths::catalog_indexes(storage, txid, slot, arena)? else {
+        let Some(catalog) = super::paths::catalog_indexes(storage, txid, slot, planning)? else {
             return Ok(None);
         };
         let (keyed, _) = super::expressions::table_expressions(
@@ -3875,7 +3877,7 @@ fn modeled_join_over<'a>(
             scope.defs.stored(table).expect("plain table"),
             &storage.table_statistics(slot, txid),
             catalog,
-            arena,
+            planning,
         )?;
         for (id, key) in expression_keys
             .iter_mut()
@@ -4084,7 +4086,7 @@ fn modeled_join_over<'a>(
     }
     // The columns above each relation's scan: the output's and those a join
     // or outer join reads (`attr_needed`).
-    let join_columns = per_relation(arena, n, 0u64)?;
+    let join_columns = per_relation(planning, n, 0u64)?;
     // The outer columns each `LATERAL` subquery reads, needed at it
     // (`find_lateral_references`, before the conditions' columns).
     for lateral in laterals.iter().take(n).flatten() {
@@ -4113,16 +4115,16 @@ fn modeled_join_over<'a>(
     // Each relation's paths (`set_base_rel_sizes`, then
     // `set_base_rel_pathlists`, whose parameterized paths read the other
     // relations' rows).
-    let rels = per_relation(arena, n, None::<ModeledRel<'a>>)?;
-    let planned_paths = per_relation(arena, n, None::<super::paths::JoinRelPaths<'a>>)?;
-    let mut needed = crate::mem::arena::ArenaList::<NeededColumn>::new(arena);
-    let rel_rows = per_relation(arena, n, 0.0f64)?;
+    let rels: &mut [Option<ModeledRel<'a>>] = per_relation(planning, n, None)?;
+    let planned_paths = per_relation(planning, n, None::<super::paths::JoinRelPaths<'a>>)?;
+    let mut needed = crate::mem::arena::ArenaList::<NeededColumn>::new(planning);
+    let rel_rows = per_relation(planning, n, 0.0f64)?;
     // The indexes each relation's first sizing found, which the
     // extracted restrictions' estimates read.
-    let sized_indexes = per_relation(arena, n, &[][..])?;
+    let sized_indexes = per_relation(planning, n, &[][..])?;
     // Each join `OR` clause's selectivity divisors, one per restriction
     // extracted from it (`consider_new_or_clause`).
-    let mut or_divisors = crate::mem::arena::ArenaList::<(usize, f64)>::new(arena);
+    let mut or_divisors = crate::mem::arena::ArenaList::<(usize, f64)>::new(planning);
     // Sizing, sizing again with the restrictions extracted from join `OR`
     // clauses, then the paths.
     for pass in 0..3 {
@@ -4162,7 +4164,8 @@ fn modeled_join_over<'a>(
                         continue;
                     };
                     let rel = rels[table].expect("sized");
-                    let single = QueryScope::resolve_schema(storage, rel.from, txid, arena, None)?;
+                    let single =
+                        QueryScope::resolve_schema(storage, rel.from, txid, planning, None)?;
                     let statistics = storage.table_statistics(scope.slots[table], txid);
                     let definition = scope.defs.stored(table).expect("plain table");
                     let planner = Planner {
@@ -4180,14 +4183,14 @@ fn modeled_join_over<'a>(
                         costs,
                         indexes: sized_indexes[table],
                         extended: &[],
-                        arena,
+                        arena: planning,
                     };
                     let Some((or_selectivity, _)) = super::paths::restriction_estimate(
                         &planner,
                         &single,
                         restriction,
                         params,
-                        arena,
+                        planning,
                     )?
                     else {
                         return Ok(None);
@@ -4271,7 +4274,7 @@ fn modeled_join_over<'a>(
                     })
                     .map_err(|_| crate::sql::eval::arena_full())?,
             };
-            let single_scope = QueryScope::resolve_schema(storage, single, txid, arena, None)?;
+            let single_scope = QueryScope::resolve_schema(storage, single, txid, planning, None)?;
             let definition = scope.defs.stored(table).expect("plain table");
             let columns = definition.columns().len();
             let all = if columns >= 64 {
@@ -4296,7 +4299,7 @@ fn modeled_join_over<'a>(
                 condition,
                 Some(ColumnSet::from_low_word(read)),
                 params,
-                arena,
+                planning,
                 QueryShape {
                     output: Some(ColumnSet::from_low_word(above)),
                     member: super::Member::Join(scan),
@@ -4350,7 +4353,10 @@ fn modeled_join_over<'a>(
             }
             rels[table] = Some(ModeledRel {
                 scan,
-                paths: paths.candidates,
+                // The paths outlive the planning memory they were found in.
+                paths: arena
+                    .alloc_slice_copy(paths.candidates)
+                    .map_err(|_| crate::sql::eval::arena_full())?,
                 ..rels[table].expect("sized")
             });
         }
@@ -4455,9 +4461,9 @@ fn modeled_join_over<'a>(
             }
         }
     }
-    let base_paths = per_relation(arena, n, &[][..])?;
+    let base_paths = per_relation(planning, n, &[][..])?;
     let base = per_relation(
-        arena,
+        planning,
         n,
         BaseRel {
             rows: 0.0,
@@ -4503,7 +4509,7 @@ fn modeled_join_over<'a>(
             base[table] = BaseRel {
                 rows: lateral.rows,
                 width: lateral.widths.iter().sum(),
-                paths: arena
+                paths: planning
                     .alloc_slice_copy(&[path])
                     .map_err(|_| crate::sql::eval::arena_full())?,
                 unique: &[],
@@ -4645,7 +4651,7 @@ fn modeled_join_over<'a>(
                 enforced[at] = list;
             }
         }
-        base_paths[table] = arena
+        base_paths[table] = planning
             .alloc_slice_with(paths.candidates.len(), |at| {
                 let candidate = paths.candidates[at];
                 BasePath {
@@ -4693,7 +4699,7 @@ fn modeled_join_over<'a>(
             rows: paths.rows,
             width: paths.width,
             paths: base_paths[table],
-            unique: arena
+            unique: planning
                 .alloc_slice_copy(&unique[..unique_count])
                 .map_err(|_| crate::sql::eval::arena_full())?,
             fixed: paths.fixed,
@@ -4747,7 +4753,7 @@ fn modeled_join_over<'a>(
         *slot = Some(ModeledRel { joins, ..rel });
     }
     // The statistics the selectivities read.
-    let statistics = arena
+    let statistics = planning
         .alloc_owned_slice_with(n, |table| {
             laterals[table]
                 .is_none()
@@ -4757,7 +4763,7 @@ fn modeled_join_over<'a>(
     // Each relation's variables: its indexes' key expressions
     // (`examine_variable` reads their statistics), then its expression
     // members that no key expression is.
-    let variables = per_relation(arena, n, None::<super::ExpressionVariables<'a>>)?;
+    let variables = per_relation(planning, n, None::<super::ExpressionVariables<'a>>)?;
     let mut expression_columns = [0usize; MAX_JOIN_EXPRESSIONS];
     let mut expression_vars = [VarList::default(); MAX_JOIN_EXPRESSIONS];
     // An expression of several relations has no variable of its own:
@@ -4778,7 +4784,7 @@ fn modeled_join_over<'a>(
         }
         let definition = scope.defs.stored(table).expect("plain table");
         let indexes = planned_paths[table].map_or(&[][..], |paths| paths.indexes);
-        let catalog = arena
+        let catalog = planning
             .alloc_slice_with(indexes.len(), |at| indexes[at].catalog)
             .map_err(|_| crate::sql::eval::arena_full())?;
         let (keyed, _) = super::expressions::table_expressions(
@@ -4788,7 +4794,7 @@ fn modeled_join_over<'a>(
             definition,
             statistics[table].as_ref().expect("a relation's statistics"),
             catalog,
-            arena,
+            planning,
         )?;
         let mut held = [None::<super::expressions::ExpressionVariable<'a>>;
             super::expressions::MAX_EXPRESSION_VARIABLES + MAX_JOIN_EXPRESSIONS];
@@ -4826,13 +4832,13 @@ fn modeled_join_over<'a>(
         }
         variables[table] = Some(super::ExpressionVariables {
             first: keyed.first,
-            variables: arena
+            variables: planning
                 .alloc_slice_with(count, |at| held[at].expect("dense variables"))
                 .map_err(|_| crate::sql::eval::arena_full())?,
         });
     }
-    let planners = arena
-        .alloc_owned_slice_with(n, |table| -> Option<Planner<'_, 'a>> {
+    let planners = planning
+        .alloc_owned_slice_with(n, |table| -> Option<Planner<'_, '_>> {
             let statistics = statistics[table].as_ref()?;
             let slot = scope.slots[table];
             let definition = scope.defs.stored(table)?;
@@ -4851,7 +4857,7 @@ fn modeled_join_over<'a>(
                 costs,
                 indexes: planned_paths[table].map_or(&[][..], |paths| paths.indexes),
                 extended: &[],
-                arena,
+                arena: planning,
             })
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
@@ -4865,11 +4871,11 @@ fn modeled_join_over<'a>(
         expression_vars: &expression_vars,
     };
     let restriction =
-        |table: usize, expression: &'a Expr<'a>| -> Result<Option<(f64, f64)>, SqlError> {
+        |table: usize, expression: &'p Expr<'p>| -> Result<Option<(f64, f64)>, SqlError> {
             let rel = rels[table].expect("planned");
-            let single = QueryScope::resolve_schema(storage, rel.from, txid, arena, None)?;
+            let single = QueryScope::resolve_schema(storage, rel.from, txid, planning, None)?;
             let planner = planners[table].as_ref().expect("planned");
-            super::paths::restriction_estimate(planner, &single, expression, params, arena)
+            super::paths::restriction_estimate(planner, &single, expression, params, planning)
         };
     // `cost_qual_eval` of a condition over several relations.
     let scope_columns = crate::sql::query::CatalogScopeCols {
@@ -4877,13 +4883,13 @@ fn modeled_join_over<'a>(
         outer: None,
         storage,
         txid,
-        arena,
+        arena: planning,
     };
-    let expression_cost = |expression: &'a Expr<'a>| {
-        super::super::plan::qual_cost(expression, &scope_columns, storage, txid, arena) / 2.0
+    let expression_cost = |expression: &'p Expr<'p>| {
+        super::super::plan::qual_cost(expression, &scope_columns, storage, txid, planning) / 2.0
             * costs.cpu_operator
     };
-    let single_rel_columns = per_relation(arena, n, 0u64)?;
+    let single_rel_columns = per_relation(planning, n, 0u64)?;
     for (id, clause) in clauses
         .as_mut_slice()
         .map_err(|_| crate::sql::eval::arena_full())?[..placed_join_count]
@@ -4928,7 +4934,7 @@ fn modeled_join_over<'a>(
                 &restriction,
                 &expression_cost,
                 costs,
-                arena,
+                planning,
             )? {
                 Some(estimate) => estimate,
                 None => {
@@ -5156,7 +5162,8 @@ fn modeled_join_over<'a>(
             if !statement.items.iter().any(
                 |item| matches!(item, SelectItem::Expr { expression, .. } if **expression == *key),
             ) {
-                let Some((entry_width, _)) = target_entry(storage, txid, scope, key, arena) else {
+                let Some((entry_width, _)) = target_entry(storage, txid, scope, key, planning)
+                else {
                     return Ok(None);
                 };
                 grouped_width += entry_width;
@@ -5168,7 +5175,7 @@ fn modeled_join_over<'a>(
             };
             grouped_width += match column_of(scope, expression) {
                 Some(column) => column_width(column),
-                None => match target_entry(storage, txid, scope, expression, arena) {
+                None => match target_entry(storage, txid, scope, expression, planning) {
                     Some((entry_width, _)) => entry_width,
                     None => {
                         return Ok(None);
@@ -5244,7 +5251,7 @@ fn modeled_join_over<'a>(
     } else if grouped || aggregated {
         // The select list's, `HAVING`'s and `ORDER BY`'s aggregates.
         let listed = statement.items.len();
-        let expressions = arena
+        let expressions = planning
             .alloc_slice_with(listed + 1 + statement.order_by.len(), |at| match statement
                 .items
                 .get(at)
@@ -5265,9 +5272,10 @@ fn modeled_join_over<'a>(
             outer: None,
             storage,
             txid,
-            arena,
+            arena: planning,
         };
-        let Some(aggregates) = super::aggregate_costs(expressions, storage, txid, &columns, arena)?
+        let Some(aggregates) =
+            super::aggregate_costs(expressions, storage, txid, &columns, planning)?
         else {
             return Ok(None);
         };
@@ -5470,10 +5478,28 @@ fn modeled_join_over<'a>(
         }
         None => None,
     };
-    let rels = arena
+    let rels: &'a [ModeledRel<'a>] = arena
         .alloc_slice_with(n, |table| rels[table].expect("planned"))
         .map_err(|_| crate::sql::eval::arena_full())?;
-    let quals = arena
+    // The classes, copied out of the planning memory.
+    let copied = arena
+        .alloc_slice_with(class_count, |_| EquivalenceClass {
+            members: &[],
+            has_const: false,
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (class, held) in copied.iter_mut().zip(&classes[..class_count]) {
+        *class = EquivalenceClass {
+            members: arena
+                .alloc_slice_copy(held.members())
+                .map_err(|_| crate::sql::eval::arena_full())?,
+            has_const: held.has_const,
+        };
+    }
+    let classes: &'a [EquivalenceClass<'a>] = copied;
+    let expressions: &'a [JoinExpression<'a>] = expressions.alloc()?;
+    let kept_for: KeptFor<'a> = kept_for;
+    let quals: &'a [&'a Expr<'a>] = arena
         .alloc_slice_copy(quals)
         .map_err(|_| crate::sql::eval::arena_full())?;
     let windows = arena
@@ -5482,7 +5508,7 @@ fn modeled_join_over<'a>(
     Ok(Some(ModeledJoin {
         plan,
         rels,
-        classes: &classes[..class_count],
+        classes,
         quals,
         output_width,
         final_width,
@@ -5494,7 +5520,7 @@ fn modeled_join_over<'a>(
         sort_shown: arena
             .alloc_slice_copy(&sort_shown[..sort_keys.as_slice().len()])
             .map_err(|_| crate::sql::eval::arena_full())?,
-        expressions: expressions.alloc()?,
+        expressions,
         nested: None,
         self_join,
         kept_for,
@@ -5504,12 +5530,12 @@ fn modeled_join_over<'a>(
 /// A select-list expression's average width and its cost per row
 /// (`set_pathtarget_cost_width`); `None` for a type the model does not
 /// size.
-fn target_entry<'a>(
+fn target_entry<'e>(
     storage: &Storage,
     txid: u32,
-    scope: &QueryScope<'a>,
-    expression: &'a Expr<'a>,
-    arena: &'a Arena,
+    scope: &QueryScope<'_>,
+    expression: &'e Expr<'e>,
+    arena: &'e Arena,
 ) -> Option<(f64, f64)> {
     let columns = crate::sql::query::CatalogScopeCols {
         scope,
@@ -5757,7 +5783,7 @@ fn reads_subquery(statement: &Select<'_>, from: &FromClause<'_>) -> bool {
 fn placed_restriction<'a>(
     scope: &QueryScope<'a>,
     expressions: &Expressions<'a>,
-    prepared: &join_tree::Prepared<'a>,
+    prepared: &join_tree::Prepared<'_>,
     quals: &[&'a Expr<'a>],
     placed: Placed,
     arena: &'a Arena,
@@ -5839,15 +5865,16 @@ fn constant_equality<'a>(
 /// earlier one shares, `innerrel_is_unique_ext` and
 /// `match_unique_clauses`), merge into the later scan until no more do.
 #[allow(clippy::too_many_arguments)]
-fn remove_self_joins<'a>(
+fn remove_self_joins<'p, 'a>(
     storage: &Storage,
     txid: u32,
     scope: &QueryScope<'a>,
-    prepared: &mut join_tree::Prepared<'a>,
+    prepared: &mut join_tree::Prepared<'p>,
     quals: &mut [&'a Expr<'a>],
     expressions: &Expressions<'a>,
     removed: Relids,
     arena: &'a Arena,
+    planning: &'p Arena,
 ) -> Result<SelfJoins<'a>, SqlError> {
     let mut joins = SelfJoins {
         kept_for: per_relation(arena, scope.n, None)?,
@@ -5898,6 +5925,7 @@ fn remove_self_joins<'a>(
                     &mut joins,
                     non_unique,
                     arena,
+                    planning,
                 )?;
                 group &= !gone;
                 if gone == Relids::EMPTY {
@@ -5912,17 +5940,18 @@ fn remove_self_joins<'a>(
 /// `remove_self_joins_one_group` of `group`, scans of one table: the
 /// relations removed.
 #[allow(clippy::too_many_arguments)]
-fn remove_self_joins_one_group<'a>(
+fn remove_self_joins_one_group<'p, 'a>(
     storage: &Storage,
     txid: u32,
     scope: &QueryScope<'a>,
-    prepared: &mut join_tree::Prepared<'a>,
+    prepared: &mut join_tree::Prepared<'p>,
     quals: &mut [&'a Expr<'a>],
     expressions: &Expressions<'a>,
     group: Relids,
     joins: &mut SelfJoins,
     non_unique: &mut [Relids],
     arena: &'a Arena,
+    planning: &'p Arena,
 ) -> Result<Relids, SqlError> {
     let mut result = Relids::EMPTY;
     let members =
@@ -6088,7 +6117,7 @@ fn remove_self_joins_one_group<'a>(
                 *qual = rename_relations(scope, &rename, qual, arena)?;
             }
             let (restrictions, join_clauses) =
-                match prepared.remove_self_join(r as u8, k as u8, arena) {
+                match prepared.remove_self_join(r as u8, k as u8, planning) {
                     Ok(moved) => moved,
                     Err(join_tree::ARENA) => return Err(crate::sql::eval::arena_full()),
                     Err(reason) => {

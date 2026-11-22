@@ -250,11 +250,16 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   nested loops (inner, left, semi and anti), `Materialize` nodes and scans
   already runs as a retained reader's pull nodes (`ModeledPull`): a stream
   or cursor reads it a row at a time and resumes each storage wait where it
-  stopped. The join search plans in the statement's memory and the reader
-  keeps only the chosen plan and its nodes' records (about 41 KB for an
-  analyzed table joined with itself, which a stream's estimate counts
-  exactly); no node holds a `Storage` or `Arena` reference between calls,
-  and a scan captures its index's statistics counter for each read. A
+  stopped, at every node kind (`pull_join_waits`). The join search and its
+  analysis (join tree, conditions, classes, statistics, candidate paths)
+  run in the statement's memory; the reader keeps the chosen plan, each
+  relation's scan and its nodes' records (about 18 KB for an analyzed
+  table joined with itself, which a stream's estimate counts exactly). No
+  node keeps a `Storage` or `Arena` argument between calls, and a scan
+  captures its index's statistics counter for each read; a scan's resolved
+  `QueryScope` still holds a `Storage` reference, which its catalog
+  lookups (named types, domains, common types) read during expression
+  typing, including record field typing while rows are evaluated. A
   `Materialize` keeps its rows, with their stored forms, in
   `plan_build_bytes` leases. Still needed: hash, merge, `Memoize` and
   `Unique` pull nodes, `EXPLAIN ANALYZE` counters on the pull nodes, a

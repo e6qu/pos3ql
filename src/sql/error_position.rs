@@ -401,6 +401,7 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
         | Expr::Null
         | Expr::Param(_)
         | Expr::Array(_)
+        | Expr::Case { .. }
         | Expr::Subquery(_) => {
             let address = core::ptr::from_ref(expression) as usize;
             // with_statement_source keeps the copy map alive with its text.

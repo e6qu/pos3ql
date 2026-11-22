@@ -1631,10 +1631,6 @@ impl<'v> ColumnLookup<'v> for JoinedReturningLookup<'_, '_, 'v> {
         self.row(qualifier).collation(qualifier, name)
     }
 
-    fn record_field_collation(&self, base: &Expr<'v>, field: &str) -> crate::sql::ast::Collation {
-        self.joined.record_field_collation(base, field)
-    }
-
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
@@ -1829,11 +1825,11 @@ pub use describe::{
     visit_record_shape_metadata as visit_record_shape_metadata_pub,
 };
 pub(crate) use describe::{
-    StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, expression_static_metadata,
-    infer_routine_argument_oid, infer_type_catalog, intrinsic_record_field_meta,
-    record_shape_metadata, record_shape_pool_bytes, routine_result_metadata, row_expansion_error,
-    unify_numeric_tower, user_routine_call_result, visit_array_constructor_conversions,
-    with_temporary_record_shapes,
+    StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, expanded_row_type,
+    expression_static_metadata, infer_routine_argument_oid, infer_type_catalog,
+    intrinsic_record_field_meta, record_shape_metadata, record_shape_pool_bytes,
+    routine_result_metadata, row_expansion_error, unify_numeric_tower, user_routine_call_result,
+    visit_array_constructor_conversions, with_temporary_record_shapes,
 };
 pub(crate) use describe::{
     bound_parameter_context_active, bound_parameter_type_oid, enter_routine_parameter_types,
@@ -33003,32 +32999,6 @@ where
             };
         }
         self.transition.collation(qualifier, name)
-    }
-
-    fn record_field_collation(
-        &self,
-        base: &Expr<'value>,
-        field: &str,
-    ) -> crate::sql::ast::Collation {
-        let Expr::Column {
-            qualifier: None,
-            name,
-        } = base
-        else {
-            return crate::sql::ast::Collation::None;
-        };
-        self.local_index(name)
-            .and_then(|index| match self.values[index] {
-                Datum::Record(fields) | Datum::Composite { fields, .. } => fields
-                    .iter()
-                    .find(|candidate| candidate.name == field)
-                    .and_then(|candidate| ColType::from_oid(candidate.type_oid)),
-                _ => None,
-            })
-            .filter(|ctype| ctype.is_collatable())
-            .map_or(crate::sql::ast::Collation::None, |_| {
-                crate::sql::ast::Collation::Default
-            })
     }
 
     fn column_user_type(
@@ -84663,10 +84633,6 @@ impl<'o: 'v, 'v, R: ColumnLookup<'v>> ColumnLookup<'v> for ProceduralMergeScope<
             Some(outer) => outer.collation(qualifier, name),
             None => self.row.collation(qualifier, name),
         }
-    }
-
-    fn record_field_collation(&self, base: &Expr<'v>, field: &str) -> crate::sql::ast::Collation {
-        self.row.record_field_collation(base, field)
     }
 
     fn column_user_type(

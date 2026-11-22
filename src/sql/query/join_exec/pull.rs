@@ -183,7 +183,7 @@ impl<'a> ModeledPull<'a> {
     /// (the query's FROM clause) through [`ModeledJoin::scope`]. Every
     /// scan's node is made here, before any row.
     pub(crate) fn new(
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         model: ModeledJoin<'a>,
         written: &QueryScope<'a>,

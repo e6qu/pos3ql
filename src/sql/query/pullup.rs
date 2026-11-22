@@ -59,7 +59,7 @@ type Step<T> = Result<T, Stop>;
 /// `select` itself when none is.
 pub(crate) fn pull_up_subqueries<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -277,7 +277,7 @@ fn flatten_parenthesized_joins<'a>(
 /// reads as a whole row stays as written.
 fn spell_out_parenthesized_joins<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -328,7 +328,7 @@ fn spell_out_parenthesized_joins<'a>(
 fn spell_out_parenthesized_join<'a>(
     select: &'a Select<'a>,
     position: usize,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -807,7 +807,7 @@ fn unaliased_join<'a>(
 /// returned. Grouping sets keep their `HAVING`.
 fn move_having_to_where<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -888,7 +888,7 @@ fn move_having_to_where<'a>(
 /// `DISTINCT ON` outputs, set-operation arms) are the view-filter ones.
 fn push_down_restrictions<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -1137,7 +1137,7 @@ fn merges_columns(from: &FromClause<'_>) -> bool {
 /// lists the merged columns first, as the join's output does.
 fn spell_out_merged_columns<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Step<&'a Select<'a>> {
@@ -1249,7 +1249,7 @@ fn spell_out_merged_columns<'a>(
 /// shapes merged here.
 fn simple_subquery<'a>(
     table: &TableRef<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
 ) -> Option<&'a Select<'a>> {
     let body = table.subquery?;
@@ -1318,7 +1318,7 @@ fn simple_subquery<'a>(
 fn pull_up_one<'a>(
     outer_select: &'a Select<'a>,
     position: usize,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -1947,7 +1947,7 @@ struct Level<'l, 'a> {
 }
 
 struct Rewrite<'r, 'a> {
-    storage: &'a Storage,
+    storage: &'r Storage,
     txid: u32,
     arena: &'a Arena,
     top: Top<'r, 'a>,
@@ -2791,7 +2791,7 @@ const MAX_FILTER_JOIN_ITEMS: usize = 16;
 /// SQL identifier contains, so nothing outside its condition can name it.
 fn pull_up_sublinks<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -2996,7 +2996,7 @@ fn equate_constants<'a>(
 fn inlined_sublink_query<'a>(
     subquery: &'a Select<'a>,
     outer_scope: &QueryScope<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Step<&'a Select<'a>> {
@@ -3021,7 +3021,7 @@ fn inlined_sublink_query<'a>(
 fn sublink_join<'a>(
     conjunct: &'a Expr<'a>,
     outer_scope: &QueryScope<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Step<Option<Join<'a>>> {

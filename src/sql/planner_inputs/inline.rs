@@ -81,10 +81,6 @@ impl<'a> crate::sql::eval::ColumnLookup<'a> for MetadataColumns<'_> {
             .column_meta(qualifier, name)
             .map_or(ast::Collation::None, |metadata| metadata.collation)
     }
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> ast::Collation {
-        crate::sql::exec::record_field_metadata(base, field, self.columns)
-            .map_or(ast::Collation::None, |metadata| metadata.collation)
-    }
     fn whole_row_type(&self, name: &str) -> Option<ColType> {
         self.columns
             .whole_row_scalar_type(name)

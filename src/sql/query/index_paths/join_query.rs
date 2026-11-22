@@ -134,7 +134,7 @@ impl<'a> ModeledRel<'a> {
 /// `relation.column`, or the expression an expression member is.
 fn column_expression<'a>(
     scope: &QueryScope<'a>,
-    expressions: &Expressions<'a>,
+    expressions: &Expressions<'_, 'a>,
     member: Member,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
@@ -241,7 +241,7 @@ pub(crate) fn flatten_merged_statement<'a>(
 /// `left = right`, each a column named by its relation.
 fn equality<'a>(
     scope: &QueryScope<'a>,
-    expressions: &Expressions<'a>,
+    expressions: &Expressions<'_, 'a>,
     left: Member,
     right: Member,
     arena: &'a Arena,
@@ -262,7 +262,7 @@ fn equality<'a>(
 /// `member.column = value`, the column named by its relation.
 fn equals_constant<'a>(
     scope: &QueryScope<'a>,
-    expressions: &Expressions<'a>,
+    expressions: &Expressions<'_, 'a>,
     member: Member,
     value: &'a Expr<'a>,
     arena: &'a Arena,
@@ -828,8 +828,8 @@ impl JoinExpression<'_> {
 }
 
 /// The expression members of one query, by [`Member::expression_id`].
-pub(crate) struct Expressions<'a> {
-    storage: &'a Storage,
+pub(crate) struct Expressions<'s, 'a> {
+    storage: &'s Storage,
     txid: u32,
     arena: &'a Arena,
     held: [Option<JoinExpression<'a>>; MAX_JOIN_EXPRESSIONS],
@@ -839,8 +839,8 @@ pub(crate) struct Expressions<'a> {
     parts: [Option<(join_tree::Var, join_tree::Var)>; MAX_JOIN_EXPRESSIONS],
 }
 
-impl<'a> Expressions<'a> {
-    fn new(storage: &'a Storage, txid: u32, arena: &'a Arena) -> Self {
+impl<'s, 'a> Expressions<'s, 'a> {
+    fn new(storage: &'s Storage, txid: u32, arena: &'a Arena) -> Self {
         Self {
             storage,
             txid,
@@ -1061,7 +1061,7 @@ impl<'a> Expressions<'a> {
 /// other `COALESCE`: one with other arguments stays an ordinary filter.
 fn coalesce_operands<'a>(
     scope: &QueryScope<'a>,
-    expressions: &mut Expressions<'a>,
+    expressions: &mut Expressions<'_, 'a>,
     full_clauses: &[join_tree::Var],
     side: &'a Expr<'a>,
 ) -> Result<Option<(Member, Member, ColType)>, SqlError> {
@@ -1119,7 +1119,7 @@ fn analyze_qual<'a>(
     scope: &QueryScope<'a>,
     expression: &'a Expr<'a>,
     constants: &mut Constants<'a>,
-    expressions: &mut Expressions<'a>,
+    expressions: &mut Expressions<'_, 'a>,
     full_clauses: &[join_tree::Var],
 ) -> Result<Option<Qual>, SqlError> {
     // `COALESCE(left, right) = constant` of two relations' columns or such
@@ -1726,7 +1726,7 @@ fn parenthesized_join<'a>(table: &'a TableRef<'a>) -> Option<&'a FromClause<'a>>
 }
 
 pub(crate) fn modeled_join<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
@@ -1769,7 +1769,7 @@ pub(crate) fn modeled_join<'a>(
 /// parenthesized join, its base relations all plain tables the join
 /// search plans.
 fn unread_parenthesized_using<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     written: &'a FromClause<'a>,
     arena: &'a Arena,
@@ -1848,7 +1848,7 @@ fn unread_parenthesized_using<'a>(
 /// [`modeled_join`] of the written FROM `written`.
 #[allow(clippy::too_many_arguments)]
 fn modeled_join_written<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     written: &'a FromClause<'a>,
@@ -1957,7 +1957,7 @@ impl<'a> PlannedJoin<'a> {
 /// Whether the join search plans `statement`; the arena space the plan
 /// took is reclaimed.
 pub(crate) fn models_join<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
@@ -2043,7 +2043,7 @@ fn nested_members<'a>(
 /// written.
 #[allow(clippy::too_many_arguments)]
 fn modeled_join_over<'p, 'a: 'p>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     from: &'a FromClause<'a>,
@@ -5782,7 +5782,7 @@ fn reads_subquery(statement: &Select<'_>, from: &FromClause<'_>) -> bool {
 /// `process_implied_equality` builds them).
 fn placed_restriction<'a>(
     scope: &QueryScope<'a>,
-    expressions: &Expressions<'a>,
+    expressions: &Expressions<'_, 'a>,
     prepared: &join_tree::Prepared<'_>,
     quals: &[&'a Expr<'a>],
     placed: Placed,
@@ -5871,7 +5871,7 @@ fn remove_self_joins<'p, 'a>(
     scope: &QueryScope<'a>,
     prepared: &mut join_tree::Prepared<'p>,
     quals: &mut [&'a Expr<'a>],
-    expressions: &Expressions<'a>,
+    expressions: &Expressions<'_, 'a>,
     removed: Relids,
     arena: &'a Arena,
     planning: &'p Arena,
@@ -5946,7 +5946,7 @@ fn remove_self_joins_one_group<'p, 'a>(
     scope: &QueryScope<'a>,
     prepared: &mut join_tree::Prepared<'p>,
     quals: &mut [&'a Expr<'a>],
-    expressions: &Expressions<'a>,
+    expressions: &Expressions<'_, 'a>,
     group: Relids,
     joins: &mut SelfJoins,
     non_unique: &mut [Relids],
@@ -6398,7 +6398,7 @@ fn reads_parameter(expression: &Expr<'_>) -> bool {
 /// parameter, calls nothing volatile (its join runs it to its end) and is
 /// written after a comma or `CROSS JOIN`. `None` for any other relation.
 fn lateral_rel<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     from: &'a FromClause<'a>,
     scope: &QueryScope<'a>,

@@ -15899,7 +15899,7 @@ fn collect_fkeys<'a>(
 /// The partition clones of a foreign key whose partition is still in the
 /// tree the key references.
 fn live_fkey_clones<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     child_slot: usize,
     identity: Option<crate::storage::ConstraintIdentity>,

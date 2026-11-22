@@ -1939,7 +1939,7 @@ impl<'a> PlannedJoin<'a> {
     /// The statement's plan, `None` when the join search does not plan it.
     pub(crate) fn get(
         &self,
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         statement: &'a Select<'a>,
         scope: &QueryScope<'a>,

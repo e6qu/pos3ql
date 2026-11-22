@@ -186,7 +186,7 @@ impl<'a> ColumnLookup<'a> for GroupRow<'_, '_, '_, 'a> {
 /// unsorted — the caller concatenates the sets and sorts once.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(super) fn groups_for_mask<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -1289,8 +1289,9 @@ pub(super) fn hashed_order(
         .alloc_slice_with(keys.len(), |_| 0usize)
         .map_err(|_| arena_full())?;
     // A composite value's fields are sized through the catalog.
+    let catalog = super::storage_catalog(storage, arena, txid);
     let value_sizing = super::postgres_memory::Sizing {
-        catalog: Some((storage, txid)),
+        catalog: Some(&catalog),
         scratch: arena,
     };
     for (length, key) in entry_lens.iter_mut().zip(keys) {
@@ -1787,7 +1788,7 @@ fn grouping_order_irrelevant<'a>(
 /// model does not decide fails with `0A000` unless its `ORDER BY` names
 /// every output column.
 pub(super) fn hashed_distinct_plan<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     statement: &'a Select<'a>,
@@ -1919,7 +1920,7 @@ pub(super) fn hashed_distinct_plan<'a>(
 /// sorts (or the query is outside the planner model) and the caller
 /// deduplicates by sorting.
 pub(super) fn hashed_distinct_rows<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     statement: &'a Select<'a>,
@@ -2151,7 +2152,7 @@ fn hashed_table_group_order<'a>(
 /// ascending order, and `keys` each group's keys.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn modeled_group_order<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     statement: &'a Select<'a>,
@@ -2232,7 +2233,7 @@ fn modeled_group_order<'a>(
 /// keyed groups use separate counting, key sorting and aggregate passes.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(super) fn grouped_rows<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -2616,7 +2617,7 @@ pub(super) fn sort_bound(statement: &Select<'_>, limit: u64, offset: u64) -> Opt
 /// then page with LIMIT/OFFSET and emit.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(super) fn grouped_select<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,

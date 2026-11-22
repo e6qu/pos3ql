@@ -1150,6 +1150,28 @@ pub(crate) fn parse_declared_type_name<'a>(
     Ok(parsed)
 }
 
+/// [`parse_expression`] keeping the parser's record of the tokens it copied
+/// from `sql`, so an analysis error can point into the statement holding it.
+pub(crate) fn parse_positioned_expression<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<(&'a Expr<'a>, &'a [super::error_position::SourceCopy]), super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser
+        .record_source_copies()
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    let expression = parser
+        .expression(0)
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    if parser.peeked != Tok::Eof {
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after expression"
+        ));
+    }
+    Ok((expression, parser.source_copies()))
+}
+
 #[cfg(test)]
 pub(crate) fn parse_expression<'a>(
     sql: &'a str,

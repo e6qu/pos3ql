@@ -328,7 +328,7 @@ pub(super) fn assign_aggregate_levels<'a>(
 /// statement's own level may appear, whether written there or in a
 /// subquery whose aggregate reads only the statement's columns.
 pub(crate) fn check_data_modification_aggregates<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     target: &'a FromClause<'a>,

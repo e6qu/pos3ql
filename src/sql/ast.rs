@@ -6987,13 +6987,24 @@ impl<'a> Expr<'a> {
     /// Whether the expression tree contains a subquery — disallowed in a column
     /// generation expression (0A000).
     pub fn contains_subquery(&self) -> bool {
+        self.first_subquery().is_some()
+    }
+
+    /// The first subquery of the tree in source order: the one PostgreSQL's
+    /// parse analysis reports.
+    pub fn first_subquery(&self) -> Option<&Expr<'a>> {
+        fn first<'s, 'a: 's>(
+            mut expressions: impl Iterator<Item = &'s Expr<'a>>,
+        ) -> Option<&'s Expr<'a>> {
+            expressions.find_map(|expression| expression.first_subquery())
+        }
         match self {
             Expr::Subquery(_)
             | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
             | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
-            | Expr::ArraySubquery(_) => true,
+            | Expr::ArraySubquery(_) => Some(self),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -7009,7 +7020,7 @@ impl<'a> Expr<'a> {
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
             | Expr::OuterAggregate { .. }
-            | Expr::DefaultMarker => false,
+            | Expr::DefaultMarker => None,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
             | Expr::BoundDefault {
@@ -7019,11 +7030,9 @@ impl<'a> Expr<'a> {
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }
-            | Expr::RecordFieldIndex { base: operand, .. } => operand.contains_subquery(),
+            | Expr::RecordFieldIndex { base: operand, .. } => operand.first_subquery(),
             Expr::Slice { base, lower, upper } => {
-                base.contains_subquery()
-                    || lower.is_some_and(|e| e.contains_subquery())
-                    || upper.is_some_and(|e| e.contains_subquery())
+                first([Some(*base), *lower, *upper].into_iter().flatten())
             }
             Expr::Binary { left, right, .. }
             | Expr::Subscript {
@@ -7034,68 +7043,66 @@ impl<'a> Expr<'a> {
                 operand: left,
                 array: right,
                 ..
-            } => left.contains_subquery() || right.contains_subquery(),
+            }
+            | Expr::Match {
+                operand: left,
+                pattern: right,
+                ..
+            } => first([*left, *right].into_iter()),
             Expr::Call {
                 args,
                 order_by,
                 over,
                 filter,
                 ..
-            } => {
-                args.iter().any(|argument| argument.contains_subquery())
-                    || order_by
-                        .iter()
-                        .any(|order| order.expression.contains_subquery())
-                    || filter.is_some_and(Expr::contains_subquery)
-                    || over.is_some_and(|window| {
-                        window
-                            .partition_by
-                            .iter()
-                            .any(|expression| expression.contains_subquery())
-                            || window
-                                .order_by
-                                .iter()
-                                .any(|order| order.expression.contains_subquery())
-                            || window.frame.is_some_and(|frame| {
-                                [frame.start, frame.end].iter().any(|bound| match bound {
+            } => first(args.iter().copied())
+                .or_else(|| first(order_by.iter().map(|order| order.expression)))
+                .or_else(|| filter.and_then(|filter| filter.first_subquery()))
+                .or_else(|| {
+                    let window = (*over)?;
+                    first(window.partition_by.iter().copied())
+                        .or_else(|| first(window.order_by.iter().map(|order| order.expression)))
+                        .or_else(|| {
+                            let frame = window.frame?;
+                            first([frame.start, frame.end].into_iter().filter_map(|bound| {
+                                match bound {
                                     FrameBound::Preceding(expression)
-                                    | FrameBound::Following(expression) => {
-                                        expression.contains_subquery()
-                                    }
-                                    _ => false,
-                                })
-                            })
-                    })
-            }
+                                    | FrameBound::Following(expression) => Some(expression),
+                                    _ => None,
+                                }
+                            }))
+                        })
+                }),
             Expr::InList { operand, list, .. } => {
-                operand.contains_subquery() || list.iter().any(|e| e.contains_subquery())
+                first(core::iter::once(*operand).chain(list.iter().copied()))
             }
             Expr::Like {
                 operand,
                 pattern,
                 escape,
                 ..
-            } => {
-                operand.contains_subquery()
-                    || pattern.contains_subquery()
-                    || escape.is_some_and(|expression| expression.contains_subquery())
-            }
-            Expr::Match {
-                operand, pattern, ..
-            } => operand.contains_subquery() || pattern.contains_subquery(),
+            } => first(
+                [Some(*operand), Some(*pattern), *escape]
+                    .into_iter()
+                    .flatten(),
+            ),
             Expr::Case {
                 operand,
                 whens,
                 otherwise,
                 ..
-            } => {
-                operand.map(|o| o.contains_subquery()).unwrap_or(false)
-                    || whens
-                        .iter()
-                        .any(|(c, r)| c.contains_subquery() || r.contains_subquery())
-                    || otherwise.map(|o| o.contains_subquery()).unwrap_or(false)
-            }
-            Expr::Array(items) => items.iter().any(|e| e.contains_subquery()),
+            } => first(
+                operand
+                    .iter()
+                    .copied()
+                    .chain(
+                        whens
+                            .iter()
+                            .flat_map(|(condition, result)| [*condition, *result]),
+                    )
+                    .chain(*otherwise),
+            ),
+            Expr::Array(items) => first(items.iter().copied()),
         }
     }
 

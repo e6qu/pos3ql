@@ -15,9 +15,9 @@ fn local_slot_owners_preserve_values_on_failed_admission_and_return_capacity_on_
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let mut values = allocate_plpgsql_local_values(&pool, 3).unwrap();
-        values[0] = Datum::Text(source.alloc_str("selected value").unwrap());
-        values[1] = Datum::Int4(73);
-        assert!(values[2].is_null());
+        values[0] = LocalSlot::formed(Datum::Text(source.alloc_str("selected value").unwrap()));
+        values[1] = LocalSlot::formed(Datum::Int4(73));
+        assert!(values[2].value.is_null());
         let held = pool.lease::<u8>(64).unwrap();
         let error = allocate_plpgsql_local_values(&pool, 1).err().unwrap();
         assert_eq!(error.sqlstate, "54000");
@@ -273,15 +273,15 @@ fn suspended_local_slots_drop_source_borrows_and_preserve_images_after_failed_re
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let mut values = LocalValues::new(&controls, &rows, 3).unwrap();
-        values[0] = Datum::Text(source.alloc_str("before waiting").unwrap());
-        values[1] = Datum::Bytea(source.alloc_slice_copy(&[3, 5, 7]).unwrap());
+        values[0] = LocalSlot::formed(Datum::Text(source.alloc_str("before waiting").unwrap()));
+        values[1] = LocalSlot::formed(Datum::Bytea(source.alloc_slice_copy(&[3, 5, 7]).unwrap()));
         let address = values.slots.as_ptr() as usize;
         let slot = values.slots.slot();
         values.capture().unwrap();
         let suspended = values.suspend();
         assert_eq!(suspended.slots.as_ptr() as usize, address);
         assert_eq!(suspended.slots.slot(), slot);
-        assert!(suspended.iter().all(Datum::is_null));
+        assert!(suspended.iter().all(|slot| slot.value.is_null()));
         source.reset();
         source.alloc_slice_with(4096, |_| 0xffu8).unwrap();
         drop(source);

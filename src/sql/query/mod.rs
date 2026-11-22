@@ -624,7 +624,7 @@ impl<'a> StoredQueryRename<'a> {
 pub(crate) fn catalog_expression_bindings<'a>(
     select: &'a Select<'a>,
     sources: &'a [super::parser::ColumnSource<'a>],
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     table: usize,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
@@ -869,7 +869,7 @@ pub(crate) fn stored_query_table_column_rename<'a>(
     sql: &'a str,
     path: crate::storage::PathContext,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     table: usize,
     column: usize,
@@ -1028,19 +1028,19 @@ mod subquery;
 #[cfg(test)]
 pub(crate) use subquery::subquery_analyses;
 pub(crate) use subquery::{
-    CorrelatedSubqueries, DmlSubqueries, NestedBindings, ProceduralSubqueries, SubqueryBinding,
-    check_sublink_columns, subquery_expression_type,
+    CorrelatedSubqueries, DeferredRuns, DmlSubqueries, NestedBindings, ProceduralSubqueries,
+    SubqueryBinding, check_sublink_columns, subquery_expression_type,
 };
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes,
     prepare_outer_subqueries,
 };
 pub(crate) use subquery::{
-    enter_sublink_of, select_correlated, subquery_node_correlated, type_witness, walk_children,
+    data_change_subquery_hooks, expression_has_correlated_subquery, subquery_hooks_outer,
+    subquery_hooks_with_outer, uncorrelated_subquery_hooks,
 };
 pub(crate) use subquery::{
-    expression_has_correlated_subquery, subquery_hooks_outer, subquery_hooks_with_outer,
-    uncorrelated_subquery_hooks,
+    enter_sublink_of, select_correlated, subquery_node_correlated, type_witness, walk_children,
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
 
@@ -1478,11 +1478,8 @@ fn run_deferred_cte<'a>(
     // than this one, whose reader then reads on from the store.
     let mut stopped = false;
     let mut overtaken = false;
-    // SAFETY: `Storage` outlives the statement; the run keeps no reference
-    // to it and returns its rows as arena bytes.
-    let run_storage: &'a Storage = unsafe { &*core::ptr::from_ref(read.storage) };
     let result = setops::stream_set_body(
-        run_storage,
+        read.storage,
         read.txid,
         deferred.tree,
         arena,
@@ -1616,11 +1613,8 @@ pub(crate) fn read_deferred_cte<'a>(
     if deferred_cte_dry_run(query) {
         let _cte = instrument::enter_block(deferred.block);
         let variables = query.outer.map(super::eval::RoutineVariables);
-        // SAFETY: `Storage` outlives the statement; the run keeps no
-        // reference to it and returns its rows as arena bytes.
-        let run_storage: &'a Storage = unsafe { &*core::ptr::from_ref(query.storage) };
         let (rows, _, _) = setops::materialize_set_body_tied(
-            run_storage,
+            query.storage,
             query.txid,
             deferred.tree,
             arena,
@@ -3968,7 +3962,7 @@ pub(crate) fn statement_returns_rows(statement: &Stmt<'_>) -> bool {
 )]
 pub(crate) fn execute_routine_query<'a>(
     query: &RoutineQuery<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -3986,7 +3980,7 @@ pub(crate) fn execute_routine_query<'a>(
 )]
 pub(crate) fn execute_bound_routine_query<'a>(
     query: &RoutineQuery<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     routine_slot: usize,
     routine: &crate::storage::RoutineDef,
     txid: u32,
@@ -4151,7 +4145,7 @@ pub(crate) fn bind_routine_statement_source<'a>(
 )]
 pub(crate) fn execute_routine_query_under<'a>(
     query: &RoutineQuery<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -5852,6 +5846,21 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn data_change_subquery<'a>(
+        &self,
+        txid: u32,
+        command: u32,
+        expression: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        outer: &dyn ColumnLookup<'a>,
+        sequences: Option<&dyn super::eval::SequenceAccess>,
+    ) -> Result<super::eval::SubqueryResult<'a>, SqlError> {
+        use super::eval::SubqueryExecution;
+        DmlSubqueries::new(self.storage, txid, command)
+            .evaluate(expression, arena, params, outer, sequences)
+    }
+
     fn inline_sql_function<'a>(
         &self,
         call: &'a Expr<'a>,
@@ -6513,7 +6522,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         &self,
         slot: crate::storage::TypeCreation,
         physical_fields: u16,
-        text: &'a str,
+        text: crate::sql::types::CompositeSpelling<'a>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         super::exec::decode_stored_composite_text(
@@ -6524,6 +6533,42 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             self.txid,
             arena,
         )
+    }
+
+    fn stored_composite_fields<'a>(
+        &self,
+        slot: crate::storage::TypeCreation,
+        physical_fields: u16,
+        text: crate::sql::types::CompositeSpelling<'a>,
+        arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+        super::exec::stored_composite_physical_fields(
+            text,
+            slot,
+            physical_fields,
+            self.storage,
+            self.txid,
+            arena,
+        )
+    }
+
+    fn composite_field(
+        &self,
+        slot: crate::storage::TypeCreation,
+        name: &str,
+    ) -> Result<Option<(usize, Option<crate::storage::TypeCreation>)>, SqlError> {
+        Ok(self
+            .storage
+            .require_row_type_definition(slot, self.txid)?
+            .active_fields()
+            .find(|field| field.name.as_str() == name)
+            .map(|field| {
+                let nested = match field.ctype {
+                    ColType::Composite(nested) => nested,
+                    _ => None,
+                };
+                (usize::from(field.attribute_number) - 1, nested)
+            }))
     }
 
     fn composite_array_element<'a>(
@@ -9728,7 +9773,7 @@ pub(super) fn require_select_routine_execute<'a>(
 /// checks them when it starts.
 pub(crate) fn require_source_routine_execute<'s, 'a: 's>(
     statement: &'a Select<'a>,
-    storage: &'s Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'s Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -9866,7 +9911,7 @@ pub(crate) fn analyse_routine_statement<'a>(
 /// Constant folding errors wait for planning, as in PostgreSQL.
 pub(crate) fn analyse_select<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -9929,7 +9974,7 @@ pub(crate) fn analyse_select<'a>(
 /// over its target and `FROM`/`USING` tables.
 pub(crate) fn analyse_dml_condition<'a>(
     statement: &'a Stmt<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -9972,7 +10017,7 @@ pub(crate) fn analyse_dml_condition<'a>(
 /// `new` name the inserted row.
 pub(crate) fn check_rule_insert_returning<'a>(
     statement: &'a Stmt<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     rule: &dyn ColumnLookup<'a>,
 ) -> Result<(), SqlError> {
@@ -10082,7 +10127,7 @@ fn check_rule_query_grouping(select: &Select<'_>) -> Result<(), SqlError> {
 
 pub(crate) fn analyse_rule_action<'a>(
     statement: &'a Stmt<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     transition: &dyn ColumnLookup<'a>,
@@ -10099,7 +10144,7 @@ pub(crate) fn analyse_rule_action<'a>(
                     arena,
                     &mut columns,
                     crate::sql::exec::DescriptionTarget::Sql,
-                    Some(transition),
+                    Some(&scope::OuterColumnTypes(transition)),
                 )?;
                 analyse_select(select, storage, txid, arena, Some(transition))?;
                 check_rule_query_grouping(select)?;
@@ -10152,7 +10197,7 @@ pub(crate) fn analyse_rule_action<'a>(
                     arena,
                     &mut columns,
                     crate::sql::exec::DescriptionTarget::Sql,
-                    Some(transition),
+                    Some(&scope::OuterColumnTypes(transition)),
                 )?;
                 analyse_select(select, storage, txid, arena, Some(transition))
             });
@@ -10183,7 +10228,7 @@ pub(crate) fn analyse_rule_action<'a>(
 /// outer query's columns.
 pub(crate) fn analyse_sublinks<'a>(
     expression: &'a Expr<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     row: &dyn ColumnLookup<'a>,
@@ -10213,7 +10258,7 @@ pub(crate) fn analyse_sublinks<'a>(
 /// [`analyse_select`] for every branch of a set-operation query.
 pub(crate) fn analyse_set_query<'a>(
     query: &'a crate::sql::ast::SetQuery<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
@@ -10222,7 +10267,7 @@ pub(crate) fn analyse_set_query<'a>(
 
 fn analyse_set_tree<'a>(
     tree: &'a crate::sql::ast::SetTree<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -11724,7 +11769,7 @@ fn describe_contextual_items<'a, 'o>(
     items: &[SelectItem<'a>],
     scope: Option<&QueryScope<'a>>,
     outer: &dyn ColumnLookup<'o>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     out: &mut [ColDesc<'a>],
@@ -14675,7 +14720,7 @@ pub(crate) fn lock_clauses_row(
 
 fn expand_select_record_calls<'a>(
     statement: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -14714,7 +14759,7 @@ fn expand_select_record_calls<'a>(
 }
 
 pub fn select_query<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     arena: &'a Arena,
@@ -14732,7 +14777,7 @@ pub fn select_query<'a>(
 /// stops when an ordered path has the rows its limit needs.
 #[allow(clippy::too_many_arguments)]
 fn enter_scan_context<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
@@ -14854,7 +14899,7 @@ fn enter_scan_context<'a>(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_query_resumable<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     arena: &'a Arena,
@@ -15655,7 +15700,7 @@ pub(crate) fn first_aggregate<'a>(
 /// (`1/0`) wait for the planning of each execution.
 pub(crate) fn analyse_fromless_select<'a>(
     statement: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
@@ -15749,7 +15794,7 @@ fn check_fromless_keys<'a>(
 /// Both wire results and INSERT/function row sources use this boundary.
 fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
     statement: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -15781,7 +15826,7 @@ fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
 /// there is no outer row to reference — so they are prepared once and injected
 /// by node identity, exactly as the table path does.
 pub fn constant_select<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     arena: &'a Arena,
@@ -15796,7 +15841,7 @@ pub fn constant_select<'a>(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn constant_select_resumable<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     arena: &'a Arena,
@@ -16499,7 +16544,7 @@ pub(crate) fn consume_query_rows(
 /// copies each emitted row before returning.
 #[allow(clippy::too_many_arguments)]
 pub fn select_into_rows<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     arena: &'a Arena,
@@ -16532,7 +16577,7 @@ pub(super) fn collect_table_sample_expressions<'a>(
 /// SST scan recycles fetched row bytes instead of growing the statement arena.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_into_rows_recycling<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     arena: &'a Arena,
@@ -16603,7 +16648,7 @@ pub(super) fn call_may_be_aggregate(expression: &Expr<'_>, storage: &Storage, tx
 
 #[allow(clippy::too_many_arguments)]
 fn select_into_rows_mode<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     arena: &'a Arena,
@@ -16672,6 +16717,8 @@ fn select_into_rows_mode<'a>(
             None
         } else {
             let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            // The description reads only the enclosing row's types.
+            let outer_types = outer.map(scope::OuterColumnTypes);
             setops::describe_set_body(
                 storage,
                 tree,
@@ -16680,7 +16727,9 @@ fn select_into_rows_mode<'a>(
                 arena,
                 None,
                 crate::sql::exec::DescriptionTarget::Sql,
-                outer,
+                outer_types
+                    .as_ref()
+                    .map(|types| types as &dyn ColumnLookup<'_>),
             )?;
             Some(columns)
         };
@@ -16905,7 +16954,12 @@ fn select_into_rows_mode<'a>(
                 match item {
                     SelectItem::Expr { expression, .. } => {
                         vals[n] = eval_full(expression, arena, params, &row, &agg_hooks)?;
-                        forms[n] = crate::sql::toast::passed_form(expression, &row, &vals[n])?;
+                        forms[n] = crate::sql::toast::passed_form(
+                            expression,
+                            &row,
+                            agg_hooks.catalog,
+                            &vals[n],
+                        )?;
                         n += 1;
                     }
                     SelectItem::RecordStar(base) => {
@@ -17124,7 +17178,12 @@ fn select_into_rows_mode<'a>(
                 match item {
                     SelectItem::Expr { expression, .. } => {
                         vals[n] = eval_full(expression, arena, params, &cols, &khooks)?;
-                        forms[n] = crate::sql::toast::passed_form(expression, &cols, &vals[n])?;
+                        forms[n] = crate::sql::toast::passed_form(
+                            expression,
+                            &cols,
+                            khooks.catalog,
+                            &vals[n],
+                        )?;
                         n += 1;
                     }
                     SelectItem::RecordStar(base) => {
@@ -17727,7 +17786,8 @@ fn project_row_skipping<'a>(
                     ));
                 }
                 out[n] = eval_full(expression, arena, params, &chained, hooks)?;
-                forms[n] = crate::sql::toast::passed_form(expression, &chained, &out[n])?;
+                forms[n] =
+                    crate::sql::toast::passed_form(expression, &chained, hooks.catalog, &out[n])?;
                 n += 1;
             }
         }
@@ -19983,7 +20043,7 @@ fn expr_contains_node<'a>(e: &'a Expr<'a>, target: *const Expr<'a>) -> bool {
 /// sequential scan of one relation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn semi_join_first_match_passes<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     select: &'a Select<'a>,
     txid: u32,
     arena: &'a Arena,
@@ -20013,7 +20073,7 @@ pub(crate) fn semi_join_first_match_passes<'a>(
         &[where_clause],
         storage,
         txid,
-        None,
+        DeferredRuns::Query(storage),
         arena,
         params,
         Some(first),
@@ -20069,7 +20129,7 @@ pub(crate) fn semi_join_first_match_passes<'a>(
 /// `matched_row` receives that row's FROM item values.
 #[allow(clippy::too_many_arguments)]
 pub fn first_from_match<'a, 'r>(
-    storage: &'a Storage,
+    storage: &Storage,
     from: &'a FromClause<'a>,
     txid: u32,
     where_clause: Option<&'a Expr<'a>>,
@@ -20146,7 +20206,7 @@ fn detached_join_values<'a, 'r>(
 /// `DELETE`: none of the statement's own level may appear in its `VALUES`,
 /// `WHERE`, `RETURNING` or `SET` clauses, checked in PostgreSQL's order.
 pub(crate) fn check_data_modification_aggregates<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     statement: &Stmt<'a>,
@@ -20265,7 +20325,7 @@ pub(crate) struct ReturningJoin<'a> {
 
 impl<'a> ReturningJoin<'a> {
     pub(crate) fn resolve(
-        storage: &'a Storage,
+        storage: &Storage,
         target: QualName<'a>,
         alias: Option<&'a str>,
         from: &'a FromClause<'a>,

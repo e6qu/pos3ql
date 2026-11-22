@@ -140,6 +140,22 @@ impl RowTypeDefinition<'_> {
         (0..self.physical_field_count()).map(|position| self.field(position))
     }
 
+    /// The physical layout a relation's dropped attribute at `position`
+    /// keeps (`attlen`, `attbyval`, `attalign`); its type is gone. `None`
+    /// for any other field, whose type gives its layout.
+    pub(crate) fn dropped_relation_layout(
+        &self,
+        position: usize,
+    ) -> Option<crate::sql::type_layouts::PhysicalLayout> {
+        match self {
+            Self::Table(definition) => match definition.attributes.slots.as_ref()[position] {
+                AttributeSlot::Dropped { layout, .. } => Some(layout),
+                AttributeSlot::Empty | AttributeSlot::Live(_) => None,
+            },
+            Self::Named(_) | Self::View(_) => None,
+        }
+    }
+
     pub(crate) fn active_fields(&self) -> impl Iterator<Item = CompositeFieldDef> + '_ {
         self.fields().filter(|field| !field.dropped)
     }

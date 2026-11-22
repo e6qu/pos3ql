@@ -77,7 +77,7 @@ pub(super) struct ProcedureBody<'r, 'a> {
     pub(super) identity: ProcedureIdentity,
     pub(super) code: &'r CompiledProgram<'a>,
     pub(super) invocation: TriggerInvocation<'a>,
-    pub(super) seeded: &'r [Datum<'a>],
+    pub(super) seeded: &'r [LocalSlot<'a>],
 }
 
 /// Runs a body whose frame `execution` was just created. On a wait it moves
@@ -228,7 +228,7 @@ impl SuspendedProcedure {
             &'a [super::super::plpgsql_inputs::Site<'a>],
             super::super::guc::PlpgsqlSettings,
         ) -> Result<TriggerInvocation<'a>, SqlError>,
-        seeded: &dyn Fn(&'a [Datum<'a>]) -> Result<&'a [Datum<'a>], SqlError>,
+        seeded: &dyn Fn(&'a [Datum<'a>]) -> Result<&'a [LocalSlot<'a>], SqlError>,
         retention: &mut Option<SuspendedProcedure>,
         finish: &mut dyn FnMut(
             &execution_frame::ExecutionFrame<'_, 'a>,

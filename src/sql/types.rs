@@ -5206,7 +5206,7 @@ pub enum Datum<'a> {
         /// their position and added attributes cannot be mistaken for old
         /// trailing values.
         physical_fields: u16,
-        text: &'a str,
+        text: CompositeSpelling<'a>,
     },
     /// A user-defined enum member. Durable identity is independent of its
     /// cached label and sort position; catalog-aware materialization refreshes
@@ -5217,6 +5217,154 @@ pub enum Datum<'a> {
         sort: f64,
         label: &'a str,
     },
+}
+
+/// The durable spelling of a named composite: PostgreSQL's text input form
+/// of its fields, then, after a NUL no field text can hold, the TOAST form
+/// of each field the datum holds other than as `heap_form_tuple` forms it.
+/// Each entry is `<path>:<form>;`, the path being physical attribute
+/// indexes from the outermost composite joined by `.`, and the form `c`
+/// (compressed in line), `x` or `X` (saved out of line, uncompressed or
+/// compressed) followed by the [`StoredForm`] size, or `u` (unmodelled).
+/// Forms describe the datum's layout, not its value: equality compares the
+/// text only.
+///
+/// [`StoredForm`]: crate::storage::StoredForm
+#[derive(Debug, Clone, Copy)]
+pub struct CompositeSpelling<'a>(&'a str);
+
+impl PartialEq for CompositeSpelling<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.text() == other.text()
+    }
+}
+
+impl<'a> CompositeSpelling<'a> {
+    /// A spelling whose fields all are as tuple forming gives them.
+    pub(crate) fn plain(text: &'a str) -> Self {
+        debug_assert!(!text.contains('\0'), "composite text holds no NUL");
+        Self(text)
+    }
+
+    /// The spelling `raw` holds, as [`Self::raw`] gave it; `None` when its
+    /// form entries are malformed.
+    pub(crate) fn parse(raw: &'a str) -> Option<Self> {
+        let spelling = Self(raw);
+        let trailer_written = raw
+            .split_once('\0')
+            .is_none_or(|(_, forms)| !forms.is_empty());
+        (trailer_written && spelling.entries().all(|entry| entry.is_some())).then_some(spelling)
+    }
+
+    /// The spelling copied into `arena`.
+    pub(crate) fn alloc_in<'b>(
+        self,
+        arena: &'b crate::mem::arena::Arena,
+    ) -> Result<CompositeSpelling<'b>, crate::mem::arena::ArenaFull> {
+        arena.alloc_str(self.0).map(CompositeSpelling)
+    }
+
+    /// The text input form.
+    pub(crate) fn text(self) -> &'a str {
+        self.0.split_once('\0').map_or(self.0, |(text, _)| text)
+    }
+
+    /// The text and form entries, as durable encodings keep them.
+    pub(crate) fn raw(self) -> &'a str {
+        self.0
+    }
+
+    /// Whether some field is held other than in line.
+    pub(crate) fn has_forms(self) -> bool {
+        self.0.contains('\0')
+    }
+
+    /// Each field's attribute path and form.
+    pub(crate) fn forms(
+        self,
+    ) -> impl Iterator<Item = (CompositeFieldPath<'a>, crate::storage::StoredForm)> {
+        self.entries()
+            .map(|entry| entry.expect("a spelling's form entries were checked when formed"))
+    }
+
+    /// Each form entry, `None` when malformed.
+    fn entries(
+        self,
+    ) -> impl Iterator<Item = Option<(CompositeFieldPath<'a>, crate::storage::StoredForm)>> {
+        use crate::storage::StoredForm;
+        self.0
+            .split_once('\0')
+            .map_or("", |(_, forms)| forms)
+            .split_terminator(';')
+            .map(|entry| {
+                let (path, form) = entry.split_once(':')?;
+                let path = CompositeFieldPath::parse(path)?;
+                let (kind, size) = form.split_at_checked(1)?;
+                let digits = size;
+                let size = || -> Option<u32> {
+                    (!digits.starts_with('+') && !digits.starts_with('0'))
+                        .then(|| digits.parse().ok())
+                        .flatten()
+                };
+                let form = match kind {
+                    "c" => StoredForm::Compressed(size()?),
+                    "x" => StoredForm::External {
+                        saved: size()?,
+                        compressed: false,
+                    },
+                    "X" => StoredForm::External {
+                        saved: size()?,
+                        compressed: true,
+                    },
+                    "u" if digits.is_empty() => StoredForm::Unmodelled,
+                    _ => return None,
+                };
+                Some((path, form))
+            })
+    }
+}
+
+/// The physical attribute indexes from an outer composite to a field
+/// nested in it, as a [`CompositeSpelling`] entry spells them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompositeFieldPath<'a>(&'a str);
+
+impl<'a> CompositeFieldPath<'a> {
+    fn parse(path: &'a str) -> Option<Self> {
+        let valid = path.split('.').all(|index| {
+            !index.is_empty()
+                && (index == "0" || !index.starts_with('0'))
+                && index.bytes().all(|byte| byte.is_ascii_digit())
+                && index
+                    .parse::<usize>()
+                    .is_ok_and(|index| index < crate::storage::MAX_COMPOSITE_FIELDS)
+        });
+        valid.then_some(Self(path))
+    }
+
+    /// Whether the path is `indexes`, outermost first.
+    pub(crate) fn is(self, indexes: &[usize]) -> bool {
+        let mut parts = self.0.split('.');
+        indexes
+            .iter()
+            .all(|index| parts.next().and_then(|part| part.parse::<usize>().ok()) == Some(*index))
+            && parts.next().is_none()
+    }
+
+    /// The outermost index and the path below it.
+    pub(crate) fn split_first(self) -> (usize, Option<Self>) {
+        let (first, rest) = self
+            .0
+            .split_once('.')
+            .map_or((self.0, None), |(first, rest)| (first, Some(Self(rest))));
+        (first.parse().expect("parsed path index"), rest)
+    }
+}
+
+impl core::fmt::Display for CompositeFieldPath<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.0)
+    }
 }
 
 /// One field of a [`Datum::Record`].
@@ -5653,7 +5801,7 @@ impl fmt::Display for Datum<'_> {
                 }
                 f.write_char(')')
             }
-            Datum::CompositeText { text, .. } => f.write_str(text),
+            Datum::CompositeText { text, .. } => f.write_str(text.text()),
         }
     }
 }

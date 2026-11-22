@@ -763,8 +763,8 @@ fn compare_stored(
         else {
             return Ok(None);
         };
-        let text = scratch
-            .alloc_str(text)
+        let text = text
+            .alloc_in(scratch)
             .map_err(|_| comparison_scratch_full())?;
         crate::sql::exec::decode_stored_composite_text(
             text,

@@ -47,7 +47,7 @@ pub fn expand_ctes<'a>(
 /// resolves the resulting query.
 pub fn expand_ctes_under<'a>(
     sel: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     path: crate::storage::PathContext,
     arena: &'a Arena,
@@ -1433,7 +1433,7 @@ pub(crate) fn rule_relation_ref<'a>(
 pub(crate) fn check_rule_condition_aggregates<'a>(
     relation: crate::sql::ast::QualName<'a>,
     condition: &'a Expr<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
@@ -3159,7 +3159,7 @@ fn pull_up_derived<'a>(
 pub(crate) fn check_rule_insert_values<'a>(
     statement: &'a Stmt<'a>,
     source: &'a TableRef<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
@@ -5322,7 +5322,7 @@ pub(crate) fn expand_set_tree<'a>(
 pub(super) fn expand_set_tree_exec<'a>(
     with: &'a [Cte<'a>],
     tree: &'a SetTree<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],

@@ -2969,6 +2969,65 @@ fn publication_row_matches(
     Ok(false)
 }
 
+/// Replaces each stored named composite among `values` by its fields as
+/// of the current catalog, the form `record_out` and `record_send` read: the
+/// durable spelling lists dropped attributes and enum member identities.
+fn replication_output_values<'a>(
+    storage: &crate::storage::Storage,
+    values: &mut [Datum<'a>],
+    binary: bool,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let catalog = query::storage_catalog(storage, arena, 0);
+    for value in values.iter_mut() {
+        *value = if binary {
+            binary_replication_value(*value, &catalog, arena)?
+        } else {
+            eval::materialize_composite_text_output(*value, &catalog, arena)?
+        };
+    }
+    Ok(())
+}
+
+/// [`replication_output_values`] of one binary value: a composite with its
+/// nested composites materialized.
+fn binary_replication_value<'a>(
+    value: Datum<'a>,
+    catalog: &dyn eval::CatalogAccess,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    Ok(match value {
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => binary_replication_value(
+            catalog.materialize_composite(slot, physical_fields, text, arena)?,
+            catalog,
+            arena,
+        )?,
+        Datum::Composite { slot, fields } => {
+            let output = arena
+                .alloc_slice_copy(fields)
+                .map_err(|_| eval::arena_full())?;
+            for field in output.iter_mut() {
+                field.value = binary_replication_value(field.value, catalog, arena)?;
+            }
+            Datum::Composite {
+                slot,
+                fields: output,
+            }
+        }
+        Datum::Array { element, .. } if matches!(element.to_coltype(), ColType::Composite(_)) => {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "binary logical replication of an array of a named composite type is not supported"
+            ));
+        }
+        value => value,
+    })
+}
+
 fn project_replication_values<'a>(
     values: &[Datum<'a>],
     column_mask: ColumnSet,
@@ -6444,18 +6503,33 @@ impl Engine {
                                         responder,
                                         end_lsn,
                                     )?;
+                                    let output_mark = filter_arena.mark();
+                                    let mut output_values = values;
+                                    replication_output_values(
+                                        storage,
+                                        &mut output_values[..column_count],
+                                        binary,
+                                        filter_arena,
+                                    )?;
+                                    let mut output_old_values = old_values;
+                                    replication_output_values(
+                                        storage,
+                                        &mut output_old_values[..column_count],
+                                        binary,
+                                        filter_arena,
+                                    )?;
                                     responder
                                         .copy_data(&|message| {
                                             let (old_projected, old_count) =
                                                 project_replication_values(
-                                                    &old_values[..column_count],
+                                                    &output_old_values[..column_count],
                                                     // Tuple width follows Relation; its key flags
                                                     // select identity columns on the subscriber.
                                                     column_mask,
                                                 );
                                             let (projected, projected_count) =
                                                 project_replication_values(
-                                                    &values[..column_count],
+                                                    &output_values[..column_count],
                                                     column_mask,
                                                 );
                                             pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
@@ -6486,6 +6560,8 @@ impl Engine {
                                             })
                                         })
                                         .map_err(|_| overflow())?;
+                                    // SAFETY: the emitted message holds no reference into the output values.
+                                    unsafe { filter_arena.rewind_to(output_mark) };
                                 }
                             } else {
                                 if publication_row_matches(
@@ -6513,11 +6589,19 @@ impl Engine {
                                         responder,
                                         end_lsn,
                                     )?;
+                                    let output_mark = filter_arena.mark();
+                                    let mut output_values = values;
+                                    replication_output_values(
+                                        storage,
+                                        &mut output_values[..column_count],
+                                        binary,
+                                        filter_arena,
+                                    )?;
                                     responder
                                         .copy_data(&|message| {
                                             let (projected, projected_count) =
                                                 project_replication_values(
-                                                    &values[..column_count],
+                                                    &output_values[..column_count],
                                                     column_mask,
                                                 );
                                             pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
@@ -6530,6 +6614,8 @@ impl Engine {
                                             })
                                         })
                                         .map_err(|_| overflow())?;
+                                    // SAFETY: the emitted message holds no reference into the output values.
+                                    unsafe { filter_arena.rewind_to(output_mark) };
                                 }
                             }
                         }
@@ -6629,11 +6715,19 @@ impl Engine {
                                     responder,
                                     end_lsn,
                                 )?;
+                                let output_mark = filter_arena.mark();
+                                let mut output_values = values;
+                                replication_output_values(
+                                    storage,
+                                    &mut output_values[..column_count],
+                                    binary,
+                                    filter_arena,
+                                )?;
                                 responder
                                     .copy_data(&|message| {
                                         let (projected, projected_count) =
                                             project_replication_values(
-                                                &values[..column_count],
+                                                &output_values[..column_count],
                                                 // K still carries the Relation projection; the
                                                 // relation flags identify its key fields.
                                                 column_mask,
@@ -6649,6 +6743,8 @@ impl Engine {
                                         })
                                     })
                                     .map_err(|_| overflow())?;
+                                // SAFETY: the emitted message holds no reference into the output values.
+                                unsafe { filter_arena.rewind_to(output_mark) };
                             }
                         }
                     }
@@ -21973,13 +22069,16 @@ impl Engine {
                 )));
             }
             // PostgreSQL's parse analysis of a CALL argument rejects subqueries.
-            if arguments
+            if let Some(subquery) = arguments
                 .iter()
-                .any(|argument| argument.contains_subquery())
+                .find_map(|argument| argument.first_subquery())
             {
-                return Ok(Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot use subquery in CALL argument"
+                return Ok(Err(error_position::at_node(
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot use subquery in CALL argument"
+                    ),
+                    subquery,
                 )));
             }
             let (slot, type_oids) = match self.select_call_procedure(
@@ -22778,13 +22877,13 @@ impl Engine {
         for (index, argument) in arguments.iter().enumerate() {
             // Analysis rejects a subquery and coerces each argument to its
             // parameter's type at the argument.
-            if argument.contains_subquery() {
-                return Err(error_position::at_expression(
+            if let Some(subquery) = argument.first_subquery() {
+                return Err(error_position::at_node(
                     sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "cannot use subquery in EXECUTE parameter"
                     ),
-                    argument,
+                    subquery,
                 ));
             }
             let source = exec::infer_type_catalog(argument, None, &self.storage, txid, arena)?.0;

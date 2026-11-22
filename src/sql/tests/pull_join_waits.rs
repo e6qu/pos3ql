@@ -1,8 +1,10 @@
 //! A join plan's pull nodes resume after storage waits at every node kind:
 //! a wait while a nested loop reads its outer or its inner rows (inner,
-//! left, semi and anti joins), while a `Materialize` fills its store and
-//! while a scan reads a row returns to the reader with every node's
-//! position kept, and the same call resumes it. Each joined row is
+//! left, semi and anti joins), while a `Materialize` fills its store, while
+//! a hash join builds its table or probes it (inner, left, full, right,
+//! anti, right semi and right anti joins) and while a scan reads a row
+//! returns to the reader with every node's position kept, and the same
+//! call resumes it. Each joined row is
 //! returned once, as PostgreSQL 18.6 returns it, whether the tables' rows
 //! are resident or saved in object storage without a block cache.
 //!
@@ -31,13 +33,57 @@ struct Kinds {
     semi: bool,
     anti: bool,
     material: bool,
+    /// Hash joins: any, one returning unmatched outer rows, one returning
+    /// unmatched inner rows, and a right semi join.
+    hash: bool,
+    hash_fill_outer: bool,
+    hash_fill_inner: bool,
+    right_semi: bool,
+}
+
+impl Kinds {
+    fn union(self, other: Self) -> Self {
+        Self {
+            inner: self.inner || other.inner,
+            left: self.left || other.left,
+            semi: self.semi || other.semi,
+            anti: self.anti || other.anti,
+            material: self.material || other.material,
+            hash: self.hash || other.hash,
+            hash_fill_outer: self.hash_fill_outer || other.hash_fill_outer,
+            hash_fill_inner: self.hash_fill_inner || other.hash_fill_inner,
+            right_semi: self.right_semi || other.right_semi,
+        }
+    }
+
+    fn all(self) -> bool {
+        self.inner
+            && self.left
+            && self.semi
+            && self.anti
+            && self.material
+            && self.hash
+            && self.hash_fill_outer
+            && self.hash_fill_inner
+            && self.right_semi
+    }
 }
 
 /// The joins the test reads, each with the rows PostgreSQL 18.6 returns
 /// (in its order) for the fixture below.
-fn queries() -> [(&'static str, Vec<String>); 4] {
+fn queries() -> Vec<(&'static str, Vec<String>)> {
     let matching = |id: i32| id % 5 == 0 && id <= 60;
-    [
+    // The inner rows no outer row matches at `k = id + 50`, in the order
+    // PostgreSQL's hash table returns them.
+    let unmatched = [
+        "w20", "w25", "w10", "w15", "w40", "w5", "w30", "w50", "w45", "w35",
+    ];
+    let shifted = |id: i32| match id {
+        5 => format!("{id}|w55"),
+        10 => format!("{id}|w60"),
+        _ => format!("{id}|NULL"),
+    };
+    vec![
         (
             "SELECT o.id, i.w FROM outer_rows o JOIN inner_rows i \
              ON i.k <= o.id AND i.k >= o.id",
@@ -75,12 +121,63 @@ fn queries() -> [(&'static str, Vec<String>); 4] {
                 .map(|id| id.to_string())
                 .collect(),
         ),
+        (
+            "SELECT o.id, i.w FROM outer_rows o JOIN inner_rows i ON i.k = o.id",
+            (1..=OUTER_ROWS)
+                .filter(|&id| matching(id))
+                .map(|id| format!("{id}|w{id}"))
+                .collect(),
+        ),
+        (
+            "SELECT o.id, i.w FROM outer_rows o LEFT JOIN inner_rows i ON i.k = o.id",
+            (1..=OUTER_ROWS)
+                .map(|id| {
+                    if matching(id) {
+                        format!("{id}|w{id}")
+                    } else {
+                        format!("{id}|NULL")
+                    }
+                })
+                .collect(),
+        ),
+        (
+            "SELECT o.id, i.w FROM outer_rows o FULL JOIN inner_rows i ON i.k = o.id + 50",
+            (1..=OUTER_ROWS)
+                .map(shifted)
+                .chain(unmatched.iter().map(|w| format!("NULL|{w}")))
+                .collect(),
+        ),
+        (
+            "SELECT o.id, i.w FROM outer_rows o RIGHT JOIN inner_rows i ON i.k = o.id + 50",
+            ["5|w55".to_owned(), "10|w60".to_owned()]
+                .into_iter()
+                .chain(unmatched.iter().map(|w| format!("NULL|{w}")))
+                .collect(),
+        ),
+        (
+            "SELECT o.id FROM outer_rows o WHERE NOT EXISTS \
+             (SELECT FROM inner_rows i WHERE i.k = o.id)",
+            (1..=OUTER_ROWS)
+                .filter(|&id| !matching(id))
+                .map(|id| id.to_string())
+                .collect(),
+        ),
+        (
+            "SELECT i.w FROM inner_rows i WHERE NOT EXISTS \
+             (SELECT FROM outer_rows o WHERE o.id + 50 = i.k)",
+            unmatched.iter().map(|w| (*w).to_owned()).collect(),
+        ),
+        (
+            "SELECT i.w FROM inner_rows i WHERE EXISTS \
+             (SELECT FROM outer_rows o WHERE o.id = i.k)",
+            (1..=12).map(|g| format!("w{}", g * 5)).collect(),
+        ),
     ]
 }
 
-/// The rows `sql`'s pull nodes return, the node kinds its plan holds, and
-/// the waits after its first row.
-fn run(engine: &mut Engine, config: &Config, sql: &str) -> (Vec<String>, Kinds, usize) {
+/// The rows `sql`'s pull nodes return, the node kinds its plan holds, the
+/// waits after its first row, and all its waits.
+fn run(engine: &mut Engine, config: &Config, sql: &str) -> (Vec<String>, Kinds, usize, usize) {
     let mut budget = Budget::new(64 << 20);
     let arena = Arena::new(&mut budget, "pull join rows", 16 << 20).unwrap();
     let planning = Arena::new(&mut budget, "pull join planning", 16 << 20).unwrap();
@@ -112,7 +209,7 @@ fn run(engine: &mut Engine, config: &Config, sql: &str) -> (Vec<String>, Kinds, 
         )
         .unwrap()
         .expect("the join search plans the join");
-        assert!(pulls(&model), "{sql}: every node pulls");
+        assert!(pulls(&model, &scope), "{sql}: every node pulls");
         let mut kinds = Kinds::default();
         for path in model.plan.paths {
             match path.kind {
@@ -124,6 +221,12 @@ fn run(engine: &mut Engine, config: &Config, sql: &str) -> (Vec<String>, Kinds, 
                     JoinType::Anti => kinds.anti = true,
                     _ => {}
                 },
+                PathKind::HashJoin { jointype, .. } => {
+                    kinds.hash = true;
+                    kinds.hash_fill_outer |= jointype.fills_outer();
+                    kinds.hash_fill_inner |= jointype.fills_inner();
+                    kinds.right_semi |= jointype == JoinType::RightSemi;
+                }
                 _ => {}
             }
         }
@@ -132,6 +235,7 @@ fn run(engine: &mut Engine, config: &Config, sql: &str) -> (Vec<String>, Kinds, 
     };
     let mut rows = Vec::new();
     let mut waits = 0;
+    let mut all_waits = 0;
     let mut progress = 0;
     let mut restarted = false;
     let mut deadline = crate::test_wait::deadline();
@@ -194,6 +298,7 @@ fn run(engine: &mut Engine, config: &Config, sql: &str) -> (Vec<String>, Kinds, 
                     "{sql}: {error:?}"
                 );
                 waits += usize::from(!rows.is_empty());
+                all_waits += 1;
                 assert!(Instant::now() < deadline, "{sql}: the join did not advance");
                 std::thread::yield_now();
             }
@@ -203,7 +308,7 @@ fn run(engine: &mut Engine, config: &Config, sql: &str) -> (Vec<String>, Kinds, 
     drop(pull);
     checkpointer.forget_statement_reads(owner);
     checkpointer.cancel_read_owner(owner);
-    (rows, kinds, waits)
+    (rows, kinds, waits, all_waits)
 }
 
 #[test]
@@ -244,21 +349,12 @@ fn pull_join_nodes_resume_waits() {
     let queries = queries();
     let mut covered = Kinds::default();
     for (sql, expected) in &queries {
-        let (rows, kinds, waits) = run(&mut engine, &config, sql);
+        let (rows, kinds, waits, _) = run(&mut engine, &config, sql);
         assert_eq!(waits, 0, "{sql}: resident rows never wait");
         assert_eq!(&rows, expected, "{sql}");
-        covered = Kinds {
-            inner: covered.inner || kinds.inner,
-            left: covered.left || kinds.left,
-            semi: covered.semi || kinds.semi,
-            anti: covered.anti || kinds.anti,
-            material: covered.material || kinds.material,
-        };
+        covered = covered.union(kinds);
     }
-    assert!(
-        covered.inner && covered.left && covered.semi && covered.anti && covered.material,
-        "every pull node kind is read: {covered:?}"
-    );
+    assert!(covered.all(), "every pull node kind is read: {covered:?}");
     assert!(engine.checkpoint().unwrap());
     drop((session, engine));
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -282,11 +378,14 @@ fn pull_join_nodes_resume_waits() {
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         replace_uncached_blocks(&mut engine, &network);
-        let (rows, _, waits) = run(&mut engine, &config, sql);
+        let (rows, _, waits, all_waits) = run(&mut engine, &config, sql);
         assert_eq!(&rows, expected, "{sql}");
-        // The outer scan reads its second block after its first rows.
+        assert!(all_waits > 0, "{sql}: the join reads saved blocks");
+        // The outer scan reads its second block after its first rows,
+        // except where a right anti join returns rows only after its outer
+        // rows end.
         assert!(
-            waits > 0,
+            waits > 0 || sql.starts_with("SELECT i.w FROM inner_rows i WHERE NOT EXISTS"),
             "{sql}: the join must wait after returning a prefix"
         );
         assert!(!engine.block_reads_pending());

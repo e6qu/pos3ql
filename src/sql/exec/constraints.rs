@@ -1485,10 +1485,7 @@ pub(crate) fn index_key_values<'a>(
         if let Datum::Composite { slot, .. } = keys[position] {
             keys[position] = Datum::CompositeText {
                 slot,
-                physical_fields: (storage
-                    .require_row_type_definition(slot, txid)?
-                    .physical_field_count() as u16)
-                    | rowenc::COMPOSITE_MEMBER_IDENTITIES,
+                physical_fields: super::stored_physical_fields(slot, storage, txid)?,
                 text: super::composite_storage_text(keys[position], slot, storage, txid, arena)?,
             };
         }
@@ -2447,8 +2444,9 @@ fn btree_tuple_size(
     txid: u32,
     arena: &Arena,
 ) -> Result<Option<usize>, SqlError> {
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let sizing = crate::sql::query::postgres_memory::Sizing {
-        catalog: Some((storage, txid)),
+        catalog: Some(&catalog),
         scratch: arena,
     };
     let mut data = 0usize;

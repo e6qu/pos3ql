@@ -1000,6 +1000,10 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for EnclosingRow<'_, 'a> {
         self.0.stored_form(qualifier, name)
     }
 
+    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.0.holds_formed_datum(qualifier, name)
+    }
+
     fn resolve_column_type_unsuggested(
         &self,
         qualifier: Option<&str>,
@@ -1112,10 +1116,12 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for RoutineVariables<'_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
-        // This row does not keep its values' stored forms.
-        Ok(crate::sql::toast::unknown_form(
-            &self.lookup(qualifier, name)?,
-        ))
+        self.lookup(qualifier, name)?;
+        self.0.stored_form(qualifier, name)
+    }
+
+    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.names(qualifier, name) && self.0.holds_formed_datum(qualifier, name)
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'b>, SqlError> {
@@ -1207,6 +1213,13 @@ pub trait ColumnLookup<'a> {
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, SqlError>;
 
+    /// Whether the column holds a datum an expression formed, with the
+    /// four-byte varlena header it gave it, rather than one read from a
+    /// tuple: a PL/pgSQL variable a simple expression assigned.
+    fn holds_formed_datum(&self, _qualifier: Option<&str>, _name: &str) -> bool {
+        false
+    }
+
     /// [`Self::lookup`] for a caller that may still find the column in an
     /// enclosing scope: a missing column's spelling suggestion is left to the
     /// caller that reports the error.
@@ -1262,7 +1275,7 @@ pub trait ColumnLookup<'a> {
     /// it. The scope also carries the statement's bindings for the
     /// correlated subqueries nested in those queries, so each is analysed
     /// once per statement however many rows run its enclosing query.
-    fn statement_subqueries(&self) -> StatementScope<'a> {
+    fn statement_subqueries(&self) -> StatementScope<'_, 'a> {
         StatementScope::default()
     }
 
@@ -2203,7 +2216,7 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).suggest_columns(suggestion);
     }
 
-    fn statement_subqueries(&self) -> StatementScope<'a> {
+    fn statement_subqueries(&self) -> StatementScope<'_, 'a> {
         (**self).statement_subqueries()
     }
 
@@ -2737,6 +2750,28 @@ pub enum RoutineCallAccess {
 }
 
 pub trait CatalogAccess {
+    /// Runs a data change's subquery as of its `command`, so it does not see
+    /// the rows the statement wrote before (see [`DeferredRunner::AsOf`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a subquery run's evaluation context"
+    )]
+    fn data_change_subquery<'a>(
+        &self,
+        _txid: u32,
+        _command: u32,
+        _expression: &Expr<'a>,
+        _arena: &'a Arena,
+        _params: &[Datum<'a>],
+        _outer: &dyn ColumnLookup<'a>,
+        _sequences: Option<&dyn SequenceAccess>,
+    ) -> Result<SubqueryResult<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a data change's subquery was evaluated without its storage"
+        ))
+    }
+
     /// The row type of the stored table or view `schema.name`.
     fn relation_row_type(
         &self,
@@ -3010,9 +3045,36 @@ pub trait CatalogAccess {
         &self,
         _slot: crate::storage::TypeCreation,
         _physical_fields: u16,
-        _text: &'a str,
+        _text: crate::sql::types::CompositeSpelling<'a>,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "named composite catalog access is unavailable"
+        ))
+    }
+    /// The physical attribute index of the active field `name` of the named
+    /// composite `slot`, and the field's own named composite type when it
+    /// has one; `None` when it has no such field.
+    fn composite_field(
+        &self,
+        _slot: crate::storage::TypeCreation,
+        _name: &str,
+    ) -> Result<Option<(usize, Option<crate::storage::TypeCreation>)>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "named composite catalog access is unavailable"
+        ))
+    }
+    /// The fields a stored composite keeps by physical attribute, dropped
+    /// attributes included, for sizing the datum.
+    fn stored_composite_fields<'a>(
+        &self,
+        _slot: crate::storage::TypeCreation,
+        _physical_fields: u16,
+        _text: crate::sql::types::CompositeSpelling<'a>,
+        _arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "named composite catalog access is unavailable"
@@ -4165,14 +4227,28 @@ pub struct SubqueryValues<'h, 'a> {
     /// The statement's slots for the uncorrelated subqueries nested in the
     /// queries it runs for each row, and its bindings for the correlated
     /// ones; see [`ColumnLookup::statement_subqueries`].
-    pub statement: StatementScope<'a>,
+    pub statement: StatementScope<'h, 'a>,
     /// The correlated scalar and `ARRAY` subqueries analysed once for the
     /// statement, before any outer row.
     pub(crate) bindings: &'a [crate::sql::query::SubqueryBinding<'a>],
     /// Runs the query's correlated subqueries where evaluation reaches them,
     /// against the row the query bound last
     /// ([`crate::sql::query::CorrelatedSubqueries::bind_row`]).
-    pub(crate) correlated: Option<&'a crate::sql::query::CorrelatedSubqueries<'a>>,
+    pub(crate) correlated: Option<&'h crate::sql::query::CorrelatedSubqueries<'h, 'a>>,
+}
+
+/// What runs a [`DeferredSubquery`].
+#[derive(Clone, Copy)]
+pub(crate) enum DeferredRunner<'h> {
+    Executor(&'h dyn SubqueryExecution),
+    /// A data change's subquery, run as of its `command` through the
+    /// evaluating catalog's storage
+    /// ([`CatalogAccess::data_change_subquery`]): the statement writes
+    /// between evaluations, so the subquery keeps no storage borrow.
+    AsOf {
+        txid: u32,
+        command: u32,
+    },
 }
 
 /// A subquery run when evaluation first reaches it. An uncorrelated one runs
@@ -4181,7 +4257,7 @@ pub struct SubqueryValues<'h, 'a> {
 #[derive(Clone, Copy)]
 pub struct DeferredSubquery<'h> {
     pub(crate) node: *const (),
-    pub(crate) executor: &'h dyn SubqueryExecution,
+    pub(crate) executor: DeferredRunner<'h>,
     pub(crate) owner: &'h Arena,
     pub(crate) cache: Option<&'h core::cell::Cell<DeferredSubqueryCache>>,
 }
@@ -4271,12 +4347,12 @@ impl Sublink {
 /// the uncorrelated subqueries nested in it and bindings for the correlated
 /// ones.
 #[derive(Clone, Copy, Default)]
-pub struct StatementScope<'a> {
-    pub(crate) slots: &'a [DeferredSubquery<'a>],
+pub struct StatementScope<'h, 'a> {
+    pub(crate) slots: &'h [DeferredSubquery<'h>],
     pub(crate) bindings: Option<crate::sql::query::NestedBindings<'a>>,
 }
 
-impl StatementScope<'_> {
+impl StatementScope<'_, '_> {
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.is_empty() && self.bindings.is_none()
     }
@@ -4287,14 +4363,14 @@ impl StatementScope<'_> {
 /// that row.
 pub(crate) struct StatementSubqueryScope<'r, 'a> {
     pub(crate) row: &'r dyn ColumnLookup<'a>,
-    pub(crate) scope: StatementScope<'a>,
+    pub(crate) scope: StatementScope<'r, 'a>,
 }
 
 impl<'a> StatementSubqueryScope<'_, 'a> {
     /// `row`, carrying `statement` unless it already carries the statement's.
     pub(crate) fn wrap<'r>(
         row: &'r dyn ColumnLookup<'a>,
-        statement: StatementScope<'a>,
+        statement: StatementScope<'r, 'a>,
         scope: &'r mut Option<StatementSubqueryScope<'r, 'a>>,
     ) -> &'r dyn ColumnLookup<'a> {
         if statement.is_empty() || !row.statement_subqueries().is_empty() {
@@ -4332,7 +4408,7 @@ impl<'a> ColumnLookup<'a> for StatementSubqueryScope<'_, 'a> {
         self.row.lookup_unsuggested(qualifier, name)
     }
 
-    fn statement_subqueries(&self) -> StatementScope<'a> {
+    fn statement_subqueries(&self) -> StatementScope<'_, 'a> {
         self.scope
     }
 
@@ -4480,25 +4556,44 @@ enum SavedSubquery {
 }
 
 impl<'h> DeferredSubquery<'h> {
+    /// Runs the subquery, or reads the value an earlier run kept. A data
+    /// change's subquery reads through the storage of `catalog`.
     fn evaluate<'a>(
         &self,
         expression: &Expr<'a>,
         arena: &'a Arena,
         params: &[Datum<'a>],
         row: &dyn ColumnLookup<'a>,
-        sequences: Option<&dyn SequenceAccess>,
+        hooks: &EvalHooks<'_, 'a>,
     ) -> Result<SubqueryResult<'a>, SqlError> {
         if let Some(saved) = self.cache.and_then(|cache| cache.get().saved) {
             return read_saved_subquery(saved, self.node, arena);
         }
+        let run = || match self.executor {
+            DeferredRunner::Executor(executor) => {
+                executor.evaluate(expression, arena, params, row, hooks.sequences)
+            }
+            DeferredRunner::AsOf { txid, command } => hooks
+                .catalog
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a data change's subquery was evaluated without its catalog"
+                    )
+                })?
+                .data_change_subquery(
+                    txid,
+                    command,
+                    expression,
+                    arena,
+                    params,
+                    row,
+                    hooks.sequences,
+                ),
+        };
         let result = match self.cache {
-            Some(_) => super::query::evaluate_initplan(self.node, || {
-                self.executor
-                    .evaluate(expression, arena, params, row, sequences)
-            })?,
-            None => self
-                .executor
-                .evaluate(expression, arena, params, row, sequences)?,
+            Some(_) => super::query::evaluate_initplan(self.node, run)?,
+            None => run()?,
         };
         if let Some(cache) = self.cache {
             cache.set(DeferredSubqueryCache {
@@ -8360,7 +8455,7 @@ fn eval_full_inner<'a>(
             &mut scope,
         );
         let sublink = crate::sql::query::enter_sublink_of(expression);
-        let evaluated = deferred.evaluate(expression, arena, params, outer, hooks.sequences);
+        let evaluated = deferred.evaluate(expression, arena, params, outer, hooks);
         drop(sublink);
         let values = match evaluated? {
             SubqueryResult::Scalar { value, witness } => {
@@ -11311,12 +11406,27 @@ fn coerce_array_constructor_element<'a>(
     }
     match value {
         Datum::Bpchar(text) if ct == ColType::Bpchar => Ok(Datum::Text(text)),
-        Datum::Composite { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
-            Ok(Datum::CompositeText {
-                slot,
-                physical_fields: 0,
-                text: arena.alloc_str_display(value).map_err(|_| arena_full())?,
-            })
+        // The catalog spells the element with its fields' forms.
+        Datum::Composite { slot, fields } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
+            match hooks.catalog {
+                Some(catalog) => catalog.composite_array_element(value, slot, arena),
+                None if fields
+                    .iter()
+                    .any(|field| field.form != crate::storage::StoredForm::Inline) =>
+                {
+                    Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "named composite catalog access is unavailable"
+                    ))
+                }
+                None => Ok(Datum::CompositeText {
+                    slot,
+                    physical_fields: 0,
+                    text: crate::sql::types::CompositeSpelling::plain(
+                        arena.alloc_str_display(value).map_err(|_| arena_full())?,
+                    ),
+                }),
+            }
         }
         value @ Datum::CompositeText { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
             Ok(value)

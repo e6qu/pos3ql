@@ -1096,7 +1096,12 @@ fn paused_initializers_and_domain_checks_retain_their_child_calls_and_values() {
     ] {
         let mut config = test_config(&format!("function-initializer-progress-{mode:?}"));
         config.transaction_mode = mode;
-        config.execution_control_bytes = 64 << 10;
+        // At the deepest wait the trigger's write completion (13.5 KiB),
+        // three nested routines' paused states (13.8 KiB each, with a 5.6
+        // KiB saved call environment) and their frames and value slots need
+        // 65.4 KiB of execution control (measured), within a few hundred
+        // bytes of 64 KiB; 96 KiB tests progress, not capacity.
+        config.execution_control_bytes = 96 << 10;
         config.execution_control_leases = 64;
         config.row_work_bytes = 128 << 10;
         config.row_work_leases = 64;

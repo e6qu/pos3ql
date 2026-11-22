@@ -1877,7 +1877,7 @@ pub(crate) fn validate_dml_assignment_casts(
 /// `RETURNING` lists. Rows reaching evaluation are checked again there.
 pub(crate) fn require_dml_builtin_execute<'a, 'o: 'a>(
     statement: &Stmt<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn crate::sql::eval::ColumnLookup<'o>>,
@@ -3170,7 +3170,7 @@ fn validate_assignment_type(
 }
 
 pub(crate) fn dml_dependency_scope<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     target: QualName<'a>,
     alias: Option<&'a str>,
     extra: Option<&'a FromClause<'a>>,
@@ -3184,7 +3184,7 @@ pub(crate) fn dml_dependency_scope<'a>(
 /// The schema scope of [`dml_dependency_scope`] with the FROM clause it
 /// resolves: the target first, then each extra FROM item joined by a comma.
 pub(crate) fn dml_join_scope<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     target: QualName<'a>,
     alias: Option<&'a str>,
     extra: Option<&'a FromClause<'a>>,

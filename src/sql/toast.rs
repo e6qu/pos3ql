@@ -240,6 +240,15 @@ pub(crate) fn may_be_toasted(value: &crate::sql::types::Datum<'_>) -> bool {
             .is_none_or(|payload| payload >= 24)
 }
 
+/// Whether `after` is the very datum `before` (a conversion that left the
+/// value as it was), not a copy formed anew.
+pub(crate) fn same_datum_identity(
+    before: &crate::sql::types::Datum<'_>,
+    after: &crate::sql::types::Datum<'_>,
+) -> bool {
+    datum_identity(before).is_some_and(|identity| Some(identity) == datum_identity(after))
+}
+
 /// The bytes a datum of a type TOAST can store compressed or out of line
 /// borrows: its identity. A datum passed on unchanged keeps it; a value
 /// formed anew borrows other bytes.
@@ -471,13 +480,14 @@ impl CarriedForms {
 pub(crate) fn passed_form<'a>(
     expression: &crate::sql::ast::Expr<'_>,
     row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     value: &crate::sql::types::Datum<'_>,
 ) -> Result<crate::storage::rowenc::StoredForm, crate::sql::eval::SqlError> {
     use crate::storage::rowenc::StoredForm;
     if !may_be_toasted(value) {
         return Ok(StoredForm::Inline);
     }
-    Ok(branch_form(expression, row, value)?.unwrap_or(StoredForm::Inline))
+    Ok(branch_form(expression, row, catalog, value)?.unwrap_or(StoredForm::Inline))
 }
 
 /// Whether a datum passed on unchanged as `passed` gives `value`: a
@@ -525,15 +535,13 @@ fn source_of<'a>(
     use crate::sql::ast::Expr;
     use crate::sql::types::Datum;
     let column = |qualifier: Option<&str>, name: &str| {
-        let read = match row.lookup(qualifier, name) {
-            Ok(read) => read,
-            // A bare relation name is a whole-row reference, which forms a
-            // new composite datum.
-            Err(error) if qualifier.is_none() && error.sqlstate == UNDEFINED_COLUMN => {
-                return Ok(Some(Source::Fresh));
-            }
-            Err(error) => return Err(error),
+        // A whole-row reference forms a new composite datum.
+        let Some(read) = column_datum(row, qualifier, name)? else {
+            return Ok(Some(Source::Fresh));
         };
+        if row.holds_formed_datum(qualifier, name) {
+            return Ok(same_datum(&read, value).then_some(Source::Fresh));
+        }
         // A composite read from a stored row is the stored datum; one a
         // query formed (a whole row, `ROW(...)`) it passes on as formed.
         Ok(match (read, value) {
@@ -679,6 +687,7 @@ fn field_form<'a>(
     base: &crate::sql::ast::Expr<'_>,
     field: &str,
     row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     value: &crate::sql::types::Datum<'_>,
 ) -> Result<Option<crate::storage::rowenc::StoredForm>, crate::sql::eval::SqlError> {
     use crate::sql::ast::Expr;
@@ -691,19 +700,22 @@ fn field_form<'a>(
                 .unwrap_or(StoredForm::Inline),
         ));
     }
+    // A field of a stored composite, or of a composite nested in one, holds
+    // the form its spelling records by attribute path.
+    if let Some(form) = stored_composite_field_form(base, field, row, catalog)? {
+        return Ok(form);
+    }
     match base {
         Expr::Column { qualifier, name } => match row.lookup(*qualifier, name)? {
             Datum::Record(fields) | Datum::Composite { fields, .. } => Ok(fields
                 .iter()
                 .find(|candidate| candidate.name == field && same_datum(&candidate.value, value))
                 .map(|candidate| candidate.form)),
-            // A stored composite's fields are as tuple forming gave them.
-            Datum::CompositeText { .. } => Ok(Some(StoredForm::Inline)),
             _ => Ok(Some(StoredForm::Unmodelled)),
         },
         _ => match row_argument(base, field) {
             // `eval_const_expressions` reads the argument itself.
-            Some(argument) => branch_form(argument, row, value),
+            Some(argument) => branch_form(argument, row, catalog, value),
             // A function's composite result holds values it formed; a
             // composite any other expression passes on is not modelled.
             None if matches!(base, Expr::Call { .. }) && !base.is_row_constructor() => {
@@ -712,6 +724,62 @@ fn field_form<'a>(
             None => Ok(Some(StoredForm::Unmodelled)),
         },
     }
+}
+
+/// The form of field `field` of `base` when `base` is a column holding a
+/// stored composite, or a chain of fields into one: `Some(None)` when the
+/// composite has no such field, `None` when `base` is not such a chain.
+fn stored_composite_field_form<'a>(
+    base: &crate::sql::ast::Expr<'_>,
+    field: &str,
+    row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+) -> Result<Option<Option<crate::storage::rowenc::StoredForm>>, crate::sql::eval::SqlError> {
+    use crate::sql::ast::Expr;
+    use crate::sql::types::Datum;
+    use crate::storage::rowenc::StoredForm;
+    // The field names from the column down, innermost last.
+    let mut names = [""; 32];
+    names[0] = field;
+    let mut depth = 1;
+    let mut column = base;
+    while let Expr::Field { base, field } = column {
+        if depth == names.len() {
+            return Ok(None);
+        }
+        names[depth] = field;
+        depth += 1;
+        column = base;
+    }
+    let Expr::Column { qualifier, name } = column else {
+        return Ok(None);
+    };
+    let Datum::CompositeText { slot, text, .. } = row.lookup(*qualifier, name)? else {
+        return Ok(None);
+    };
+    if !text.has_forms() {
+        return Ok(Some(Some(StoredForm::Inline)));
+    }
+    let Some(catalog) = catalog else {
+        return Ok(Some(Some(StoredForm::Unmodelled)));
+    };
+    let mut path = [0usize; 32];
+    let mut slot = Some(slot);
+    for (at, name) in names[..depth].iter().rev().enumerate() {
+        let Some(composite) = slot else {
+            return Ok(Some(Some(StoredForm::Unmodelled)));
+        };
+        let Some((attribute, nested)) = catalog.composite_field(composite, name)? else {
+            return Ok(Some(None));
+        };
+        path[at] = attribute;
+        slot = nested;
+    }
+    Ok(Some(Some(
+        text.forms()
+            .find(|(entry, _)| entry.is(&path[..depth]))
+            .map_or(StoredForm::Inline, |(_, form)| form),
+    )))
 }
 
 /// Aggregates and window functions that return a datum they read from an
@@ -782,6 +850,21 @@ fn reads_column(expression: &crate::sql::ast::Expr<'_>) -> bool {
     }
 }
 
+/// The datum column `name` holds, or `None` when an unqualified `name` is
+/// no column but a bare relation name, a whole-row reference (`NEW` and
+/// `OLD` in a trigger).
+fn column_datum<'a>(
+    row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    qualifier: Option<&str>,
+    name: &str,
+) -> Result<Option<crate::sql::types::Datum<'a>>, crate::sql::eval::SqlError> {
+    match row.lookup(qualifier, name) {
+        Ok(read) => Ok(Some(read)),
+        Err(error) if qualifier.is_none() && error.sqlstate == UNDEFINED_COLUMN => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Whether the column `expression` reads holds `value`.
 fn branch_gives<'a>(
     expression: &crate::sql::ast::Expr<'_>,
@@ -790,7 +873,10 @@ fn branch_gives<'a>(
 ) -> Result<bool, crate::sql::eval::SqlError> {
     use crate::sql::ast::Expr;
     Ok(match expression {
-        Expr::Column { qualifier, name } => same_datum(&row.lookup(*qualifier, name)?, value),
+        // A whole-row reference forms its composite anew.
+        Expr::Column { qualifier, name } => {
+            column_datum(row, *qualifier, name)?.is_some_and(|read| same_datum(&read, value))
+        }
         Expr::SchemaColumn { table, name, .. } => {
             same_datum(&row.lookup(Some(table), name)?, value)
         }
@@ -807,9 +893,10 @@ fn branch_gives<'a>(
 fn branch_form<'a>(
     expression: &crate::sql::ast::Expr<'_>,
     row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     value: &crate::sql::types::Datum<'_>,
 ) -> Result<Option<crate::storage::rowenc::StoredForm>, crate::sql::eval::SqlError> {
-    Ok(given_form(expression, row, value)?.map(|given| given.form))
+    Ok(given_form(expression, row, catalog, value)?.map(|given| given.form))
 }
 
 /// A form a branch of an expression may have given its value in.
@@ -824,6 +911,7 @@ struct Given {
 fn given_form<'a>(
     expression: &crate::sql::ast::Expr<'_>,
     row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     value: &crate::sql::types::Datum<'_>,
 ) -> Result<Option<Given>, crate::sql::eval::SqlError> {
     use crate::sql::ast::Expr;
@@ -835,15 +923,19 @@ fn given_form<'a>(
         }))
     };
     let column = |qualifier: Option<&str>, name: &str| {
-        let read = match row.lookup(qualifier, name) {
-            Ok(read) => read,
-            // A whole-row reference forms its composite datum anew.
-            Err(error) if qualifier.is_none() && error.sqlstate == UNDEFINED_COLUMN => {
-                return formed(StoredForm::Inline);
-            }
-            Err(error) => return Err(error),
+        // A whole-row reference forms its composite datum anew.
+        let Some(read) = column_datum(row, qualifier, name)? else {
+            return formed(StoredForm::Inline);
         };
-        if !same_datum(&read, value) {
+        // A stored composite reads materialized with its fields.
+        let materialized = matches!(
+            (&read, value),
+            (
+                crate::sql::types::Datum::CompositeText { slot, .. },
+                crate::sql::types::Datum::Composite { slot: given, .. },
+            ) if slot == given
+        );
+        if !materialized && !same_datum(&read, value) {
             return Ok(None);
         }
         let identity = datum_identity(value);
@@ -861,7 +953,7 @@ fn given_form<'a>(
     let branches = |branches: &mut dyn Iterator<Item = &Expr<'_>>| {
         let mut found: Option<Given> = None;
         for branch in branches {
-            let Some(given) = given_form(branch, row, value)? else {
+            let Some(given) = given_form(branch, row, catalog, value)? else {
                 continue;
             };
             found = Some(match found {
@@ -880,12 +972,12 @@ fn given_form<'a>(
     match expression {
         Expr::Column { qualifier, name } => column(*qualifier, name),
         Expr::SchemaColumn { table, name, .. } => column(Some(table), name),
-        Expr::Collate { operand, .. } => given_form(operand, row, value),
+        Expr::Collate { operand, .. } => given_form(operand, row, catalog, value),
         // A cast without a length coercion that leaves the datum as it was
         // is binary coercible (`RelabelType`) or a domain's check.
         Expr::Cast {
             operand, type_mod, ..
-        } if *type_mod == -1 => given_form(operand, row, value),
+        } if *type_mod == -1 => given_form(operand, row, catalog, value),
         Expr::Case {
             whens, otherwise, ..
         } => branches(
@@ -928,12 +1020,14 @@ fn given_form<'a>(
                 formed(StoredForm::Inline)
             }
         }
-        Expr::OuterAggregate { call, .. } => given_form(call, row, value),
+        Expr::OuterAggregate { call, .. } => given_form(call, row, catalog, value),
         Expr::Subquery(query) if subquery_may_pass(query) => formed(StoredForm::Unmodelled),
-        Expr::Field { base, field } => Ok(field_form(base, field, row, value)?.map(|form| Given {
-            form,
-            identical: false,
-        })),
+        Expr::Field { base, field } => Ok(field_form(base, field, row, catalog, value)?.map(
+            |form| Given {
+                form,
+                identical: false,
+            },
+        )),
         _ => formed(StoredForm::Inline),
     }
 }
@@ -990,7 +1084,7 @@ pub(crate) fn grouped_form<'a>(
     expression: &crate::sql::ast::Expr<'_>,
     value: &crate::sql::types::Datum<'a>,
 ) -> Result<crate::storage::rowenc::StoredForm, crate::sql::eval::SqlError> {
-    passed_form(expression, &GroupingKey(*value), value)
+    passed_form(expression, &GroupingKey(*value), None, value)
 }
 
 /// The row a grouped query's output `.0` reads: every column it reads is a
@@ -1123,7 +1217,7 @@ pub(crate) fn row_forms(
         definition.columns(),
         definition.has_toast,
         &crate::sql::query::postgres_memory::Sizing {
-            catalog: Some((storage, txid)),
+            catalog: Some(&crate::sql::query::storage_catalog(storage, arena, txid)),
             scratch: arena,
         },
         values,
@@ -1146,13 +1240,6 @@ pub(crate) fn row_forms_as(
     use crate::storage::rowenc::{StoredForm, carries_stored_form};
     let forms = &mut forms[..values.len()];
     forms.fill(StoredForm::Inline);
-    // The row encoding keeps a composite value's fields as formed.
-    if values.iter().any(holds_toasted_field) {
-        return Err(crate::sql_err!(
-            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-            "storing a composite value that holds a compressed or out-of-line field is not supported"
-        ));
-    }
     // A row that cannot reach the threshold even with four-byte headers and
     // full alignment, and keeps no stored form, stays in line.
     if carried.count == 0 {
@@ -1262,19 +1349,6 @@ pub(crate) fn row_forms_as(
         *form = toasted;
     }
     Ok(())
-}
-
-/// Whether the composite `value`, or one nested in it, holds a field in a
-/// form other than as tuple forming gives it.
-fn holds_toasted_field(value: &crate::sql::types::Datum<'_>) -> bool {
-    use crate::sql::types::Datum;
-    match value {
-        Datum::Record(fields) | Datum::Composite { fields, .. } => fields.iter().any(|field| {
-            field.form != crate::storage::rowenc::StoredForm::Inline
-                || holds_toasted_field(&field.value)
-        }),
-        _ => false,
-    }
 }
 
 /// `ToastTupleContext` of one row.

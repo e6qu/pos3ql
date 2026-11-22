@@ -44,9 +44,13 @@ fn numeric_scope_owners_outlive_layout_and_syntax_without_borrowing_their_memory
     crate::mem::guard::forbid_alloc(|| {
         let mut outer = frames.take().unwrap();
         let mut inner = frames.take().unwrap();
-        outer.values[0] = Datum::Text(source.alloc_str("outer remains selected").unwrap());
-        inner.values[0] = Datum::Int4(7);
-        inner.values[1] = Datum::Text(source.alloc_str("inner remains selected").unwrap());
+        outer.values[0] = LocalSlot::formed(Datum::Text(
+            source.alloc_str("outer remains selected").unwrap(),
+        ));
+        inner.values[0] = LocalSlot::formed(Datum::Int4(7));
+        inner.values[1] = LocalSlot::formed(Datum::Text(
+            source.alloc_str("inner remains selected").unwrap(),
+        ));
         drop(frames);
         let moved = outer;
         assert_eq!(moved.values[0], Datum::Text("outer remains selected"));
@@ -93,7 +97,8 @@ fn numeric_control_admission_preserves_live_owners_and_releases_partial_reservat
         let mut outer = frames.take().unwrap();
         let inner = frames.take().unwrap();
         outer.locals[0] = locals[0];
-        outer.values[0] = Datum::Text(arena.alloc_str("live outer value").unwrap());
+        outer.values[0] =
+            LocalSlot::formed(Datum::Text(arena.alloc_str("live outer value").unwrap()));
         drop(frames);
         assert!(pool.lease::<u8>(8192).is_err());
         drop(inner);
@@ -137,10 +142,10 @@ fn nested_frames_reuse_backing_and_release_references_before_scratch_rewinds() {
         for _ in 0..256 {
             {
                 let mut outer = frames.take().unwrap();
-                outer.values[0] = Datum::Int4(41);
+                outer.values[0] = LocalSlot::formed(Datum::Int4(41));
                 let mut inner = frames.take().unwrap();
                 let temporary = arena.alloc_str("temporary loop text").unwrap();
-                inner.values[0] = Datum::Text(temporary);
+                inner.values[0] = LocalSlot::formed(Datum::Text(temporary));
                 inner.locals[0].name = SqlName::parse("temporary_name").unwrap();
                 assert_eq!(frames.take().err().unwrap().sqlstate, "54000");
                 frames.restore(inner);
@@ -150,7 +155,7 @@ fn nested_frames_reuse_backing_and_release_references_before_scratch_rewinds() {
             // Both frames have cleared all references into this suffix.
             unsafe { arena.rewind_to(mark) };
             let outer = frames.take().unwrap();
-            assert!(outer.values.iter().all(Datum::is_null));
+            assert!(outer.values.iter().all(|slot| slot.value.is_null()));
             assert!(
                 outer
                     .locals
@@ -158,7 +163,7 @@ fn nested_frames_reuse_backing_and_release_references_before_scratch_rewinds() {
                     .all(|local| local.name == SqlName::EMPTY)
             );
             let inner = frames.take().unwrap();
-            assert!(inner.values.iter().all(Datum::is_null));
+            assert!(inner.values.iter().all(|slot| slot.value.is_null()));
             frames.restore(inner);
             frames.restore(outer);
             if let Some(prior) = prior_high_water {

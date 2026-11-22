@@ -176,7 +176,7 @@ impl SubqueryListProbe for ExternalSubqueryList {
 /// type must resolve through the catalog before execution begins.
 fn spooled_column_witness<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     scope: Option<&QueryScope<'a>>,
     arena: &'a Arena,
@@ -185,6 +185,8 @@ fn spooled_column_witness<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+        // The description reads only the enclosing row's types.
+        let outer_types = outer.map(super::scope::OuterColumnTypes);
         super::setops::describe_set_body(
             storage,
             tree,
@@ -193,7 +195,9 @@ fn spooled_column_witness<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
-            outer,
+            outer_types
+                .as_ref()
+                .map(|types| types as &dyn ColumnLookup<'_>),
         )?;
         if let Some((ColType::Composite(slot), _)) =
             crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
@@ -250,7 +254,7 @@ fn spooled_column_witness<'a>(
 }
 
 fn composite_slot_witness<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     slot: crate::storage::TypeCreation,
     arena: &'a Arena,
@@ -312,7 +316,7 @@ fn composite_slot_witness<'a>(
 fn scope_record_witness<'a>(
     expression: &'a Expr<'a>,
     scope: Option<&QueryScope<'a>>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<(Datum<'a>, &'a [Collation])>, SqlError> {
@@ -386,7 +390,7 @@ fn scope_record_witness<'a>(
 fn external_list_subquery<'a>(
     node: &Expr<'a>,
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -548,7 +552,7 @@ fn external_list_subquery<'a>(
 fn list_column_types<'a>(
     select: &'a Select<'a>,
     row_witness: Option<Datum<'a>>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -594,7 +598,7 @@ fn list_column_types<'a>(
 #[allow(clippy::too_many_arguments)]
 fn streaming_scalar_subquery<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -701,7 +705,7 @@ fn streaming_scalar_subquery<'a>(
 #[allow(clippy::too_many_arguments)]
 fn streaming_array_subquery<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -1375,7 +1379,7 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
 
 fn subquery_collations<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -1383,6 +1387,8 @@ fn subquery_collations<'a>(
     let mut output = [Collation::None; MAX_PROJ];
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+        // The description reads only the enclosing row's types.
+        let outer_types = outer.map(super::scope::OuterColumnTypes);
         let count = super::setops::describe_set_body(
             storage,
             tree,
@@ -1391,7 +1397,9 @@ fn subquery_collations<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
-            outer,
+            outer_types
+                .as_ref()
+                .map(|types| types as &dyn ColumnLookup<'_>),
         )?;
         if count == 1
             && let Some((ColType::Composite(slot), _)) =
@@ -1500,7 +1508,7 @@ fn subquery_collations<'a>(
 
 fn row_subquery_witness<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -1515,6 +1523,8 @@ fn row_subquery_witness<'a>(
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
         // Each branch may read the enclosing row, as a correlated subquery does.
+        // The description reads only the enclosing row's types.
+        let outer_types = outer.map(super::scope::OuterColumnTypes);
         let count = super::setops::describe_set_body(
             storage,
             tree,
@@ -1523,13 +1533,15 @@ fn row_subquery_witness<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
-            outer,
+            outer_types
+                .as_ref()
+                .map(|types| types as &dyn ColumnLookup<'_>),
         )?;
         for (index, column) in columns[..count].iter().enumerate() {
             let value = catalog_type_witness(storage, txid, column.type_oid)?;
             fields[index] = RecordField {
                 form: crate::storage::StoredForm::Inline,
-                name: column.name,
+                name: arena.alloc_str(column.name).map_err(|_| arena_full())?,
                 type_oid: column.type_oid,
                 type_mod: column.type_mod,
                 value,
@@ -1558,7 +1570,7 @@ fn row_subquery_witness<'a>(
         for (index, column) in columns[..count].iter().enumerate() {
             fields[index] = RecordField {
                 form: crate::storage::StoredForm::Inline,
-                name: column.name,
+                name: arena.alloc_str(column.name).map_err(|_| arena_full())?,
                 type_oid: column.type_oid,
                 type_mod: column.type_mod,
                 value: catalog_type_witness(storage, txid, column.type_oid)?,
@@ -1679,16 +1691,16 @@ fn set_leaf<'a>(tree: &'a SetTree<'a>) -> &'a Select<'a> {
 /// Pre-evaluates every (uncorrelated) subquery in the statement and stores
 /// the results in the arena for hook-based lookup during evaluation.
 #[allow(clippy::too_many_arguments)]
-pub fn prepare_subqueries<'a>(
+pub fn prepare_subqueries<'h, 'a: 'h>(
     exprs: &[Option<&'a Expr<'a>>],
-    storage: &'a Storage,
+    storage: &'h Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     depth: u32,
-    outer: Option<&dyn ColumnLookup<'a>>,
+    outer: Option<&'h dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+) -> Result<SubqueryValues<'h, 'a>, SqlError> {
     let mut nodes = ArenaList::new(arena);
     for expression in exprs.iter().flatten() {
         collect_subqueries(expression, &mut nodes)?;
@@ -1701,10 +1713,13 @@ pub fn prepare_subqueries<'a>(
         params,
         depth,
         outer,
+        outer
+            .map(|outer| outer.statement_subqueries())
+            .unwrap_or_default(),
         sequences,
         SubqueryTiming::FirstRead {
             uncorrelated: false,
-            command: None,
+            runs: DeferredRuns::Query(storage),
         },
         &[],
     )
@@ -1714,32 +1729,33 @@ pub fn prepare_subqueries<'a>(
 /// EXISTS) into arena-backed [`SubqueryValues`] keyed by node identity.
 /// EXISTS results are stored as boolean scalars.
 #[allow(clippy::too_many_arguments)]
-fn eval_subquery_nodes<'a>(
+fn eval_subquery_nodes<'h, 'a: 'h>(
     nodes: &[&Expr<'a>],
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
+    // The statement scope `outer` carries.
+    statement: super::super::eval::StatementScope<'h, 'a>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-    timing: SubqueryTiming,
+    timing: SubqueryTiming<'h>,
     // Correlated subqueries the statement bound once, for a run `Now`.
     bindings: &[SubqueryBinding<'a>],
-) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+) -> Result<SubqueryValues<'h, 'a>, SqlError> {
     // A run for a row of a query the statement runs again for each row
     // finds its correlated subqueries' bindings in the statement's scope.
     let nested;
-    let bindings =
-        match outer.and_then(|outer| Some((outer, outer.statement_subqueries().bindings?))) {
-            Some((outer, statement))
-                if bindings.is_empty() && matches!(timing, SubqueryTiming::Now) =>
-            {
-                nested = statement.bind_registered(nodes, storage, txid, outer, arena)?;
-                nested
-            }
-            _ => bindings,
-        };
+    let bindings = match outer.and_then(|outer| Some((outer, statement.bindings?))) {
+        Some((outer, statement))
+            if bindings.is_empty() && matches!(timing, SubqueryTiming::Now) =>
+        {
+            nested = statement.bind_registered(nodes, storage, txid, outer, arena)?;
+            nested
+        }
+        _ => bindings,
+    };
     let defers = |_: &Expr<'_>| matches!(timing, SubqueryTiming::FirstRead { .. });
     let n_list_nodes = nodes
         .iter()
@@ -1759,79 +1775,78 @@ fn eval_subquery_nodes<'a>(
     let lists: &mut [SubqueryList<'a>] = arena
         .alloc_slice_with(n_list_nodes, |_| empty_subquery_list())
         .map_err(|_| arena_full())?;
-    let deferred = if n_deferred == 0 {
-        &mut []
-    } else {
-        let executor: &'a dyn super::super::eval::SubqueryExecution = match timing {
-            SubqueryTiming::FirstRead {
-                command: Some(command),
-                ..
-            } => arena
-                .alloc(DmlSubqueries::new(storage, txid, command))
-                .map_err(|_| arena_full())?,
-            _ => arena
-                .alloc(ProceduralSubqueries { storage, txid })
-                .map_err(|_| arena_full())?,
-        };
-        let mut entries = nodes.iter().filter(|node| defers(node));
-        let mut failed = false;
-        let deferred = arena
-            .alloc_slice_with(n_deferred, |_| {
-                let node = entries.next().copied();
-                // An uncorrelated subquery runs once and keeps its result for
-                // the rest of these expressions' evaluations; one that reads
-                // a row runs each time it is reached. A correlation that
-                // cannot be read here counts as one.
-                let once = match timing {
-                    SubqueryTiming::FirstRead {
-                        uncorrelated: true, ..
-                    } => true,
-                    _ => node.is_some_and(|node| {
-                        matches!(
-                            subquery_node_correlated(node, storage, txid, arena),
-                            Ok(false)
-                        )
-                    }),
-                };
-                // The statement keeps a slot for an uncorrelated subquery
-                // nested in a query it runs for each row.
-                if once
-                    && let Some(node) = node
-                    && let Some(slot) = outer.and_then(|outer| {
-                        super::super::eval::DeferredSubquery::find(
-                            outer.statement_subqueries().slots,
-                            node,
-                        )
-                    })
-                {
-                    return slot;
+    let deferred = match timing {
+        SubqueryTiming::FirstRead { runs, .. } if n_deferred > 0 => {
+            // The executor may read through a storage borrow, so it lives no
+            // longer than that borrow.
+            let executors: &'h Arena = arena;
+            let executor = match runs {
+                DeferredRuns::DataChange { command } => {
+                    super::super::eval::DeferredRunner::AsOf { txid, command }
                 }
-                let cache = if !once {
-                    None
-                } else {
-                    match arena.alloc(super::super::eval::DeferredSubqueryCache::default()) {
-                        Ok(cache) => {
-                            let cache: &core::cell::Cell<_> = core::cell::Cell::from_mut(cache);
-                            Some(cache)
-                        }
-                        Err(_) => {
-                            failed = true;
-                            None
-                        }
+                DeferredRuns::Query(storage) => super::super::eval::DeferredRunner::Executor(
+                    executors
+                        .alloc(ProceduralSubqueries { storage, txid })
+                        .map_err(|_| arena_full())?,
+                ),
+            };
+            let mut entries = nodes.iter().filter(|node| defers(node));
+            let mut failed = false;
+            let deferred = executors
+                .alloc_slice_with(n_deferred, |_| {
+                    let node = entries.next().copied();
+                    // An uncorrelated subquery runs once and keeps its result for
+                    // the rest of these expressions' evaluations; one that reads
+                    // a row runs each time it is reached. A correlation that
+                    // cannot be read here counts as one.
+                    let once = match timing {
+                        SubqueryTiming::FirstRead {
+                            uncorrelated: true, ..
+                        } => true,
+                        _ => node.is_some_and(|node| {
+                            matches!(
+                                subquery_node_correlated(node, storage, txid, arena),
+                                Ok(false)
+                            )
+                        }),
+                    };
+                    // The statement keeps a slot for an uncorrelated subquery
+                    // nested in a query it runs for each row.
+                    if once
+                        && let Some(node) = node
+                        && let Some(slot) =
+                            super::super::eval::DeferredSubquery::find(statement.slots, node)
+                    {
+                        return slot;
                     }
-                };
-                super::super::eval::DeferredSubquery {
-                    node: node.map_or(core::ptr::null(), |node| (node as *const Expr).cast()),
-                    executor,
-                    owner: arena,
-                    cache,
-                }
-            })
-            .map_err(|_| arena_full())?;
-        if failed {
-            return Err(arena_full());
+                    let cache = if !once {
+                        None
+                    } else {
+                        match arena.alloc(super::super::eval::DeferredSubqueryCache::default()) {
+                            Ok(cache) => {
+                                let cache: &core::cell::Cell<_> = core::cell::Cell::from_mut(cache);
+                                Some(cache)
+                            }
+                            Err(_) => {
+                                failed = true;
+                                None
+                            }
+                        }
+                    };
+                    super::super::eval::DeferredSubquery {
+                        node: node.map_or(core::ptr::null(), |node| (node as *const Expr).cast()),
+                        executor,
+                        owner: arena,
+                        cache,
+                    }
+                })
+                .map_err(|_| arena_full())?;
+            if failed {
+                return Err(arena_full());
+            }
+            deferred
         }
-        deferred
+        _ => &mut [],
     };
     let (mut n_scalars, mut n_lists) = (0, 0);
     for node in nodes {
@@ -2069,9 +2084,7 @@ fn eval_subquery_nodes<'a>(
         scalars,
         lists,
         deferred,
-        statement: outer
-            .map(|outer| outer.statement_subqueries())
-            .unwrap_or_default(),
+        statement,
         bindings: &[],
         correlated: None,
     })
@@ -2093,19 +2106,29 @@ pub(super) fn subquery_shape_position(error: SqlError, node: &Expr<'_>) -> SqlEr
 
 /// When prepared subqueries run.
 #[derive(Clone, Copy)]
-enum SubqueryTiming {
+enum SubqueryTiming<'h> {
     /// Before the expressions that contain them.
     Now,
     /// Each subquery runs where evaluation reaches it, as PostgreSQL's
     /// initPlans and subplans do: an expression no row reaches never runs its
     /// subquery. An uncorrelated one runs once and keeps its result;
-    /// `uncorrelated` says every node is known to be one.
-    /// `command` is the data-modifying command whose own writes these
-    /// subqueries do not see, however late they first run.
+    /// `uncorrelated` says every node is known to be one. `runs` runs them.
     FirstRead {
         uncorrelated: bool,
-        command: Option<u32>,
+        runs: DeferredRuns<'h>,
     },
+}
+
+/// What runs the subqueries evaluation reaches after they are prepared.
+#[derive(Clone, Copy)]
+pub(crate) enum DeferredRuns<'h> {
+    /// A query's, reading through its storage borrow.
+    Query(&'h Storage),
+    /// A data change's, reading as of its command, so a subquery first run
+    /// after the statement wrote rows does not see them. The statement
+    /// writes between evaluations, so each run reads through the storage
+    /// of the catalog that evaluates it ([`DmlSubqueries`]).
+    DataChange { command: u32 },
 }
 
 /// Runs a subquery only to determine whether it yields any row (EXISTS).
@@ -2113,7 +2136,7 @@ enum SubqueryTiming {
 #[allow(clippy::too_many_arguments)]
 fn subquery_exists<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -2306,7 +2329,7 @@ fn subquery_exists<'a>(
 /// nested subqueries once, against the enclosing row only).
 fn needs_row_source<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
@@ -2424,7 +2447,7 @@ pub(crate) fn select_from_resolves<'a>(
 
 pub(crate) fn expression_has_correlated_subquery<'a>(
     expression: &'a Expr<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
@@ -2716,8 +2739,8 @@ fn expr_has_outer_ref<'a>(
 
 /// Pre-evaluated uncorrelated subqueries plus the list of correlated subquery
 /// nodes that must be re-evaluated per outer row.
-pub(super) struct OuterSubs<'a> {
-    pub(super) base: SubqueryValues<'a, 'a>,
+pub(super) struct OuterSubs<'h, 'a> {
+    pub(super) base: SubqueryValues<'h, 'a>,
     pub(super) correlated: &'a [&'a Expr<'a>],
 }
 
@@ -2727,20 +2750,20 @@ pub(super) struct OuterSubs<'a> {
     clippy::too_many_arguments,
     reason = "a query's subqueries are prepared against its FROM items and enclosing row"
 )]
-pub(super) fn prepare_outer_subqueries<'a>(
+pub(super) fn prepare_outer_subqueries<'h, 'a: 'h>(
     exprs: &[Option<&'a Expr<'a>>],
     from: Option<&'a crate::sql::ast::FromClause<'a>>,
-    storage: &'a Storage,
+    storage: &'h Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     // The enclosing row of a query run for one; it carries the statement's
     // slots for the uncorrelated subqueries nested in such a query.
-    outer: Option<&dyn ColumnLookup<'a>>,
+    outer: Option<&'h dyn ColumnLookup<'a>>,
     // The declared types of the rows correlated subqueries read.
     row_types: &dyn ColumnLookup<'a>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<OuterSubs<'a>, SqlError> {
+) -> Result<OuterSubs<'h, 'a>, SqlError> {
     let mut nodes = ArenaList::new(arena);
     for expression in exprs.iter().flatten() {
         collect_subqueries(expression, &mut nodes)?;
@@ -2802,10 +2825,13 @@ pub(super) fn prepare_outer_subqueries<'a>(
         params,
         SUBQUERY_DEPTH,
         outer,
+        // A query run for no enclosing row reads none of the statement's
+        // slots: they belong to the queries it runs for each of its rows.
+        outer.map_or_else(Default::default, |_| statement),
         sequences,
         SubqueryTiming::FirstRead {
             uncorrelated: true,
-            command: None,
+            runs: DeferredRuns::Query(storage),
         },
         &[],
     )?;
@@ -2819,7 +2845,9 @@ pub(super) fn prepare_outer_subqueries<'a>(
     if !corr.is_empty() {
         let row =
             core::cell::Cell::from_mut(arena.alloc(None::<BoundRow>).map_err(|_| arena_full())?);
-        let runner: &'a CorrelatedSubqueries<'a> = arena
+        // The runner reads `storage`, so it lives no longer than its borrow.
+        let executors: &'h Arena = arena;
+        let runner: &'h CorrelatedSubqueries<'h, 'a> = executors
             .alloc(CorrelatedSubqueries {
                 storage,
                 txid,
@@ -2830,12 +2858,12 @@ pub(super) fn prepare_outer_subqueries<'a>(
             .map_err(|_| arena_full())?;
         let uncorrelated = base.deferred;
         let correlated = corr.as_slice();
-        base.deferred = arena
+        base.deferred = executors
             .alloc_slice_with(uncorrelated.len() + correlated.len(), |index| {
                 uncorrelated.get(index).copied().unwrap_or_else(|| {
                     super::super::eval::DeferredSubquery {
                         node: (correlated[index - uncorrelated.len()] as *const Expr).cast(),
-                        executor: runner,
+                        executor: super::super::eval::DeferredRunner::Executor(runner),
                         owner: arena,
                         cache: None,
                     }
@@ -2882,62 +2910,117 @@ pub(super) fn stable_uncorrelated<'a>(
     )
 }
 
-/// Uncorrelated subqueries `nodes` that run when an expression first
-/// reads them, as PostgreSQL's initPlans do. Nothing runs here. Their state
-/// and results live in `arena`'s persistent tail and retained bytes, which a
-/// reader's per-row rewinds and resumed attempts do not reclaim.
+/// The kept state of a reader's uncorrelated subqueries, which run when an
+/// expression first reads them, as PostgreSQL's initPlans do: one cache per
+/// subquery in `owner`'s persistent tail, which a reader's per-row rewinds
+/// and resumed attempts do not reclaim. Nothing runs here, and nothing here
+/// keeps a `Storage` borrow: each call runs them through its own
+/// ([`Self::values`]).
+#[derive(Clone, Copy)]
+pub(crate) struct FirstReadSubqueries<'a> {
+    nodes: &'a [&'a Expr<'a>],
+    caches: &'a [core::cell::Cell<super::super::eval::DeferredSubqueryCache>],
+    owner: &'a Arena,
+}
+
 pub(super) fn first_read_subqueries<'a>(
-    nodes: &[&'a Expr<'a>],
-    storage: &Storage,
-    txid: u32,
+    nodes: &'a [&'a Expr<'a>],
     arena: &'a Arena,
-) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    Ok(SubqueryValues {
-        scalars: &[],
-        lists: &[],
-        deferred: statement_slots(nodes, storage, txid, arena)?,
-        statement: super::super::eval::StatementScope::default(),
-        bindings: &[],
-        correlated: None,
+) -> Result<FirstReadSubqueries<'a>, SqlError> {
+    Ok(FirstReadSubqueries {
+        nodes,
+        caches: slot_caches(nodes.len(), arena)?,
+        owner: arena,
     })
 }
 
-/// A slot for each of `nodes`, uncorrelated subqueries run when first read
-/// and kept for the statement: their state and results live in `arena`'s
-/// persistent tail and retained bytes, which per-row rewinds and resumed
-/// attempts do not reclaim.
-fn statement_slots<'a>(
-    nodes: &[&'a Expr<'a>],
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<&'a [super::super::eval::DeferredSubquery<'a>], SqlError> {
-    if nodes.is_empty() {
-        return Ok(&[]);
-    }
-    // SAFETY: the engine's storage outlives every statement and reader that
-    // keeps these subqueries, and each run detaches its result before any
-    // borrow of storage escapes.
-    let storage: &'a Storage = unsafe { &*(storage as *const Storage) };
-    let executor: &'a dyn super::super::eval::SubqueryExecution = &arena
-        .alloc_persistent_slice_with(1, |_| {
-            StatementSubqueries(ProceduralSubqueries { storage, txid })
+impl<'a> FirstReadSubqueries<'a> {
+    /// The subqueries for one call reading through `storage`, their slots in
+    /// the call's `work` memory.
+    pub(super) fn values<'h>(
+        &self,
+        storage: &'h Storage,
+        txid: u32,
+        work: &'h Arena,
+    ) -> Result<SubqueryValues<'h, 'a>, SqlError>
+    where
+        'a: 'h,
+    {
+        Ok(SubqueryValues {
+            scalars: &[],
+            lists: &[],
+            deferred: statement_slots(
+                self.nodes,
+                self.caches,
+                storage,
+                txid,
+                self.owner,
+                SlotMemory::Call(work),
+            )?,
+            statement: super::super::eval::StatementScope::default(),
+            bindings: &[],
+            correlated: None,
         })
-        .map_err(|_| arena_full())?[0];
+    }
+}
+
+/// One cache per statement slot, in `arena`'s persistent tail.
+fn slot_caches(
+    count: usize,
+    arena: &Arena,
+) -> Result<&[core::cell::Cell<super::super::eval::DeferredSubqueryCache>], SqlError> {
     let caches = arena
-        .alloc_persistent_slice_with(nodes.len(), |_| {
+        .alloc_persistent_slice_with(count, |_| {
             super::super::eval::DeferredSubqueryCache::default()
         })
         .map_err(|_| arena_full())?;
-    let caches = core::cell::Cell::from_mut(caches).as_slice_of_cells();
-    Ok(arena
-        .alloc_persistent_slice_with(nodes.len(), |index| super::super::eval::DeferredSubquery {
+    Ok(core::cell::Cell::from_mut(caches).as_slice_of_cells())
+}
+
+/// Where statement slots live: in an arena's persistent tail for the rest of
+/// the statement, or in one call's memory.
+#[derive(Clone, Copy)]
+enum SlotMemory<'h> {
+    Statement(&'h Arena),
+    Call(&'h Arena),
+}
+
+/// A slot for each of `nodes`, uncorrelated subqueries run through `storage`
+/// when first read and kept for the statement in `caches`, their results in
+/// `owner`'s retained bytes.
+fn statement_slots<'h>(
+    nodes: &[&Expr<'_>],
+    caches: &'h [core::cell::Cell<super::super::eval::DeferredSubqueryCache>],
+    storage: &'h Storage,
+    txid: u32,
+    owner: &'h Arena,
+    memory: SlotMemory<'h>,
+) -> Result<&'h [super::super::eval::DeferredSubquery<'h>], SqlError> {
+    if nodes.is_empty() {
+        return Ok(&[]);
+    }
+    let executor = StatementSubqueries(ProceduralSubqueries { storage, txid });
+    let slot = |executor: &'h dyn super::super::eval::SubqueryExecution| {
+        move |index: usize| super::super::eval::DeferredSubquery {
             node: (nodes[index] as *const Expr).cast(),
-            executor,
-            owner: arena,
+            executor: super::super::eval::DeferredRunner::Executor(executor),
+            owner,
             cache: Some(&caches[index]),
-        })
-        .map_err(|_| arena_full())?)
+        }
+    };
+    let slots = match memory {
+        SlotMemory::Statement(arena) => {
+            let executor = &arena
+                .alloc_persistent_slice_with(1, |_| executor)
+                .map_err(|_| arena_full())?[0];
+            arena.alloc_persistent_slice_with(nodes.len(), slot(executor))
+        }
+        SlotMemory::Call(arena) => {
+            let executor = arena.alloc(executor).map_err(|_| arena_full())?;
+            arena.alloc_slice_with(nodes.len(), slot(executor))
+        }
+    };
+    Ok(slots.map_err(|_| arena_full())?)
 }
 
 /// Slots for the uncorrelated subqueries nested, at any depth, in the
@@ -2950,13 +3033,13 @@ fn statement_slots<'a>(
 ///
 /// The scope also holds a binding table with an entry for each correlated
 /// subquery found there, filled as each is first prepared.
-pub(super) fn nested_statement_scope<'a>(
+pub(super) fn nested_statement_scope<'h, 'a: 'h>(
     correlated: &[&'a Expr<'a>],
     from: Option<&'a crate::sql::ast::FromClause<'a>>,
-    storage: &'a Storage,
+    storage: &'h Storage,
     txid: u32,
     arena: &'a Arena,
-) -> Result<super::super::eval::StatementScope<'a>, SqlError> {
+) -> Result<super::super::eval::StatementScope<'h, 'a>, SqlError> {
     fn function_arguments<'a>(
         table: &'a crate::sql::ast::TableRef<'a>,
         found: &mut ArenaList<'a, &'a Expr<'a>>,
@@ -3015,8 +3098,16 @@ pub(super) fn nested_statement_scope<'a>(
             arena,
         )?;
     }
+    let slots: &'h Arena = arena;
     Ok(super::super::eval::StatementScope {
-        slots: statement_slots(found.as_slice(), storage, txid, arena)?,
+        slots: statement_slots(
+            found.as_slice(),
+            slot_caches(found.len(), arena)?,
+            storage,
+            txid,
+            arena,
+            SlotMemory::Statement(slots),
+        )?,
         bindings: NestedBindings::new(correlated.as_slice(), arena)?,
     })
 }
@@ -3028,7 +3119,7 @@ fn sort_nested_sublinks<'a>(
     found: &mut ArenaList<'a, &'a Expr<'a>>,
     correlated: &mut ArenaList<'a, &'a Expr<'a>>,
     selects: &mut ArenaList<'a, &'a Select<'a>>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
@@ -3181,11 +3272,11 @@ impl super::super::eval::SubqueryExecution for StatementSubqueries<'_> {
 /// rows enclosing it. The runner and its binding are fixed per statement;
 /// a run's values live in the evaluation's arena like any expression's.
 #[derive(Clone, Copy)]
-pub(crate) struct CorrelatedSubqueries<'a> {
-    storage: &'a Storage,
+pub(crate) struct CorrelatedSubqueries<'s, 'a> {
+    storage: &'s Storage,
     txid: u32,
     bindings: &'a [SubqueryBinding<'a>],
-    statement: super::super::eval::StatementScope<'a>,
+    statement: super::super::eval::StatementScope<'s, 'a>,
     row: &'a core::cell::Cell<Option<BoundRow>>,
 }
 
@@ -3197,7 +3288,7 @@ struct BoundRow {
     enclosing: Option<*const (dyn ColumnLookup<'static> + 'static)>,
 }
 
-impl<'a> CorrelatedSubqueries<'a> {
+impl<'a> CorrelatedSubqueries<'_, 'a> {
     /// Makes `row`, inside `enclosing`, the row the correlated subqueries
     /// read while the returned binding lives; dropping it restores the
     /// previous binding. Without a binding a subquery reads the row it is
@@ -3239,7 +3330,7 @@ impl Drop for RowBinding<'_> {
     }
 }
 
-impl super::super::eval::SubqueryExecution for CorrelatedSubqueries<'_> {
+impl<'s> super::super::eval::SubqueryExecution for CorrelatedSubqueries<'s, '_> {
     fn evaluate<'x>(
         &self,
         expression: &Expr<'x>,
@@ -3249,8 +3340,8 @@ impl super::super::eval::SubqueryExecution for CorrelatedSubqueries<'_> {
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<super::super::eval::SubqueryResult<'x>, SqlError> {
         // SAFETY: a bound row outlives its binding (see `bind_row`), and the
-        // statement's storage, bindings and slots outlive every row.
-        let (row, enclosing, storage, bindings, statement) = unsafe {
+        // statement's bindings outlive every row.
+        let (row, enclosing, bindings, statement) = unsafe {
             let (row, enclosing) = match self.row.get() {
                 Some(bound) => (
                     &*core::mem::transmute::<
@@ -3270,16 +3361,16 @@ impl super::super::eval::SubqueryExecution for CorrelatedSubqueries<'_> {
             (
                 row,
                 enclosing,
-                &*(self.storage as *const Storage),
                 core::mem::transmute::<&[SubqueryBinding<'_>], &'x [SubqueryBinding<'x>]>(
                     self.bindings,
                 ),
                 core::mem::transmute::<
-                    super::super::eval::StatementScope<'_>,
-                    super::super::eval::StatementScope<'x>,
+                    super::super::eval::StatementScope<'s, '_>,
+                    super::super::eval::StatementScope<'s, 'x>,
                 >(self.statement),
             )
         };
+        let storage = self.storage;
         let chained = Chained {
             inner: row,
             outer: enclosing,
@@ -3295,6 +3386,7 @@ impl super::super::eval::SubqueryExecution for CorrelatedSubqueries<'_> {
             params,
             SUBQUERY_DEPTH,
             Some(outer),
+            statement,
             sequences,
             SubqueryTiming::Now,
             bindings,
@@ -3318,7 +3410,7 @@ impl super::super::eval::SubqueryExecution for CorrelatedSubqueries<'_> {
 /// subqueries read while the returned binding lives (see
 /// [`CorrelatedSubqueries`]).
 pub(super) fn bind_correlated_row<'g, 'a>(
-    base: &SubqueryValues<'_, 'a>,
+    base: &SubqueryValues<'g, 'a>,
     row: &'g dyn ColumnLookup<'a>,
     enclosing: Option<&'g dyn ColumnLookup<'a>>,
 ) -> Option<RowBinding<'g>>
@@ -4135,7 +4227,7 @@ fn catalog_type_witness(
 #[allow(clippy::too_many_arguments)]
 fn run_scalar_record_subquery<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -4223,7 +4315,7 @@ fn run_scalar_record_subquery<'a>(
 #[allow(clippy::too_many_arguments)]
 fn run_record_subquery<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -4304,7 +4396,7 @@ fn run_record_subquery<'a>(
 #[allow(clippy::too_many_arguments)]
 fn run_row_subquery<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -4357,7 +4449,7 @@ fn run_row_subquery<'a>(
 #[allow(clippy::too_many_arguments)]
 fn run_subquery<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -4934,7 +5026,7 @@ fn run_subquery<'a>(
 fn run_set_subquery<'a>(
     tree: &'a SetTree<'a>,
     outer_select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -4960,6 +5052,8 @@ fn run_set_subquery<'a>(
         rows
     } else {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+        // The description reads only the enclosing row's types.
+        let outer_types = outer.map(super::scope::OuterColumnTypes);
         super::setops::describe_set_body(
             storage,
             tree,
@@ -4968,7 +5062,9 @@ fn run_set_subquery<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
-            outer,
+            outer_types
+                .as_ref()
+                .map(|types| types as &dyn ColumnLookup<'_>),
         )?;
         let sorted = arena.alloc_slice_copy(rows).map_err(|_| arena_full())?;
         super::setops::sort_set_rows(
@@ -5159,15 +5255,50 @@ fn build_array_scalar<'a>(
 }
 
 /// Order helpers exported for update/delete WHERE-subquery support.
-pub fn subquery_hooks<'a>(
+pub fn subquery_hooks<'h, 'a: 'h>(
     exprs: &[Option<&'a Expr<'a>>],
-    storage: &Storage,
+    storage: &'h Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+) -> Result<SubqueryValues<'h, 'a>, SqlError> {
     subquery_hooks_with_outer(exprs, storage, txid, arena, params, None, sequences)
+}
+
+/// [`subquery_hooks`] for the expressions of a data change's action on a
+/// row (`ON CONFLICT DO UPDATE`): each subquery runs when first read, as of
+/// `command`, so it does not see the rows the statement wrote before.
+pub(crate) fn data_change_subquery_hooks<'a>(
+    exprs: &[Option<&'a Expr<'a>>],
+    storage: &Storage,
+    txid: u32,
+    command: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    let mut nodes = ArenaList::new(arena);
+    for expression in exprs.iter().flatten() {
+        collect_subqueries(expression, &mut nodes)?;
+    }
+    let borrowed = eval_subquery_nodes(
+        nodes.as_slice(),
+        storage,
+        txid,
+        arena,
+        params,
+        SUBQUERY_DEPTH,
+        None,
+        super::super::eval::StatementScope::default(),
+        sequences,
+        SubqueryTiming::FirstRead {
+            uncorrelated: false,
+            runs: DeferredRuns::DataChange { command },
+        },
+        &[],
+    )?;
+    detach_subquery_values(borrowed, arena)
 }
 
 /// [`subquery_hooks`] for a data change's expressions: a subquery that reads
@@ -5179,76 +5310,71 @@ pub fn subquery_hooks<'a>(
     clippy::too_many_arguments,
     reason = "a data change's subqueries are prepared against its command and row"
 )]
-pub(crate) fn uncorrelated_subquery_hooks<'a>(
+pub(crate) fn uncorrelated_subquery_hooks<'h, 'a: 'h>(
     exprs: &[Option<&'a Expr<'a>>],
     storage: &Storage,
     txid: u32,
-    command: Option<u32>,
+    runs: DeferredRuns<'h>,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    outer: Option<&dyn ColumnLookup<'a>>,
+    outer: Option<&'h dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    // SAFETY: as in `subquery_hooks_with_outer`; values are detached below.
-    let storage_for_eval: &'a Storage = unsafe { &*(storage as *const Storage) };
+) -> Result<SubqueryValues<'h, 'a>, SqlError> {
     let mut nodes = ArenaList::new(arena);
     for expression in exprs.iter().flatten() {
         collect_subqueries(expression, &mut nodes)?;
     }
     let mut uncorrelated = ArenaList::new(arena);
     for &node in nodes.as_slice() {
-        if !subquery_node_correlated(node, storage_for_eval, txid, arena)? {
+        if !subquery_node_correlated(node, storage, txid, arena)? {
             uncorrelated.push(node).map_err(|_| arena_full())?;
         }
     }
     let borrowed = eval_subquery_nodes(
         uncorrelated.as_slice(),
-        storage_for_eval,
+        storage,
         txid,
         arena,
         params,
         SUBQUERY_DEPTH,
         outer,
+        outer
+            .map(|outer| outer.statement_subqueries())
+            .unwrap_or_default(),
         sequences,
         SubqueryTiming::FirstRead {
             uncorrelated: true,
-            command,
+            runs,
         },
         &[],
     )?;
     detach_subquery_values(borrowed, arena)
 }
 
-pub(crate) fn subquery_hooks_outer<'a>(
+pub(crate) fn subquery_hooks_outer<'h, 'a: 'h>(
     exprs: &[Option<&'a Expr<'a>>],
-    storage: &Storage,
+    storage: &'h Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    outer: &dyn ColumnLookup<'a>,
+    outer: &'h dyn ColumnLookup<'a>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+) -> Result<SubqueryValues<'h, 'a>, SqlError> {
     subquery_hooks_with_outer(exprs, storage, txid, arena, params, Some(outer), sequences)
 }
 
-pub(crate) fn subquery_hooks_with_outer<'a>(
+pub(crate) fn subquery_hooks_with_outer<'h, 'a: 'h>(
     exprs: &[Option<&'a Expr<'a>>],
-    storage: &Storage,
+    storage: &'h Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    outer: Option<&dyn ColumnLookup<'a>>,
+    outer: Option<&'h dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    // `prepare_subqueries` may return values borrowing relation bytes. This
-    // adapter immediately round-trips every value through the arena codec, so
-    // no storage borrow escapes. The engine keeps Storage live for the call.
-    // SAFETY: Storage outlives this call, remains immutable during evaluation,
-    // and every possibly borrowed datum is detached before this function returns.
-    let storage_for_eval: &'a Storage = unsafe { &*(storage as *const Storage) };
+) -> Result<SubqueryValues<'h, 'a>, SqlError> {
     let borrowed = prepare_subqueries(
         exprs,
-        storage_for_eval,
+        storage,
         txid,
         arena,
         params,
@@ -5259,10 +5385,10 @@ pub(crate) fn subquery_hooks_with_outer<'a>(
     detach_subquery_values(borrowed, arena)
 }
 
-pub(super) fn detach_subquery_values<'a>(
-    borrowed: SubqueryValues<'a, '_>,
+pub(super) fn detach_subquery_values<'h, 'a: 'h>(
+    borrowed: SubqueryValues<'h, 'a>,
     arena: &'a Arena,
-) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+) -> Result<SubqueryValues<'h, 'a>, SqlError> {
     let scalars = arena
         .alloc_slice_with(borrowed.scalars.len(), |_| {
             (core::ptr::null(), Datum::Null, Datum::Null)
@@ -5313,18 +5439,14 @@ pub(super) fn detach_subquery_values<'a>(
 /// Runs a data-modifying statement's subqueries as of its command, so one
 /// first run after the statement has written rows does not see them.
 #[derive(Clone, Copy)]
-pub(crate) struct DmlSubqueries {
-    /// The engine's storage, which outlives every statement. The statement
-    /// writes through its own exclusive borrow between evaluations; this
-    /// executor reads only while an expression is evaluated, when no write
-    /// is in progress.
-    storage: *const Storage,
+pub(crate) struct DmlSubqueries<'s> {
+    storage: &'s Storage,
     txid: u32,
     command: u32,
 }
 
-impl DmlSubqueries {
-    pub(crate) fn new(storage: &Storage, txid: u32, command: u32) -> Self {
+impl<'s> DmlSubqueries<'s> {
+    pub(crate) fn new(storage: &'s Storage, txid: u32, command: u32) -> Self {
         Self {
             storage,
             txid,
@@ -5333,7 +5455,7 @@ impl DmlSubqueries {
     }
 }
 
-impl super::super::eval::SubqueryExecution for DmlSubqueries {
+impl super::super::eval::SubqueryExecution for DmlSubqueries<'_> {
     fn evaluate<'a>(
         &self,
         expression: &Expr<'a>,
@@ -5342,11 +5464,9 @@ impl super::super::eval::SubqueryExecution for DmlSubqueries {
         outer: &dyn ColumnLookup<'a>,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
-        // SAFETY: see the field invariant; an expression is being evaluated.
-        let storage: &Storage = unsafe { &*self.storage };
-        let _snapshot = storage.dml_expression_snapshot(self.command);
+        let _snapshot = self.storage.dml_expression_snapshot(self.command);
         ProceduralSubqueries {
-            storage,
+            storage: self.storage,
             txid: self.txid,
         }
         .evaluate(expression, arena, params, outer, sequences)
@@ -5368,17 +5488,15 @@ impl super::super::eval::SubqueryExecution for ProceduralSubqueries<'_> {
         outer: &dyn ColumnLookup<'a>,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
-        // SAFETY: storage remains immutable and live for this call; the
-        // result is detached before the borrow can escape.
-        let storage: &'a Storage = unsafe { &*(self.storage as *const Storage) };
         let borrowed = eval_subquery_nodes(
             &[expression],
-            storage,
+            self.storage,
             self.txid,
             arena,
             params,
             SUBQUERY_DEPTH,
             Some(outer),
+            outer.statement_subqueries(),
             sequences,
             SubqueryTiming::Now,
             &[],
@@ -5491,7 +5609,7 @@ fn bound_witness<'a>(
 /// only when a row reaches it.
 pub(super) fn bind_correlated_subqueries<'a>(
     nodes: &[&'a Expr<'a>],
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: &dyn ColumnLookup<'a>,
@@ -5514,7 +5632,7 @@ pub(super) fn bind_correlated_subqueries<'a>(
 /// of the rows it will read, or `None` for one bound for each row instead.
 fn bind_correlated_subquery<'a>(
     node: &'a Expr<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: &dyn ColumnLookup<'a>,
@@ -5614,7 +5732,7 @@ impl<'a> NestedBindings<'a> {
     fn bind(
         &self,
         nodes: &[&'a Expr<'a>],
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         outer: &dyn ColumnLookup<'a>,
         arena: &'a Arena,
@@ -5644,7 +5762,7 @@ impl<'a> NestedBindings<'a> {
     fn bind_registered(
         &self,
         nodes: &[&Expr<'a>],
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         outer: &dyn ColumnLookup<'a>,
         arena: &'a Arena,
@@ -5681,7 +5799,7 @@ impl<'a> NestedBindings<'a> {
     fn bind_entry(
         &self,
         entry: &'a core::cell::Cell<NestedBinding<'a>>,
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         outer: &dyn ColumnLookup<'a>,
     ) -> Result<Option<SubqueryBinding<'a>>, SqlError> {
@@ -5743,7 +5861,7 @@ fn nested_binding_workspace_full() -> SqlError {
 /// Binds an `EXISTS` subquery: which executor runs it.
 fn bind_exists_subquery<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: &dyn ColumnLookup<'a>,
@@ -5771,7 +5889,7 @@ fn bind_exists_subquery<'a>(
 /// Binds a row subquery: its row type.
 fn bind_row_subquery<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: &dyn ColumnLookup<'a>,
@@ -5802,7 +5920,7 @@ fn bind_row_subquery<'a>(
 fn bind_list_subquery<'a>(
     operand: &'a Expr<'a>,
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: &dyn ColumnLookup<'a>,
@@ -5855,7 +5973,7 @@ fn bind_list_subquery<'a>(
 
 fn bind_scalar_subquery<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: &dyn ColumnLookup<'a>,

@@ -587,6 +587,40 @@ impl<'a> BatchTable<'a> {
     }
 }
 
+/// The skew buckets `ExecHashBuildSkewHash` fills.
+trait SkewBuckets {
+    /// Enables `length` skew slots, charging `space` bytes.
+    fn enable_skew(&mut self, length: u32, space: usize);
+    /// The hash of the skew slot at `position`, when one is taken there.
+    fn skew_slot(&self, position: u32) -> Option<u32>;
+    /// Takes a skew slot (`HashSkewBucket`), charging its space.
+    fn take_skew_slot(&mut self, slot: SkewSlot) -> Result<(), SqlError>;
+}
+
+impl SkewBuckets for BatchTable<'_> {
+    fn enable_skew(&mut self, length: u32, space: usize) {
+        self.skew_enabled = true;
+        self.skew_length = length;
+        self.note_space(space);
+        self.skew_used += space;
+    }
+
+    fn skew_slot(&self, position: u32) -> Option<u32> {
+        self.skew
+            .borrowed_slice()
+            .iter()
+            .find(|held| held.position == position)
+            .map(|held| held.hash)
+    }
+
+    fn take_skew_slot(&mut self, slot: SkewSlot) -> Result<(), SqlError> {
+        self.skew.push(slot).map_err(|_| arena_full())?;
+        self.note_space(16);
+        self.skew_used += 16;
+        Ok(())
+    }
+}
+
 /// A built table's main rows, ordered for probing.
 #[derive(Clone, Copy)]
 struct Frozen<'a> {
@@ -781,7 +815,7 @@ pub(crate) fn key_hash(
             text,
         } => {
             let decoded = crate::sql::exec::decode_stored_composite_text(
-                text,
+                *text,
                 *slot,
                 *physical_fields,
                 storage,
@@ -1024,7 +1058,7 @@ type Row<'a> = &'a [Option<BaseRow<'a>>];
 struct Runner<'r, 'a> {
     cx: JoinContext<'r, 'a>,
     /// The statement's storage, which the scan nodes it makes borrow.
-    storage: &'a Storage,
+    storage: &'r Storage,
     /// Each path's kept hash table or store, which a rescan reads again
     /// (`ExecReScanHashJoin`, `ExecReScanMaterial`).
     built: &'a [core::cell::Cell<Option<Built<'a>>>],
@@ -1110,6 +1144,18 @@ impl<'a> JoinLayout<'a> {
             ),
         })
     }
+}
+
+/// The type of a relation's column, or of an expression member, in `scope`.
+fn member_type(
+    model: &ModeledJoin<'_>,
+    scope: &QueryScope<'_>,
+    (table, column): (usize, usize),
+) -> crate::sql::types::ColType {
+    if let Some(id) = Member::plain(0, column as u16).expression_id() {
+        return model.expressions[id].ctype;
+    }
+    scope.defs.stored(table).expect("a plain table").columns()[column].ctype
 }
 
 /// What every node of a join's plan reads to compare and bind rows: the
@@ -1235,16 +1281,8 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             .collation
     }
 
-    fn column_type(&self, (table, column): (usize, usize)) -> crate::sql::types::ColType {
-        if let Some(id) = Member::plain(0, column as u16).expression_id() {
-            return self.model.expressions[id].ctype;
-        }
-        self.scope
-            .defs
-            .stored(table)
-            .expect("a plain table")
-            .columns()[column]
-            .ctype
+    fn column_type(&self, member: (usize, usize)) -> crate::sql::types::ColType {
+        member_type(self.model, self.scope, member)
     }
 
     /// Each clause's (outer, inner) columns.
@@ -1448,6 +1486,186 @@ impl<'r, 'a> JoinContext<'r, 'a> {
         }
         Ok(Ordering::Equal)
     }
+
+    /// `create_hashjoin_plan`'s skew table: the join hashes one key whose
+    /// outer side is a column.
+    fn skewed(&self, keys: &KeySides) -> bool {
+        JoinContext::keys(keys).count() == 1
+            && Member::plain(0, keys[0].0.1 as u16)
+                .expression_id()
+                .is_none()
+    }
+
+    /// Whether every key's type has a hash function here.
+    fn hashable(&self, keys: &KeySides) -> bool {
+        JoinContext::keys(keys).all(|&(outer, inner)| {
+            [outer, inner]
+                .into_iter()
+                .all(|member| datum_type_hashable(self.column_type(member)))
+        })
+    }
+
+    /// The combined hash of a row's join keys (`ExecHashGetHashValue`):
+    /// `None` when a key is NULL.
+    fn key_hash(
+        &self,
+        row: &[Option<BaseRow<'a>>],
+        keys: &KeySides,
+        outer: bool,
+        keep_nulls: bool,
+    ) -> Result<Option<u32>, SqlError> {
+        let mut hash = 0u32;
+        for (at, &(o, i)) in JoinContext::keys(keys).enumerate() {
+            let value = self.value(row, if outer { o } else { i });
+            if value.is_null() {
+                // A join returning the side's unmatched rows hashes a NULL
+                // key as nothing (`EEOP_HASHDATUM_FIRST`, `NEXT32`).
+                if !keep_nulls {
+                    return Ok(None);
+                }
+                if at != 0 {
+                    hash = hash.rotate_left(1);
+                }
+                continue;
+            }
+            let one = datum_hash(&value).ok_or_else(|| {
+                crate::sql_err!(
+                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                    "a hash join of several batches over keys of this type is not supported"
+                )
+            })?;
+            hash = if at == 0 {
+                one
+            } else {
+                hash.rotate_left(1) ^ one
+            };
+        }
+        Ok(Some(hash))
+    }
+
+    fn build_skew(
+        &self,
+        table: &mut dyn SkewBuckets,
+        (rel, column): (usize, usize),
+        sizing: super::index_paths::joins::HashSizing,
+    ) -> Result<(), SqlError> {
+        let wanted = sizing.skew_mcvs as usize;
+        if wanted == 0 {
+            return Ok(());
+        }
+        let slot = self.scope.slots[rel];
+        let definition = self.scope.defs.stored(rel).expect("a plain table");
+        let statistics = self.storage.table_statistics(slot, self.txid);
+        let Some(distribution) = definition
+            .attributes
+            .number(column)
+            .and_then(|attribute| statistics.index_distribution(0, attribute))
+        else {
+            return Ok(());
+        };
+        let ctype = definition.columns()[column].ctype;
+        let count = wanted.min(distribution.mcv_len());
+        if count == 0 {
+            return Ok(());
+        }
+        let fraction: f64 = (0..count)
+            .map(|index| f64::from(distribution.mcv_frequency(index)))
+            .sum();
+        // `SKEW_MIN_OUTER_FRACTION`.
+        if fraction < 0.01 {
+            return Ok(());
+        }
+        let length = ((count + 1) as u32).next_power_of_two() << 2;
+        table.enable_skew(length, length as usize * 8 + count * 4);
+        for index in 0..count {
+            let value = distribution.mcv_value(index, ctype)?;
+            let Some(hash) = datum_hash(&value) else {
+                return Err(crate::sql_err!(
+                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                    "a hash join of several batches over keys of this type is not supported"
+                ));
+            };
+            // Open addressing in the skew array; a repeated hash is skipped.
+            let mut bucket = hash & (length - 1);
+            loop {
+                match table.skew_slot(bucket) {
+                    Some(held) if held == hash => break,
+                    Some(_) => bucket = (bucket + 1) & (length - 1),
+                    None => {
+                        table.take_skew_slot(SkewSlot {
+                            position: bucket,
+                            hash,
+                            removed: false,
+                        })?;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The `t_len` of the minimal tuple of path `id`'s target list for
+    /// the bound row.
+    fn tuple_len(&self, bound: &[Option<BaseRow<'a>>], id: u32) -> Result<usize, SqlError> {
+        self.tuple_sizes(bound, id, false).map(|(length, _)| length)
+    }
+
+    /// The `t_len` of a row's tuple under the `id` path and what a sort
+    /// writes of it to a tape (`writetup_heap`, or `writetup_datum` when
+    /// `datum` names a sort of one column).
+    fn tuple_sizes(
+        &self,
+        bound: &[Option<BaseRow<'a>>],
+        id: u32,
+        datum: bool,
+    ) -> Result<(usize, usize), SqlError> {
+        let mut values = [Datum::Null; 128];
+        let mut width = 0;
+        let mut fits = true;
+        self.model
+            .plan
+            .target_list(self.model.plan.path(id).relids, &mut |column| {
+                if width < values.len() {
+                    values[width] =
+                        self.value(bound, (usize::from(column.rel), usize::from(column.column)));
+                    width += 1;
+                } else {
+                    fits = false;
+                }
+            });
+        let sizes = fits
+            .then(|| {
+                super::postgres_memory::SizeSource {
+                    storage: self.storage,
+                    txid: self.txid,
+                }
+                .with(|sizing| {
+                    let length = super::postgres_memory::minimal_tuple_len_with_tids(
+                        Some(sizing),
+                        values[..width].iter().copied(),
+                        0,
+                    )?;
+                    let written = if datum {
+                        4 + super::postgres_memory::value_written_size(
+                            Some(sizing),
+                            &values[0],
+                            false,
+                        )?
+                    } else {
+                        length - 10 + 4
+                    };
+                    Some((length, written))
+                })
+            })
+            .flatten();
+        sizes.ok_or_else(|| {
+            crate::sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "a join whose rows have no PostgreSQL size here is not supported"
+            )
+        })
+    }
 }
 
 /// Scans `statement`'s FROM clause: by the plan PostgreSQL's join search
@@ -1457,7 +1675,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
 pub(super) fn scan_statement_source<'a>(
     statement: &'a crate::sql::ast::Select<'a>,
     recycle_rows: bool,
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a crate::sql::ast::FromClause<'a>,
     txid: u32,
@@ -1523,7 +1741,7 @@ pub(super) fn scan_statement_source<'a>(
 /// PostgreSQL's order.
 #[allow(clippy::too_many_arguments)]
 fn run_modeled_sorted<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     model: &ModeledJoin<'a>,
@@ -1683,7 +1901,7 @@ fn run_modeled_sorted<'a>(
 /// returns false.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_modeled<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     model: &ModeledJoin<'a>,
@@ -3063,24 +3281,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         Ok(true)
     }
 
-    /// `create_hashjoin_plan`'s skew table: the join hashes one key whose
-    /// outer side is a column.
-    fn skewed(&self, keys: &KeySides) -> bool {
-        JoinContext::keys(keys).count() == 1
-            && Member::plain(0, keys[0].0.1 as u16)
-                .expression_id()
-                .is_none()
-    }
-
-    /// Whether every key's type has a hash function here.
-    fn hashable(&self, keys: &KeySides) -> bool {
-        JoinContext::keys(keys).all(|&(outer, inner)| {
-            [outer, inner]
-                .into_iter()
-                .all(|member| datum_type_hashable(self.column_type(member)))
-        })
-    }
-
     /// A hash join PostgreSQL plans with several batches
     /// (`ExecHashJoin` with `ExecHashTableInsert`, `ExecHashIncreaseNumBatches`,
     /// the skew buckets of `ExecHashBuildSkewHash` and
@@ -3310,44 +3510,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         Ok(true)
     }
 
-    /// The combined hash of a row's join keys (`ExecHashGetHashValue`):
-    /// `None` when a key is NULL.
-    fn key_hash(
-        &self,
-        row: &[Option<BaseRow<'a>>],
-        keys: &KeySides,
-        outer: bool,
-        keep_nulls: bool,
-    ) -> Result<Option<u32>, SqlError> {
-        let mut hash = 0u32;
-        for (at, &(o, i)) in JoinContext::keys(keys).enumerate() {
-            let value = self.value(row, if outer { o } else { i });
-            if value.is_null() {
-                // A join returning the side's unmatched rows hashes a NULL
-                // key as nothing (`EEOP_HASHDATUM_FIRST`, `NEXT32`).
-                if !keep_nulls {
-                    return Ok(None);
-                }
-                if at != 0 {
-                    hash = hash.rotate_left(1);
-                }
-                continue;
-            }
-            let one = datum_hash(&value).ok_or_else(|| {
-                crate::sql_err!(
-                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                    "a hash join of several batches over keys of this type is not supported"
-                )
-            })?;
-            hash = if at == 0 {
-                one
-            } else {
-                hash.rotate_left(1) ^ one
-            };
-        }
-        Ok(Some(hash))
-    }
-
     /// Builds the table of path `inner`'s rows (`MultiExecPrivateHash`).
     fn build_batches(
         &self,
@@ -3383,81 +3545,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         hash_node.rows(table.total as u64);
         hash_node.hash_table(table.figures(inner));
         Ok(table)
-    }
-
-    fn build_skew(
-        &self,
-        table: &mut BatchTable<'a>,
-        (rel, column): (usize, usize),
-        sizing: super::index_paths::joins::HashSizing,
-    ) -> Result<(), SqlError> {
-        let wanted = sizing.skew_mcvs as usize;
-        if wanted == 0 {
-            return Ok(());
-        }
-        let slot = self.scope.slots[rel];
-        let definition = self.scope.defs.stored(rel).expect("a plain table");
-        let statistics = self.storage.table_statistics(slot, self.txid);
-        let Some(distribution) = definition
-            .attributes
-            .number(column)
-            .and_then(|attribute| statistics.index_distribution(0, attribute))
-        else {
-            return Ok(());
-        };
-        let ctype = definition.columns()[column].ctype;
-        let count = wanted.min(distribution.mcv_len());
-        if count == 0 {
-            return Ok(());
-        }
-        let fraction: f64 = (0..count)
-            .map(|index| f64::from(distribution.mcv_frequency(index)))
-            .sum();
-        // `SKEW_MIN_OUTER_FRACTION`.
-        if fraction < 0.01 {
-            return Ok(());
-        }
-        let length = ((count + 1) as u32).next_power_of_two() << 2;
-        table.skew_enabled = true;
-        table.skew_length = length;
-        table.note_space(length as usize * 8 + count * 4);
-        table.skew_used += length as usize * 8 + count * 4;
-        for index in 0..count {
-            let value = distribution.mcv_value(index, ctype)?;
-            let Some(hash) = datum_hash(&value) else {
-                return Err(crate::sql_err!(
-                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                    "a hash join of several batches over keys of this type is not supported"
-                ));
-            };
-            // Open addressing in the skew array; a repeated hash is skipped.
-            let mut bucket = hash & (length - 1);
-            loop {
-                match table
-                    .skew
-                    .borrowed_slice()
-                    .iter()
-                    .find(|held| held.position == bucket)
-                {
-                    Some(held) if held.hash == hash => break,
-                    Some(_) => bucket = (bucket + 1) & (length - 1),
-                    None => {
-                        table
-                            .skew
-                            .push(SkewSlot {
-                                position: bucket,
-                                hash,
-                                removed: false,
-                            })
-                            .map_err(|_| arena_full())?;
-                        table.note_space(16);
-                        table.skew_used += 16;
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Probes the current batch (or skew bucket `skew`) for the bound outer
@@ -3795,68 +3882,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         })?;
         *bound = saved;
         Ok(Held { rows })
-    }
-
-    /// The `t_len` of the minimal tuple of path `id`'s target list for
-    /// the bound row.
-    fn tuple_len(&self, bound: &[Option<BaseRow<'a>>], id: u32) -> Result<usize, SqlError> {
-        self.tuple_sizes(bound, id, false).map(|(length, _)| length)
-    }
-
-    /// The `t_len` of a row's tuple under the `id` path and what a sort
-    /// writes of it to a tape (`writetup_heap`, or `writetup_datum` when
-    /// `datum` names a sort of one column).
-    fn tuple_sizes(
-        &self,
-        bound: &[Option<BaseRow<'a>>],
-        id: u32,
-        datum: bool,
-    ) -> Result<(usize, usize), SqlError> {
-        let mut values = [Datum::Null; 128];
-        let mut width = 0;
-        let mut fits = true;
-        self.model
-            .plan
-            .target_list(self.model.plan.path(id).relids, &mut |column| {
-                if width < values.len() {
-                    values[width] =
-                        self.value(bound, (usize::from(column.rel), usize::from(column.column)));
-                    width += 1;
-                } else {
-                    fits = false;
-                }
-            });
-        let sizes = fits
-            .then(|| {
-                super::postgres_memory::SizeSource {
-                    storage: self.storage,
-                    txid: self.txid,
-                }
-                .with(|sizing| {
-                    let length = super::postgres_memory::minimal_tuple_len_with_tids(
-                        Some(sizing),
-                        values[..width].iter().copied(),
-                        0,
-                    )?;
-                    let written = if datum {
-                        4 + super::postgres_memory::value_written_size(
-                            Some(sizing),
-                            &values[0],
-                            false,
-                        )?
-                    } else {
-                        length - 10 + 4
-                    };
-                    Some((length, written))
-                })
-            })
-            .flatten();
-        sizes.ok_or_else(|| {
-            crate::sql_err!(
-                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                "a join whose rows have no PostgreSQL size here is not supported"
-            )
-        })
     }
 
     /// The held inner rows without NULL keys, ordered by key and, among

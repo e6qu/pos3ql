@@ -1180,7 +1180,7 @@ pub(crate) fn member_path<'a>(
 
 /// The one-relation scope of member `leaf` exposed under `exposed`.
 pub(crate) fn member_scope<'s>(
-    storage: &'s Storage,
+    storage: &Storage,
     txid: u32,
     leaf: usize,
     exposed: &'s str,

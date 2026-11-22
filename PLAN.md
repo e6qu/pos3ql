@@ -494,7 +494,9 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   argument expression is not traced through routine input preparation and
   the saved invocation log: a short value is taken as packed, a longer one
   is `0A000`), a long value a `FETCH` row or a `RETURNS TABLE` query passes
-  on, and `NEW` and `OLD` columns TOAST may store otherwise (`0A000`;
+  on, a long value a query forms anew for `SELECT INTO` or a `FOR` loop
+  (`FOR v IN SELECT big || ''` reads 3004; query results report a formed
+  value and one whose form they do not carry alike, so it is `0A000`), and `NEW` and `OLD` columns TOAST may store otherwise (`0A000`;
   PostgreSQL reads a `BEFORE` trigger's `NEW` as formed, 3004, and an
   `AFTER` trigger's as stored, 44; the firing path and queued `AFTER`
   events carry row values without forms).

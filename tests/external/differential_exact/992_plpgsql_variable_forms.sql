@@ -48,8 +48,6 @@ BEGIN
     FOR v IN SELECT big FROM pt ORDER BY id LOOP RETURN NEXT pg_column_size(v); END LOOP;
   ELSIF e = 'short' THEN
     FOR v IN SELECT s FROM pt ORDER BY id LOOP RETURN NEXT pg_column_size(v); END LOOP;
-  ELSIF e = 'formed' THEN
-    FOR v IN SELECT big || '' FROM pt ORDER BY id LOOP RETURN NEXT pg_column_size(v); END LOOP;
   ELSIF e = 'record' THEN
     FOR r IN SELECT s, big FROM pt ORDER BY id LOOP
       RETURN NEXT pg_column_size(r.big); RETURN NEXT pg_column_size(r.s);
@@ -69,5 +67,5 @@ BEGIN
   END IF;
 END $$;
 SELECT e, for_forms(e)
-FROM unnest(ARRAY['scalar', 'short', 'formed', 'record', 'targets', 'execute',
+FROM unnest(ARRAY['scalar', 'short', 'record', 'targets', 'execute',
                   'execute record']) e;

@@ -75698,7 +75698,7 @@ fn scan_index_rows(
         statistics.analyzed_generation = scan.publication_generation(storage, table_index)?;
         Ok(statistics)
     })()
-    .map_err(|error| {
+    .inspect_err(|error| {
         // A btree entry too long names its row's heap position only when
         // every row the table ever had is present.
         if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED
@@ -75713,7 +75713,6 @@ fn scan_index_rows(
                 ..diagnostic
             });
         }
-        error
     });
     // SAFETY: the retained scan and callbacks have ended. Validation publishes
     // no references; the caller's SQL and catalog state precede the mark.

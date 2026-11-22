@@ -75645,8 +75645,7 @@ fn validate_index_rows(
             table_index,
             txid,
             &definition,
-            ordered,
-            None,
+            BuildRowOrder::ordered(ordered),
             arena,
             visit,
         )
@@ -75658,8 +75657,7 @@ fn validate_index_rows(
                 table_index,
                 txid,
                 &definition,
-                ordered,
-                None,
+                BuildRowOrder::ordered(ordered),
                 arena,
                 visit,
             )
@@ -75797,8 +75795,7 @@ pub(crate) fn measure_index_counts(
                 table,
                 txid,
                 &definition,
-                false,
-                Some(0),
+                BuildRowOrder::Any { decoded: Some(0) },
                 arena,
                 &mut |_, _, _| {
                     rows += 1;
@@ -75841,8 +75838,7 @@ pub(crate) fn measure_index_counts(
                             table,
                             txid,
                             &definition,
-                            false,
-                            decoded,
+                            BuildRowOrder::Any { decoded },
                             arena,
                             visit,
                         )
@@ -76011,13 +76007,31 @@ pub(crate) fn index_build_counts_table(storage: &Storage, table: usize, txid: u3
 /// stored size. `ordered` visits them in a sequential scan's physical order,
 /// which takes a sorted copy of the resident rows; otherwise resident rows
 /// come first and saved ones after.
+/// The order an index build visits rows in.
+#[derive(Clone, Copy)]
+enum BuildRowOrder {
+    /// A sequential scan's physical order.
+    Physical,
+    /// Any order, decoding at least the columns of `decoded` when given.
+    Any { decoded: Option<u64> },
+}
+
+impl BuildRowOrder {
+    const fn ordered(ordered: bool) -> Self {
+        if ordered {
+            Self::Physical
+        } else {
+            Self::Any { decoded: None }
+        }
+    }
+}
+
 fn for_each_index_build_row(
     storage: &Storage,
     table_index: usize,
     txid: u32,
     definition: &TableDef,
-    ordered: bool,
-    decoded: Option<u64>,
+    order: BuildRowOrder,
     arena: &Arena,
     visit: &mut constraints::BuildRowVisit<'_>,
 ) -> Result<(), SqlError> {
@@ -76033,9 +76047,7 @@ fn for_each_index_build_row(
         })?;
         Ok(core::ops::ControlFlow::Continue(()))
     };
-    let scanned = if ordered {
-        scan.for_each_home_physically(arena, &mut |rowid, home| each(visit, rowid, home))?
-    } else {
+    let scanned = if let BuildRowOrder::Any { decoded } = order {
         scan.for_each_spilled_row_batch(arena, true, decoded, &mut |batch| {
             for spilled in batch {
                 match spilled.representation {
@@ -76054,6 +76066,8 @@ fn for_each_index_build_row(
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
         scan.for_each_resident_physically(arena, &mut |rowid, home| each(visit, rowid, home))?
+    } else {
+        scan.for_each_home_physically(arena, &mut |rowid, home| each(visit, rowid, home))?
     };
     if scanned.is_break() {
         return Err(sql_err!(
@@ -99555,8 +99569,7 @@ fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
             table,
             txid,
             &physical,
-            ordered,
-            None,
+            BuildRowOrder::ordered(ordered),
             arena,
             &mut |rowid, physical_values, stored| {
                 let mut values = [Datum::Null; MAX_COLUMNS];

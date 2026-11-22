@@ -99,7 +99,7 @@ impl<'a> PathScan<'a> {
     /// call to [`Self::next`] after [`Self::rescan`] starts an execution.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         from: &'a FromClause<'a>,
         condition: Option<&'a Expr<'a>>,
@@ -138,6 +138,8 @@ impl<'a> PathScan<'a> {
                 Some(reorder_qual(
                     fold_null(simplified, &scope, arena)?,
                     &scope,
+                    storage,
+                    txid,
                     arena,
                 )?)
             }

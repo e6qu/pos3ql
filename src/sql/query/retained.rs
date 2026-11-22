@@ -540,7 +540,7 @@ fn retained_expression_with(
 /// volatile or user-defined function.
 fn statement_sublinks<'a>(
     statement: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<&'a [&'a Expr<'a>]>, SqlError> {
@@ -1310,7 +1310,7 @@ fn constant_function_argument(expression: &Expr<'_>) -> bool {
 /// call's generator. Other function sources run when declared.
 fn retained_function_source<'a>(
     tref: &'a TableRef<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Option<&'a [(super::generator::GeneratorKind, i32)]> {
@@ -1442,7 +1442,7 @@ fn scope_expressions_retained(
 #[allow(clippy::type_complexity)]
 fn reader_grouping<'a>(
     statement: &'a Select<'a>,
-    columns: &CatalogScopeCols<'_, 'a, '_, 'a>,
+    columns: &CatalogScopeCols<'_, 'a, '_, '_>,
     catalog: &dyn super::super::eval::CatalogAccess,
     groups_itself: bool,
     arena: &'a Arena,
@@ -1492,7 +1492,7 @@ enum JoinReader<'a> {
 /// literal items encoded, and how it is read.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn retained_join_scope<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     from: &'a FromClause<'a>,
@@ -1630,7 +1630,7 @@ fn retained_join_scope<'a>(
 fn pulled_join_admitted<'a>(
     statement: &'a Select<'a>,
     grouped: bool,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
@@ -1648,7 +1648,7 @@ fn pulled_join_admitted<'a>(
 
 /// Encodes a literal VALUES source's rows in the reader's memory.
 fn literal_rows<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     query: &'a Select<'a>,
     count: usize,
@@ -3045,7 +3045,7 @@ impl<'a> RetainedSelect<'a> {
     /// `planning`, which the reader does not borrow.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         statement: &'a Select<'a>,
         params: &[Datum<'a>],
@@ -3141,7 +3141,7 @@ impl<'a> RetainedSelect<'a> {
     ) -> Result<Option<Self>, SqlError> {
         // A statement plans in its own arena, which it reclaims when it
         // ends.
-        let reader = RetainedSelect::open_mode(
+        let mut reader = RetainedSelect::open_mode(
             storage,
             txid,
             statement,
@@ -3153,15 +3153,6 @@ impl<'a> RetainedSelect<'a> {
             RetainedUse::Stream,
             statement_use,
         )?;
-        // SAFETY: only one physical local table without policies, inheritance
-        // or joins, a literal VALUES list, or a builtin function source reaches
-        // this point. Scope arrays, names, ASTs, literal rows and generator
-        // state borrow the supplied arena/statement; definition images and row
-        // roots have owned leases. No retained field borrows Storage. Its
-        // conservative schema-resolution lifetime can therefore be extended to
-        // the arena.
-        let mut reader = reader
-            .map(|reader| unsafe { core::mem::transmute::<RetainedSelect<'_>, Self>(reader) });
         if let Some(reader) = reader.as_mut() {
             reader.start_generator(storage, txid, arena, params)?;
         }
@@ -3170,7 +3161,7 @@ impl<'a> RetainedSelect<'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn open_mode(
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         statement: &'a Select<'a>,
         params: &[Datum<'a>],
@@ -3567,7 +3558,7 @@ impl<'a> RetainedSelect<'a> {
                 // PostgreSQL's cost order of the conjuncts.
                 let predicate = simplify_qual(predicate, arena)?;
                 let predicate = plan::fold_null(predicate, &scope, arena)?;
-                reorder_qual(predicate, &scope, arena)
+                reorder_qual(predicate, &scope, storage, txid, arena)
             })
             .transpose()?;
         let (predicate, eliminated) = match predicate {
@@ -3815,7 +3806,7 @@ impl<'a> RetainedSelect<'a> {
     /// run in the caller, so routine calls hand off on their row.
     #[allow(clippy::too_many_arguments)]
     fn open_join(
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         statement: &'a Select<'a>,
         from: &'a FromClause<'a>,
@@ -3940,7 +3931,7 @@ impl<'a> RetainedSelect<'a> {
                 // PostgreSQL's cost order of the conjuncts.
                 let predicate = simplify_qual(predicate, arena)?;
                 let predicate = plan::fold_null(predicate, &scope, arena)?;
-                reorder_qual(predicate, &scope, arena)
+                reorder_qual(predicate, &scope, storage, txid, arena)
             })
             .transpose()?;
         // A modeled join's plan evaluates the whole condition.

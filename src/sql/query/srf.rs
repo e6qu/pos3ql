@@ -2895,7 +2895,7 @@ fn finish_derived_definition<'a, 'd>(
 /// function name), so a bare reference to the alias resolves to the value.
 pub(super) fn table_func_def<'a>(
     tref: &'a TableRef<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -3376,7 +3376,7 @@ pub(super) fn sql_table_constructor(tref: &TableRef<'_>) -> bool {
 
 pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -3419,7 +3419,7 @@ fn function_type_miss(mut error: SqlError, tref: &TableRef<'_>) -> SqlError {
 
 fn table_func_def_unpositioned<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -4316,7 +4316,7 @@ fn table_func_def_unpositioned<'a, C: ColumnLookup<'a>>(
 fn rows_from_def_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
     functions: &'a [TableRef<'a>],
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -4457,7 +4457,7 @@ fn table_function_input_count(tref: &TableRef<'_>) -> usize {
 
 pub(super) fn select_table_func_routine<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     columns: &C,

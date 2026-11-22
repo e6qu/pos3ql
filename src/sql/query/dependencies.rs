@@ -3602,12 +3602,6 @@ impl<'a> crate::sql::eval::ColumnLookup<'a> for DependencyTypes<'_, '_, '_> {
             .routine_result_for_oid(self.column_meta(qualifier, name)?.type_oid, self.txid)?
             .user_type
     }
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
-        crate::sql::exec::record_field_metadata(base, field, self)
-            .map_or(crate::sql::ast::Collation::None, |metadata| {
-                metadata.collation
-            })
-    }
 }
 
 impl ColTypeResolver for DependencyTypes<'_, '_, '_> {

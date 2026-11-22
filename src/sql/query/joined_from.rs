@@ -1404,7 +1404,7 @@ pub(crate) fn joined_write_join<'a>(
         // PostgreSQL hashes on any equality between the two relations; one
         // this plan cannot hash leaves the join to the general executor.
         let side_type = |side: &Expr<'_>| {
-            super::infer_scope_type(side, &scope)
+            super::infer_scope_type(side, &scope, storage, txid, arena)
                 .ok()
                 .and_then(|(oid, _)| crate::sql::types::ColType::from_oid(oid))
         };

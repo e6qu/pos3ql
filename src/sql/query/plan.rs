@@ -16,7 +16,7 @@ use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::storage::Storage;
 
-use super::{MAX_OPTIMIZED_JOIN_TABLES, QueryScope, ResolvedColumn, ScopeCols, arena_full};
+use super::{MAX_OPTIMIZED_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full};
 
 /// Top-level qualification terms retained for cost ordering and join
 /// pushdown. A full 64-relation equality chain has 63 terms; leave another
@@ -604,10 +604,18 @@ pub(super) fn fold_null<'a>(
 pub(super) fn reorder_qual<'a>(
     pred: &'a Expr<'a>,
     scope: &QueryScope<'a>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
-    let (storage, txid) = scope.catalog();
-    order_qual(pred, &ScopeCols(scope), storage, txid, arena)
+    let columns = super::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    order_qual(pred, &columns, storage, txid, arena)
 }
 
 /// [`reorder_qual`] with the conjuncts' columns typed by `columns`.
@@ -1308,16 +1316,21 @@ fn operator_cost(e: &Expr, columns: &dyn ColTypeResolver, storage: &Storage, txi
 /// and AND/OR/IS NULL cost nothing. Used for the sort/limit projection
 /// postponement decision (threshold empirically pinned against PostgreSQL 18.4:
 /// items costing more than 10 operators are projected above the Sort + Limit).
-pub(super) fn postpone_cost(e: &Expr<'_>, scope: &QueryScope<'_>, arena: &Arena) -> f64 {
-    let (storage, txid) = scope.catalog();
-    expression_cost(
-        e,
-        &ScopeCols(scope),
+pub(super) fn postpone_cost(
+    e: &Expr<'_>,
+    scope: &QueryScope<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> f64 {
+    let columns = super::CatalogScopeCols {
+        scope,
+        outer: None,
         storage,
         txid,
         arena,
-        CostUse::Projection,
-    )
+    };
+    expression_cost(e, &columns, storage, txid, arena, CostUse::Projection)
 }
 
 /// Where an expression's cost is weighed. PostgreSQL turns an uncorrelated

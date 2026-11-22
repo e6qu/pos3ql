@@ -256,10 +256,12 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   relation's scan and its nodes' records (about 18 KB for an analyzed
   table joined with itself, which a stream's estimate counts exactly). No
   node keeps a `Storage` or `Arena` argument between calls, and a scan
-  captures its index's statistics counter for each read; a scan's resolved
-  `QueryScope` still holds a `Storage` reference, which its catalog
-  lookups (named types, domains, common types) read during expression
-  typing, including record field typing while rows are evaluated. A
+  captures its index's statistics counter for each read. A reader opens
+  with a `Storage` borrow its type does not carry, so the compiler rejects
+  a node or scope that keeps one: a scope records each table's OID and
+  whether it has descendants, and a view's row type, as it resolves them,
+  and a record field's collation is typed against the evaluating call's
+  catalog. A
   `Materialize` keeps its rows, with their stored forms, in
   `plan_build_bytes` leases. Still needed: hash, merge, `Memoize` and
   `Unique` pull nodes, `EXPLAIN ANALYZE` counters on the pull nodes, a

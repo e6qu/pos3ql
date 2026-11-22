@@ -1416,10 +1416,6 @@ pub trait ColumnLookup<'a> {
         crate::sql::ast::Collation::None
     }
 
-    fn record_field_collation(&self, _base: &Expr<'a>, _field: &str) -> crate::sql::ast::Collation {
-        crate::sql::ast::Collation::None
-    }
-
     /// The stable user-defined type identity of a bare column, if any.
     fn column_user_type(
         &self,
@@ -10700,7 +10696,12 @@ fn expression_collation<'a>(
                 ))
             }
             _ => {
-                let value = row.record_field_collation(base, field);
+                let value = crate::sql::exec::record_field_metadata(
+                    base,
+                    field,
+                    &RuntimeColumnTypes { row, catalog },
+                )
+                .map_or(crate::sql::ast::Collation::None, |meta| meta.collation);
                 Ok(DerivedCollation::implicit(
                     value,
                     static_type(expression, row).is_some_and(ColType::is_collatable),

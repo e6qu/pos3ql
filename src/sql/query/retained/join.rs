@@ -346,7 +346,7 @@ fn source_ref<'a>(from: &'a FromClause<'a>, table: usize) -> &'a TableRef<'a> {
 /// a literal VALUES list or builtin generator calls with constant arguments.
 pub(super) fn item_shape<'a>(
     tref: &'a TableRef<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Option<ItemShape<'a>> {
@@ -412,7 +412,7 @@ pub(super) struct JoinShape<'a> {
 /// result decides both a stream's eligibility and the reader that opens it,
 /// so the two cannot disagree.
 pub(super) fn join_shape<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     from: &'a FromClause<'a>,
     where_clause: Option<&'a Expr<'a>>,
@@ -632,7 +632,7 @@ pub(super) fn join_shape<'a>(
 /// already in `scope.derived`; physical sources capture their positions.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn open_levels<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     from: &'a FromClause<'a>,
     scope: &QueryScope<'a>,

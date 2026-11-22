@@ -176,11 +176,6 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
             .unwrap_or(Collation::None)
     }
 
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
-        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.scope))
-            .map_or(Collation::None, |meta| meta.collation)
-    }
-
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
@@ -1386,10 +1381,6 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
             .map(|entry| self.0.output_collation(entry))
             .unwrap_or(Collation::None)
     }
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
-        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.0))
-            .map_or(Collation::None, |meta| meta.collation)
-    }
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
@@ -1554,10 +1545,6 @@ impl<'a> ColumnLookup<'a> for ScopePrefix<'_, '_> {
             .ok()
             .map(|entry| self.scope.output_collation(entry))
             .unwrap_or(Collation::None)
-    }
-
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
-        ScopeSchema(self.scope).record_field_collation(base, field)
     }
 
     fn column_user_type(
@@ -2153,8 +2140,8 @@ pub(super) fn prepare_materialization<'a>(
                 super::predicate_safety::AnalysisStage::RuntimeProjection,
                 arena,
             )?;
-            let sorted_expensive =
-                statement.limit.is_some() && postpone_cost(expression, scope, arena) > 20.0;
+            let sorted_expensive = statement.limit.is_some()
+                && postpone_cost(expression, scope, storage, txid, arena) > 20.0;
             if properties.volatile || sorted_expensive {
                 postponed[index] = true;
                 any_postponed = true;

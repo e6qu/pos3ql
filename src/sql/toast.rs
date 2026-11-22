@@ -1053,6 +1053,34 @@ fn may_compress(bytes: &[u8]) -> bool {
     covered.iter().filter(|&&covered| covered).count() >= 15
 }
 
+/// How `toast_compress_datum` treats a value of `payload` data bytes.
+pub(crate) enum Compression {
+    /// Compressed: the datum's `VARSIZE`.
+    Compressed(usize),
+    /// pglz keeps no result short enough.
+    Incompressible,
+    /// The bytes pglz reads of the value are not modelled.
+    Unknown,
+}
+
+/// [`Compression`] of `value` under pglz, the default
+/// `default_toast_compression`.
+pub(crate) fn pglz_compression(
+    value: &crate::sql::types::Datum<'_>,
+    payload: usize,
+    arena: &crate::mem::arena::Arena,
+) -> Result<Compression, crate::sql::eval::SqlError> {
+    let Some(bytes) = pglz_input(value, arena)? else {
+        return Ok(Compression::Unknown);
+    };
+    Ok(match crate::sql::pglz::compressed_size(bytes) {
+        Some(length) if length + COMPRESSED_HEADER < payload.saturating_sub(2) => {
+            Compression::Compressed(length + COMPRESSED_HEADER)
+        }
+        _ => Compression::Incompressible,
+    })
+}
+
 /// The bytes pglz reads of `value` as PostgreSQL stores it: the data of the
 /// types pos3ql holds byte for byte, or formed into `scratch` for a tsvector,
 /// path or polygon. `None` for a type whose stored data is not modelled.

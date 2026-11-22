@@ -75492,6 +75492,106 @@ fn for_each_index_build_row(
     Ok(())
 }
 
+/// Whether the table in slot `table_index`, which holds `rows` rows, keeps
+/// them in PostgreSQL's heap layout: it has only ever had rows inserted, all
+/// of them present, since its statistics were counted (PostgreSQL leaves an
+/// updated, deleted or rolled-back row's tuple in place until a vacuum, and
+/// a vacuum lets later rows reuse its line pointers).
+fn heap_layout_known(storage: &Storage, table_index: usize, txid: u32, rows: Option<u64>) -> bool {
+    let committed = storage.relation_cumulative_statistics(table_index);
+    let pending = storage.relation_transaction_statistics(txid, table_index);
+    committed.n_tup_upd == 0
+        && committed.n_tup_del == 0
+        && committed.n_dead_tup == 0
+        && committed.vacuum_count == 0
+        && pending.n_tup_upd == 0
+        && pending.n_tup_del == 0
+        && rows.is_none_or(|rows| committed.n_tup_ins.saturating_add(pending.n_tup_ins) == rows)
+}
+
+/// The stored rows of the table in slot `table_index` in a sequential
+/// scan's physical order, packed into heap pages.
+fn pack_stored_rows(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(crate::storage::heap_layout::HeapPacking, u64), SqlError> {
+    let definition = storage.table_def(table_index, txid);
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    let schema = &schema[..definition.n_columns];
+    let mut packing = crate::storage::heap_layout::HeapPacking::new();
+    let mut rows = 0u64;
+    let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
+    let scanned = scan.for_each_home_physically(arena, &mut |rowid, home| {
+        storage.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut values)?;
+            packing.add(crate::storage::heap_layout::stored_tuple_length(
+                bytes,
+                &values[..schema.len()],
+                schema,
+            )?);
+            rows += 1;
+            Ok(())
+        })?;
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    if scanned.is_break() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "heap layout scan stopped before completing"
+        ));
+    }
+    Ok((packing, rows))
+}
+
+/// The heap position (`ctid`) PostgreSQL gives the new row `values` of the
+/// table in slot `table_index`: after its stored rows, as the statement
+/// forms it. `None` when the table's heap layout is not known.
+pub(crate) fn new_row_heap_position(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    values: &[Datum],
+    arena: &Arena,
+) -> Result<Option<(u64, usize)>, SqlError> {
+    if !heap_layout_known(storage, table_index, txid, None) {
+        return Ok(None);
+    }
+    let mark = arena.mark();
+    let result = (|| {
+        let (mut packing, rows) = pack_stored_rows(storage, table_index, txid, arena)?;
+        if !heap_layout_known(storage, table_index, txid, Some(rows)) {
+            return Ok(None);
+        }
+        let definition = storage.table_def(table_index, txid);
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        definition.schema(&mut schema);
+        let schema = &schema[..definition.n_columns];
+        let mut forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+        crate::sql::toast::row_forms(
+            storage,
+            table_index,
+            txid,
+            values,
+            &crate::sql::toast::CarriedForms::NONE,
+            &mut forms,
+            arena,
+        )?;
+        packing.add(crate::storage::heap_layout::tuple_length_in_forms(
+            values,
+            schema,
+            &forms[..values.len()],
+        ));
+        Ok(Some(packing.position()))
+    })();
+    // SAFETY: the scan and the row's forms are consumed before returning.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
 /// Checks one row an index build reads: its row identifier, the table's
 /// column types and its values.
 type IndexRowCheck<'c> = dyn FnMut(u64, &[ColType], &[Datum]) -> Result<(), SqlError> + 'c;
@@ -75513,27 +75613,32 @@ fn scan_index_rows(
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         definition.schema(&mut schema);
         let schema = &schema[..definition.n_columns];
-        let mut validate_values = |rowid: u64, values: &[Datum]| -> Result<(), SqlError> {
-            let row_mark = arena.mark();
-            let result = crate::sql::query::index_key_calls::with_key_row(rowid, || {
-                check_index_tuple_sizes(storage, &definition, values, only, txid, arena)
-            })
-            .and_then(|()| check(rowid, schema, values));
-            // SAFETY: validation returns only an owned error or success; key
-            // values and parsed expressions are consumed before returning.
-            unsafe { arena.rewind_to(row_mark) };
-            result
-        };
+        // A stored row's heap position, while the layout may be known; an
+        // index build's error names it after the rows are counted.
+        let layout_known = heap_layout_known(storage, table_index, txid, None);
+        let mut validate_values =
+            |rowid: u64, values: &[Datum], position: (u64, usize)| -> Result<(), SqlError> {
+                let row_mark = arena.mark();
+                let heap = constraints::HeapTuple::Stored(layout_known.then_some(position));
+                let result = crate::sql::query::index_key_calls::with_key_row(rowid, || {
+                    check_index_tuple_sizes(storage, &definition, values, only, heap, txid, arena)
+                })
+                .and_then(|()| check(rowid, schema, values));
+                // SAFETY: validation returns only an owned error or success; key
+                // values and parsed expressions are consumed before returning.
+                unsafe { arena.rewind_to(row_mark) };
+                result
+            };
         let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
         let mut rows = 0u64;
         let mut row_bytes = 0u64;
         let mut packing = crate::storage::heap_layout::HeapPacking::new();
-        let mut pack = |bytes: &[u8], values: &[Datum]| -> Result<(), SqlError> {
+        let mut pack = |bytes: &[u8], values: &[Datum]| -> Result<(u64, usize), SqlError> {
             let schema = &schema[..definition.n_columns];
             packing.add(crate::storage::heap_layout::stored_tuple_length(
                 bytes, values, schema,
             )?);
-            Ok(())
+            Ok(packing.position())
         };
         // A sequential scan's order: saved rows, then resident rows.
         scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
@@ -75548,7 +75653,6 @@ fn scan_index_rows(
                         &crate::storage::SpilledValues { values, .. },
                     ) => values,
                 };
-                validate_values(spilled.rowid, values)?;
                 // A PAX row's encoding holds every column of a full scan.
                 let bytes = match spilled.representation {
                     crate::storage::SpilledRowRepresentation::Encoded(bytes)
@@ -75556,7 +75660,8 @@ fn scan_index_rows(
                         &crate::storage::SpilledValues { encoded: bytes, .. },
                     ) => bytes,
                 };
-                pack(bytes, values)?;
+                let position = pack(bytes, values)?;
+                validate_values(spilled.rowid, values, position)?;
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(bytes.len() as u64);
             }
@@ -75566,8 +75671,8 @@ fn scan_index_rows(
             storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, schema, &mut values)?;
-                validate_values(rowid, &values[..definition.n_columns])?;
-                pack(bytes, &values[..definition.n_columns])?;
+                let position = pack(bytes, &values[..definition.n_columns])?;
+                validate_values(rowid, &values[..definition.n_columns], position)?;
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(bytes.len() as u64);
                 Ok(())
@@ -75592,7 +75697,24 @@ fn scan_index_rows(
             .min(u64::from(u32::MAX)) as u32;
         statistics.analyzed_generation = scan.publication_generation(storage, table_index)?;
         Ok(statistics)
-    })();
+    })()
+    .map_err(|error| {
+        // A btree entry too long names its row's heap position only when
+        // every row the table ever had is present.
+        if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED
+            && error.message.as_str().starts_with("index row size ")
+            && heap_layout_known(storage, table_index, txid, None)
+            && let Some(diagnostic) = crate::sql::eval::take_diagnostic()
+        {
+            let known = pack_stored_rows(storage, table_index, txid, arena)
+                .is_ok_and(|(_, rows)| heap_layout_known(storage, table_index, txid, Some(rows)));
+            crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+                detail: if known { diagnostic.detail } else { None },
+                ..diagnostic
+            });
+        }
+        error
+    });
     // SAFETY: the retained scan and callbacks have ended. Validation publishes
     // no references; the caller's SQL and catalog state precede the mark.
     unsafe { arena.rewind_to(mark) };
@@ -106258,7 +106380,15 @@ fn alter_table_relation(
         };
         // The rebuilt indexes evaluate their keys over the rewritten rows.
         if let Err(error) = rows(true, &mut |_, values, _| {
-            constraints::check_index_tuple_sizes(storage, &new_def, values, None, txn.txid, arena)
+            constraints::check_index_tuple_sizes(
+                storage,
+                &new_def,
+                values,
+                None,
+                constraints::HeapTuple::Stored(None),
+                txn.txid,
+                arena,
+            )
         }) {
             return sql_fail(error);
         }

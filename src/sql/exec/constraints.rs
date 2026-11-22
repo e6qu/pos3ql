@@ -2415,6 +2415,159 @@ fn check_index_key_tuple_size(
     Ok(())
 }
 
+/// `BTMaxItemSize` with 8 kB blocks: a btree page holds at least three
+/// items (`_bt_check_third_page`).
+const BTREE_MAX_ITEM_SIZE: usize = 2704;
+/// `TOAST_INDEX_TARGET` (`MaxHeapTupleSize / 16`): `index_form_tuple`
+/// compresses a longer value of a type whose storage allows it.
+const TOAST_INDEX_TARGET: usize = 510;
+/// `_bt_check_third_page`'s hint.
+const BTREE_ITEM_HINT: &str = "Values larger than 1/3 of a buffer page cannot be indexed.\nConsider a function index of an MD5 hash of the value, or use full text indexing.";
+
+/// The heap tuple a checked index entry references.
+#[derive(Clone, Copy)]
+pub(crate) enum HeapTuple {
+    /// A row being written, placed after the stored rows.
+    New,
+    /// A stored row an index build reads, at its heap position when the
+    /// table's physical layout is known.
+    Stored(Option<(u64, usize)>),
+}
+
+/// The length of the btree tuple `index_form_tuple` forms of `key`, each
+/// value sized as its declared type in `hints` where that differs from the
+/// datum's own (`name`): a value longer than `TOAST_INDEX_TARGET` is
+/// compressed when pglz shortens it enough, a short one takes a one-byte
+/// header. `None` when a value has no PostgreSQL size here, or the tuple
+/// could only fit after compressing bytes the model does not have.
+fn btree_tuple_size(
+    key: &[Datum],
+    hints: &[Option<i32>],
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<Option<usize>, SqlError> {
+    let sizing = crate::sql::query::postgres_memory::Sizing {
+        catalog: Some((storage, txid)),
+        scratch: arena,
+    };
+    let mut data = 0usize;
+    let mut unknown = false;
+    for (value, hint) in key.iter().zip(hints) {
+        if value.is_null() {
+            continue;
+        }
+        let Some(stored) = crate::sql::query::postgres_memory::stored(Some(&sizing), *hint, value)
+        else {
+            return Ok(None);
+        };
+        let layout = stored.layout;
+        let aligned = |offset: usize| {
+            offset.next_multiple_of(match layout.alignment {
+                b'd' => 8,
+                b'i' => 4,
+                b's' => 2,
+                _ => 1,
+            })
+        };
+        if layout.length > 0 {
+            data = aligned(data) + layout.length as usize;
+            continue;
+        }
+        // A `name` key is stored as `cstring` (`name_ops`' `opckeytype`).
+        if layout.length == -2 {
+            let Datum::Text(text) = value else {
+                return Ok(None);
+            };
+            data += text.len() + 1;
+            continue;
+        }
+        if layout.length != -1 {
+            return Ok(None);
+        }
+        let payload = stored.payload;
+        if payload + 4 > TOAST_INDEX_TARGET && matches!(layout.storage, b'x' | b'm') {
+            match crate::sql::toast::pglz_compression(value, payload, arena)? {
+                crate::sql::toast::Compression::Compressed(size) => {
+                    data = aligned(data) + size;
+                    continue;
+                }
+                crate::sql::toast::Compression::Incompressible => {}
+                crate::sql::toast::Compression::Unknown => unknown = true,
+            }
+        }
+        data = if layout.storage != b'p' && payload < 127 {
+            data + payload + 1
+        } else {
+            aligned(data) + payload + 4
+        };
+    }
+    // `IndexTupleData`, then a null bitmap's four bytes when a value is NULL.
+    let header = if key.iter().any(Datum::is_null) {
+        16
+    } else {
+        8
+    };
+    let size = (header + data).next_multiple_of(8);
+    // Compression only shortens a value: a tuple that fits uncompressed fits.
+    Ok((!unknown || size <= BTREE_MAX_ITEM_SIZE).then_some(size))
+}
+
+/// `_bt_check_third_page` of the btree index `index_name` on the table
+/// `def` (slot `table_slot`), whose entry for the row `values` holds `key`
+/// and then `included`.
+#[allow(clippy::too_many_arguments)]
+fn check_btree_item_size(
+    storage: &Storage,
+    table_slot: usize,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    index_name: &str,
+    entry: &[Datum],
+    hints: &[Option<i32>],
+    values: &[Datum],
+    heap: HeapTuple,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let Some(size) = btree_tuple_size(entry, hints, storage, txid, arena)? else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "sizing a btree entry of index \"{}\" holding a value with no PostgreSQL size here is not supported",
+            index_name
+        ));
+    };
+    if size <= BTREE_MAX_ITEM_SIZE {
+        return Ok(());
+    }
+    let position = match heap {
+        HeapTuple::Stored(position) => position,
+        HeapTuple::New => super::new_row_heap_position(storage, table_slot, txid, values, arena)?,
+    };
+    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+        position.map(|(page, offset)| {
+            crate::sql::eval::DiagnosticText::format(format_args!(
+                "Index row references tuple ({},{}) in relation \"{}\".",
+                page,
+                offset,
+                def.name.as_str()
+            ))
+        }),
+        Some(crate::sql::eval::DiagnosticText::copy(BTREE_ITEM_HINT)),
+        crate::sql::eval::ErrorObjects::table_constraint(
+            def.schema.as_str(),
+            def.name.as_str(),
+            index_name,
+        ),
+    ));
+    Err(sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "index row size {} exceeds btree version 4 maximum {} for index \"{}\"",
+        size,
+        BTREE_MAX_ITEM_SIZE,
+        index_name
+    ))
+}
+
 /// Validates every persistent tuple shape visible on a table, including
 /// non-unique named indexes (which uniqueness-only enforcement does not walk),
 /// or only the index whose OID is `only`, which an index build forms.
@@ -2423,11 +2576,12 @@ pub(crate) fn check_index_tuple_sizes(
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &[Datum],
     only: Option<i32>,
+    heap: HeapTuple,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let mark = arena.mark();
-    let result = check_index_tuple_sizes_inner(storage, def, values, only, txid, arena);
+    let result = check_index_tuple_sizes_inner(storage, def, values, only, heap, txid, arena);
     // SAFETY: parsed definitions and evaluated keys are consumed completely
     // by the size check and never escape this call.
     unsafe { arena.rewind_to(mark) };
@@ -2439,19 +2593,10 @@ fn check_index_tuple_sizes_inner(
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &[Datum],
     only: Option<i32>,
+    heap: HeapTuple,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    if only.is_none() {
-        for (column, metadata) in def.columns().iter().enumerate() {
-            if metadata.unique {
-                check_index_tuple_size(&[column as u16], values)?;
-            }
-        }
-        for unique in def.uniques() {
-            check_index_tuple_size(unique.columns(), values)?;
-        }
-    }
     let table_slot = storage
         .find_visible(def.schema.as_str(), def.name.as_str(), txid)
         .ok_or_else(|| {
@@ -2462,6 +2607,62 @@ fn check_index_tuple_sizes_inner(
                 def.name.as_str()
             )
         })?;
+    // The declared type of column `column`, which sizes a `name` as such.
+    let column_oid = |column: u16| -> Result<Option<i32>, SqlError> {
+        Ok(Some(
+            match storage.declared_column_type(&def.columns()[usize::from(column)], txid)? {
+                crate::storage::DeclaredColumnType::Builtin { oid }
+                | crate::storage::DeclaredColumnType::UserDefined { oid, .. } => oid,
+            },
+        ))
+    };
+    // A key's stored type: btree's `name_ops` keeps a `name` as `cstring`.
+    let key_oid = |column: u16| -> Result<Option<i32>, SqlError> {
+        Ok(column_oid(column)?.map(|oid| {
+            if oid == crate::sql::types::oid::NAME {
+                crate::sql::types::oid::CSTRING
+            } else {
+                oid
+            }
+        }))
+    };
+    if only.is_none() {
+        let btree_key = |columns: &[u16], name: SqlName| -> Result<(), SqlError> {
+            let mut entry = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+            let mut hints = [None; crate::storage::MAX_INDEX_COLS];
+            for (at, column) in columns.iter().enumerate() {
+                entry[at] = values[usize::from(*column)];
+                hints[at] = key_oid(*column)?;
+            }
+            check_btree_item_size(
+                storage,
+                table_slot,
+                def,
+                name.as_str(),
+                &entry[..columns.len()],
+                &hints[..columns.len()],
+                values,
+                heap,
+                txid,
+                arena,
+            )?;
+            check_index_tuple_size(columns, values)
+        };
+        for (column, metadata) in def.columns().iter().enumerate() {
+            if metadata.unique {
+                let name = def.column_key_name(column).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "inline unique key has no admitted name"
+                    )
+                })?;
+                btree_key(&[column as u16], name)?;
+            }
+        }
+        for unique in def.uniques() {
+            btree_key(unique.columns(), unique.name)?;
+        }
+    }
     let index_source = storage.table_def(table_slot, txid);
     for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
         if !index.mutable_for(txid).kind.live()
@@ -2557,6 +2758,34 @@ fn check_index_tuple_sizes_inner(
                 arena,
             )
         })?;
+        if index.method == crate::sql::ast::IndexAccessMethod::Btree {
+            // A btree entry holds its key, then its included columns.
+            let width = index.n_cols + index.n_include_cols;
+            let mut entry = [Datum::Null; 2 * crate::storage::MAX_INDEX_COLS];
+            let mut hints = [None; 2 * crate::storage::MAX_INDEX_COLS];
+            for at in 0..index.n_cols {
+                entry[at] = key[at];
+                if index.expressions[at].is_none() {
+                    hints[at] = key_oid(columns[at])?;
+                }
+            }
+            for (at, column) in include_columns[..index.n_include_cols].iter().enumerate() {
+                entry[index.n_cols + at] = values[usize::from(*column)];
+                hints[index.n_cols + at] = column_oid(*column)?;
+            }
+            check_btree_item_size(
+                storage,
+                table_slot,
+                def,
+                index_name.as_str(),
+                &entry[..width],
+                &hints[..width],
+                values,
+                heap,
+                txid,
+                arena,
+            )?;
+        }
         check_index_key_tuple_size(
             &key[..index.n_cols],
             &include_columns[..index.n_include_cols],
@@ -3017,7 +3246,7 @@ pub(crate) fn enforce_row_keys(
     checks: &ParsedChecks,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    check_index_tuple_sizes(storage, def, values, None, txid, arena)?;
+    check_index_tuple_sizes(storage, def, values, None, HeapTuple::New, txid, arena)?;
     let constraint_table = storage
         .find_visible(def.schema.as_str(), def.name.as_str(), txid)
         .unwrap_or(table_index);

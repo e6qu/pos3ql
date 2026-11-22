@@ -472,15 +472,17 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   subquery passes on (PostgreSQL keeps its one-byte header). The result of
   a user-defined function is taken as formed anew, though PostgreSQL may
   return a stored datum it read.
-- [ ] PL/pgSQL forms as PostgreSQL 18.6 keeps them: a variable or record
-  field filled by `SELECT INTO`, `FOR` or `FETCH` holds its value formed
-  anew (detoasted, four-byte header: `pg_column_size` of a stored `'short'`
-  is 9, pos3ql reports 6 today), while the record as a whole keeps the
-  stored tuple; `v := NEW.t` keeps `NEW.t`'s form; `NEW` and `OLD` fields
-  hold the stored forms (`NEW` of a `BEFORE` trigger the forms the new row
-  passes on). pos3ql refuses such a variable's `pg_column_size` once it may
-  be toasted (`0A000`). The forms must survive a suspended routine's saved
-  values.
+- [ ] PL/pgSQL forms as PostgreSQL 18.6 keeps them (measured 2026-11-22): a
+  variable filled by `:=`, `SELECT INTO`, `FOR` or `FETCH`, `NEW` and `OLD`
+  fields and a record's fields hold the datum as passed (`datumTransfer`):
+  a stored `'short'` reads 6, a compressed value its compressed size, an
+  out-of-line one its saved size (a record field read in an expression is
+  fetched in line, the record as a whole holds its stored tuple). A value an
+  expression forms keeps its four-byte header: `y := 'lit'` reads 7,
+  `z := v || ''` 9 and `v := (SELECT s ...)` 9, where pos3ql reports the
+  packed 4, 6 and 6 today; a value TOAST may have stored otherwise is
+  refused (`0A000`). Needs a form slot beside each local, carried through
+  scope construction, `SavedValues` and trigger rows.
 - [ ] Composite forms not carried yet: storing a composite value that holds
   a compressed or out-of-line field (`0A000`; PostgreSQL stores the datum as
   formed), the one-byte header a short composite gets when a sort or a
@@ -491,9 +493,15 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 - [ ] A short value a subquery PostgreSQL does not materialize passes on
   (`(SELECT a || '' x ... LIMIT 5) s`, a subquery without `FROM`) keeps its
   four-byte header; `pg_column_size` reports the packed one-byte form today.
-- [ ] A btree index entry wider than 2704 bytes after `index_form_tuple`
-  compresses it fails with `index row size ... exceeds btree version 4
-  maximum` in PostgreSQL; pos3ql indexes it.
+- [ ] A heap position (`ctid`) model for the `index row size ... exceeds
+  btree version 4 maximum 2704` error (`989`): its DETAIL names the row's
+  tuple only while the table has had rows inserted and none updated,
+  deleted, rolled back or vacuumed since its statistics were counted
+  (PostgreSQL leaves those tuples in place), and not for a row `ALTER TABLE`
+  rewrites; an index build names the first oversized row in scan order,
+  where PostgreSQL names the first in key order. A value under 511 bytes
+  passed on compressed is sized as formed (PostgreSQL indexes the
+  compressed datum as it is).
 - [ ] Hash aggregates inherit `aset.c`'s recycled executor and transition
   contexts after a session's hash aggregate under `work_mem` below 1MB
   (`0A000` from the next statement on while the bucket array is within 8 kB

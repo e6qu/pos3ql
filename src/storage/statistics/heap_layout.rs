@@ -52,7 +52,11 @@ pub(crate) fn stored_tuple_length(
 use crate::storage::rowenc::StoredForm;
 
 /// [`tuple_length`] with each value in `forms` (`Inline` past its end).
-fn tuple_length_in_forms(values: &[Datum<'_>], schema: &[ColType], forms: &[StoredForm]) -> usize {
+pub(crate) fn tuple_length_in_forms(
+    values: &[Datum<'_>],
+    schema: &[ColType],
+    forms: &[StoredForm],
+) -> usize {
     let has_nulls = values.iter().any(Datum::is_null);
     let header = 23
         + if has_nulls {
@@ -132,6 +136,12 @@ impl HeapPacking {
 
     pub(crate) const fn pages(&self) -> u64 {
         self.pages
+    }
+
+    /// The heap position (`ctid`) of the tuple placed last: its zero-based
+    /// page and one-based line pointer.
+    pub(crate) const fn position(&self) -> (u64, usize) {
+        (self.pages.saturating_sub(1), self.tuples)
     }
 
     /// The bytes the last page has left for tuples and line pointers.

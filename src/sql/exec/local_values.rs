@@ -225,6 +225,10 @@ pub(crate) struct LocalSlot<'a> {
     pub(crate) form: LocalForm,
 }
 
+// The execution control pool's documented per-variable cost: a 32-byte
+// value and its 8-byte form.
+const _: () = assert!(core::mem::size_of::<LocalSlot<'static>>() == 40);
+
 impl<'a> LocalSlot<'a> {
     pub(crate) const NULL: Self = Self {
         value: Datum::Null,

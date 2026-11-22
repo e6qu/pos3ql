@@ -535,14 +535,9 @@ fn source_of<'a>(
     use crate::sql::ast::Expr;
     use crate::sql::types::Datum;
     let column = |qualifier: Option<&str>, name: &str| {
-        let read = match row.lookup(qualifier, name) {
-            Ok(read) => read,
-            // A bare relation name is a whole-row reference, which forms a
-            // new composite datum.
-            Err(error) if qualifier.is_none() && error.sqlstate == UNDEFINED_COLUMN => {
-                return Ok(Some(Source::Fresh));
-            }
-            Err(error) => return Err(error),
+        // A whole-row reference forms a new composite datum.
+        let Some(read) = column_datum(row, qualifier, name)? else {
+            return Ok(Some(Source::Fresh));
         };
         if row.holds_formed_datum(qualifier, name) {
             return Ok(same_datum(&read, value).then_some(Source::Fresh));
@@ -855,6 +850,21 @@ fn reads_column(expression: &crate::sql::ast::Expr<'_>) -> bool {
     }
 }
 
+/// The datum column `name` holds, or `None` when an unqualified `name` is
+/// no column but a bare relation name, a whole-row reference (`NEW` and
+/// `OLD` in a trigger).
+fn column_datum<'a>(
+    row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    qualifier: Option<&str>,
+    name: &str,
+) -> Result<Option<crate::sql::types::Datum<'a>>, crate::sql::eval::SqlError> {
+    match row.lookup(qualifier, name) {
+        Ok(read) => Ok(Some(read)),
+        Err(error) if qualifier.is_none() && error.sqlstate == UNDEFINED_COLUMN => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Whether the column `expression` reads holds `value`.
 fn branch_gives<'a>(
     expression: &crate::sql::ast::Expr<'_>,
@@ -863,7 +873,9 @@ fn branch_gives<'a>(
 ) -> Result<bool, crate::sql::eval::SqlError> {
     use crate::sql::ast::Expr;
     Ok(match expression {
-        Expr::Column { qualifier, name } => same_datum(&row.lookup(*qualifier, name)?, value),
+        // A whole-row reference forms its composite anew.
+        Expr::Column { qualifier, name } => column_datum(row, *qualifier, name)?
+            .is_some_and(|read| same_datum(&read, value)),
         Expr::SchemaColumn { table, name, .. } => {
             same_datum(&row.lookup(Some(table), name)?, value)
         }
@@ -910,13 +922,9 @@ fn given_form<'a>(
         }))
     };
     let column = |qualifier: Option<&str>, name: &str| {
-        let read = match row.lookup(qualifier, name) {
-            Ok(read) => read,
-            // A whole-row reference forms its composite datum anew.
-            Err(error) if qualifier.is_none() && error.sqlstate == UNDEFINED_COLUMN => {
-                return formed(StoredForm::Inline);
-            }
-            Err(error) => return Err(error),
+        // A whole-row reference forms its composite datum anew.
+        let Some(read) = column_datum(row, qualifier, name)? else {
+            return formed(StoredForm::Inline);
         };
         // A stored composite reads materialized with its fields.
         let materialized = matches!(

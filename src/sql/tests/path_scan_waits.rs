@@ -54,7 +54,7 @@ fn path(kind: ScanKind) -> ScanPath<'static> {
 }
 
 /// Moves the checkpointer's pending block reads on.
-fn advance_block_reads(checkpointer: &mut crate::checkpoint::Checkpointer) {
+pub(super) fn advance_block_reads(checkpointer: &mut crate::checkpoint::Checkpointer) {
     checkpointer.advance_background_io(Instant::now());
     for slot in 0..checkpointer.block_read_slots() {
         if checkpointer.pending_block_read_fd(slot).is_some() {
@@ -67,7 +67,7 @@ fn advance_block_reads(checkpointer: &mut crate::checkpoint::Checkpointer) {
 /// Answers every object GET on `listener` from `namespace` until `stop`,
 /// each connection on its own thread: a client may connect before it sends
 /// its request.
-fn serve(
+pub(super) fn serve(
     listener: TcpListener,
     prefix: String,
     namespace: crate::object_store::sim::SimNamespaceHandle,

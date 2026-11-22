@@ -226,8 +226,9 @@ Syntax and errors:
   cursor position when it is cast, assigned, compared or passed to a full-text
   routine.
 - JSON nests as deeply as PostgreSQL 18.6's `json` and `jsonb` inputs do under
-  the default `max_stack_depth` (21,790 and 18,675 levels on the reference
-  build); deeper documents, or a recursion that would exhaust the query
+  the default `max_stack_depth` (14,521 and 14,520 levels on CI's pinned
+  linux/amd64 `postgres:18` image; other builds differ, see
+  [contributing](../CONTRIBUTING.md#development-and-resource-policy)); deeper documents, or a recursion that would exhaust the query
   thread's fixed stack, fail with `54001` `stack depth limit exceeded`
   (`differential_exact/747`). PostgreSQL's limit varies with each operation's
   frames, which pos3ql does not model.
@@ -1125,6 +1126,50 @@ Differential fixture
 sample words of every language, configurations, dictionary DDL and psql's
 describe output with PostgreSQL 18.6.
 
+## Stored value forms (TOAST)
+
+PostgreSQL stores a wide value compressed (pglz) or out of line (TOAST, "The
+Oversized-Attribute Storage Technique"), and passes that stored datum on
+unchanged; functions such as `pg_column_size` report its stored size. pos3ql
+models the same forms:
+
+- A stored row over 2032 bytes keeps its widest values compressed or out of
+  line as `heap_toast_insert_or_update` stores them; `pg_column_size`,
+  `relpages` and `ANALYZE` read the stored forms (`966`). A row too wide for a
+  heap page after toasting fails with `row is too big` (`986`). A `tsquery`
+  has plain storage and stays as formed.
+- A stored value keeps its form through column references, binary-coercible
+  casts, `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `CASE`, derived tables,
+  sorts, joins, partition scans, `INSERT ... SELECT`, `CREATE TABLE AS`,
+  `REFRESH MATERIALIZED VIEW`, `MERGE` and `UPDATE` (`967`-`969`). pglz reads
+  a `tsvector`, `path` or `polygon` in its stored binary form. A PL/pgSQL
+  special variable such as `TG_TABLE_NAME` and a scalar subquery's value are
+  formed anew, and a datum of unknown form that neither pglz nor lz4 could
+  compress is stored as one formed anew (`981`, `239`).
+- A whole-row reference, `ROW(...)`, a field of either, and a stored
+  composite with its fields (nested composites and array elements included)
+  keep their stored forms (`987`, `990`). A dropped column of a table row type
+  stored before `ALTER TABLE ... DROP COLUMN` is sized by the layout the table
+  keeps when it was fixed-width by-value.
+- A PL/pgSQL variable keeps the datum it is given (`datumTransfer`): a simple
+  expression's result keeps the header the expression gave it (`y := 'lit'`
+  reads 7 bytes, `z := v || ''` 9), a copy of a variable keeps that variable's
+  form, and a query's result (`SELECT INTO`, a `FOR` or `FETCH` row, a
+  procedure's outputs) is read from a result tuple, which packs a short value
+  (`SELECT 'lit' INTO a` reads 4) and keeps a stored value's form (`SELECT big
+  INTO w` reads 44). Records keep their fields' forms, and `FOR` loops over
+  static or `EXECUTE` queries keep each row's forms (`992`).
+- A routine's parameters hold the datums their caller passes (`psize(s)`
+  reads 6, `psize('lit')` 7, `psize(big)` 44), also across retained inputs,
+  saved invocation logs and suspended calls; a binary-coercible conversion
+  keeps the form and a cast function forms a new datum (`psize(c)` of a
+  `char(3)` reads 6). A value a query forms anew, such as `SELECT big || ''
+  INTO w`, reads 3004 through `FOR`, `EXECUTE ... INTO` and `FETCH`, and a
+  cursor's rows keep the forms its query gave them (`992`).
+
+Forms pos3ql does not carry yet fail with `0A000` wherever the form decides a
+size; [PLAN.md](../PLAN.md#close-application-compatibility-gaps) lists them.
+
 ## Physical access paths
 
 | Method | Supported paths |
@@ -1234,7 +1279,9 @@ why none of these numbers is a throughput rate.
 | `RAISE ... USING DETAIL` or `HINT` text | 12,288 bytes each | `54000` |
 | Built-in function NOTICE/WARNING messages raised before the next output message; one message's text | 64; 256 bytes | `54000` |
 | Transaction identities and command counters | 32-bit, checked | `54000` before reuse |
-| `json` / `jsonb` nesting; jsonpath depth | 21,790 / 18,675; 128 | `54001`; see [SQL/JSON](sql-json.md) |
+| `json` / `jsonb` nesting; jsonpath depth | 14,521 / 14,520; 128 | `54001`; see [SQL/JSON](sql-json.md) |
+| `tsquery` input parenthesis nesting; output depth | 7,685; 16,340 (CI's pinned `postgres:18` image) | `54001` |
+| Btree index entry | 2,704 bytes | `54000` (`index row size ... exceeds btree version 4 maximum 2704`) |
 | XML nesting, XPath work, constructor output | see [SQL/XML](sql-xml.md) | program-limit error |
 
 ### Startup reservations

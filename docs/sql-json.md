@@ -46,8 +46,9 @@ insert. Invalid paths and unsupported syntax fail with an error.
 
 ## Limits
 
-- JSON nesting: 21,790 levels for `json` and 18,675 for `jsonb`, the depths
-  PostgreSQL 18.6 reaches under its default `max_stack_depth` (2048kB). Deeper
+- JSON nesting: 14,521 levels for `json` and 14,520 for `jsonb`, the depths
+  PostgreSQL 18.6 reaches under its default `max_stack_depth` (2048kB) on
+  CI's pinned linux/amd64 `postgres:18` image. Deeper
   input fails with `54001` (`stack depth limit exceeded`), as in PostgreSQL.
   `jsonpath` nesting: 128.
 - Everything else (members, path steps, result items, `JSON_TABLE` rows,

@@ -51,6 +51,15 @@ from `initdb --locale=C -E UTF8 -A trust -U postgres`, started with
 `wal_level=logical` and `max_prepared_transactions=8` as CI's service is; the
 differential refuses a reference without them.
 
+Limits that come from how much stack PostgreSQL uses per nesting level
+(`max_stack_depth` depths for `json`, `jsonb` and `tsquery`) differ between
+builds: Homebrew's arm64 PostgreSQL 18.6 parses 9,329 nested `tsquery`
+parentheses, while CI's linux/amd64 `postgres:18` image stops at 7,685. pos3ql
+matches the image CI pins, so measure such a limit against that image
+(`docker run --platform linux/amd64` with the digest in
+`.github/workflows/`), and keep fixtures clear of the boundary so they pass
+against either build.
+
 Protect the interactive machine. Full builds, full test gates and large
 benchmark or evidence regeneration run on GitHub runners. Local work is serial
 and low priority: run one build or one test workload at a time, never a test

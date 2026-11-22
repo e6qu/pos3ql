@@ -977,18 +977,24 @@ impl<'a, T: Copy + 'a> ArenaList<'a, T> {
     }
 }
 
-/// A list whose entries live in fixed-size chunks of one arena. Growth adds
-/// a chunk and never copies, so the arena holds the entries and one partly
-/// filled chunk, where an [`ArenaList`] leaves every outgrown buffer behind.
-/// Truncating keeps the chunks for the entries pushed next.
+/// A list whose entries live in chunks of one arena: the first holds
+/// [`CHUNKS_FIRST`] entries, each later one twice its predecessor's up to
+/// the list's chunk size, so a short list takes little and a long one adds
+/// full chunks. Growth adds a chunk and never copies, so the arena holds the
+/// entries and one partly filled chunk, where an [`ArenaList`] leaves every
+/// outgrown buffer behind. Truncating keeps the chunks for the entries
+/// pushed next.
 pub(crate) struct ArenaChunks<'a, T: Copy> {
     chunks: ArenaList<'a, *mut T>,
     chunk: usize,
     len: usize,
 }
 
+/// Entries of an [`ArenaChunks`] list's first chunk.
+const CHUNKS_FIRST: usize = 8;
+
 impl<'a, T: Copy + 'a> ArenaChunks<'a, T> {
-    /// A list of chunks of `chunk` entries each.
+    /// A list of chunks of at most `chunk` entries each.
     pub(crate) const fn new(arena: &'a Arena, chunk: usize) -> Self {
         assert!(chunk > 0);
         Self {
@@ -998,14 +1004,42 @@ impl<'a, T: Copy + 'a> ArenaChunks<'a, T> {
         }
     }
 
+    /// Chunk `number`'s capacity.
+    fn capacity(&self, number: usize) -> usize {
+        let first = CHUNKS_FIRST.min(self.chunk);
+        if number >= usize::BITS as usize {
+            return self.chunk;
+        }
+        first.saturating_mul(1 << number).min(self.chunk)
+    }
+
+    /// The chunk holding entry `index` and the entry's place in it.
+    fn locate(&self, mut index: usize) -> (usize, usize) {
+        let mut number = 0;
+        loop {
+            let capacity = self.capacity(number);
+            if capacity == self.chunk {
+                return (number + index / capacity, index % capacity);
+            }
+            if index < capacity {
+                return (number, index);
+            }
+            index -= capacity;
+            number += 1;
+        }
+    }
+
     pub(crate) fn push(&mut self, value: T) -> Result<(), ArenaFull> {
-        let (chunk, at) = (self.len / self.chunk, self.len % self.chunk);
+        let (chunk, at) = self.locate(self.len);
         if chunk == self.chunks.len() {
-            let entries = self.chunks.arena.alloc_slice_with(self.chunk, |_| value)?;
+            let entries = self
+                .chunks
+                .arena
+                .alloc_slice_with(self.capacity(chunk), |_| value)?;
             self.chunks.push(entries.as_mut_ptr())?;
         }
-        // SAFETY: each chunk holds `self.chunk` initialized entries for the
-        // arena's lifetime, and this list alone writes them.
+        // SAFETY: each chunk holds its capacity's initialized entries for
+        // the arena's lifetime, and this list alone writes them.
         unsafe { self.chunks.borrowed_slice()[chunk].add(at).write(value) };
         self.len += 1;
         Ok(())
@@ -1022,14 +1056,16 @@ impl<'a, T: Copy + 'a> ArenaChunks<'a, T> {
 
     pub(crate) fn entry(&self, index: usize) -> &T {
         assert!(index < self.len);
+        let (chunk, at) = self.locate(index);
         // SAFETY: the entry is initialized and within its chunk.
-        unsafe { &*self.chunks.borrowed_slice()[index / self.chunk].add(index % self.chunk) }
+        unsafe { &*self.chunks.borrowed_slice()[chunk].add(at) }
     }
 
     pub(crate) fn entry_mut(&mut self, index: usize) -> &mut T {
         assert!(index < self.len);
+        let (chunk, at) = self.locate(index);
         // SAFETY: as for `entry`; `&mut self` excludes every other borrow.
-        unsafe { &mut *self.chunks.borrowed_slice()[index / self.chunk].add(index % self.chunk) }
+        unsafe { &mut *self.chunks.borrowed_slice()[chunk].add(at) }
     }
 
     /// Drops the entries past `len`, which must not exceed the length.
@@ -1239,6 +1275,30 @@ fn apply_permutation<T>(items: &mut [T], perm: &[u32], visited: &mut [bool]) {
 
 #[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
+    #[test]
+    fn arena_chunks_grow_geometrically_to_their_chunk_size() {
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "chunks", 1 << 16).unwrap();
+        let mut list = ArenaChunks::new(&arena, 32);
+        // A short list takes its first chunk, not a whole one of 32.
+        list.push(0u64).unwrap();
+        assert!(arena.used() < 32 * 8, "{} bytes", arena.used());
+        // Chunks of 8, 16, then 32 entries, then full chunks of 32.
+        for value in 1..200u64 {
+            list.push(value).unwrap();
+        }
+        assert_eq!(list.len(), 200);
+        for index in 0..200 {
+            assert_eq!(list.get(index), index as u64);
+        }
+        *list.entry_mut(57) = 1000;
+        assert_eq!(list.get(57), 1000);
+        assert_eq!(list.iter().count(), 200);
+        list.truncate(9);
+        list.push(7).unwrap();
+        assert_eq!(list.get(9), 7);
+    }
+
     #[test]
     fn scoped_encoded_outputs_compact_overlapping_bytes_and_preserve_durable_effects() {
         let mut budget = Budget::new(1024);

@@ -32,6 +32,9 @@ use super::{QueryScope, arena_full};
 /// value's stored form.
 type OuterValues<'a> = (&'a [Datum<'a>], &'a [usize], &'a [StoredForm]);
 
+mod pull;
+pub(crate) use pull::{ModeledPull, pulls};
+
 /// The plan node numbers of a join's nodes under `EXPLAIN ANALYZE`, past
 /// the numbers the block's own nodes use.
 pub(crate) fn node_number(path: u32) -> Option<u16> {
@@ -1020,6 +1023,8 @@ type Row<'a> = &'a [Option<BaseRow<'a>>];
 
 struct Runner<'r, 'a> {
     cx: JoinContext<'r, 'a>,
+    /// The statement's storage, which the scan nodes it makes borrow.
+    storage: &'a Storage,
     /// Each path's kept hash table or store, which a rescan reads again
     /// (`ExecReScanHashJoin`, `ExecReScanMaterial`).
     built: &'a [core::cell::Cell<Option<Built<'a>>>],
@@ -1111,7 +1116,7 @@ impl<'a> JoinLayout<'a> {
 /// plan, its relations' layout and the statement's evaluation context.
 #[derive(Clone, Copy)]
 pub(super) struct JoinContext<'r, 'a> {
-    storage: &'a Storage,
+    storage: &'r Storage,
     scope: &'r QueryScope<'a>,
     txid: u32,
     model: &'r ModeledJoin<'a>,
@@ -1129,7 +1134,7 @@ pub(super) struct JoinContext<'r, 'a> {
 impl<'r, 'a> JoinContext<'r, 'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        storage: &'a Storage,
+        storage: &'r Storage,
         scope: &'r QueryScope<'a>,
         txid: u32,
         model: &'r ModeledJoin<'a>,
@@ -1719,6 +1724,7 @@ pub(super) fn run_modeled<'a>(
     let layout = JoinLayout::new(model, scope, arena)?;
     let runner = Runner {
         cx: JoinContext::new(storage, scope, txid, model, arena, params, hooks, &layout),
+        storage,
         built,
         frozen,
         scan_nodes: &scan_nodes,
@@ -3738,6 +3744,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         };
         node.rescan();
         while node.next(
+            self.storage,
             crate::storage::CursorScratch::Statement,
             self.arena,
             self.params,

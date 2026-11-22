@@ -1158,7 +1158,8 @@ struct IndexKeyCandidate {
 
 pub(crate) struct IndexedCandidates<'a> {
     table: usize,
-    statistics: crate::storage::IndexStatisticsCapture<'a>,
+    /// The index's statistics counter, captured again for each use.
+    statistics: crate::storage::IndexStatisticsTicket,
     scan_executed: bool,
     index_entries: usize,
     preserves_order: bool,
@@ -1214,8 +1215,17 @@ impl<'a> IndexedCandidates<'a> {
         }
     }
 
-    pub(crate) fn statistics(&self) -> &crate::storage::IndexStatisticsCapture<'a> {
-        &self.statistics
+    /// The index's statistics counter, captured for a use.
+    pub(crate) fn statistics<'s>(
+        &self,
+        storage: &'s Storage,
+    ) -> Result<crate::storage::IndexStatisticsCapture<'s>, SqlError> {
+        storage.recapture_index_statistics(self.statistics)
+    }
+
+    /// The index's statistics counter, which a scan keeps between reads.
+    pub(crate) fn statistics_ticket(&self) -> crate::storage::IndexStatisticsTicket {
+        self.statistics
     }
 
     pub(crate) const fn scan_executed(&self) -> bool {
@@ -3962,7 +3972,7 @@ pub(crate) fn dml_index_access_plan<'a>(
     reason = "the outer row a join's scan reads its keys from is explicit"
 )]
 fn indexed_candidates<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     where_clause: Option<&'a Expr<'a>>,
@@ -4167,7 +4177,7 @@ fn ranked_knn_offer(
 
 #[allow(clippy::too_many_arguments)]
 fn ranked_knn_candidates<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     table: usize,
     slot: usize,
     txid: u32,
@@ -4191,7 +4201,9 @@ fn ranked_knn_candidates<'a>(
     if !storage.value_binding_durable_complete(slot, plan.binding) {
         return Ok(None);
     }
-    let statistics = storage.capture_index_statistics(txid, slot, ordered.index_oid)?;
+    let statistics = storage
+        .capture_index_statistics(txid, slot, ordered.index_oid)?
+        .ticket();
     if window == 0 {
         return Ok(Some(IndexedCandidates {
             table,
@@ -4397,7 +4409,7 @@ fn ranked_knn_candidates<'a>(
 
 #[allow(clippy::too_many_arguments)]
 fn indexed_candidates_for_plan<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     table: usize,
     slot: usize,
     definition: &TableDef,
@@ -4411,7 +4423,9 @@ fn indexed_candidates_for_plan<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
     let index_oid = ordered_plan.map_or(plan.index_oid, |ordered| ordered.index_oid);
-    let statistics = storage.capture_index_statistics(txid, slot, index_oid)?;
+    let statistics = storage
+        .capture_index_statistics(txid, slot, index_oid)?
+        .ticket();
     if !plan.chosen_for_scan(storage, slot, definition, txid, ordered_plan.is_some()) {
         return Ok(None);
     }
@@ -8582,7 +8596,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
                     storage.record_relation_scan(
                         txid,
                         leaf,
-                        Some(access.statistics()),
+                        Some(&access.statistics(storage)?),
                         access.index_entries,
                         observed_at,
                     )?;
@@ -8596,7 +8610,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
                     &member_scope,
                     arena,
                 )?;
-                return Ok((rows, Some(access.statistics)));
+                return Ok((rows, Some(access.statistics(storage)?)));
             }
             let rows = member_rows_in_order(storage, txid, leaf, path, None, &member_scope, arena)?;
             return Ok((rows, None));
@@ -11400,11 +11414,12 @@ fn scan_source_mode<'a>(
                 else {
                     return Ok::<Option<bool>, SqlError>(None);
                 };
+                let statistics = access.statistics(storage)?;
                 if access.scan_executed {
                     storage.record_relation_scan(
                         txid,
                         slot,
-                        Some(access.statistics()),
+                        Some(&statistics),
                         access.index_entries,
                         crate::sql::datetime::now_micros(),
                     )?;
@@ -11417,7 +11432,7 @@ fn scan_source_mode<'a>(
                     let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
                         continue;
                     };
-                    storage.record_relation_tuple_read(txid, slot, Some(access.statistics()))?;
+                    storage.record_relation_tuple_read(txid, slot, Some(&statistics))?;
                     let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                         let bytes = storage.row_bytes(slot, rowid, home, arena)?;
                         visit_candidate!(index, BoundRow::Encoded(bytes), Some(rowid))
@@ -11876,11 +11891,14 @@ fn scan_source_mode<'a>(
                     visit_sequential_physical_rows!(slot);
                     break 'scanned;
                 }
+                let statistics = access
+                    .map(|access| access.statistics(storage))
+                    .transpose()?;
                 if hashed.is_none() && access.is_none_or(|access| access.scan_executed) {
                     storage.record_relation_scan(
                         txid,
                         slot,
-                        access.map(|access| access.statistics()),
+                        statistics.as_ref(),
                         access.map_or(0, |access| access.index_entries),
                         crate::sql::datetime::now_micros(),
                     )?;
@@ -11979,11 +11997,7 @@ fn scan_source_mode<'a>(
                         let Some(row) = cursor.next(storage, arena, candidates)? else {
                             break;
                         };
-                        storage.record_relation_tuple_read(
-                            txid,
-                            slot,
-                            Some(access.statistics()),
-                        )?;
+                        storage.record_relation_tuple_read(txid, slot, statistics.as_ref())?;
                         let keep_scanning =
                             recycled_from(arena, mark, recycle_rows, retain_match, || {
                                 visit_candidate!(
@@ -12063,11 +12077,7 @@ fn scan_source_mode<'a>(
                         break;
                     };
                     if hashed.is_none() {
-                        storage.record_relation_tuple_read(
-                            txid,
-                            slot,
-                            access.map(|access| access.statistics()),
-                        )?;
+                        storage.record_relation_tuple_read(txid, slot, statistics.as_ref())?;
                     }
                     let keep_scanning =
                         recycled_from(arena, mark, recycle_rows, retain_match, || {

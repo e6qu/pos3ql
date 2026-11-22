@@ -530,12 +530,16 @@ impl CursorQuery {
         Ok(())
     }
 
+    /// Opens the retained source of the bound query, planning a join in
+    /// `planning` (the statement's memory), which the source does not
+    /// borrow: the caller reclaims it.
     pub(crate) fn prepare_source(
         &mut self,
         storage: &crate::storage::Storage,
         txid: u32,
         responder: &mut crate::pg::respond::Responder<'_>,
         reader_use: crate::sql::query::RetainedUse,
+        planning: &Arena,
     ) -> Result<bool, SqlError> {
         self.prepare_result_types(storage, txid)?;
         let bound = self.bound.as_ref().expect("bound cursor query");
@@ -579,6 +583,7 @@ impl CursorQuery {
                     statement,
                     bound.params,
                     &self.arena,
+                    planning,
                     responder,
                     reader_use,
                 )

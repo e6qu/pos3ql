@@ -245,20 +245,22 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   through its scan node (`PathScan`), which holds its sequential cursor or
   its path's candidates, its filter, the chosen path's counts and its
   `LIMIT` stop, and resumes a storage wait without counting twice; the
-  nested-loop, `Materialize`, hash, merge, `Memoize` and `Unique` nodes
-  above it still push rows in `join_exec.rs`, whose statement starts again
-  after a wait. Their condition and row helpers (`JoinContext`) and the
-  output row a plan returns (`OutputRow`) are already shared plan-level
-  state, and a scan node reads through the caller's cursor scratch (a
-  reader's buffers or the statement's). Running a modeled join as a
-  retained reader still needs: the join search to plan in less than a
-  stream's `result_stream_bytes` (planning an analyzed two-column table
-  joined with itself takes 235,888 bytes of the reader's arena today, most
-  of the default 256 KiB stream), the scan
-  node to take its `Storage` per call and capture index statistics per read
-  (a retained reader holds no `Storage` or `Arena` reference across calls),
-  and a `Materialize` store in `plan_build_bytes` leases. A `LATERAL`
-  subquery's rows become a subtree of the same plan.
+  hash, merge, `Memoize` and `Unique` nodes above it still push rows in
+  `join_exec.rs`, whose statement starts again after a wait. A plan of
+  nested loops (inner, left, semi and anti), `Materialize` nodes and scans
+  already runs as a retained reader's pull nodes (`ModeledPull`): a stream
+  or cursor reads it a row at a time and resumes each storage wait where it
+  stopped. The join search plans in the statement's memory and the reader
+  keeps only the chosen plan and its nodes' records (about 41 KB for an
+  analyzed table joined with itself, which a stream's estimate counts
+  exactly); no node holds a `Storage` or `Arena` reference between calls,
+  and a scan captures its index's statistics counter for each read. A
+  `Materialize` keeps its rows, with their stored forms, in
+  `plan_build_bytes` leases. Still needed: hash, merge, `Memoize` and
+  `Unique` pull nodes, `EXPLAIN ANALYZE` counters on the pull nodes, a
+  pulled-up subquery's join as a reader, then the general executor running
+  the same nodes (deleting its push-based runner). A `LATERAL` subquery's
+  rows become a subtree of the same plan.
 - [x] `LATERAL` subqueries of one table planned by the search, with `Memoize`
   and exact `EXPLAIN ANALYZE` counters (`977`). A scan reading spilled rows
   decodes the columns a `LATERAL` body reads of it, so an aggregate over

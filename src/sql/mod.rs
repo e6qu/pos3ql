@@ -28303,6 +28303,7 @@ impl Engine {
                                 txid,
                                 &mut capture,
                                 query::RetainedUse::Cursor,
+                                work,
                             )
                         };
                         match prepared {

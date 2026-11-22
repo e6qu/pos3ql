@@ -160,10 +160,12 @@ the pull executor.
 
 **Finish the pull executor (in progress), in this order:**
 
-1. [ ] Merge join, `Memoize` and `Unique` pull nodes, and a hash join over
-   keys without a ported hash function (a sorted table), so every plan the
-   join search makes pulls. `EXPLAIN ANALYZE` counters live in the pull
-   nodes; a pulled-up subquery's join reads as a retained reader.
+1. [ ] Every plan the join search makes pulls but one scanning a `LATERAL`
+   item: merge join, `Memoize` and `Unique` pull nodes run beside the
+   others (`997`), and a hash join's keys always have a ported hash
+   function, since the model plans joins only over such types. Still open:
+   `EXPLAIN ANALYZE` counters live in the pull nodes, and a pulled-up
+   subquery's join reads as a retained reader.
 2. [ ] The general executor runs the same nodes. Delete the push-based
    `Runner` in `join_exec.rs`, the retained reader's `JoinState` levels and
    `MAX_RETAINED_SOURCES` (the eight-item limit on retained joins).

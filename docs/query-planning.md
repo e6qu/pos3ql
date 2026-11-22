@@ -267,10 +267,11 @@ sides without an equality fails as PostgreSQL's full join does (`0A000`).
 
 ### Pull-based join executor
 
-A plan the search chooses runs as **pull nodes** when it holds only scans,
-nested loops (inner, left, semi and anti), hash joins over keys of hashable
-types (every join type) and `Materialize` (`src/sql/query/join_exec/pull.rs`).
-A result stream or cursor then reads it a row at a time, and a storage wait
+A plan the search chooses runs as **pull nodes**: scans, nested loops
+(inner, left, semi and anti), hash joins and merge joins (every join type),
+`Materialize`, `Memoize` and `Unique` (`src/sql/query/join_exec/pull.rs`).
+Only a plan scanning a `LATERAL` item runs in the general executor. A result
+stream or cursor reads a pulled plan a row at a time, and a storage wait
 at any node returns to the reader with every node's position kept, so the
 same call resumes without counting a row twice (`pull_join_waits`). Each
 node's record lives in one `plan_build_bytes` lease per plan path (`54000`
@@ -292,16 +293,35 @@ its analysis run in the statement's memory.
   batches grow as `ExecHashJoin`'s do. A batch's saved outer rows hold only
   the query's relations and are read in place (`979`); a one-batch table is
   probed again at a rescan.
+- A merge join runs `ExecMergeJoin`'s states one row per call. An outer
+  input already in merge order (an index scan) is read as the join advances;
+  a sorted input is read whole at its first fetch and ordered by
+  PostgreSQL's tuplesort comparison. The inner input is always kept in the
+  node's store, sorted or in its own order, so marking and restoring a
+  position is an index into it.
+- A `Memoize` keeps each entry's key and rows encoded in leases, finds
+  entries through its own hash table and evicts the least recently used ones
+  when the entries and rows PostgreSQL would count exceed `hash_mem`
+  (`work_mem` times `hash_mem_multiplier`), as `cache_reduce_memory` does; an
+  entry a semi join left unfinished is read again at its next lookup. Dead
+  bytes are reclaimed by copying the live entries once they outweigh them.
+- A sorted or hashed `Unique` reads its input into the node's store and
+  returns the first row of each run or group in its sort's or hash table's
+  order.
+- Ordering a store decodes all of its rows into the reader's memory at once
+  and releases them after, so a sort input larger than that memory fails
+  with `54000`.
 - No node keeps a `Storage` or `Arena` reference between calls: each call
   passes them, and a reader's type does not carry the storage borrow, so the
   compiler rejects a node that would keep one.
 
-A plan with a merge join, `Memoize` or `Unique` node, or a hash join over
-keys without a ported hash function, runs in the general executor
-(`join_exec.rs`), which pushes each joined row through a callback; a storage
-wait there restarts the statement. Joins outside the search run in the
-retained reader's own nested-loop and hash levels, in FROM order, up to eight
-items. [PLAN.md](../PLAN.md#pause-and-resume-every-query-path) lists the work
+Every join the model plans has keys whose type `datum_hash` hashes: a join
+clause over any other type is outside the model. A statement the retained
+reader does not hold (`EXPLAIN ANALYZE` among them) still runs the plan in
+the general executor (`join_exec.rs`), which pushes each joined row through a
+callback; a storage wait there restarts the statement. Joins outside the
+search run in the retained reader's own nested-loop and hash levels, in FROM
+order, up to eight items. [PLAN.md](../PLAN.md#pause-and-resume-every-query-path) lists the work
 that moves every plan onto pull nodes.
 
 ## Sorting, hashing and memory figures

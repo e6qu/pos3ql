@@ -17,9 +17,14 @@
 //! inner rows and the outer rows it saves to later batches encoded in its
 //! store, and moves through `ExecHashJoin`'s phases one row at a time.
 //!
-//! Nested loops, hash joins over keys of hashable types, `Materialize` and
-//! scans run here; a plan holding any other node runs in
-//! [`super::run_modeled`].
+//! A merge join ([`merge`]) reads an outer input in merge order from its
+//! path and keeps a sorted input, and always its inner one, in its store; a
+//! sorted or hashed `Unique` keeps its input there too, each ordered over
+//! its rows decoded at once and released. A `Memoize` keeps its cache in
+//! leases ([`memo`]), evicting as PostgreSQL does.
+//!
+//! Every node of the join search's plans runs here but a scan of a
+//! `LATERAL` item, whose plan runs in [`super::run_modeled`].
 
 use super::*;
 use crate::mem::arena::ArenaMark;
@@ -28,49 +33,27 @@ use crate::storage::{CursorScratch, RowCursorBuffers};
 use std::sync::Arc;
 
 mod hash;
+mod memo;
+mod merge;
 
-/// Whether every node of `model`'s plan, whose relations resolve in
-/// `written`, runs as a pull node.
-pub(crate) fn pulls<'a>(model: &ModeledJoin<'a>, written: &QueryScope<'a>) -> bool {
-    fn path_pulls(model: &ModeledJoin<'_>, scope: &QueryScope<'_>, id: u32) -> bool {
+/// Whether every node of `model`'s plan runs as a pull node: every node
+/// but a scan of a `LATERAL` item, which reads its own subquery.
+pub(crate) fn pulls(model: &ModeledJoin<'_>) -> bool {
+    fn path_pulls(model: &ModeledJoin<'_>, id: u32) -> bool {
         match model.plan.path(id).kind {
             PathKind::Dummy => true,
             PathKind::Scan { rel, .. } => model.rels[usize::from(rel)].lateral.is_none(),
-            PathKind::Material { input } => path_pulls(model, scope, input),
-            PathKind::NestLoop {
-                jointype,
-                outer,
-                inner,
-                ..
-            } => {
-                matches!(
-                    jointype,
-                    JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti
-                ) && path_pulls(model, scope, outer)
-                    && path_pulls(model, scope, inner)
-            }
-            // A join over keys without a hash function here builds a sorted
-            // table instead, which runs in the general executor.
-            PathKind::HashJoin {
-                outer, inner, hash, ..
-            } => {
-                hash.as_slice().iter().all(|&clause| {
-                    model
-                        .clause_columns(&model.plan.clauses[usize::from(clause)])
-                        .is_some_and(|(left, right)| {
-                            [left, right].into_iter().all(|member| {
-                                datum_type_hashable(member_type(model, scope, member))
-                            })
-                        })
-                }) && path_pulls(model, scope, outer)
-                    && path_pulls(model, scope, inner)
-            }
-            PathKind::Unique { .. } | PathKind::Memoize { .. } | PathKind::MergeJoin { .. } => {
-                false
+            PathKind::Material { input }
+            | PathKind::Unique { input, .. }
+            | PathKind::Memoize { input, .. } => path_pulls(model, input),
+            PathKind::NestLoop { outer, inner, .. }
+            | PathKind::HashJoin { outer, inner, .. }
+            | PathKind::MergeJoin { outer, inner, .. } => {
+                path_pulls(model, outer) && path_pulls(model, inner)
             }
         }
     }
-    path_pulls(model, model.scope(written), model.plan.top)
+    path_pulls(model, model.plan.top)
 }
 
 /// Where a nested loop is between its rows.
@@ -130,13 +113,7 @@ impl MaterialStore {
         bound: &[Option<BaseRow<'a>>],
         relids: Relids,
     ) -> Result<u32, SqlError> {
-        let first = u32::try_from(self.entries.len()).map_err(|_| {
-            crate::sql_err!(
-                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "a join node stores more than 4294967295 relation rows"
-            )
-            .plan_build_exhausted()
-        })?;
+        let first = self.next_entry()?;
         for table in (0..cx.scope.n).filter(|&table| relids.contains(table as u32)) {
             let row = bound[table].expect("a stored row binds its relations");
             let mark = cx.arena.mark();
@@ -243,6 +220,209 @@ impl MaterialStore {
         }
         self.entries.push(entry).map_err(store_full)
     }
+
+    /// Encodes `values` as one stored relation (a `Memoize` key), returning
+    /// its entry.
+    fn save_values<'a>(
+        &mut self,
+        cx: JoinContext<'_, 'a>,
+        values: &[Datum<'a>],
+    ) -> Result<u32, SqlError> {
+        let first = self.next_entry()?;
+        let mark = cx.arena.mark();
+        let pushed = crate::sql::exec::encode_projected_formed(values, &[], cx.arena)
+            .and_then(|encoded| self.push_bytes(encoded));
+        // SAFETY: the encoding was copied into the store.
+        unsafe { cx.arena.rewind_to(mark) };
+        let (start, len) = pushed?;
+        self.push_entry(StoredRel {
+            rel: 0,
+            start,
+            len,
+            rowid: None,
+        })?;
+        Ok(first)
+    }
+
+    /// The `count` values [`Self::save_values`] stored at `entry`, decoded
+    /// into the arena.
+    fn load_values<'a>(
+        &self,
+        entry: usize,
+        count: usize,
+        arena: &'a Arena,
+    ) -> Result<&'a [Datum<'a>], SqlError> {
+        let rel = self.entries.as_slice()[entry];
+        let bytes = arena
+            .alloc_slice_copy(
+                &self.bytes.as_slice()[rel.start as usize..(rel.start + rel.len) as usize],
+            )
+            .map_err(|_| arena_full())?;
+        let values = arena
+            .alloc_slice_with(count, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (column, value) in values.iter_mut().enumerate() {
+            *value = crate::sql::exec::decode_projected_col_record(bytes, column, arena)?;
+        }
+        Ok(values)
+    }
+
+    /// The number the next stored relation takes.
+    fn next_entry(&self) -> Result<u32, SqlError> {
+        u32::try_from(self.entries.len()).map_err(|_| {
+            crate::sql_err!(
+                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "a join node stores more than 4294967295 relation rows"
+            )
+            .plan_build_exhausted()
+        })
+    }
+
+    /// The encoded bytes of the `count` relations stored from `first`.
+    fn bytes_of(&self, first: usize, count: usize) -> usize {
+        self.entries.as_slice()[first..first + count]
+            .iter()
+            .map(|rel| rel.len as usize)
+            .sum()
+    }
+
+    /// Copies the `count` relations `from` stored at `first` to this
+    /// store's end, returning their new first entry.
+    fn copy_from(
+        &mut self,
+        from: &MaterialStore,
+        first: usize,
+        count: usize,
+    ) -> Result<u32, SqlError> {
+        let copied = self.next_entry()?;
+        for rel in &from.entries.as_slice()[first..first + count] {
+            let (start, len) = self.push_bytes(
+                &from.bytes.as_slice()[rel.start as usize..(rel.start + rel.len) as usize],
+            )?;
+            self.push_entry(StoredRel { start, len, ..*rel })?;
+        }
+        Ok(copied)
+    }
+}
+
+/// Rows a node keeps in its store and reads in the order its sort or hash
+/// table gives them. The order is computed over every row decoded into the
+/// arena at once, which is released after; each read decodes one row.
+struct OrderedRows {
+    store: MaterialStore,
+    /// The stored rows' numbers in read order.
+    order: MutableSlice<u32>,
+    /// Relations per stored row.
+    width: usize,
+    /// The input was read to its end.
+    filled: bool,
+    /// `order` holds the rows' order.
+    arranged: bool,
+}
+
+impl OrderedRows {
+    fn new(pool: &Arc<LeasePool>, width: usize) -> Result<Self, SqlError> {
+        debug_assert!(width > 0, "a stored row binds a relation");
+        Ok(Self {
+            store: MaterialStore::new(pool)?,
+            order: pool.lease(0).map_err(store_full)?,
+            width,
+            filled: false,
+            arranged: false,
+        })
+    }
+
+    /// Forgets every row: the input is read again.
+    fn clear(&mut self) {
+        self.store.clear();
+        self.order.clear();
+        self.filled = false;
+        self.arranged = false;
+    }
+
+    /// The rows a read returns.
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Orders the stored rows by `order`, which ranks them by the values
+    /// of `members` in each row and each row's sizes under path `id` and
+    /// returns their positions in read order. Only those values are held at
+    /// once: each row is decoded alone, its values encoded into a store of
+    /// keys, and the keys are decoded together, then released.
+    fn arrange<'a>(
+        &mut self,
+        cx: JoinContext<'_, 'a>,
+        members: &[(usize, usize)],
+        id: u32,
+        order: impl FnOnce(&[&'a [Datum<'a>]], &[(usize, usize)]) -> Result<&'a [u32], SqlError>,
+    ) -> Result<(), SqlError> {
+        let count = self.store.entries.len() / self.width;
+        let pool = Arc::clone(self.order.pool());
+        let mut keys = MaterialStore::new(&pool)?;
+        let mut sizes = pool.lease::<(usize, usize)>(count).map_err(store_full)?;
+        let mark = cx.arena.mark();
+        let ordered = (|| {
+            for row in 0..count {
+                let row_mark = cx.arena.mark();
+                let held = cx
+                    .arena
+                    .alloc_slice_with(cx.scope.n, |_| None::<BaseRow<'a>>)
+                    .map_err(|_| arena_full())?;
+                self.store.load(row * self.width, self.width, cx, held)?;
+                let values = cx
+                    .arena
+                    .alloc_slice_with(members.len(), |at| cx.value(held, members[at]))
+                    .map_err(|_| arena_full())?;
+                sizes
+                    .push_reserved(cx.sort_sizes(held, id, members)?)
+                    .map_err(store_full)?;
+                keys.save_values(cx, values)?;
+                // SAFETY: the row's key values and sizes were copied out.
+                unsafe { cx.arena.rewind_to(row_mark) };
+            }
+            let rows = cx
+                .arena
+                .alloc_slice_with(count, |_| -> &'a [Datum<'a>] { &[] })
+                .map_err(|_| arena_full())?;
+            for (at, row) in rows.iter_mut().enumerate() {
+                *row = keys.load_values(at, members.len(), cx.arena)?;
+            }
+            let order = order(rows, sizes.as_slice())?;
+            self.order.clear();
+            self.order.reserve_exact(order.len()).map_err(store_full)?;
+            self.order.extend_from_slice(order).map_err(store_full)
+        })();
+        // SAFETY: the order was copied into its lease; no row of this node
+        // is bound yet.
+        unsafe { cx.arena.rewind_to(mark) };
+        ordered?;
+        self.arranged = true;
+        Ok(())
+    }
+
+    /// Reads the stored rows in the order they were stored.
+    fn arrange_stored(&mut self) -> Result<(), SqlError> {
+        let count = self.store.entries.len() / self.width;
+        self.order.clear();
+        self.order.reserve_exact(count).map_err(store_full)?;
+        for row in 0..count {
+            self.order.push_reserved(row as u32).map_err(store_full)?;
+        }
+        self.arranged = true;
+        Ok(())
+    }
+
+    /// Binds the row read `at`th in `bound`, decoded into the arena.
+    fn load<'a>(
+        &self,
+        at: usize,
+        cx: JoinContext<'_, 'a>,
+        bound: &mut [Option<BaseRow<'a>>],
+    ) -> Result<(), SqlError> {
+        let row = self.order.as_slice()[at] as usize;
+        self.store.load(row * self.width, self.width, cx, bound)
+    }
 }
 
 /// One plan path's state between rows.
@@ -274,6 +454,15 @@ enum Record<'a> {
         mark: Option<ArenaMark>,
     },
     HashJoin(HashRecord),
+    /// A sorted or hashed `Unique`: its input's rows and the next one a
+    /// read returns.
+    Unique {
+        rows: OrderedRows,
+        at: usize,
+        mark: Option<ArenaMark>,
+    },
+    Memoize(memo::MemoRecord),
+    MergeJoin(merge::MergeRecord<'a>),
 }
 
 /// Where a hash join is between its rows (`ExecHashJoin`'s states).
@@ -425,7 +614,7 @@ impl<'a> ModeledPull<'a> {
         params: &[Datum<'a>],
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
-        debug_assert!(pulls(&model, written));
+        debug_assert!(pulls(&model));
         let params: &'a [Datum<'a>] = arena.alloc_slice_copy(params).map_err(|_| arena_full())?;
         let scope = model.scope(written);
         let layout = JoinLayout::new(&model, scope, arena)?;
@@ -474,6 +663,34 @@ impl<'a> ModeledPull<'a> {
                     matched: false,
                 },
                 PathKind::HashJoin { .. } => Record::HashJoin(HashRecord::new(pool)?),
+                PathKind::Unique { input, method, .. }
+                    if method != super::super::index_paths::joins::UniqueMethod::Noop =>
+                {
+                    Record::Unique {
+                        rows: OrderedRows::new(
+                            pool,
+                            relation_count(model.plan.path(input).relids, scope.n),
+                        )?,
+                        at: 0,
+                        mark: None,
+                    }
+                }
+                PathKind::Memoize { .. } => Record::Memoize(memo::MemoRecord::new()),
+                PathKind::MergeJoin {
+                    outer,
+                    inner,
+                    outer_sort,
+                    ..
+                } => Record::MergeJoin(merge::MergeRecord::new(
+                    pool,
+                    (
+                        relation_count(model.plan.path(outer).relids, scope.n),
+                        !outer_sort.as_slice().is_empty(),
+                    ),
+                    relation_count(model.plan.path(inner).relids, scope.n),
+                    scope.n,
+                    arena,
+                )?),
                 PathKind::Material { input } => Record::Material {
                     store: MaterialStore::new(pool)?,
                     width: (0..scope.n)
@@ -566,11 +783,33 @@ impl<'a> ModeledPull<'a> {
                     *phase = LoopPhase::Outer;
                     *matched = false;
                 }
-                Record::Material { at, mark, .. } => {
+                // A store whose input was not read to its end is read
+                // again from the first row.
+                Record::Material {
+                    store,
+                    filled,
+                    at,
+                    mark,
+                    ..
+                } => {
+                    if !*filled {
+                        store.clear();
+                    }
                     *at = 0;
                     *mark = None;
                 }
                 Record::HashJoin(record) => record.restart(false),
+                Record::Unique { rows, at, mark } => {
+                    if !rows.filled {
+                        rows.clear();
+                    }
+                    *at = 0;
+                    *mark = None;
+                }
+                Record::Memoize(record) => record.rescan(),
+                Record::MergeJoin(record) => {
+                    record.restart(false, false);
+                }
             }
         }
         self.bound.fill(None);
@@ -657,11 +896,15 @@ fn reaches(model: &ModeledJoin<'_>, from: u32, id: u32) -> bool {
         return true;
     }
     match model.plan.path(from).kind {
-        PathKind::Material { input } => reaches(model, input, id),
-        PathKind::NestLoop { outer, inner, .. } | PathKind::HashJoin { outer, inner, .. } => {
+        PathKind::Material { input }
+        | PathKind::Unique { input, .. }
+        | PathKind::Memoize { input, .. } => reaches(model, input, id),
+        PathKind::NestLoop { outer, inner, .. }
+        | PathKind::HashJoin { outer, inner, .. }
+        | PathKind::MergeJoin { outer, inner, .. } => {
             reaches(model, outer, id) || reaches(model, inner, id)
         }
-        _ => false,
+        PathKind::Scan { .. } | PathKind::Dummy => false,
     }
 }
 
@@ -751,11 +994,75 @@ impl<'a> Step<'_, '_, 'a> {
                 hash,
                 ..
             } => self.hash_join(id, jointype, (outer, inner), &clauses, &hash),
-            PathKind::Unique { .. } | PathKind::Memoize { .. } | PathKind::MergeJoin { .. } => {
-                Err(crate::sql_err!(
-                    crate::sql::eval::sqlstate::INTERNAL_ERROR,
-                    "a join plan node without a pull node"
-                ))
+            PathKind::Unique {
+                input,
+                keys,
+                key_count,
+                method,
+            } => {
+                if method == super::super::index_paths::joins::UniqueMethod::Noop {
+                    return self.next(input);
+                }
+                self.unique(
+                    id,
+                    input,
+                    method,
+                    self.cx.model.plan.keys(keys, key_count),
+                    path.rows,
+                )
+            }
+            PathKind::Memoize {
+                input,
+                keys,
+                key_count,
+                single_row,
+                binary,
+            } => self.memoize(
+                id,
+                input,
+                self.cx.model.plan.keys(keys, key_count),
+                single_row,
+                binary,
+            ),
+            PathKind::MergeJoin {
+                jointype,
+                outer,
+                inner,
+                merge,
+                outer_sort,
+                inner_sort,
+                clauses,
+                inner_unique,
+                descending,
+                nulls_first,
+                ..
+            } => {
+                let outer_relids = self.cx.model.plan.path(outer).relids;
+                let (join_quals, other_quals) =
+                    self.cx.split(&clauses, path.relids, jointype, &merge);
+                // `ExecInitMergeJoin`: a unique inner relation or a semi
+                // join stops each outer row at its first match; without
+                // other join clauses such a join never restores its mark.
+                let skip_mark_restore = (inner_unique
+                    || matches!(jointype, JoinType::Semi | JoinType::Anti))
+                    && clauses.as_slice().len() == merge.as_slice().len();
+                self.merge_join(
+                    id,
+                    &merge::MergeJoin {
+                        jointype,
+                        outer,
+                        inner,
+                        outer_sort,
+                        inner_sort,
+                        keys: self.cx.sides(&merge, outer_relids),
+                        join_quals: &join_quals,
+                        other_quals: &other_quals,
+                        single_match: inner_unique || jointype == JoinType::Semi,
+                        skip_mark_restore,
+                        descending,
+                        nulls_first,
+                    },
+                )
             }
         }
     }
@@ -795,8 +1102,114 @@ impl<'a> Step<'_, '_, 'a> {
                 hash_record(self.records, id).restart(rebuild);
                 self.rescan(outer);
             }
-            _ => {}
+            PathKind::Unique { input, method, .. } => {
+                if method == super::super::index_paths::joins::UniqueMethod::Noop {
+                    self.rescan(input);
+                    return;
+                }
+                // A `Sort` or `HashAggregate` returns its rows again; one
+                // whose input reads an outer row above, or was not read to
+                // its end, reads it again.
+                let reread = self.cx.model.plan.path(input).param != Relids::EMPTY;
+                let Record::Unique { rows, at, mark } = &mut self.records[id as usize] else {
+                    unreachable!("a unique's record");
+                };
+                *at = 0;
+                *mark = None;
+                if reread || !rows.filled {
+                    rows.clear();
+                    self.rescan(input);
+                }
+            }
+            // The input is read again at the next miss.
+            PathKind::Memoize { .. } => {
+                if let Record::Memoize(record) = &mut self.records[id as usize] {
+                    record.rescan();
+                }
+            }
+            PathKind::MergeJoin { outer, inner, .. } => {
+                let reread = |path: u32| self.cx.model.plan.path(path).param != Relids::EMPTY;
+                let (reread_outer, reread_inner) = (reread(outer), reread(inner));
+                let Record::MergeJoin(record) = &mut self.records[id as usize] else {
+                    unreachable!("a merge join's record");
+                };
+                // An outer input in merge order is read again each time.
+                let (outer_read, inner_read) = record.restart(reread_outer, reread_inner);
+                if outer_read {
+                    self.rescan(outer);
+                }
+                if inner_read {
+                    self.rescan(inner);
+                }
+            }
+            PathKind::Dummy => {}
         }
+    }
+
+    /// Reads path `input`'s rows to their end into the store `rows`
+    /// selects in path `id`'s record; a wait resumes with the rows read so
+    /// far kept.
+    fn fill(
+        &mut self,
+        id: u32,
+        input: u32,
+        rows: for<'r> fn(&'r mut Record<'a>) -> &'r mut OrderedRows,
+    ) -> Result<(), SqlError> {
+        let cx = self.cx;
+        let relids = cx.model.plan.path(input).relids;
+        while !rows(&mut self.records[id as usize]).filled {
+            if !self.next(input)? {
+                rows(&mut self.records[id as usize]).filled = true;
+                break;
+            }
+            rows(&mut self.records[id as usize])
+                .store
+                .save(cx, self.bound, relids)?;
+        }
+        Ok(())
+    }
+
+    /// A sorted or hashed `Unique`: its input read whole, then the first
+    /// row of each run or group of equal compared columns in the order its
+    /// sort or hash table returns them.
+    fn unique(
+        &mut self,
+        id: u32,
+        input: u32,
+        method: super::super::index_paths::joins::UniqueMethod,
+        keys: &[Member],
+        groups: f64,
+    ) -> Result<bool, SqlError> {
+        let cx = self.cx;
+        self.fill(id, input, |record| {
+            let Record::Unique { rows, .. } = record else {
+                unreachable!("a unique's record");
+            };
+            rows
+        })?;
+        let Record::Unique { rows, at, mark } = &mut self.records[id as usize] else {
+            unreachable!("a unique's record");
+        };
+        if !rows.arranged {
+            let (members, count) = JoinContext::unique_members(keys);
+            let members = &members[..count];
+            if method == super::super::index_paths::joins::UniqueMethod::Hash {
+                rows.arrange(cx, members, input, |held, _| {
+                    cx.unique_hashed_order(input, held, members, groups)
+                })?;
+            } else {
+                rows.arrange(cx, members, input, |held, sizes| {
+                    cx.unique_order(input, held, sizes, members)
+                })?;
+            }
+        }
+        Self::release(cx.arena, mark);
+        if *at >= rows.len() {
+            return Ok(false);
+        }
+        rows.load(*at, cx, self.bound)?;
+        *at += 1;
+        Ok(true)
     }
 
     /// Releases the bytes of a path's previous row and marks where its next

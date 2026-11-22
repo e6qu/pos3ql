@@ -9195,7 +9195,9 @@ fn sort_by_index_key<'a>(
 
 /// The order in which the index scan of `path` reads `count` rows given in
 /// row identity order, `row` reading each one's bytes: by the index keys in
-/// the index's order, equal keys by identity.
+/// the index's order, equal keys by identity. Only the key values are held
+/// at once: each row is read alone, its keys encoded into a
+/// `plan_build_bytes` lease, and the keys are decoded together.
 fn index_key_permutation<'a>(
     storage: &Storage,
     scope: &QueryScope<'a>,
@@ -9210,9 +9212,6 @@ fn index_key_permutation<'a>(
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     let n_columns = definition.schema(&mut schema);
     let width = path.keys.len();
-    let values = arena
-        .alloc_slice_with(count * width, |_| Datum::Null)
-        .map_err(|_| arena_full())?;
     let reader = super::index_paths::KeyReader::new(
         storage,
         txid,
@@ -9221,21 +9220,67 @@ fn index_key_permutation<'a>(
         path.keys,
         arena,
     )?;
+    let full = |error: crate::mem::lease_pool::LeaseError| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "an index scan's keys exceed plan_build_bytes: {}",
+            error
+        )
+        .plan_build_exhausted()
+    };
+    let pool = storage.plan_build();
+    let mut encoded = pool.lease::<u8>(0).map_err(full)?;
+    let mut ends = pool.lease::<usize>(count).map_err(full)?;
     for position in 0..count {
-        let bytes = row(position)?;
-        let mut decoded = [Datum::Null; MAX_COLUMNS];
-        rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
+        let mark = arena.mark();
+        let keys = (|| {
+            let bytes = row(position)?;
+            let mut decoded = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
+            let mut keys = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+            for (at, key) in keys.iter_mut().enumerate().take(width) {
+                *key = reader.value(
+                    storage,
+                    txid,
+                    definition,
+                    path.keys,
+                    at,
+                    &decoded[..n_columns],
+                    arena,
+                )?;
+            }
+            crate::sql::exec::encode_projected_formed(&keys[..width], &[], arena)
+        })();
+        let pushed = keys.and_then(|keys| {
+            let end = encoded.len() + keys.len();
+            if end > encoded.capacity_entries() {
+                let grown = encoded
+                    .capacity_entries()
+                    .saturating_mul(2)
+                    .min(encoded.max_entries())
+                    .max(end);
+                encoded.reserve_exact(grown).map_err(full)?;
+            }
+            encoded.extend_from_slice(keys).map_err(full)?;
+            ends.push_reserved(end).map_err(full)
+        });
+        // SAFETY: the row and its keys were encoded into the lease.
+        unsafe { arena.rewind_to(mark) };
+        pushed?;
+    }
+    let values = arena
+        .alloc_slice_with(count * width, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let mut start = 0;
+    for (position, &end) in ends.iter().enumerate() {
+        let bytes = arena
+            .alloc_slice_copy(&encoded[start..end])
+            .map_err(|_| arena_full())?;
         for at in 0..width {
-            values[position * width + at] = reader.value(
-                storage,
-                txid,
-                definition,
-                path.keys,
-                at,
-                &decoded[..n_columns],
-                arena,
-            )?;
+            values[position * width + at] =
+                crate::sql::exec::decode_projected_col_record(bytes, at, arena)?;
         }
+        start = end;
     }
     index_key_order(
         storage,

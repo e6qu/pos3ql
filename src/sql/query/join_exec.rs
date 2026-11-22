@@ -86,11 +86,10 @@ struct BaseRow<'a> {
     rowid: Option<u64>,
 }
 
-/// A hash table or `Materialize` store a node keeps across rescans.
+/// A `Materialize` store a node keeps across rescans.
 #[derive(Clone, Copy)]
 struct Built<'a> {
     rows: &'a [Row<'a>],
-    index: &'a [u32],
 }
 
 /// A row a batched hash table holds: its hash value and its size as
@@ -1048,6 +1047,9 @@ struct Probe<'k> {
 /// Each key clause's (outer, inner) column; unused entries hold `usize::MAX`.
 type KeySides = [((usize, usize), (usize, usize)); super::index_paths::joins::MAX_JOIN_CLAUSES];
 
+/// Each row's sort or compared key values, and its sizes under a sort.
+type KeyedRows<'a> = (&'a [&'a [Datum<'a>]], &'a [(usize, usize)]);
+
 /// The rows bound so far, by FROM position.
 type Bound<'a> = [Option<BaseRow<'a>>; RELATION_NUMBERS];
 
@@ -1144,18 +1146,6 @@ impl<'a> JoinLayout<'a> {
             ),
         })
     }
-}
-
-/// The type of a relation's column, or of an expression member, in `scope`.
-fn member_type(
-    model: &ModeledJoin<'_>,
-    scope: &QueryScope<'_>,
-    (table, column): (usize, usize),
-) -> crate::sql::types::ColType {
-    if let Some(id) = Member::plain(0, column as u16).expression_id() {
-        return model.expressions[id].ctype;
-    }
-    scope.defs.stored(table).expect("a plain table").columns()[column].ctype
 }
 
 /// What every node of a join's plan reads to compare and bind rows: the
@@ -1279,10 +1269,6 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             .expect("a plain table")
             .columns()[column]
             .collation
-    }
-
-    fn column_type(&self, member: (usize, usize)) -> crate::sql::types::ColType {
-        member_type(self.model, self.scope, member)
     }
 
     /// Each clause's (outer, inner) columns.
@@ -1496,15 +1482,6 @@ impl<'r, 'a> JoinContext<'r, 'a> {
                 .is_none()
     }
 
-    /// Whether every key's type has a hash function here.
-    fn hashable(&self, keys: &KeySides) -> bool {
-        JoinContext::keys(keys).all(|&(outer, inner)| {
-            [outer, inner]
-                .into_iter()
-                .all(|member| datum_type_hashable(self.column_type(member)))
-        })
-    }
-
     /// The combined hash of a row's join keys (`ExecHashGetHashValue`):
     /// `None` when a key is NULL.
     fn key_hash(
@@ -1531,7 +1508,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             let one = datum_hash(&value).ok_or_else(|| {
                 crate::sql_err!(
                     crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                    "a hash join of several batches over keys of this type is not supported"
+                    "a hash join over keys of this type is not supported"
                 )
             })?;
             hash = if at == 0 {
@@ -1582,7 +1559,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             let Some(hash) = datum_hash(&value) else {
                 return Err(crate::sql_err!(
                     crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                    "a hash join of several batches over keys of this type is not supported"
+                    "a hash join over keys of this type is not supported"
                 ));
             };
             // Open addressing in the skew array; a repeated hash is skipped.
@@ -1608,32 +1585,58 @@ impl<'r, 'a> JoinContext<'r, 'a> {
     /// The `t_len` of the minimal tuple of path `id`'s target list for
     /// the bound row.
     fn tuple_len(&self, bound: &[Option<BaseRow<'a>>], id: u32) -> Result<usize, SqlError> {
-        self.tuple_sizes(bound, id, false).map(|(length, _)| length)
+        self.tuple_sizes(bound, id, &[]).map(|(length, _)| length)
     }
 
-    /// The `t_len` of a row's tuple under the `id` path and what a sort
-    /// writes of it to a tape (`writetup_heap`, or `writetup_datum` when
-    /// `datum` names a sort of one column).
+    /// The columns of path `id`'s target list, then each of `extra` it
+    /// lacks: a sort's key expressions, which `make_sort_from_pathkeys`
+    /// adds to its input's target list as resjunk columns.
+    fn sort_columns(
+        &self,
+        id: u32,
+        extra: &[(usize, usize)],
+        each: &mut dyn FnMut((usize, usize)),
+    ) {
+        let mut listed = [(usize::MAX, 0usize); super::index_paths::joins::MAX_KEYS];
+        self.model
+            .plan
+            .target_list(self.model.plan.path(id).relids, &mut |column| {
+                let member = (usize::from(column.rel), usize::from(column.column));
+                for (slot, &key) in listed.iter_mut().zip(extra) {
+                    if key == member {
+                        *slot = key;
+                    }
+                }
+                each(member);
+            });
+        for (at, &key) in extra.iter().enumerate() {
+            if listed.get(at) != Some(&key) {
+                each(key);
+            }
+        }
+    }
+
+    /// The `t_len` of a row's tuple under the `id` path, with the sort key
+    /// columns `extra` it lacks, and what a sort writes of it to a tape
+    /// (`writetup_heap`, or `writetup_datum` for a sort of one column).
     fn tuple_sizes(
         &self,
         bound: &[Option<BaseRow<'a>>],
         id: u32,
-        datum: bool,
+        extra: &[(usize, usize)],
     ) -> Result<(usize, usize), SqlError> {
         let mut values = [Datum::Null; 128];
         let mut width = 0;
         let mut fits = true;
-        self.model
-            .plan
-            .target_list(self.model.plan.path(id).relids, &mut |column| {
-                if width < values.len() {
-                    values[width] =
-                        self.value(bound, (usize::from(column.rel), usize::from(column.column)));
-                    width += 1;
-                } else {
-                    fits = false;
-                }
-            });
+        self.sort_columns(id, extra, &mut |member| {
+            if width < values.len() {
+                values[width] = self.value(bound, member);
+                width += 1;
+            } else {
+                fits = false;
+            }
+        });
+        let datum = !extra.is_empty() && width == 1;
         let sizes = fits
             .then(|| {
                 super::postgres_memory::SizeSource {
@@ -2199,13 +2202,17 @@ impl<'r, 'a> Runner<'r, 'a> {
                 method,
             } => match method {
                 super::index_paths::joins::UniqueMethod::Noop => self.exec(input, bound, sink),
-                super::index_paths::joins::UniqueMethod::Sort => {
-                    self.unique(input, self.model.plan.keys(keys, key_count), bound, sink)
-                }
-                super::index_paths::joins::UniqueMethod::Hash => self.unique_hashed(
+                super::index_paths::joins::UniqueMethod::Sort => self.unique(
                     input,
                     self.model.plan.keys(keys, key_count),
-                    path.rows,
+                    None,
+                    bound,
+                    sink,
+                ),
+                super::index_paths::joins::UniqueMethod::Hash => self.unique(
+                    input,
+                    self.model.plan.keys(keys, key_count),
+                    Some(path.rows),
                     bound,
                     sink,
                 ),
@@ -2328,7 +2335,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                                     } else {
                                         self.hold(input, bound)?.rows.as_slice()
                                     };
-                                    let store = Built { rows, index: &[] };
+                                    let store = Built { rows };
                                     // The tuplestore `EXPLAIN ANALYZE` reports.
                                     if lazy.is_none() {
                                         material_node.store_opened();
@@ -2389,140 +2396,23 @@ impl<'r, 'a> Runner<'r, 'a> {
                 inner,
                 clauses,
                 hash,
-                buckets,
-                batches,
                 ..
             } => {
                 // An inner input reading the values of an outer row above
                 // changes at each rescan, which builds the table again
                 // (`ExecReScanHashJoin` with the inner plan's `chgParam`).
                 if self.model.plan.path(inner).param != Relids::EMPTY {
-                    self.built[id as usize].set(None);
                     self.frozen[id as usize].set(None);
                 }
                 let outer_relids = self.model.plan.path(outer).relids;
-                let inner_relids = self.model.plan.path(inner).relids;
                 let keys = self.sides(&hash, outer_relids);
                 let quals = self.split(&clauses, path.relids, jointype, &hash);
                 let join = node(super::instrument::Role::Join, id);
                 let hash_node = node(super::instrument::Role::Hash, id);
                 let _join = join.start();
-                if self.hashable(&keys) {
-                    return self.batched_hash_join(
-                        id, jointype, outer, inner, quals, &keys, join, hash_node, bound, sink,
-                    );
-                }
-                debug_assert_eq!(batches, 1, "planned batches need hashable keys");
-                debug_assert!(!jointype.fills_inner(), "planned without hashable keys");
-                let build = |bound: &mut Bound<'a>| -> Result<Built<'a>, SqlError> {
-                    let _hash = hash_node.start();
-                    let held = self.hold(inner, bound)?;
-                    let (index, bytes) = self.hash_index(&held, &keys, inner, buckets)?;
-                    // A table that outgrows its memory splits into batches,
-                    // which rows of these key types cannot be assigned to.
-                    let inner_path = self.model.plan.path(inner);
-                    let sizing = super::index_paths::joins::choose_hash_table_size(
-                        inner_path.rows,
-                        inner_path.width,
-                        self.skewed(&keys),
-                        self.model.plan.settings,
-                    );
-                    let mut final_buckets = buckets as usize;
-                    while index.len() > final_buckets + 1 {
-                        final_buckets *= 2;
-                    }
-                    if bytes + final_buckets * 8 > sizing.space_allowed as usize {
-                        return Err(crate::sql_err!(
-                            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                            "a hash join whose table outgrows its memory over keys of this type is not supported"
-                        ));
-                    }
-                    hash_node.rows(index.len() as u64);
-                    hash_node.hash_table(super::instrument::HashTable {
-                        tuples: index.len() as u64,
-                        tuple_bytes: Some(bytes),
-                        own_bytes: 0,
-                        batches: None,
-                    });
-                    let built = Built {
-                        rows: held.rows.as_slice(),
-                        index,
-                    };
-                    self.built[id as usize].set(Some(built));
-                    Ok(built)
-                };
-                // `ExecHashJoin` reads the first outer row before building
-                // its table when it returns unmatched outer rows or the
-                // outer plan starts cheaper than the table costs, and ends
-                // at an empty table unless it returns unmatched outer rows;
-                // a rescan reuses the table and reads every outer row.
-                let fill_outer = jointype.fills_outer();
-                let mut table = self.built[id as usize].get();
-                if table.is_none()
-                    && !fill_outer
-                    && self.model.plan.path(outer).startup >= self.model.plan.path(inner).total
-                {
-                    let built = build(bound)?;
-                    if built.index.is_empty() {
-                        return Ok(true);
-                    }
-                    table = Some(built);
-                }
-                let (join_quals, other_quals) = quals;
-                let mut ended = false;
-                let kept = self.exec(outer, bound, &mut |bound| {
-                    if table.is_none() {
-                        let built = build(bound)?;
-                        if built.index.is_empty() && !fill_outer {
-                            ended = true;
-                            return Ok(false);
-                        }
-                        table = Some(built);
-                    }
-                    let Built { rows, index } = table.expect("built");
-                    let mut matched = false;
-                    if let Some(start) = self.first_match(bound, rows, index, &keys)? {
-                        for &at in &index[start..] {
-                            let row = &rows[at as usize];
-                            if self.compare_sides(bound, row, &keys)? != Ordering::Equal {
-                                break;
-                            }
-                            self.bind(bound, row, inner_relids);
-                            if !self.equal(bound, &join_quals)? {
-                                join.join_filtered();
-                                continue;
-                            }
-                            matched = true;
-                            if jointype == JoinType::Anti {
-                                break;
-                            }
-                            if self.equal(bound, &other_quals)? {
-                                join.row();
-                                if !sink(bound)? {
-                                    return Ok(false);
-                                }
-                            } else {
-                                join.filtered();
-                            }
-                            if jointype == JoinType::Semi {
-                                break;
-                            }
-                        }
-                    }
-                    if !matched && fill_outer {
-                        self.null_extend(bound, inner_relids);
-                        if self.equal(bound, &other_quals)? {
-                            join.row();
-                            if !sink(bound)? {
-                                return Ok(false);
-                            }
-                        } else {
-                            join.filtered();
-                        }
-                    }
-                    Ok(true)
-                })?;
-                Ok(kept || ended)
+                self.batched_hash_join(
+                    id, jointype, outer, inner, quals, &keys, join, hash_node, bound, sink,
+                )
             }
             PathKind::MergeJoin {
                 jointype,
@@ -3009,8 +2899,11 @@ impl<'r, 'a> Runner<'r, 'a> {
             );
             let _sort = sort.start();
             let held = self.hold(id, bound)?;
-            let (order, space) = self.sorted(&held, keys, relids, id)?;
             let rows = held.rows.borrowed_slice();
+            let (members, flags, count) = self.sort_members(keys, relids);
+            let (key_rows, sizes) = self.keyed(rows, &members[..count], id)?;
+            let (order, space) =
+                self.sort_order(id, key_rows, sizes, (&members[..count], &flags[..count]))?;
             // The planner puts a `Materialize` above an inner sort the join
             // marks, so both sorts are ordinary tuplesorts.
             if super::instrument::active() {
@@ -3243,42 +3136,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         memoize.memoize(cache.stats);
         self.memos[id as usize].set(Some(cache));
         Ok(!stopped)
-    }
-
-    /// Whether two Memoize keys are equal: NULLs equal each other.
-    fn same_key(
-        &self,
-        held: &[Datum<'a>],
-        key: &[Datum<'a>],
-        members: &[super::index_paths::joins::Member],
-        binary: bool,
-    ) -> Result<bool, SqlError> {
-        for ((left, right), member) in held.iter().zip(key).zip(members) {
-            match (left.is_null(), right.is_null()) {
-                (true, true) => continue,
-                (true, false) | (false, true) => return Ok(false),
-                (false, false) => {}
-            }
-            let collation = self.collation((usize::from(member.rel), usize::from(member.column)));
-            if crate::sql::eval::compare_datums_collated(
-                self.storage,
-                self.txid,
-                collation,
-                left,
-                right,
-            )? != Ordering::Equal
-            {
-                return Ok(false);
-            }
-            // Binary mode (`datum_image_eq`) tells apart equal values whose
-            // stored images differ: numerics of different scales, zeros of
-            // either sign, intervals of different units and times in
-            // different zones.
-            if binary && !same_image(left, right) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     /// A hash join PostgreSQL plans with several batches
@@ -3884,214 +3741,27 @@ impl<'r, 'a> Runner<'r, 'a> {
         Ok(Held { rows })
     }
 
-    /// The held inner rows without NULL keys, ordered by key and, among
-    /// equal keys, in the order a probe walks their bucket's chain: newest
-    /// first as `ExecHashTableInsert` prepends them, unless the table held
-    /// more rows than its planned buckets, when `ExecHashIncreaseNumBuckets`
-    /// prepends them again walking its memory chunks, newest chunk first.
-    fn hash_index(
-        &self,
-        held: &Held<'a>,
-        keys: &KeySides,
-        inner: u32,
-        buckets: u32,
-    ) -> Result<(&'a [u32], usize), SqlError> {
-        /// `HASH_CHUNK_SIZE` and `HASH_CHUNK_THRESHOLD`.
-        const CHUNK: usize = 32 * 1024;
-        const THRESHOLD: usize = CHUNK / 4;
-        let rows = held.rows.borrowed_slice();
-        let mut count = 0;
-        let index = self
-            .arena
-            .alloc_slice_with(rows.len(), |_| 0u32)
-            .map_err(|_| arena_full())?;
-        for (at, row) in rows.iter().enumerate() {
-            if !self.has_null(row, keys, false) {
-                index[count] = at as u32;
-                count += 1;
-            }
-        }
-        let index = &mut index[..count];
-        // Each inserted row's place in its chain: lower walks first.
-        let rank = self
-            .arena
-            .alloc_slice_with(rows.len(), |_| 0i64)
-            .map_err(|_| arena_full())?;
-        // Each inserted row's minimal tuple length.
-        let lengths = self
-            .arena
-            .alloc_slice_with(count, |_| 0usize)
-            .map_err(|_| arena_full())?;
-        let mut bytes = 0usize;
-        for (at, &row) in index.iter().enumerate() {
-            lengths[at] = self.tuple_len(rows[row as usize], inner)?;
-            // `HJTUPLE_OVERHEAD` and the tuple, as `spaceUsed` counts them.
-            bytes += 16 + lengths[at];
-        }
-        if count > buckets as usize + 1 {
-            // The chunk list as `dense_alloc` links it: a new chunk heads
-            // it, an oversized row's own chunk goes after the head.
-            let chunk_of = self
-                .arena
-                .alloc_slice_with(count, |_| 0u32)
-                .map_err(|_| arena_full())?;
-            let list = self
-                .arena
-                .alloc_slice_with(count, |_| 0u32)
-                .map_err(|_| arena_full())?;
-            // (maxlen, used) per chunk.
-            let space = self
-                .arena
-                .alloc_slice_with(count, |_| (0usize, 0usize))
-                .map_err(|_| arena_full())?;
-            let mut chunks = 0usize;
-            for at in 0..count {
-                let length = lengths[at];
-                let size = (16 + length).next_multiple_of(8);
-                let id = chunks;
-                if size > THRESHOLD {
-                    space[id] = (size, size);
-                    let position = usize::from(chunks > 0);
-                    list.copy_within(position..chunks, position + 1);
-                    list[position] = id as u32;
-                    chunks += 1;
-                    chunk_of[at] = id as u32;
-                } else if chunks == 0 || {
-                    let (maxlen, used) = space[list[0] as usize];
-                    maxlen - used < size
-                } {
-                    space[id] = (CHUNK, size);
-                    list.copy_within(0..chunks, 1);
-                    list[0] = id as u32;
-                    chunks += 1;
-                    chunk_of[at] = id as u32;
-                } else {
-                    let head = list[0] as usize;
-                    space[head].1 += size;
-                    chunk_of[at] = head as u32;
-                }
-            }
-            let place = self
-                .arena
-                .alloc_slice_with(chunks, |_| 0usize)
-                .map_err(|_| arena_full())?;
-            for (position, &id) in list[..chunks].iter().enumerate() {
-                place[id as usize] = position;
-            }
-            // The walk: chunks in list order, each one's rows in insertion
-            // order; prepending them in that order puts the last walked
-            // first.
-            let walk = self
-                .arena
-                .alloc_slice_with(count, |at| (place[chunk_of[at] as usize], at, index[at]))
-                .map_err(|_| arena_full())?;
-            walk.sort_unstable();
-            let total = walk.len() as i64;
-            for (walked, &(_, _, row)) in walk.iter().enumerate() {
-                rank[row as usize] = total - walked as i64;
-            }
-        } else {
-            for &row in index.iter() {
-                rank[row as usize] = -i64::from(row);
-            }
-        }
-        let rank: &[i64] = rank;
-        crate::mem::arena::try_stable_sort_via(
-            self.arena,
-            index,
-            |&a, &b| {
-                for &(o, i) in JoinContext::keys(keys) {
-                    let order = crate::sql::eval::compare_datums_collated(
-                        self.storage,
-                        self.txid,
-                        self.collation(o),
-                        &self.value(rows[a as usize], i),
-                        &self.value(rows[b as usize], i),
-                    )?;
-                    if order != Ordering::Equal {
-                        return Ok(order);
-                    }
-                }
-                Ok(rank[a as usize].cmp(&rank[b as usize]))
-            },
-            |_| arena_full(),
-        )?;
-        Ok((index, bytes))
-    }
-
-    /// The first position of `index` whose keys are not below the bound
-    /// outer row's, when that row's keys have no NULL.
-    fn first_match(
-        &self,
-        bound: &[Option<BaseRow<'a>>],
-        rows: &[Row<'a>],
-        index: &[u32],
-        keys: &KeySides,
-    ) -> Result<Option<usize>, SqlError> {
-        if self.has_null(bound, keys, true) {
-            return Ok(None);
-        }
-        let (mut low, mut high) = (0usize, index.len());
-        while low < high {
-            let middle = (low + high) / 2;
-            if self.compare_sides(bound, rows[index[middle] as usize], keys)? == Ordering::Greater {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        Ok(Some(low))
-    }
-
-    /// A `Unique` over a `Sort` of a semi join's compared columns: the
-    /// input's rows sorted by them (`pg_qsort`, NULLs last) and the first
-    /// of each run of equal values, NULLs equal (`execTuplesUnique`).
+    /// A `Unique` node: the first input row of each run or group of equal
+    /// compared columns, in the order its sort or hash table returns them.
     fn unique(
         &self,
         input: u32,
         keys: &[super::index_paths::joins::Member],
+        hashed: Option<f64>,
         bound: &mut Bound<'a>,
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         let held = self.hold(input, bound)?;
         let rows = held.rows.borrowed_slice();
         let relids = self.model.plan.path(input).relids;
-        let column = |member: &super::index_paths::joins::Member| {
-            (usize::from(member.rel), usize::from(member.column))
+        let (members, count) = JoinContext::unique_members(keys);
+        let members = &members[..count];
+        let (key_rows, sizes) = self.keyed(rows, members, input)?;
+        let order = match hashed {
+            Some(groups) => self.unique_hashed_order(input, key_rows, members, groups)?,
+            None => self.unique_order(input, key_rows, sizes, members)?,
         };
-        let compare =
-            |a: &[Option<BaseRow<'a>>], b: &[Option<BaseRow<'a>>]| -> Result<Ordering, SqlError> {
-                for member in keys {
-                    let (one, two) = (self.value(a, column(member)), self.value(b, column(member)));
-                    let order = match (one.is_null(), two.is_null()) {
-                        (true, true) => Ordering::Equal,
-                        (true, false) => Ordering::Greater,
-                        (false, true) => Ordering::Less,
-                        (false, false) => crate::sql::eval::compare_datums_collated(
-                            self.storage,
-                            self.txid,
-                            self.collation(column(member)),
-                            &one,
-                            &two,
-                        )?,
-                    };
-                    if order != Ordering::Equal {
-                        return Ok(order);
-                    }
-                }
-                Ok(Ordering::Equal)
-            };
-        let (order, _) = self.tuplesort(input, rows, &mut |a, b| {
-            compare(rows[a as usize], rows[b as usize])
-        })?;
-        let mut previous: Option<u32> = None;
-        for &at in order.iter() {
-            if let Some(held) = previous
-                && compare(rows[held as usize], rows[at as usize])? == Ordering::Equal
-            {
-                continue;
-            }
-            previous = Some(at);
+        for &at in order {
             self.bind(bound, rows[at as usize], relids);
             if !sink(bound)? {
                 return Ok(false);
@@ -4099,39 +3769,192 @@ impl<'r, 'a> Runner<'r, 'a> {
         }
         Ok(true)
     }
+}
 
-    /// A `HashAggregate` making a semi join's inner relation unique: the
-    /// first input row of each group of equal compared columns (NULLs
-    /// equal), returned in the order `ExecAgg` walks its `simplehash` table
-    /// (`TupleHashTableHash`'s `murmurhash32` of the combined hashes, robin
-    /// hood insertion, growth by doubling, `SH_START_ITERATE` from the
-    /// first empty bucket backwards).
-    fn unique_hashed(
+/// The orders the nodes read stored rows in, each over the rows decoded
+/// into the arena.
+impl<'r, 'a> JoinContext<'r, 'a> {
+    /// Whether two Memoize keys are equal: NULLs equal each other.
+    fn same_key(
+        &self,
+        held: &[Datum<'a>],
+        key: &[Datum<'a>],
+        members: &[super::index_paths::joins::Member],
+        binary: bool,
+    ) -> Result<bool, SqlError> {
+        for ((left, right), member) in held.iter().zip(key).zip(members) {
+            match (left.is_null(), right.is_null()) {
+                (true, true) => continue,
+                (true, false) | (false, true) => return Ok(false),
+                (false, false) => {}
+            }
+            let collation = self.collation((usize::from(member.rel), usize::from(member.column)));
+            if crate::sql::eval::compare_datums_collated(
+                self.storage,
+                self.txid,
+                collation,
+                left,
+                right,
+            )? != Ordering::Equal
+            {
+                return Ok(false);
+            }
+            // Binary mode (`datum_image_eq`) tells apart equal values whose
+            // stored images differ: numerics of different scales, zeros of
+            // either sign, intervals of different units and times in
+            // different zones.
+            if binary && !same_image(left, right) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// `ExecInitSort`: a sort by `keys` of path `id`'s rows whose tuple is
+    /// a single column sorts datums.
+    fn sorts_datums(&self, id: u32, keys: &[(usize, usize)]) -> bool {
+        let mut columns = 0;
+        self.sort_columns(id, keys, &mut |_| columns += 1);
+        columns == 1
+    }
+
+    /// The sizes a tuplesort by `keys` of path `id`'s rows charges for the
+    /// bound row: its tuple's `t_len` and what a run writes of it.
+    fn sort_sizes(
+        &self,
+        row: &[Option<BaseRow<'a>>],
+        id: u32,
+        keys: &[(usize, usize)],
+    ) -> Result<(usize, usize), SqlError> {
+        self.tuple_sizes(row, id, keys)
+    }
+
+    /// The values of `members` in each of `rows`, and each row's sizes under
+    /// path `id`, as the orders below read them.
+    fn keyed(
+        &self,
+        rows: &[Row<'a>],
+        members: &[(usize, usize)],
+        id: u32,
+    ) -> Result<KeyedRows<'a>, SqlError> {
+        let keys = self
+            .arena
+            .alloc_slice_with(rows.len(), |_| -> &'a [Datum<'a>] { &[] })
+            .map_err(|_| arena_full())?;
+        let sizes = self
+            .arena
+            .alloc_slice_with(rows.len(), |_| (0usize, 0usize))
+            .map_err(|_| arena_full())?;
+        for ((key, size), row) in keys.iter_mut().zip(sizes.iter_mut()).zip(rows) {
+            *key = self
+                .arena
+                .alloc_slice_with(members.len(), |at| self.value(row, members[at]))
+                .map_err(|_| arena_full())?;
+            *size = self.sort_sizes(row, id, members)?;
+        }
+        Ok((keys, sizes))
+    }
+
+    /// The members a sort by `keys` of a path of `relids` compares, each
+    /// with its key's flags.
+    fn sort_members(&self, keys: &Keys, relids: Relids) -> ([(usize, usize); 8], [u8; 8], usize) {
+        let mut members = [(0usize, 0usize); 8];
+        let mut flags = [0u8; 8];
+        for (at, &key) in keys.as_slice().iter().enumerate() {
+            let class = key & KEY_CLASS;
+            let member = self.model.plan.classes[usize::from(class)]
+                .sort_member(relids)
+                .expect("a sort key reads its input");
+            members[at] = self.model.member(class, member as u8);
+            flags[at] = key;
+        }
+        (members, flags, keys.as_slice().len())
+    }
+
+    /// Each compared member's column, for its collation.
+    fn unique_members(
+        keys: &[super::index_paths::joins::Member],
+    ) -> ([(usize, usize); super::index_paths::joins::MAX_KEYS], usize) {
+        let mut members = [(0usize, 0usize); super::index_paths::joins::MAX_KEYS];
+        for (slot, member) in members.iter_mut().zip(keys) {
+            *slot = (usize::from(member.rel), usize::from(member.column));
+        }
+        (members, keys.len())
+    }
+
+    /// A `Unique` over a `Sort` of a semi join's compared columns, whose
+    /// values each row of `keys` holds: the rows' positions sorted by them
+    /// (`pg_qsort`, NULLs last), the first of each run of equal values,
+    /// NULLs equal (`execTuplesUnique`).
+    fn unique_order(
         &self,
         input: u32,
-        keys: &[super::index_paths::joins::Member],
-        groups: f64,
-        bound: &mut Bound<'a>,
-        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
-        let held = self.hold(input, bound)?;
-        let rows = held.rows.borrowed_slice();
-        let relids = self.model.plan.path(input).relids;
-        let width = self.model.plan.path(input).width;
-        let column = |member: &super::index_paths::joins::Member| {
-            (usize::from(member.rel), usize::from(member.column))
+        keys: &[&[Datum<'a>]],
+        sizes: &[(usize, usize)],
+        members: &[(usize, usize)],
+    ) -> Result<&'a [u32], SqlError> {
+        let compare = |a: u32, b: u32| -> Result<Ordering, SqlError> {
+            for (at, &member) in members.iter().enumerate() {
+                let (one, two) = (&keys[a as usize][at], &keys[b as usize][at]);
+                let order = match (one.is_null(), two.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => crate::sql::eval::compare_datums_collated(
+                        self.storage,
+                        self.txid,
+                        self.collation(member),
+                        one,
+                        two,
+                    )?,
+                };
+                if order != Ordering::Equal {
+                    return Ok(order);
+                }
+            }
+            Ok(Ordering::Equal)
         };
+        let (order, _) = self.tuplesort((input, members), sizes, &mut |a, b| compare(a, b))?;
+        let kept = self
+            .arena
+            .alloc_slice_with(order.len(), |_| 0u32)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for &at in order {
+            if count > 0 && compare(kept[count - 1], at)? == Ordering::Equal {
+                continue;
+            }
+            kept[count] = at;
+            count += 1;
+        }
+        Ok(&kept[..count])
+    }
+
+    /// A `HashAggregate` making a semi join's inner relation unique: the
+    /// positions of the first row of each group of equal compared columns,
+    /// whose values each row of `keys` holds (NULLs equal), in the order
+    /// `ExecAgg` walks its `simplehash` table (`TupleHashTableHash`'s
+    /// `murmurhash32` of the combined hashes, robin hood insertion, growth
+    /// by doubling, `SH_START_ITERATE` from the first empty bucket
+    /// backwards).
+    fn unique_hashed_order(
+        &self,
+        input: u32,
+        keys: &[&[Datum<'a>]],
+        members: &[(usize, usize)],
+        groups: f64,
+    ) -> Result<&'a [u32], SqlError> {
+        let width = self.model.plan.path(input).width;
         let row_hash = |row: usize| -> Result<u32, SqlError> {
             let mut hash = 0u32;
-            for (at, member) in keys.iter().enumerate() {
+            for (at, value) in keys[row].iter().enumerate() {
                 if at != 0 {
                     hash = hash.rotate_left(1);
                 }
-                let value = self.value(rows[row], column(member));
                 if value.is_null() {
                     continue;
                 }
-                hash ^= datum_hash(&value).ok_or_else(|| {
+                hash ^= datum_hash(value).ok_or_else(|| {
                     crate::sql_err!(
                         crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
                         "a hashed unique-ified relation over keys of this type is not supported"
@@ -4141,20 +3964,17 @@ impl<'r, 'a> Runner<'r, 'a> {
             Ok(super::simplehash::murmur32(hash))
         };
         let same = |a: usize, b: usize| -> Result<bool, SqlError> {
-            for member in keys {
-                let (one, two) = (
-                    self.value(rows[a], column(member)),
-                    self.value(rows[b], column(member)),
-                );
+            for (at, &member) in members.iter().enumerate() {
+                let (one, two) = (&keys[a][at], &keys[b][at]);
                 let equal = match (one.is_null(), two.is_null()) {
                     (true, true) => true,
                     (false, false) => {
                         crate::sql::eval::compare_datums_collated(
                             self.storage,
                             self.txid,
-                            self.collation(column(member)),
-                            &one,
-                            &two,
+                            self.collation(member),
+                            one,
+                            two,
                         )? == Ordering::Equal
                     }
                     _ => false,
@@ -4165,36 +3985,35 @@ impl<'r, 'a> Runner<'r, 'a> {
             }
             Ok(true)
         };
-        let sizing =
-            super::index_paths::plain_hash_sizing(width, groups, keys.len()).ok_or_else(|| {
+        let sizing = super::index_paths::plain_hash_sizing(width, groups, members.len())
+            .ok_or_else(|| {
                 crate::sql_err!(
                     crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
                     "a hashed unique-ified relation over {} columns is not supported",
-                    keys.len()
+                    members.len()
                 )
             })?;
         let hashes = self
             .arena
-            .alloc_slice_with(rows.len(), |_| 0u32)
-            .map_err(|_| crate::sql::eval::arena_full())?;
+            .alloc_slice_with(keys.len(), |_| 0u32)
+            .map_err(|_| arena_full())?;
         let lens = self
             .arena
-            .alloc_slice_with(rows.len(), |_| 0usize)
-            .map_err(|_| crate::sql::eval::arena_full())?;
-        for row in 0..rows.len() {
+            .alloc_slice_with(keys.len(), |_| 0usize)
+            .map_err(|_| arena_full())?;
+        for row in 0..keys.len() {
             hashes[row] = row_hash(row)?;
             lens[row] = super::postgres_memory::minimal_tuple_len_with_tids(
                 None,
-                keys.iter()
-                    .map(|member| self.value(rows[row], column(member))),
+                keys[row].iter().copied(),
                 0,
             )
             .ok_or_else(super::instrument::unsized_value)?;
         }
         let order = self
             .arena
-            .alloc_slice_with(rows.len(), |_| 0u32)
-            .map_err(|_| crate::sql::eval::arena_full())?;
+            .alloc_slice_with(keys.len(), |_| 0u32)
+            .map_err(|_| arena_full())?;
         let (count, _) = super::hashagg::hashed_row_order(
             self.storage.plan_build(),
             sizing,
@@ -4203,41 +4022,23 @@ impl<'r, 'a> Runner<'r, 'a> {
             same,
             order,
         )?;
-        let order = &order[..count];
-        for &row in order {
-            self.bind(bound, rows[row as usize], relids);
-            if !sink(bound)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(&order[..count])
     }
 
-    /// The held rows' order after a sort by `keys` (PostgreSQL's tuplesort,
-    /// NULLs last), or as held without keys, and the space the sort reports.
-    fn sorted(
+    /// The order of rows whose sort key values each row of `keys` holds
+    /// after a sort by `members` with `flags` (PostgreSQL's tuplesort,
+    /// NULLs last unless a key puts them first), and the space the sort
+    /// reports.
+    fn sort_order(
         &self,
-        held: &Held<'a>,
-        keys: &Keys,
-        relids: Relids,
         id: u32,
+        keys: &[&[Datum<'a>]],
+        sizes: &[(usize, usize)],
+        (members, flags): (&[(usize, usize)], &[u8]),
     ) -> Result<(&'a [u32], super::instrument::SortSpace), SqlError> {
-        let rows = held.rows.borrowed_slice();
-        let mut columns = [((0usize, 0usize), 0u8); 8];
-        for (at, &key) in keys.as_slice().iter().enumerate() {
-            let class = key & KEY_CLASS;
-            let member = self.model.plan.classes[usize::from(class)]
-                .sort_member(relids)
-                .expect("a sort key reads its input");
-            columns[at] = (self.model.member(class, member as u8), key);
-        }
-        let columns = &columns[..keys.as_slice().len()];
-        self.tuplesort(id, rows, &mut |a, b| {
-            for &(column, key) in columns {
-                let (one, two) = (
-                    self.value(rows[a as usize], column),
-                    self.value(rows[b as usize], column),
-                );
+        self.tuplesort((id, members), sizes, &mut |a, b| {
+            for (at, (&member, &key)) in members.iter().zip(flags).enumerate() {
+                let (one, two) = (&keys[a as usize][at], &keys[b as usize][at]);
                 let first = key & KEY_NULLS_FIRST != 0;
                 let order = match (one.is_null(), two.is_null()) {
                     (true, true) => Ordering::Equal,
@@ -4249,9 +4050,9 @@ impl<'r, 'a> Runner<'r, 'a> {
                         let order = crate::sql::eval::compare_datums_collated(
                             self.storage,
                             self.txid,
-                            self.collation(column),
-                            &one,
-                            &two,
+                            self.collation(member),
+                            one,
+                            two,
                         )?;
                         if key & KEY_DESCENDING != 0 {
                             order.reverse()
@@ -4268,25 +4069,20 @@ impl<'r, 'a> Runner<'r, 'a> {
         })
     }
 
-    /// PostgreSQL's tuplesort of the `id` path's `rows` in arrival order, as
+    /// PostgreSQL's tuplesort of the `id` path's rows, of `sizes`, in arrival order, as
     /// `tuplesort.c` runs it: each tuple (the path's target list) is charged
     /// as it arrives, a sort that outgrows `work_mem` forms its runs where
     /// `dumptuples` does and merges them as `mergeruns` does, any other is
     /// one `pg_qsort`. Rows `compare` ranks equal come out in that order.
     fn tuplesort(
         &self,
-        id: u32,
-        rows: &[Row<'a>],
+        (id, keys): (u32, &[(usize, usize)]),
+        sizes: &[(usize, usize)],
         compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
     ) -> Result<(&'a [u32], super::instrument::SortSpace), SqlError> {
         use super::postgres_memory::{SortTuples, TuplesortModel};
-        // `ExecInitSort`: a sort of a single column sorts datums.
-        let mut columns = 0;
-        self.model
-            .plan
-            .target_list(self.model.plan.path(id).relids, &mut |_| columns += 1);
         let mut model = TuplesortModel::new(
-            if columns == 1 {
+            if self.sorts_datums(id, keys) {
                 SortTuples::Datum
             } else {
                 SortTuples::Bump
@@ -4296,11 +4092,10 @@ impl<'r, 'a> Runner<'r, 'a> {
         // The row counts of the runs `dumptuples` wrote.
         let runs = self
             .arena
-            .alloc_slice_with(rows.len() + 1, |_| 0u32)
+            .alloc_slice_with(sizes.len() + 1, |_| 0u32)
             .map_err(|_| arena_full())?;
         let mut run_count = 0usize;
-        for row in rows {
-            let (length, written) = self.tuple_sizes(row, id, columns == 1)?;
+        for &(length, written) in sizes {
             if let Some(run) = model.push(length, written) {
                 runs[run_count] = run as u32;
                 run_count += 1;
@@ -4312,13 +4107,13 @@ impl<'r, 'a> Runner<'r, 'a> {
         }
         let order = self
             .arena
-            .alloc_slice_with(rows.len(), |at| at as u32)
+            .alloc_slice_with(sizes.len(), |at| at as u32)
             .map_err(|_| arena_full())?;
         if let Some(merge_order) = model.merge_order() {
             let scratch = crate::sql::pg_qsort::RunScratch {
                 moved: self
                     .arena
-                    .alloc_slice_with(rows.len(), |_| 0u32)
+                    .alloc_slice_with(sizes.len(), |_| 0u32)
                     .map_err(|_| arena_full())?,
                 bounds: self
                     .arena

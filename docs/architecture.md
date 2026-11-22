@@ -350,10 +350,10 @@ rejects a node or scope that would keep one. A reader keeps only its
 subqueries' cached values, and a data change's subqueries run through the
 storage of the catalog evaluating them.
 
-**Joins.** A plan PostgreSQL's join search chose runs as pull nodes when it
-holds only scans, nested loops, hash joins over hashable keys and
-`Materialize`; [query planning](query-planning.md#pull-based-join-executor)
-describes them and which plans still run in the general executor. Other
+**Joins.** A plan PostgreSQL's join search chose runs as pull nodes unless
+it scans a `LATERAL` item;
+[query planning](query-planning.md#pull-based-join-executor) describes them
+and which statements still run plans in the general executor. Other
 joins of up to eight FROM items (tables, generator calls or `VALUES` lists)
 read through the retained reader's own levels, in the general executor's
 order (FROM order, or its cost order for a cross join):

@@ -591,6 +591,31 @@ struct LocalCleanup {
     heap_changed: bool,
 }
 
+/// SKIP_LOCKED's warning for a named relation it passes over.
+fn warn_analyze_skipped(
+    responder: &mut Responder,
+    target: &ast::MaintenanceTarget<'_>,
+) -> Result<(), WireFull> {
+    responder.warning(
+        sqlstate::LOCK_NOT_AVAILABLE,
+        stack_format!(
+            160,
+            "skipping analyze of \"{}\" --- lock not available",
+            target.table.name
+        )
+        .as_str(),
+    )
+}
+
+/// How ANALYZE holds its relations' locks: all taken before it runs, or,
+/// under SKIP_LOCKED, each taken as it is reached unless another holder has
+/// it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MaintenanceLocking {
+    Held,
+    SkipUnavailable,
+}
+
 #[derive(Clone, Copy)]
 enum LocalCleanupSource {
     Checkpoint,
@@ -1124,7 +1149,7 @@ fn calls_routines_outside_queries(statement: &Stmt<'_>, txn: &TxnState) -> bool 
         Stmt::CreateIndex { .. } => txn.concurrent_index.is_none(),
         Stmt::Reindex { .. }
         | Stmt::Cluster { .. }
-        | Stmt::Analyze(_)
+        | Stmt::Analyze { .. }
         | Stmt::Vacuum { .. }
         | Stmt::RefreshMaterializedView { .. }
         | Stmt::CreateTableAs { .. } => true,
@@ -1171,7 +1196,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DeclareCursor { .. }
         | Stmt::FetchCursor { .. }
         | Stmt::CloseCursor(_)
-        | Stmt::Analyze(_)
+        | Stmt::Analyze { .. }
         | Stmt::Listen(_)
         | Stmt::Unlisten(_) => false,
         Stmt::Call { .. } | Stmt::Do { .. } => true,
@@ -1581,7 +1606,7 @@ pub(crate) fn unquoted_body_unsupported_tag(statement: &Stmt<'_>) -> Option<&'st
         Stmt::CommitPrepared(_) => "COMMIT PREPARED",
         Stmt::RollbackPrepared(_) => "ROLLBACK PREPARED",
         Stmt::Vacuum { .. } => "VACUUM",
-        Stmt::Analyze(_) => "ANALYZE",
+        Stmt::Analyze { .. } => "ANALYZE",
         Stmt::Checkpoint => "CHECKPOINT",
         Stmt::Set { .. }
         | Stmt::SetRole { .. }
@@ -1780,7 +1805,7 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         }
         Stmt::AlterDefaultPrivileges { .. } => "ALTER DEFAULT PRIVILEGES",
         Stmt::DropOwned { .. } => "DROP OWNED",
-        Stmt::Analyze(_) | Stmt::Vacuum { .. } => return None,
+        Stmt::Analyze { .. } | Stmt::Vacuum { .. } => return None,
         Stmt::CreateEventTrigger(_)
         | Stmt::AlterEventTrigger { .. }
         | Stmt::DropEventTrigger { .. } => return None,
@@ -10554,6 +10579,7 @@ impl Engine {
         targets: &[ast::MaintenanceTarget<'_>],
         txn: &mut TxnState,
         measure_indexes: bool,
+        locking: MaintenanceLocking,
     ) -> Result<u64, SqlError> {
         self.validate_maintenance_targets(targets, txn.txid)?;
         let _snapshot = self.storage.analyze_snapshot();
@@ -10566,6 +10592,7 @@ impl Engine {
                         .storage
                         .relation_visible_to_current_session(slot, txn.txid)
                     && self.maintenance_permitted(slot, txn.txid)
+                    && self.maintenance_lock_available(slot, txn.txid, locking)?
                 {
                     txn.record_statistics(slot as u32)?;
                     self.work.reset();
@@ -10633,6 +10660,7 @@ impl Engine {
                         && (target.inheritance == ast::RelationInheritance::Only
                             || !self.storage.relation_descends_from(slot, root, txn.txid)))
                     || !self.maintenance_permitted(slot, txn.txid)
+                    || !self.maintenance_lock_available(slot, txn.txid, locking)?
                 {
                     continue;
                 }
@@ -10887,7 +10915,8 @@ impl Engine {
             return Ok(Err(error));
         }
         let validation = if options.analyze {
-            self.analyze_targets(targets, txn, false).map(|_| ())
+            self.analyze_targets(targets, txn, false, MaintenanceLocking::Held)
+                .map(|_| ())
         } else {
             self.validate_maintenance_targets(targets, txn.txid)
         };
@@ -10914,26 +10943,123 @@ impl Engine {
     pub(crate) fn execute_analyze_statement(
         &mut self,
         targets: &[ast::MaintenanceTarget<'_>],
+        options: ast::AnalyzeOptions,
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let locking = if options.skip_locked {
+            MaintenanceLocking::SkipUnavailable
+        } else {
+            MaintenanceLocking::Held
+        };
+        // SKIP_LOCKED passes over a named relation it cannot lock at once,
+        // with a warning; its members and a database-wide ANALYZE's tables
+        // are passed over silently, as `vacuum_open_relation` does. As in
+        // `expand_vacuum_rel`, every named relation is first probed with an
+        // ACCESS SHARE lock, released at once, before any is locked for the
+        // analysis itself.
+        let mut kept = [ast::MaintenanceTarget {
+            table: ast::QualName::bare(""),
+            columns: &[],
+            inheritance: ast::RelationInheritance::Descendants,
+        }; 64];
+        let mut kept_count = 0usize;
+        for target in targets {
+            if locking == MaintenanceLocking::SkipUnavailable {
+                let root = match exec::resolve_dml_table(&self.storage, &target.table, txn.txid) {
+                    Ok(root) => root,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if self.maintenance_permitted(root, txn.txid) {
+                    let mark = self.storage.lock_mark();
+                    let probe = self.storage.lock_table(
+                        txn.txid,
+                        root,
+                        ast::TableLockMode::AccessShare,
+                        true,
+                    );
+                    self.storage.rollback_locks_to(txn.txid, mark);
+                    match probe {
+                        Ok(()) => {}
+                        Err(error) if error.sqlstate == sqlstate::LOCK_NOT_AVAILABLE => {
+                            warn_analyze_skipped(responder, target)?;
+                            continue;
+                        }
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+            }
+            kept[kept_count] = *target;
+            kept_count += 1;
+        }
+        if locking == MaintenanceLocking::SkipUnavailable {
+            let mut locked = 0usize;
+            for index in 0..kept_count {
+                let target = kept[index];
+                let root = match exec::resolve_dml_table(&self.storage, &target.table, txn.txid) {
+                    Ok(root) => root,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if self.maintenance_permitted(root, txn.txid) {
+                    match self.maintenance_lock_available(root, txn.txid, locking) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn_analyze_skipped(responder, &target)?;
+                            continue;
+                        }
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+                kept[locked] = target;
+                locked += 1;
+            }
+            kept_count = locked;
+        }
+        if !targets.is_empty() && kept_count == 0 {
+            responder.command_complete("ANALYZE")?;
+            return Ok(Ok(()));
+        }
+        let targets = &kept[..kept_count];
         if let Err(error) =
             self.warn_maintenance_denials(targets, txn.txid, "analyze", responder)?
         {
             return Ok(Err(error));
         }
-        if let Err(error) = self.lock_maintenance_targets(
-            targets,
-            txn.txid,
-            ast::TableLockMode::ShareUpdateExclusive,
-        ) {
+        if locking == MaintenanceLocking::Held
+            && let Err(error) = self.lock_maintenance_targets(
+                targets,
+                txn.txid,
+                ast::TableLockMode::ShareUpdateExclusive,
+            )
+        {
             return Ok(Err(error));
         }
-        if let Err(error) = self.analyze_targets(targets, txn, true) {
+        if let Err(error) = self.analyze_targets(targets, txn, true, locking) {
             return Ok(Err(error));
         }
         responder.command_complete("ANALYZE")?;
         Ok(Ok(()))
+    }
+
+    /// Whether ANALYZE may go on with `slot`: always when its locks were
+    /// taken beforehand, and under SKIP_LOCKED when its lock is free now.
+    fn maintenance_lock_available(
+        &self,
+        slot: usize,
+        txid: u32,
+        locking: MaintenanceLocking,
+    ) -> Result<bool, SqlError> {
+        if locking == MaintenanceLocking::Held {
+            return Ok(true);
+        }
+        match self
+            .storage
+            .lock_table(txid, slot, ast::TableLockMode::ShareUpdateExclusive, true)
+        {
+            Ok(()) => Ok(true),
+            Err(error) if error.sqlstate == sqlstate::LOCK_NOT_AVAILABLE => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn execute_listen_statement(
@@ -26815,7 +26941,9 @@ impl Engine {
             // ANALYZE resolves every requested relation/column and walks its
             // MVCC-visible row state. Cardinality and widths are exact for that
             // snapshot; distinct counts use the fixed-size estimator.
-            Stmt::Analyze(targets) => self.execute_analyze_statement(targets, txn, responder),
+            Stmt::Analyze { targets, options } => {
+                self.execute_analyze_statement(targets, *options, txn, responder)
+            }
             Stmt::Listen(channel) => self.execute_listen_statement(channel, txn, responder),
             Stmt::Unlisten(channel) => self.execute_unlisten_statement(*channel, txn, responder),
             Stmt::Notify { channel, payload } => {

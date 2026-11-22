@@ -935,6 +935,7 @@ fn fire_trigger_merge_row<'a>(
         event,
         old,
         new.as_deref_mut(),
+        trigger_firing::ImageForms::UNRECORDED,
     )? {
         return Ok(false);
     }

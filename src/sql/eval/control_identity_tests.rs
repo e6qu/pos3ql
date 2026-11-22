@@ -117,6 +117,7 @@ impl super::CatalogAccess for InputCatalog {
         _: super::DomainCoercion,
         _: &'a Arena,
         _: Option<&dyn super::SequenceAccess>,
+        _: crate::sql::toast::DatumForm,
     ) -> Result<Option<super::Datum<'a>>, SqlError> {
         Err(crate::sql_err!(self.0, "input conversion outcome"))
     }

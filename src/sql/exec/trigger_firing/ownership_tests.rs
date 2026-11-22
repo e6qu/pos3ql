@@ -200,6 +200,9 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             Datum::Int4(11),
             Datum::Text(original.alloc_str("initial").unwrap()),
         ];
+        let mut old_forms =
+            [crate::sql::toast::DatumForm::Stored(crate::storage::StoredForm::Inline); 2];
+        let mut new_forms = old_forms;
         let argv = crate::sql::array::build_shaped(
             &[Datum::Text(original.alloc_str("!").unwrap())],
             crate::sql::array::Shape::new(&[1], &[0]).unwrap(),
@@ -313,8 +316,8 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 invocation,
                 definition,
                 rows: super::TriggerRows {
-                    old: super::TriggerRecord::new(&mut old, true),
-                    new: super::TriggerRecord::new(&mut new, true),
+                    old: super::TriggerRecord::new(&mut old, &mut old_forms, true),
+                    new: super::TriggerRecord::new(&mut new, &mut new_forms, true),
                     before: true,
                 },
                 caller_new: true,

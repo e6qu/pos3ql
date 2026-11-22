@@ -399,6 +399,9 @@ pub(super) unsafe fn for_each_validation_row(
 /// candidate input, for evaluating that domain's CHECK predicates.
 struct ValueLookup<'v> {
     value: Datum<'v>,
+    /// How the coercion holds `value`: as it was given, unless the base
+    /// type's conversion formed a new datum.
+    form: crate::sql::toast::DatumForm,
     /// The domain's base type and collation, which `VALUE` has.
     ctype: crate::sql::types::ColType,
     collation: crate::sql::ast::Collation,
@@ -410,10 +413,7 @@ impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
-        // This row does not keep its values' stored forms.
-        Ok(crate::sql::toast::unknown_form(
-            &self.lookup(qualifier, name)?,
-        ))
+        Ok(self.form.stored(&self.lookup(qualifier, name)?))
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
@@ -428,14 +428,14 @@ impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
         }
     }
 
-    // `VALUE` is the datum the coercion was given, held in a form this
-    // lookup does not record.
+    // `VALUE` is the datum the coercion holds (`CoerceToDomain` passes its
+    // input datum on to the check).
     fn datum_header(
         &self,
         _qualifier: Option<&str>,
         _name: &str,
     ) -> crate::sql::toast::DatumHeader {
-        crate::sql::toast::DatumHeader::Unknown
+        self.form.header()
     }
 
     fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
@@ -463,6 +463,7 @@ pub(crate) fn coerce_domain_value<'a>(
     storage: &Storage,
     target: crate::storage::TypeDefinitionTarget,
     value: Datum<'a>,
+    form: crate::sql::toast::DatumForm,
     coercion: crate::sql::eval::DomainCoercion,
     txid: u32,
     arena: &'a Arena,
@@ -473,7 +474,7 @@ pub(crate) fn coerce_domain_value<'a>(
         .read_domain_definition(target, txid)?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))?;
     coerce_selected_domain_value(
-        storage, &domain, value, coercion, txid, arena, params, sequences,
+        storage, &domain, value, form, coercion, txid, arena, params, sequences,
     )
 }
 
@@ -560,22 +561,30 @@ fn coerce_selected_domain_value<'a>(
     storage: &Storage,
     domain: &crate::storage::DomainDef,
     value: Datum<'a>,
+    form: crate::sql::toast::DatumForm,
     coercion: crate::sql::eval::DomainCoercion,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
+    let given = value;
     let value = coerce_domain_base(storage, domain, value, coercion, txid, arena, sequences)?;
-    validate_domain_chain(storage, domain, value, txid, arena, params, sequences)?;
+    let form = form.converted(&given, &value);
+    validate_domain_chain(storage, domain, value, form, txid, arena, params, sequences)?;
     Ok(value)
 }
 
 /// Enforces a domain's base domains' rules, outermost first, then its own.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "domain checks preserve the value's form and explicit sequence context"
+)]
 fn validate_domain_chain(
     storage: &Storage,
     domain: &crate::storage::DomainDef,
     value: Datum,
+    form: crate::sql::toast::DatumForm,
     txid: u32,
     arena: &Arena,
     params: &[Datum],
@@ -593,16 +602,23 @@ fn validate_domain_chain(
                     parent_name.name.as_str()
                 )
             })?;
-        validate_domain_chain(storage, &parent, value, txid, arena, params, sequences)?;
+        validate_domain_chain(
+            storage, &parent, value, form, txid, arena, params, sequences,
+        )?;
     }
-    validate_domain_value(storage, txid, domain, value, arena, params, sequences)
+    validate_domain_value(storage, txid, domain, value, form, arena, params, sequences)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "domain checks preserve the value's form and explicit sequence context"
+)]
 fn validate_domain_value(
     storage: &Storage,
     txid: u32,
     domain: &crate::storage::DomainDef,
     value: Datum,
+    form: crate::sql::toast::DatumForm,
     arena: &Arena,
     params: &[Datum],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
@@ -610,7 +626,7 @@ fn validate_domain_value(
     validate_domain_not_null(storage, txid, domain, value)?;
     for check in domain.checks() {
         validate_domain_check(
-            storage, txid, domain, check, value, arena, params, sequences,
+            storage, txid, domain, check, value, form, arena, params, sequences,
         )?;
     }
     Ok(())
@@ -674,12 +690,14 @@ pub(crate) fn validate_domain_check<'a>(
     domain: &crate::storage::DomainDef,
     check: &crate::storage::CheckConstraint,
     value: Datum<'a>,
+    form: crate::sql::toast::DatumForm,
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     let context = ValueLookup {
         value,
+        form,
         ctype: domain.base,
         collation: domain.collation,
     };
@@ -799,6 +817,7 @@ pub(crate) fn check_domain_constraints(
             storage,
             slot,
             value,
+            crate::sql::toast::DatumForm::Unknown,
             crate::sql::eval::DomainCoercion::Assignment,
             txid,
             arena,

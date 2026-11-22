@@ -297,19 +297,24 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   (PL/pgSQL `RETURN`, a SQL function's inlined body or result tuple, a folded
   IMMUTABLE call, a user-defined operator or cast), the arguments a
   user-defined cast, operator or aggregate transition function is passed,
-  and a procedure's output parameters keep their forms (`998`). Still `0A000` where the form decides a size
+  and a procedure's output parameters keep their forms (`998`). A row
+  trigger's `NEW` and `OLD` (a `BEFORE` trigger's `NEW` as `heap_form_tuple`
+  forms it, `OLD` and an `AFTER` trigger's `NEW` as stored, including queued,
+  deferred and engine-moved firings), an explicit domain cast's `VALUE`, an
+  aggregate's transition state, sorted and `DISTINCT` inputs and final
+  function state, and an array constructor element's cast keep theirs
+  (`1010`, `1011`). Still `0A000` where the form decides a size
   (`pg_column_size`):
-  - `NEW` and `OLD` columns: PostgreSQL reads a `BEFORE` trigger's `NEW` as
-    formed (3004 bytes) and an `AFTER` trigger's as stored (44); the firing
-    path, the movable engine firings and queued `AFTER` events carry row
-    values without forms;
-  - a domain `CHECK`'s `VALUE`: the coercion does not carry its datum's form
-    into the check;
-  - an aggregate's transition state, its sorted or `DISTINCT` inputs, and
-    its final function's arguments; an array constructor element's cast;
-  - a SQL function body that returns a parameter without being inlined
-    (PostgreSQL's plan cache folds it into a new datum or passes it on),
-    and a SQL procedure's or data-modifying SQL function's result row.
+  - an `INSTEAD OF` trigger's rows, a foreign table's trigger rows, a row a
+    partition move or logical replication passes on in its TOAST form, and
+    a `MERGE` source datum a `BEFORE` trigger's `NEW` holds;
+  - `VALUE` of a domain checked by a table write, a routine argument's
+    coercion or a validation scan;
+  - a SQL function body that returns a parameter without being inlined: its
+    form depends on PostgreSQL's plan cache, which plans the first five calls
+    of a session with the parameter folded into a detoasted constant and later
+    ones generically with the parameter passed on; and a SQL procedure's or
+    data-modifying SQL function's result row.
 - [ ] **TOAST stored forms in the executor:** the input datum `min`, `max`,
   `any_value`, `mode`, `percentile_disc` and window value functions return,
   grouping keys, scalar subqueries, window rows, index-only scans, `RETURNING`
@@ -691,6 +696,10 @@ These fail with `0A000` (or the code shown) and need implementing.
 - [ ] `COPY` to or from a server file or program, `COPY ... FREEZE`, and
   `ENCODING` other than UTF8: implement, or record each as an architecture
   boundary in the compatibility guide.
+- [ ] `ANALYZE VERBOSE`, whose report of sampled pages, timing and buffer
+  usage this engine does not reproduce; `VACUUM` options other than `FULL`
+  and `ANALYZE`. `ANALYZE`'s `SKIP_LOCKED` and `BUFFER_USAGE_LIMIT` work
+  (`1013`).
 
 **Logical replication and postgres_fdw**
 

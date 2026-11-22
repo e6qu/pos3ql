@@ -484,6 +484,15 @@ impl VacuumOptions {
     };
 }
 
+/// The ANALYZE options that change what it does. `BUFFER_USAGE_LIMIT` is
+/// checked but sizes only PostgreSQL's shared-buffer ring, which this engine
+/// does not have; `VERBOSE` is rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnalyzeOptions {
+    /// Skip a relation whose lock is not immediately available.
+    pub skip_locked: bool,
+}
+
 /// EXPLAIN's output representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExplainFormat {
@@ -1288,7 +1297,10 @@ pub enum Stmt<'a> {
     },
     /// ANALYZE [options] [table [(columns)] [, ...]] — validates the requested
     /// relations and walks the exact live row state used by the planner.
-    Analyze(&'a [MaintenanceTarget<'a>]),
+    Analyze {
+        targets: &'a [MaintenanceTarget<'a>],
+        options: AnalyzeOptions,
+    },
     /// LISTEN channel — register interest; delivered notifications arrive as
     /// asynchronous NotificationResponse messages.
     Listen(&'a str),

@@ -14,6 +14,7 @@ pub(super) fn prepare_move<'arena>(
     definition: &TableDef,
     generated: &[Option<&'arena Expr<'arena>>],
     values: &mut [Datum<'arena>],
+    forms: trigger_firing::ImageForms<'_>,
     arena: &'arena Arena,
     services: &mut TriggerServices<'_>,
     responder: &mut Responder,
@@ -33,6 +34,10 @@ pub(super) fn prepare_move<'arena>(
         ColumnSet::EMPTY,
         Some(old_values),
         None,
+        trigger_firing::ImageForms {
+            old: forms.old,
+            new: trigger_firing::RowForms::Unrecorded,
+        },
     )? {
         return Ok(false);
     }
@@ -67,6 +72,10 @@ pub(super) fn prepare_move<'arena>(
         ColumnSet::EMPTY,
         None,
         Some(values),
+        trigger_firing::ImageForms {
+            old: trigger_firing::RowForms::Unrecorded,
+            new: forms.new,
+        },
     )? {
         if table_is_referenced(
             storage,
@@ -98,6 +107,10 @@ pub(super) fn prepare_move<'arena>(
             ColumnSet::EMPTY,
             Some(old_values),
             None,
+            trigger_firing::ImageForms {
+                old: forms.old,
+                new: trigger_firing::RowForms::Unrecorded,
+            },
         )?;
         return Ok(false);
     }
@@ -116,6 +129,7 @@ pub(super) fn fire_after_move<'arena>(
     target: usize,
     definition: &TableDef,
     values: &mut [Datum<'arena>],
+    forms: trigger_firing::ImageForms<'_>,
     arena: &'arena Arena,
     services: &mut TriggerServices<'_>,
     responder: &mut Responder,
@@ -134,6 +148,10 @@ pub(super) fn fire_after_move<'arena>(
         ColumnSet::EMPTY,
         Some(old_values),
         None,
+        trigger_firing::ImageForms {
+            old: forms.old,
+            new: trigger_firing::RowForms::Unrecorded,
+        },
     )?;
     fire_partition_row_triggers(
         storage,
@@ -149,6 +167,10 @@ pub(super) fn fire_after_move<'arena>(
         ColumnSet::EMPTY,
         None,
         Some(values),
+        trigger_firing::ImageForms {
+            old: trigger_firing::RowForms::Unrecorded,
+            new: forms.new,
+        },
     )?;
     Ok(())
 }

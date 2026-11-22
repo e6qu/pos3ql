@@ -327,6 +327,7 @@ impl ParseError {
     }
 }
 
+mod analyze_options;
 mod copy_options;
 mod expr;
 mod typmod;
@@ -5708,21 +5709,28 @@ impl<'a> Parser<'a> {
         };
         let mut saw_full = false;
         let mut saw_analyze = false;
-        if self.eat_op("(")? {
+        let mut analyze = analyze_options::WrittenAnalyzeOptions {
+            options: crate::sql::ast::AnalyzeOptions { skip_locked: false },
+            verbose: false,
+            error: None,
+        };
+        if !is_vacuum {
+            if self.eat_op("(")? {
+                analyze = self.analyze_options()?;
+            } else {
+                analyze.verbose = self.eat_ident("verbose")?;
+            }
+        } else if self.eat_op("(")? {
             loop {
                 let option = self.any_ident("VACUUM option")?;
-                let value = {
-                    let _ = self.eat_op("=")?;
-                    self.explain_bool()?
-                };
-                if option.eq_ignore_ascii_case("full") && is_vacuum {
+                let value = self.explain_bool()?;
+                if option.eq_ignore_ascii_case("full") {
                     if core::mem::replace(&mut saw_full, true) {
                         return Err(self.err_here("VACUUM option FULL specified more than once"));
                     }
                     options.full = value;
-                } else if (option.eq_ignore_ascii_case("analyze")
-                    || option.eq_ignore_ascii_case("analyse"))
-                    && is_vacuum
+                } else if option.eq_ignore_ascii_case("analyze")
+                    || option.eq_ignore_ascii_case("analyse")
                 {
                     if core::mem::replace(&mut saw_analyze, true) {
                         return Err(self.err_here("VACUUM option ANALYZE specified more than once"));
@@ -5733,8 +5741,7 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(
                             PARSE_MESSAGE_BYTES,
-                            "unsupported {} option \"{}\"",
-                            if is_vacuum { "VACUUM" } else { "ANALYZE" },
+                            "unsupported VACUUM option \"{}\"",
                             option
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
@@ -5751,7 +5758,7 @@ impl<'a> Parser<'a> {
             }
         } else {
             loop {
-                if self.eat_ident("full")? && is_vacuum {
+                if self.eat_ident("full")? {
                     if core::mem::replace(&mut saw_full, true) {
                         return Err(self.err_here("VACUUM option FULL specified more than once"));
                     }
@@ -5759,20 +5766,6 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 if self.eat_ident("analyze")? || self.eat_ident("analyse")? {
-                    if !is_vacuum {
-                        return Err(ParseError {
-                            at: self.peek_at,
-                            message: stack_format!(
-                                PARSE_MESSAGE_BYTES,
-                                "unsupported ANALYZE option \"ANALYZE\""
-                            ),
-                            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                            cursor: None,
-                            hint: None,
-                            near: None,
-                            detail: None,
-                        });
-                    }
                     if core::mem::replace(&mut saw_analyze, true) {
                         return Err(self.err_here("VACUUM option ANALYZE specified more than once"));
                     }
@@ -5802,8 +5795,7 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(
                             PARSE_MESSAGE_BYTES,
-                            "unsupported {} option \"{}\"",
-                            if is_vacuum { "VACUUM" } else { "ANALYZE" },
+                            "unsupported VACUUM option \"{}\"",
                             option
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
@@ -5865,10 +5857,24 @@ impl<'a> Parser<'a> {
             }
         }
         let targets = self.arena_slice(&targets[..target_count])?;
+        if let Some(error) = analyze.error {
+            return Err(error);
+        }
+        // VERBOSE reports PostgreSQL's page sampling and its timing and
+        // buffer usage, which this engine does not reproduce.
+        if analyze.verbose {
+            return Err(ParseError {
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                ..ParseError::new(self.peek_at, "ANALYZE option VERBOSE is not supported")
+            });
+        }
         Ok(if is_vacuum {
             Stmt::Vacuum { targets, options }
         } else {
-            Stmt::Analyze(targets)
+            Stmt::Analyze {
+                targets,
+                options: analyze.options,
+            }
         })
     }
 

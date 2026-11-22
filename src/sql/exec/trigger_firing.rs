@@ -14,6 +14,8 @@ use crate::storage::{PinnedRelationDefinition, RelationDefinition, TableDefiniti
 /// structure; assigning NULL leaves it with none.
 pub(super) struct TriggerRecord<'r, 'a> {
     values: &'r mut [Datum<'a>],
+    /// How the record holds each of `values`, which `pg_column_size` reads.
+    forms: &'r mut [DatumForm],
     state: RecordState<'a>,
 }
 
@@ -34,32 +36,203 @@ enum RecordState<'a> {
 pub(crate) enum TriggerRecordValue<'s, 'v> {
     /// NULL with the relation's structure.
     Empty,
-    Row(&'s [Datum<'v>]),
+    Row(TriggerRow<'s, 'v>),
     /// A record or composite value of another structure.
     Foreign(Datum<'v>),
     /// NULL with no structure.
     Unassigned,
 }
 
+/// A relation-shaped row a trigger record holds, with how it holds each
+/// value.
+#[derive(Clone, Copy)]
+pub(crate) struct TriggerRow<'s, 'v> {
+    pub(crate) values: &'s [Datum<'v>],
+    pub(crate) forms: &'s [DatumForm],
+}
+
 impl<'s, 'v> TriggerRecordValue<'s, 'v> {
     /// A record of the relation's structure holding `row`, if any.
-    pub(crate) fn of_row(row: Option<&'s [Datum<'v>]>) -> Self {
+    pub(crate) fn of_row(row: Option<TriggerRow<'s, 'v>>) -> Self {
         row.map_or(Self::Empty, Self::Row)
     }
 
     /// The relation-shaped row, or `None` for a record without one.
     pub(crate) fn row(self) -> Option<&'s [Datum<'v>]> {
         match self {
-            Self::Row(row) => Some(row),
+            Self::Row(row) => Some(row.values),
+            _ => None,
+        }
+    }
+
+    /// How the relation-shaped row holds column `column`; `None` for a
+    /// record without one.
+    pub(crate) fn form(self, column: usize) -> Option<DatumForm> {
+        match self {
+            Self::Row(row) => row.forms.get(column).copied(),
             _ => None,
         }
     }
 }
 
+/// How a row a row trigger fires with holds its values.
+#[derive(Clone, Copy)]
+pub(crate) enum RowForms<'c> {
+    /// A stored row version, by column.
+    Stored(&'c [crate::storage::StoredForm]),
+    /// The row a write forms: the stored datums `carried` lists keep their
+    /// forms, and the write formed every other value. A `BEFORE` trigger
+    /// reads it as `heap_form_tuple` forms it; an `AFTER` trigger as TOAST
+    /// stored it.
+    Written(&'c crate::sql::toast::CarriedForms),
+    /// A row whose source does not record its forms: a value TOAST may have
+    /// stored otherwise is not modelled.
+    Unrecorded,
+}
+
+impl RowForms<'_> {
+    /// How the row `values` of a table with the columns `columns` (and a
+    /// TOAST relation when `has_toast`) holds each value, for a `BEFORE`
+    /// firing when `before`, into `forms`.
+    pub(crate) fn resolve(
+        self,
+        values: &[Datum<'_>],
+        columns: &[crate::storage::ColumnMeta],
+        has_toast: bool,
+        before: bool,
+        sizing: &crate::sql::query::postgres_memory::Sizing<'_>,
+        forms: &mut [DatumForm],
+    ) -> Result<(), SqlError> {
+        use crate::storage::StoredForm;
+        let forms = &mut forms[..values.len()];
+        match self {
+            Self::Stored(stored) => {
+                if stored.len() != values.len() {
+                    return Err(invalid("a trigger row's forms do not match its values"));
+                }
+                for (form, stored) in forms.iter_mut().zip(stored) {
+                    *form = DatumForm::Stored(*stored);
+                }
+            }
+            Self::Unrecorded => {
+                for (form, value) in forms.iter_mut().zip(values) {
+                    *form = DatumForm::Stored(crate::sql::toast::uncarried_form(value));
+                }
+            }
+            Self::Written(carried) if before => {
+                if columns.len() != values.len() {
+                    return Err(invalid("a trigger row does not match its relation"));
+                }
+                for (column, (form, value)) in forms.iter_mut().zip(values).enumerate() {
+                    *form = DatumForm::Stored(
+                        carried
+                            .tuple_form_of(value, column, &columns[column])
+                            .unwrap_or(StoredForm::Inline),
+                    );
+                }
+            }
+            Self::Written(carried) => {
+                let mut stored = [StoredForm::Inline; MAX_COLUMNS];
+                crate::sql::toast::row_forms_as(
+                    columns,
+                    has_toast,
+                    sizing,
+                    values,
+                    carried,
+                    &mut stored[..values.len()],
+                )?;
+                for (form, stored) in forms.iter_mut().zip(stored) {
+                    *form = DatumForm::Stored(stored);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The stored forms an `AFTER` event keeps of a row `values` held as
+/// `forms`, into `stored`: a value that records no TOAST form is in line.
+pub(crate) fn event_forms(
+    values: &[Datum<'_>],
+    forms: &[DatumForm],
+    stored: &mut [crate::storage::StoredForm],
+) {
+    for ((stored, form), value) in stored.iter_mut().zip(forms).zip(values) {
+        *stored = if crate::storage::rowenc::carries_stored_form(value) {
+            form.stored(value)
+                .unwrap_or(crate::storage::StoredForm::Inline)
+        } else {
+            crate::storage::StoredForm::Inline
+        };
+    }
+}
+
+/// How a firing's `OLD` and `NEW` hold their values, by column: empty for
+/// a row the firing does not have.
+#[derive(Clone, Copy)]
+pub(crate) struct FiringForms<'f> {
+    pub(crate) old: &'f [DatumForm],
+    pub(crate) new: &'f [DatumForm],
+}
+
+impl FiringForms<'_> {
+    /// A statement firing's: it has no rows.
+    pub(crate) const NONE: Self = Self { old: &[], new: &[] };
+}
+
+/// How a row trigger's `OLD` and `NEW` rows hold their values.
+#[derive(Clone, Copy)]
+pub(crate) struct ImageForms<'c> {
+    pub(crate) old: RowForms<'c>,
+    pub(crate) new: RowForms<'c>,
+}
+
+impl<'c> ImageForms<'c> {
+    /// Neither row records its forms.
+    pub(crate) const UNRECORDED: Self = Self {
+        old: RowForms::Unrecorded,
+        new: RowForms::Unrecorded,
+    };
+
+    /// An `INSERT`: a new row the write forms.
+    pub(crate) const fn insert(carried: &'c crate::sql::toast::CarriedForms) -> Self {
+        Self {
+            old: RowForms::Unrecorded,
+            new: RowForms::Written(carried),
+        }
+    }
+
+    /// An `UPDATE` of the stored row holding `old`, into a row the write
+    /// forms.
+    pub(crate) const fn update(
+        old: &'c [crate::storage::StoredForm],
+        carried: &'c crate::sql::toast::CarriedForms,
+    ) -> Self {
+        Self {
+            old: RowForms::Stored(old),
+            new: RowForms::Written(carried),
+        }
+    }
+
+    /// A `DELETE` of the stored row holding `old`.
+    pub(crate) const fn delete(old: &'c [crate::storage::StoredForm]) -> Self {
+        Self {
+            old: RowForms::Stored(old),
+            new: RowForms::Unrecorded,
+        }
+    }
+}
+
 impl<'r, 'a> TriggerRecord<'r, 'a> {
-    pub(super) fn new(values: &'r mut [Datum<'a>], assigned: bool) -> Self {
+    pub(super) fn new(
+        values: &'r mut [Datum<'a>],
+        forms: &'r mut [DatumForm],
+        assigned: bool,
+    ) -> Self {
+        debug_assert_eq!(values.len(), forms.len());
         Self {
             values,
+            forms,
             state: if assigned {
                 RecordState::Row
             } else {
@@ -77,7 +250,10 @@ impl<'r, 'a> TriggerRecord<'r, 'a> {
     pub(super) fn value(&self) -> TriggerRecordValue<'_, 'a> {
         match self.state {
             RecordState::Empty => TriggerRecordValue::Empty,
-            RecordState::Row => TriggerRecordValue::Row(self.values),
+            RecordState::Row => TriggerRecordValue::Row(TriggerRow {
+                values: self.values,
+                forms: self.forms,
+            }),
             RecordState::Foreign(value) => TriggerRecordValue::Foreign(value),
             RecordState::Unassigned => TriggerRecordValue::Unassigned,
         }
@@ -90,19 +266,23 @@ impl<'r, 'a> TriggerRecord<'r, 'a> {
     }
 
     /// Assigning a field of a NULL record makes its other fields NULL.
-    pub(super) fn set_field(&mut self, column: usize, value: Datum<'a>) {
+    pub(super) fn set_field(&mut self, column: usize, value: Datum<'a>, form: DatumForm) {
         debug_assert!(self.has_relation_structure());
         if !matches!(self.state, RecordState::Row) {
             self.values.fill(Datum::Null);
+            self.forms
+                .fill(DatumForm::Stored(crate::storage::StoredForm::Inline));
             self.state = RecordState::Row;
         }
         self.values[column] = value;
+        self.forms[column] = form;
     }
 
-    pub(super) fn set_row(&mut self, row: Option<&[Datum<'a>]>) {
+    pub(super) fn set_row(&mut self, row: Option<TriggerRow<'_, 'a>>) {
         match row {
             Some(row) => {
-                self.values.copy_from_slice(row);
+                self.values.copy_from_slice(row.values);
+                self.forms.copy_from_slice(row.forms);
                 self.state = RecordState::Row;
             }
             None => self.state = RecordState::Empty,
@@ -192,8 +372,8 @@ pub(super) struct TriggerRows<'r, 'a> {
 impl<'r, 'a> TriggerRows<'r, 'a> {
     pub(super) fn none() -> Self {
         Self {
-            old: TriggerRecord::new(&mut [], false),
-            new: TriggerRecord::new(&mut [], false),
+            old: TriggerRecord::new(&mut [], &mut [], false),
+            new: TriggerRecord::new(&mut [], &mut [], false),
             before: false,
         }
     }
@@ -366,10 +546,15 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
                 if binding.caller_new {
                     // Copy through a stack image: the returned row can be
                     // `NEW` itself.
+                    let width = returned.values.len();
                     let mut image = [Datum::Null; MAX_COLUMNS];
-                    image[..returned.len()].copy_from_slice(returned);
-                    let width = returned.len();
-                    binding.rows.new.set_row(Some(&image[..width]));
+                    image[..width].copy_from_slice(returned.values);
+                    let mut forms = [DatumForm::Unknown; MAX_COLUMNS];
+                    forms[..width].copy_from_slice(returned.forms);
+                    binding.rows.new.set_row(Some(TriggerRow {
+                        values: &image[..width],
+                        forms: &forms[..width],
+                    }));
                 }
                 Ok(true)
             }
@@ -499,13 +684,23 @@ fn capture_values(
     ];
     let old = &*binding.rows.old.values;
     let new = &*binding.rows.new.values;
-    saved.replace_indexed(HEADER_VALUES + old.len() + new.len(), |index| {
+    let old_forms = &*binding.rows.old.forms;
+    let new_forms = &*binding.rows.new.forms;
+    let width = old.len() + new.len();
+    // Each value's form follows the values as its code.
+    saved.replace_indexed(HEADER_VALUES + 2 * width, |index| {
         if index < HEADER_VALUES {
-            header[index]
-        } else if index - HEADER_VALUES < old.len() {
-            old[index - HEADER_VALUES]
+            return header[index];
+        }
+        let at = index - HEADER_VALUES;
+        if at < old.len() {
+            old[at]
+        } else if at < width {
+            new[at - old.len()]
+        } else if at - width < old.len() {
+            Datum::Int8(old_forms[at - width].code())
         } else {
-            new[index - HEADER_VALUES - old.len()]
+            Datum::Int8(new_forms[at - width - old.len()].code())
         }
     })
 }
@@ -620,11 +815,22 @@ impl SavedMetadata {
         arena: &'run Arena,
     ) -> Result<FiringBinding<'run, 'run, 'run>, SqlError> {
         let definition = self.definition.relation();
-        let width = HEADER_VALUES + 2 * self.width;
+        let width = HEADER_VALUES + 4 * self.width;
         if values.len() != width {
             return Err(invalid("saved trigger firing value width changed"));
         }
         let (header_values, rows) = values.split_at_mut(HEADER_VALUES);
+        let (rows, codes) = rows.split_at_mut(2 * self.width);
+        let forms = arena
+            .alloc_slice_with(codes.len(), |_| DatumForm::Unknown)
+            .map_err(|_| super::super::query::arena_full_pub())?;
+        for (form, code) in forms.iter_mut().zip(codes.iter()) {
+            *form = match *code {
+                Datum::Int8(code) => DatumForm::from_code(code),
+                _ => None,
+            }
+            .ok_or_else(|| invalid("saved trigger firing form changed type"))?;
+        }
         let text = |index| match header_values[index] {
             Datum::Text(value) => Ok(value),
             _ => Err(invalid("saved trigger firing text changed type")),
@@ -694,9 +900,10 @@ impl SavedMetadata {
             ..self.header
         };
         let (old, new) = rows.split_at_mut(self.width);
-        let mut old = TriggerRecord::new(old, false);
+        let (old_forms, new_forms) = forms.split_at_mut(self.width);
+        let mut old = TriggerRecord::new(old, old_forms, false);
         old.restore_state(header_values[8], header_values[10])?;
-        let mut new = TriggerRecord::new(new, false);
+        let mut new = TriggerRecord::new(new, new_forms, false);
         new.restore_state(header_values[9], header_values[11])?;
         Ok(FiringBinding {
             invocation,

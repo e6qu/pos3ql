@@ -74,6 +74,7 @@ pub(super) fn fire<'s, 'a, 'b>(
     movable: Option<MovableFiring>,
     old: Option<&[Datum<'a>]>,
     new: &mut Option<&mut [Datum<'a>]>,
+    forms: trigger_firing::FiringForms<'_>,
     run: impl FnOnce(
         &mut TriggerExecContext<'s, 'a, 'b>,
         &mut Option<&mut [Datum<'a>]>,
@@ -93,7 +94,7 @@ pub(super) fn fire<'s, 'a, 'b>(
     };
     let _scope = FiringScope::enter(FiringHost::Movable);
     let arena = context.arena;
-    let arguments = firing_arguments(old, new.as_deref(), arena)?;
+    let (arguments, argument_forms) = firing_arguments(old, new.as_deref(), forms, arena)?;
     let call = TriggerCall {
         slot: movable.slot,
         target: movable.target,
@@ -127,6 +128,7 @@ pub(super) fn fire<'s, 'a, 'b>(
                         call,
                     },
                     arguments,
+                    argument_forms,
                     statement,
                 ),
                 None => log_changed(),
@@ -136,20 +138,33 @@ pub(super) fn fire<'s, 'a, 'b>(
     }
 }
 
-/// The firing's `OLD` then `NEW` values, copied before the body changes `NEW`.
+/// The firing's `OLD` then `NEW` values and how each is held, copied before
+/// the body changes `NEW`.
 fn firing_arguments<'a>(
     old: Option<&[Datum<'a>]>,
     new: Option<&[Datum<'a>]>,
+    forms: trigger_firing::FiringForms<'_>,
     arena: &'a Arena,
-) -> Result<&'a [Datum<'a>], SqlError> {
+) -> Result<(&'a [Datum<'a>], &'a [DatumForm]), SqlError> {
     let old = old.unwrap_or(&[]);
     let new = new.unwrap_or(&[]);
+    if forms.old.len() != old.len() || forms.new.len() != new.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a trigger firing's forms do not match its rows"
+        ));
+    }
     let values = arena
         .alloc_slice_with(old.len() + new.len(), |_| Datum::Null)
         .map_err(|_| query::arena_full_pub())?;
     values[..old.len()].copy_from_slice(old);
     values[old.len()..].copy_from_slice(new);
-    Ok(values)
+    let held = arena
+        .alloc_slice_with(values.len(), |_| DatumForm::Unknown)
+        .map_err(|_| query::arena_full_pub())?;
+    held[..old.len()].copy_from_slice(forms.old);
+    held[old.len()..].copy_from_slice(forms.new);
+    Ok((values, held))
 }
 
 /// FNV-1a over a firing's encoded rows.
@@ -287,9 +302,18 @@ fn run_pending_firing<'w, Definition0: crate::storage::DefinitionBacking>(
             "a pending row trigger's rows do not match its relation"
         ));
     }
-    let (old, new) = values.split_at_mut(if call.old { columns } else { 0 });
+    let forms = scratch
+        .alloc_slice_with(width, |column| projected_datum_form(arguments, column))
+        .map_err(|_| query::arena_full_pub())?;
+    let split = if call.old { columns } else { 0 };
+    let (old, new) = values.split_at_mut(split);
+    let (old_forms, new_forms) = forms.split_at(split);
     let old = call.old.then_some(&*old);
     let mut new = call.new.then_some(new);
+    let forms = trigger_firing::FiringForms {
+        old: if call.old { old_forms } else { &[] },
+        new: if call.new { new_forms } else { &[] },
+    };
     // The body's own commands advance the counter; the write that fired it
     // continues as its own command, as it would after an inline firing.
     let command = txn.command_id();
@@ -328,6 +352,7 @@ fn run_pending_firing<'w, Definition0: crate::storage::DefinitionBacking>(
             true,
             old,
             &mut new,
+            forms,
             None,
         )
     } else {

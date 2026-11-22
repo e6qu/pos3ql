@@ -659,23 +659,32 @@ fn run_selected_firing<'run>(
         .then(|| transitions.for_event(event.event))
         .flatten();
     let rows = queued_transition_rows(&mut context, &trigger, selected, own)?;
-    let (old, new) = if selected.statement {
-        (None, None)
+    let ((old, old_forms), (new, new_forms)) = if selected.statement {
+        ((None, &[][..]), (None, &[][..]))
     } else {
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         definition.schema(&mut schema);
-        let mut decode = |tuple| -> Result<Option<&'run mut [Datum<'run>]>, SqlError> {
-            let Some(tuple) = tuple else {
-                return Ok(None);
+        // An event's row keeps the forms its values were stored in.
+        let mut decode =
+            |tuple| -> Result<(Option<&'run mut [Datum<'run>]>, &'run [DatumForm]), SqlError> {
+                let Some(tuple) = tuple else {
+                    return Ok((None, &[]));
+                };
+                let schema = &schema[..definition.n_columns];
+                let bytes = context.txn.trigger_event_tuple(tuple, context.arena)?;
+                let values = context
+                    .arena
+                    .alloc_slice_with(definition.n_columns, |_| Datum::Null)
+                    .map_err(|_| super::super::query::arena_full_pub())?;
+                rowenc::decode(bytes, schema, values)?;
+                let mut stored = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+                rowenc::stored_forms(bytes, schema, &mut stored)?;
+                let forms = context
+                    .arena
+                    .alloc_slice_with(schema.len(), |column| DatumForm::Stored(stored[column]))
+                    .map_err(|_| super::super::query::arena_full_pub())?;
+                Ok((Some(values), &*forms))
             };
-            let bytes = context.txn.trigger_event_tuple(tuple, context.arena)?;
-            let values = context
-                .arena
-                .alloc_slice_with(definition.n_columns, |_| Datum::Null)
-                .map_err(|_| super::super::query::arena_full_pub())?;
-            rowenc::decode(bytes, &schema[..definition.n_columns], values)?;
-            Ok(Some(values))
-        };
         (decode(event.old)?, decode(event.new)?)
     };
     context.txn.fire_trigger_event(selected.index)?;
@@ -702,6 +711,10 @@ fn run_selected_firing<'run>(
         false,
         old.map(|row| &*row),
         new,
+        trigger_firing::FiringForms {
+            old: old_forms,
+            new: new_forms,
+        },
         rows,
     )?;
     match firing.execute(&mut context) {

@@ -54682,11 +54682,18 @@ fn vacuum_and_analyze() {
         "VACUUM SKIP_DATABASE_STATS",
         "VACUUM ONLY_DATABASE_STATS",
         "ANALYZE (VERBOSE) vt",
+        "ANALYZE VERBOSE vt",
     ] {
         let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
         assert!(text.contains("0A000"), "{cmd}: {text}");
     }
-    for cmd in ["ANALYZE", "ANALYZE vt", "ANALYZE vt (a, b)"] {
+    for cmd in [
+        "ANALYZE",
+        "ANALYZE vt",
+        "ANALYZE vt (a, b)",
+        "ANALYZE (SKIP_LOCKED) vt",
+        "ANALYZE (VERBOSE false, BUFFER_USAGE_LIMIT '1MB') vt",
+    ] {
         let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
         assert!(text.contains("ANALYZE"), "{cmd}: {text}");
     }

@@ -6391,8 +6391,8 @@ fn row_trigger_when_passes<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     trigger: &crate::storage::TriggerDef,
     definition: crate::storage::RelationDefinition<'_>,
-    old: Option<&[Datum<'a>]>,
-    new: Option<&[Datum<'a>]>,
+    old: Option<trigger_firing::TriggerRow<'_, 'a>>,
+    new: Option<trigger_firing::TriggerRow<'_, 'a>>,
 ) -> Result<bool, SqlError> {
     let Some(when) = trigger.when else {
         return Ok(true);
@@ -6517,6 +6517,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
     before: bool,
     old: Option<&[Datum<'a>]>,
     new: &mut Option<&mut [Datum<'a>]>,
+    forms: trigger_firing::FiringForms<'_>,
     transition_rows: Option<TransitionRows<'a>>,
 ) -> Result<bool, SqlError> {
     if let crate::storage::TriggerFunction::Builtin(builtin) = trigger.function {
@@ -6529,7 +6530,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         target,
         event,
     });
-    engine_triggers::fire(context, movable, old, new, |context, new| {
+    engine_triggers::fire(context, movable, old, new, forms, |context, new| {
         execute_row_trigger_body_here(
             context,
             trigger,
@@ -6539,6 +6540,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
             before,
             old,
             new,
+            forms,
             transition_rows,
         )
     })
@@ -6557,6 +6559,7 @@ fn execute_row_trigger_body_here<'a, Definition0: crate::storage::DefinitionBack
     before: bool,
     old: Option<&[Datum<'a>]>,
     new: &mut Option<&mut [Datum<'a>]>,
+    forms: trigger_firing::FiringForms<'_>,
     transition_rows: Option<TransitionRows<'a>>,
 ) -> Result<bool, SqlError> {
     let mut firing_context = context.for_trigger();
@@ -6583,6 +6586,7 @@ fn execute_row_trigger_body_here<'a, Definition0: crate::storage::DefinitionBack
         before,
         old,
         new.as_deref_mut(),
+        forms,
         transition_rows,
     )?;
     // A trigger body's effects cannot be repeated by a restart, so the
@@ -6605,6 +6609,7 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
     before: bool,
     old: Option<&'rows [Datum<'values>]>,
     new: Option<&'rows mut [Datum<'values>]>,
+    forms: trigger_firing::FiringForms<'_>,
     transition_rows: Option<TransitionRows<'values>>,
 ) -> Result<trigger_firing::TriggerFiring<'values, 'schema, 'rows>, SqlError> {
     let crate::storage::TriggerFunction::Routine(function) = trigger.function else {
@@ -6725,6 +6730,13 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
             (row, assigned, false)
         }
     };
+    let local_forms = |forms: &[DatumForm]| {
+        arena.alloc_slice_with(width, |column| {
+            forms.get(column).copied().unwrap_or(DatumForm::Unknown)
+        })
+    };
+    let old_forms = local_forms(forms.old).map_err(|_| super::query::arena_full_pub())?;
+    let new_forms = local_forms(forms.new).map_err(|_| super::query::arena_full_pub())?;
     trigger_firing::TriggerFiring::new(
         context,
         code,
@@ -6733,8 +6745,8 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
             invocation,
             definition,
             rows: trigger_firing::TriggerRows {
-                old: trigger_firing::TriggerRecord::new(old, old_assigned),
-                new: trigger_firing::TriggerRecord::new(new, new_assigned),
+                old: trigger_firing::TriggerRecord::new(old, old_forms, old_assigned),
+                new: trigger_firing::TriggerRecord::new(new, new_forms, new_assigned),
                 before: before && trigger.level == TriggerLevel::Row,
             },
             caller_new,
@@ -9546,6 +9558,14 @@ where
         written: inserted | assigned_columns(oc.update.unwrap_or(&[]), logical_definition),
     };
     let generated = parse_generated(def, arena, storage, txn.txid)?;
+    // The updated row keeps the stored datums it passes on.
+    let carried = crate::sql::toast::CarriedForms::of_stored_row(
+        conflict.bytes,
+        schema,
+        &existing[..def.n_columns],
+        true,
+    )?;
+    let old_forms = stored_row_forms(conflict.bytes, schema, arena)?;
     if !fire_partition_row_triggers(
         storage,
         txn,
@@ -9560,6 +9580,7 @@ where
         updated_columns,
         Some(&existing[..def.n_columns]),
         Some(&mut new_values[..def.n_columns]),
+        trigger_firing::ImageForms::update(old_forms, &carried),
     )? {
         return Ok(ConflictOutcome::Skip);
     }
@@ -9653,13 +9674,6 @@ where
     if !dml_row_available(storage, txn, conflict.selected, "updated")? {
         return Ok(ConflictOutcome::Skip);
     }
-    // The updated row keeps the stored datums it passes on.
-    let carried = crate::sql::toast::CarriedForms::of_stored_row(
-        conflict.bytes,
-        schema,
-        &existing[..def.n_columns],
-        true,
-    )?;
     let new_bytes = encode_table_row(
         storage,
         table_index,
@@ -9720,6 +9734,10 @@ where
         updated_columns,
         Some(&existing[..def.n_columns]),
         Some(&mut new_values[..def.n_columns]),
+        trigger_firing::ImageForms {
+            old: trigger_firing::RowForms::Stored(old_forms),
+            new: trigger_firing::RowForms::Stored(stored_row_forms(new_bytes, schema, arena)?),
+        },
     )?;
     if let Some(transition_capture) = transition_capture {
         let logical_old = partition_insert::logical_insert_values(
@@ -24202,20 +24220,28 @@ impl<'s, 'v> TriggerTransition<'_, 's, 'v> {
 
     fn record_fields<'value>(
         &self,
-        values: Option<&[Datum<'v>]>,
+        row: Option<trigger_firing::TriggerRow<'_, 'v>>,
         arena: &'value Arena,
     ) -> Result<&'value [RecordField<'value>], SqlError>
     where
         'v: 'value,
     {
         let columns = self.definition.columns();
+        // A whole-row datum is a tuple formed of the record's values, which
+        // keeps each stored datum's TOAST form.
         let fields = arena
-            .alloc_slice_with(columns.len(), |index| RecordField {
-                form: crate::storage::StoredForm::Inline,
-                name: "",
-                type_oid: columns[index].ctype.oid(),
-                type_mod: columns[index].type_mod,
-                value: values.map_or(Datum::Null, |values| values[index]),
+            .alloc_slice_with(columns.len(), |index| {
+                let value = row.map_or(Datum::Null, |row| row.values[index]);
+                RecordField {
+                    form: row
+                        .and_then(|row| row.forms.get(index))
+                        .and_then(|form| form.stored(&value))
+                        .unwrap_or(crate::storage::StoredForm::Inline),
+                    name: "",
+                    type_oid: columns[index].ctype.oid(),
+                    type_mod: columns[index].type_mod,
+                    value,
+                }
             })
             .map_err(|_| super::query::arena_full_pub())?;
         for (field, column) in fields.iter_mut().zip(columns) {
@@ -24246,10 +24272,16 @@ impl<'s, 'v> TriggerTransition<'_, 's, 'v> {
     {
         match record {
             TriggerRecordValue::Empty => self.record_fields(None, arena),
-            TriggerRecordValue::Row(values) => self.record_fields(Some(values), arena),
+            TriggerRecordValue::Row(row) => self.record_fields(Some(row), arena),
             TriggerRecordValue::Foreign(value) => Ok(Self::foreign_fields(value)),
             TriggerRecordValue::Unassigned => Err(unassigned_record(name)),
         }
+    }
+
+    /// How the relation-shaped record `qualifier` holds its column `name`.
+    fn column_form(&self, qualifier: Option<&str>, name: &str) -> Option<DatumForm> {
+        let record = self.record(qualifier?).ok()?;
+        record.form(self.definition.column_index(name)?)
     }
 
     /// The type of `record.name` when the record does not have the
@@ -24290,10 +24322,18 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
-        // This row does not keep its values' stored forms.
-        Ok(crate::sql::toast::unknown_form(
-            &self.lookup(qualifier, name)?,
-        ))
+        let value = self.lookup(qualifier, name)?;
+        Ok(match self.column_form(qualifier, name) {
+            Some(form) => form.stored(&value),
+            // A record of another structure does not keep its values'
+            // stored forms.
+            None => crate::sql::toast::unknown_form(&value),
+        })
+    }
+
+    fn datum_header(&self, qualifier: Option<&str>, name: &str) -> crate::sql::toast::DatumHeader {
+        self.column_form(qualifier, name)
+            .map_or(crate::sql::toast::DatumHeader::Tuple, DatumForm::header)
     }
 
     fn whole_row_field_metadata(
@@ -24361,7 +24401,7 @@ where
         arena: &'value Arena,
     ) -> Result<Option<&'value [RecordField<'value>]>, SqlError> {
         match self.record(table)? {
-            TriggerRecordValue::Row(values) => self.record_fields(Some(values), arena).map(Some),
+            TriggerRecordValue::Row(row) => self.record_fields(Some(row), arena).map(Some),
             TriggerRecordValue::Foreign(value) => Ok(Some(Self::foreign_fields(value))),
             TriggerRecordValue::Empty | TriggerRecordValue::Unassigned => Ok(None),
         }
@@ -32826,25 +32866,32 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
+        let canonical = qualifier.map(|qualifier| self.canonical(qualifier));
+        // `NEW` and `OLD` hold their columns as the firing gave them.
+        if self.names_trigger_record(canonical) {
+            return self.transition.stored_form(canonical, name);
+        }
         if let Some(variable) = self.named(qualifier, name) {
             return Ok(variable.form.stored(&variable.value));
         }
         // A record variable holds its fields as the row it was given did.
-        let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
-        if let Some(index) = self.record_index(qualifier, name)
+        if let Some(index) = self.record_index(canonical, name)
             && let Datum::Record(fields) | Datum::Composite { fields, .. } =
                 self.values[index].value
             && let Some(field) = fields.iter().find(|field| field.name == name)
         {
             return Ok(Some(field.form));
         }
-        // A trigger row's column.
         Ok(crate::sql::toast::unknown_form(
             &self.lookup(qualifier, name)?,
         ))
     }
 
     fn datum_header(&self, qualifier: Option<&str>, name: &str) -> crate::sql::toast::DatumHeader {
+        let canonical = qualifier.map(|qualifier| self.canonical(qualifier));
+        if self.names_trigger_record(canonical) {
+            return self.transition.datum_header(canonical, name);
+        }
         self.named(qualifier, name)
             .map_or(crate::sql::toast::DatumHeader::Tuple, |variable| {
                 variable.form.header()
@@ -33489,12 +33536,18 @@ fn snapshot_trigger_dml_scope<'a>(
             Ok(match record {
                 TriggerRecordValue::Row(record) => {
                     let copy = arena
-                        .alloc_slice_with(record.len(), |_| Datum::Null)
+                        .alloc_slice_with(record.values.len(), |_| Datum::Null)
                         .map_err(|_| super::query::arena_full_pub())?;
                     for (index, value) in copy.iter_mut().enumerate() {
-                        *value = detached_trigger_datum(record[index], arena)?;
+                        *value = detached_trigger_datum(record.values[index], arena)?;
                     }
-                    TriggerRecordValue::Row(&*copy)
+                    let forms = arena
+                        .alloc_slice_copy(record.forms)
+                        .map_err(|_| super::query::arena_full_pub())?;
+                    TriggerRecordValue::Row(trigger_firing::TriggerRow {
+                        values: &*copy,
+                        forms: &*forms,
+                    })
                 }
                 TriggerRecordValue::Foreign(value) => {
                     TriggerRecordValue::Foreign(detached_trigger_datum(value, arena)?)
@@ -37399,7 +37452,9 @@ fn execute_bound_plpgsql_utility<'a>(
                 Stmt::Vacuum { targets, options } => {
                     engine.execute_vacuum_statement(targets, *options, txn, responder)
                 }
-                Stmt::Analyze(targets) => engine.execute_analyze_statement(targets, txn, responder),
+                Stmt::Analyze { targets, options } => {
+                    engine.execute_analyze_statement(targets, *options, txn, responder)
+                }
                 Stmt::Listen(channel) => engine.execute_listen_statement(channel, txn, responder),
                 Stmt::Unlisten(channel) => {
                     engine.execute_unlisten_statement(*channel, txn, responder)
@@ -37678,6 +37733,11 @@ fn static_write_locals<'a>(
                     )
                 })?;
             field.value = values.map_or(Datum::Null, |values| values[index]);
+            // The row holds its values as the firing gave them.
+            field.form = record
+                .form(index)
+                .and_then(|form| form.stored(&field.value))
+                .unwrap_or(crate::storage::StoredForm::Inline);
         }
         *slot = super::cursor::CursorLocal {
             name: SqlName::parse(name).expect("static transition name"),
@@ -38407,7 +38467,8 @@ fn fit_plpgsql_row<'a>(
     for ((out, &target), source) in fitted.iter_mut().zip(target_oids).zip(fields) {
         let converted = plpgsql_conversion_input(source.value, Some(target), storage, txid, arena)?;
         *out = RecordField {
-            form: crate::storage::StoredForm::Inline,
+            // A field the conversion leaves as it was keeps its datum.
+            form: crate::sql::toast::converted_form(&source.value, &converted, source.form),
             name: source.name,
             type_oid: if matches!(converted, Datum::Text(_))
                 && !matches!(source.value, Datum::Text(_))
@@ -38494,8 +38555,22 @@ fn coerce_plpgsql_table_rowtype<'a>(
     }; MAX_COLUMNS];
     for (index, (source, column)) in fields.iter().zip(definition.columns()).enumerate() {
         let cast = prepare_assignment_cast(source.type_oid, column, storage, txid, arena)?;
+        let value = coerce_assignment(
+            source.value,
+            column,
+            PlannedAssignmentCast {
+                input_collation: crate::sql::ast::Collation::None,
+                defined: cast.as_ref(),
+                site: None,
+            },
+            storage,
+            txid,
+            arena,
+            Some(sequences),
+        )?;
         coerced[index] = RecordField {
-            form: crate::storage::StoredForm::Inline,
+            // A field the coercion leaves as it was keeps its datum.
+            form: crate::sql::toast::converted_form(&source.value, &value, source.form),
             name: arena
                 .alloc_str(column.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
@@ -38504,19 +38579,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
                 .routine_type_oid(column.ctype, column.user_type, txid)
                 .unwrap_or(column.ctype.oid()),
             type_mod: column.type_mod,
-            value: coerce_assignment(
-                source.value,
-                column,
-                PlannedAssignmentCast {
-                    input_collation: crate::sql::ast::Collation::None,
-                    defined: cast.as_ref(),
-                    site: None,
-                },
-                storage,
-                txid,
-                arena,
-                Some(sequences),
-            )?,
+            value,
         };
     }
     let fields = arena
@@ -39174,7 +39237,8 @@ fn assign_plpgsql_into_target<'a>(
         context.arena,
         &sequences,
     )?;
-    records.record_mut(record).set_field(column, value);
+    let form = assigned.form.converted(&assigned.value, &value);
+    records.record_mut(record).set_field(column, value, form);
     Ok(())
 }
 
@@ -39302,6 +39366,7 @@ fn assign_trigger_record_column<'a>(
     let input_collation =
         super::eval::coercion_input_collation(assignment.expression, &scope, hooks.catalog)?;
     let value = eval_procedural_expression(context, assignment.expression, &scope, continuation)?;
+    let form = assigned_local_form(assignment.expression, &scope, &value)?;
     let coerced = coerce_assignment(
         value,
         &definition.columns()[column],
@@ -39319,6 +39384,7 @@ fn assign_trigger_record_column<'a>(
             context.txn.txid,
         )),
     );
+    let uncoerced = value;
     let value = match coerced {
         Ok(value) => value,
         // PostgreSQL plans the field's conversion into the assignment's
@@ -39393,7 +39459,8 @@ fn assign_trigger_record_column<'a>(
             };
         }
     };
-    records.record_mut(record).set_field(column, value);
+    let form = form.converted(&uncoerced, &value);
+    records.record_mut(record).set_field(column, value, form);
 
     Ok(())
 }
@@ -39540,7 +39607,7 @@ pub(super) fn trigger_record_row<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
-) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+) -> Result<Option<trigger_firing::TriggerRow<'a, 'a>>, SqlError> {
     // A named composite's fields keep their declared type modifiers and a
     // record's fields their own, which PostgreSQL compares too.
     let mut field_mods = [-1; crate::storage::MAX_COMPOSITE_FIELDS];
@@ -39644,7 +39711,14 @@ pub(super) fn trigger_record_row<'a>(
     let row = arena
         .alloc_slice_with(columns.len(), |index| fields[index].value)
         .map_err(|_| super::query::arena_full_pub())?;
-    Ok(Some(&*row))
+    // A row's fields are held as its tuple holds them.
+    let forms = arena
+        .alloc_slice_with(columns.len(), |index| DatumForm::Stored(fields[index].form))
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(Some(trigger_firing::TriggerRow {
+        values: &*row,
+        forms: &*forms,
+    }))
 }
 
 /// Replaces one field of a row or record variable and stores the row through
@@ -45344,18 +45418,17 @@ impl CursorOutputSlot {
                         "cursor output local is unavailable"
                     )
                 }),
-            // A trigger record keeps no forms.
             Self::Assigned(name) => Ok((
                 Datum::Bool(records.record_mut(name).row().is_some()),
-                DatumForm::Unknown,
+                DatumForm::Formed,
             )),
-            Self::Field(name, column) => Ok((
-                records
-                    .record_mut(name)
-                    .row()
-                    .map_or(Datum::Null, |row| row[column]),
-                DatumForm::Unknown,
-            )),
+            Self::Field(name, column) => {
+                let record = records.record_mut(name).value();
+                Ok((
+                    record.row().map_or(Datum::Null, |row| row[column]),
+                    record.form(column).unwrap_or(DatumForm::Unknown),
+                ))
+            }
         }
     }
 
@@ -45371,7 +45444,9 @@ impl CursorOutputSlot {
             (Self::Local(index), value) => local_values[index] = LocalSlot { value, form },
             (Self::Assigned(_), Datum::Bool(true)) => {}
             (Self::Assigned(name), Datum::Bool(false)) => records.record_mut(name).set_row(None),
-            (Self::Field(name, column), value) => records.record_mut(name).set_field(column, value),
+            (Self::Field(name, column), value) => {
+                records.record_mut(name).set_field(column, value, form);
+            }
             (Self::Assigned(_), _) => {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -46276,6 +46351,7 @@ fn fire_row_trigger_slot<'a, Definition0: crate::storage::DefinitionBacking>(
     updated_columns: ColumnSet,
     old: Option<&[Datum<'a>]>,
     new: Option<&mut [Datum<'a>]>,
+    forms: trigger_firing::ImageForms<'_>,
 ) -> Result<Option<bool>, SqlError> {
     let mut new = new;
     let trigger = context
@@ -46330,29 +46406,50 @@ fn fire_row_trigger_slot<'a, Definition0: crate::storage::DefinitionBacking>(
     {
         return Ok(None);
     }
+    // A WHEN condition reads the new row as the write formed it, before
+    // TOAST stores it, even for an AFTER trigger, whose body reads the row
+    // as stored.
+    let firing_forms =
+        resolve_firing_forms(&context, definition, before, old, new.as_deref(), forms)?;
+    let when_forms = if before || trigger.when.is_none() {
+        firing_forms
+    } else {
+        resolve_firing_forms(&context, definition, true, old, new.as_deref(), forms)?
+    };
     if !row_trigger_when_passes(
         &context,
         &trigger,
         crate::storage::RelationDefinition::from_definition(definition),
-        old,
-        new.as_deref(),
+        old.map(|values| trigger_firing::TriggerRow {
+            values,
+            forms: when_forms.old,
+        }),
+        new.as_deref().map(|values| trigger_firing::TriggerRow {
+            values,
+            forms: when_forms.new,
+        }),
     )? {
         return Ok(None);
     }
-    let encode = |values: Option<&[Datum<'a>]>| -> Result<Option<&'a [u8]>, SqlError> {
-        let Some(values) = values else {
-            return Ok(None);
+    // A queued event keeps each value's form with its row.
+    let encode =
+        |values: Option<&[Datum<'a>]>, forms: &[DatumForm]| -> Result<Option<&'a [u8]>, SqlError> {
+            let Some(values) = values else {
+                return Ok(None);
+            };
+            let mut stored = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+            let stored = &mut stored[..values.len()];
+            trigger_firing::event_forms(values, forms, stored);
+            let encoded = context
+                .arena
+                .alloc_slice_with(rowenc::encoded_len_with_forms(values, stored), |_| 0u8)
+                .map_err(|_| super::query::arena_full_pub())?;
+            rowenc::encode_with_forms(values, stored, encoded);
+            Ok(Some(&*encoded))
         };
-        let encoded = context
-            .arena
-            .alloc_slice_with(rowenc::encoded_len(values), |_| 0u8)
-            .map_err(|_| super::query::arena_full_pub())?;
-        rowenc::encode(values, encoded);
-        Ok(Some(&*encoded))
-    };
     if matches!(trigger.kind, crate::storage::TriggerKind::Constraint { .. }) {
-        let old_bytes = encode(old)?;
-        let new_bytes = encode(new.as_deref())?;
+        let old_bytes = encode(old, firing_forms.old)?;
+        let new_bytes = encode(new.as_deref(), firing_forms.new)?;
         context.txn.queue_constraint_trigger(
             crate::sql::txn::ConstraintIdentity::Trigger {
                 table: match target {
@@ -46385,8 +46482,8 @@ fn fire_row_trigger_slot<'a, Definition0: crate::storage::DefinitionBacking>(
             effective_table,
             event,
             updated_columns,
-            encode(old)?,
-            encode(new.as_deref())?,
+            encode(old, firing_forms.old)?,
+            encode(new.as_deref(), firing_forms.new)?,
         )?;
         return Ok(Some(true));
     }
@@ -46400,6 +46497,7 @@ fn fire_row_trigger_slot<'a, Definition0: crate::storage::DefinitionBacking>(
         before,
         old,
         &mut new,
+        firing_forms,
         None,
     )? {
         return Ok(Some(false));
@@ -46422,6 +46520,71 @@ fn fire_row_trigger_slot<'a, Definition0: crate::storage::DefinitionBacking>(
     Ok(Some(true))
 }
 
+/// The TOAST forms of the stored row `bytes` of types `schema`, by column.
+fn stored_row_forms<'a>(
+    bytes: &[u8],
+    schema: &[ColType],
+    arena: &'a Arena,
+) -> Result<&'a [crate::storage::StoredForm], SqlError> {
+    let forms = arena
+        .alloc_slice_with(schema.len(), |_| crate::storage::StoredForm::Inline)
+        .map_err(|_| super::query::arena_full_pub())?;
+    rowenc::stored_forms(bytes, schema, forms)?;
+    Ok(&*forms)
+}
+
+/// [`stored_row_forms`] of a stored row of `definition`.
+fn definition_row_forms<'a, Definition0: crate::storage::DefinitionBacking>(
+    bytes: &[u8],
+    definition: &crate::storage::TableDefinition<Definition0>,
+    arena: &'a Arena,
+) -> Result<&'a [crate::storage::StoredForm], SqlError> {
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    stored_row_forms(bytes, &schema[..definition.n_columns], arena)
+}
+
+/// How a row firing's `OLD` and `NEW` rows of `definition` hold their
+/// values, by column, as `forms` describes them.
+fn resolve_firing_forms<'a, Definition0: crate::storage::DefinitionBacking>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    before: bool,
+    old: Option<&[Datum<'a>]>,
+    new: Option<&[Datum<'a>]>,
+    forms: trigger_firing::ImageForms<'_>,
+) -> Result<trigger_firing::FiringForms<'a>, SqlError> {
+    let arena = context.arena;
+    let catalog = super::query::storage_catalog(context.storage(), arena, context.txn.txid);
+    let sizing = crate::sql::query::postgres_memory::Sizing {
+        catalog: Some(&catalog),
+        scratch: arena,
+    };
+    let resolve = |values: Option<&[Datum<'a>]>,
+                   forms: trigger_firing::RowForms<'_>|
+     -> Result<&'a [DatumForm], SqlError> {
+        let Some(values) = values else {
+            return Ok(&[]);
+        };
+        let resolved = arena
+            .alloc_slice_with(values.len(), |_| DatumForm::Unknown)
+            .map_err(|_| super::query::arena_full_pub())?;
+        forms.resolve(
+            values,
+            definition.columns(),
+            definition.has_toast,
+            before,
+            &sizing,
+            resolved,
+        )?;
+        Ok(&*resolved)
+    };
+    Ok(trigger_firing::FiringForms {
+        old: resolve(old, forms.old)?,
+        new: resolve(new, forms.new)?,
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "row-transition dispatch carries the complete typed firing context"
@@ -46440,6 +46603,7 @@ fn fire_row_triggers<
     updated_columns: ColumnSet,
     old: Option<&[Datum<'a>]>,
     mut new: Option<&mut [Datum<'a>]>,
+    forms: trigger_firing::ImageForms<'_>,
 ) -> Result<bool, SqlError> {
     let target = target.into();
     let mut last_name: Option<SqlName> = None;
@@ -46475,6 +46639,7 @@ fn fire_row_triggers<
                 updated_columns,
                 old,
                 new.as_deref_mut(),
+                forms,
             )?,
             Some(false)
         ) {
@@ -46538,6 +46703,7 @@ fn execute_queued_firing<'a>(
         false,
         None,
         None,
+        trigger_firing::FiringForms::NONE,
         rows,
     )?;
     super::query::protect_replayable_effect();
@@ -46568,12 +46734,23 @@ fn execute_deferred_trigger_event<'a>(
     definition.schema(&mut schema);
     let mut old_values = [Datum::Null; MAX_COLUMNS];
     let mut new_values = [Datum::Null; MAX_COLUMNS];
-    if let Some(bytes) = old_bytes {
-        rowenc::decode(bytes, &schema[..definition.n_columns], &mut old_values)?;
-    }
-    if let Some(bytes) = new_bytes {
-        rowenc::decode(bytes, &schema[..definition.n_columns], &mut new_values)?;
-    }
+    // An event's row keeps the forms its values were stored in.
+    let schema = &schema[..definition.n_columns];
+    let event_row =
+        |bytes: Option<&'a [u8]>, values: &mut [Datum<'a>]| -> Result<&'a [DatumForm], SqlError> {
+            let Some(bytes) = bytes else {
+                return Ok(&[]);
+            };
+            rowenc::decode(bytes, schema, values)?;
+            let mut stored = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
+            rowenc::stored_forms(bytes, schema, &mut stored)?;
+            arena
+                .alloc_slice_with(schema.len(), |column| DatumForm::Stored(stored[column]))
+                .map(|forms| &*forms)
+                .map_err(|_| super::query::arena_full_pub())
+        };
+    let old_forms = event_row(old_bytes, &mut old_values)?;
+    let new_forms = event_row(new_bytes, &mut new_values)?;
     let trigger = context.storage().trigger(usize::from(trigger_slot));
     let old = old_bytes.map(|_| &old_values[..definition.n_columns]);
     let mut new = new_bytes.map(|_| &mut new_values[..definition.n_columns]);
@@ -46590,6 +46767,10 @@ fn execute_deferred_trigger_event<'a>(
         false,
         old,
         &mut new,
+        trigger_firing::FiringForms {
+            old: old_forms,
+            new: new_forms,
+        },
         transition_rows,
     )?;
     Ok(())
@@ -46803,6 +46984,7 @@ fn fire_partition_row_triggers<'a, Definition0: crate::storage::DefinitionBackin
     updated_columns: ColumnSet,
     old: Option<&[Datum<'a>]>,
     mut new: Option<&mut [Datum<'a>]>,
+    forms: trigger_firing::ImageForms<'_>,
 ) -> Result<bool, SqlError> {
     let mut root = leaf;
     while let Some(attachment) = storage.table_def(root, txn.txid).partition.attachment {
@@ -46877,6 +47059,7 @@ fn fire_partition_row_triggers<'a, Definition0: crate::storage::DefinitionBackin
                 updated_columns,
                 old,
                 new.as_deref_mut(),
+                forms,
             )?,
             Some(false)
         ) {
@@ -47038,10 +47221,19 @@ fn execute_statement_trigger<'a>(
                 target,
                 event,
             });
-    engine_triggers::fire(context, movable, None, &mut None, |context, _| {
-        execute_statement_trigger_here(context, trigger, target, definition, event, before, rows)
+    engine_triggers::fire(
+        context,
+        movable,
+        None,
+        &mut None,
+        trigger_firing::FiringForms::NONE,
+        |context, _| {
+            execute_statement_trigger_here(
+                context, trigger, target, definition, event, before, rows,
+            )
             .map(|()| true)
-    })
+        },
+    )
     .map(|_| ())
 }
 
@@ -47071,6 +47263,7 @@ fn execute_statement_trigger_here<'a>(
         before,
         None,
         None,
+        trigger_firing::FiringForms::NONE,
         rows,
     )?;
     // A trigger body's effects cannot be repeated by a restart, so the
@@ -67292,6 +67485,7 @@ fn validate_stored_domain_value(
             storage,
             crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(leaf)),
             value,
+            crate::sql::toast::DatumForm::Unknown,
             crate::sql::eval::DomainCoercion::Assignment,
             txid,
             arena,
@@ -67322,6 +67516,7 @@ fn validate_stored_domain_value(
                 &target_domain,
                 check,
                 value,
+                crate::sql::toast::DatumForm::Unknown,
                 arena,
                 crate::sql::eval::NO_PARAMS,
                 sequences,
@@ -82179,6 +82374,7 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                 ColumnSet::EMPTY,
                 None,
                 Some(&mut values[..physical.n_columns]),
+                trigger_firing::ImageForms::insert(&crate::sql::toast::CarriedForms::NONE),
             )? {
                 return Ok(CopyRowOutcome::Filtered);
             }
@@ -82319,6 +82515,7 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                 ColumnSet::EMPTY,
                 None,
                 Some(&mut values[..physical.n_columns]),
+                trigger_firing::ImageForms::insert(&crate::sql::toast::CarriedForms::NONE),
             )?;
             Ok(CopyRowOutcome::Stored)
         },
@@ -82446,6 +82643,7 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
                 ColumnSet::EMPTY,
                 None,
                 Some(&mut values[..definition.n_columns]),
+                trigger_firing::ImageForms::insert(&crate::sql::toast::CarriedForms::NONE),
             )? {
                 return Ok(());
             }
@@ -82511,6 +82709,7 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
                 ColumnSet::EMPTY,
                 None,
                 Some(&mut values[..definition.n_columns]),
+                trigger_firing::ImageForms::insert(&crate::sql::toast::CarriedForms::NONE),
             )?;
             Ok(())
         },
@@ -82868,6 +83067,11 @@ fn apply_replication_delete_row(
         ColumnSet::EMPTY,
         Some(&old_values[..definition.n_columns]),
         None,
+        trigger_firing::ImageForms::delete(stored_row_forms(
+            bytes,
+            &schema[..definition.n_columns],
+            arena,
+        )?),
     )? {
         return Ok(());
     }
@@ -82911,6 +83115,11 @@ fn apply_replication_delete_row(
         ColumnSet::EMPTY,
         Some(&old_values[..definition.n_columns]),
         None,
+        trigger_firing::ImageForms::delete(stored_row_forms(
+            bytes,
+            &schema[..definition.n_columns],
+            arena,
+        )?),
     )?;
     Ok(())
 }
@@ -83053,6 +83262,15 @@ pub(crate) fn apply_replication_update(
     mapping.overlay(&logical_new, &mut new_values);
     let checks = parse_checks(definition, storage, txn.txid, arena)?;
     let generated = parse_generated(definition, arena, storage, txn.txid)?;
+    // An unchanged value is the stored datum, kept in place.
+    let carried = crate::sql::toast::CarriedForms::of_stored_row(
+        row.bytes(),
+        &schema[..definition.n_columns],
+        &old_values[..definition.n_columns],
+        true,
+    )?;
+    let old_forms = stored_row_forms(row.bytes(), &schema[..definition.n_columns], arena)?;
+    let forms = trigger_firing::ImageForms::update(old_forms, &carried);
     if !fire_partition_row_triggers(
         storage,
         txn,
@@ -83067,6 +83285,7 @@ pub(crate) fn apply_replication_update(
         ColumnSet::EMPTY,
         Some(&old_values[..definition.n_columns]),
         Some(&mut new_values[..definition.n_columns]),
+        forms,
     )? {
         return Ok(());
     }
@@ -83113,13 +83332,6 @@ pub(crate) fn apply_replication_update(
         },
     )?;
     row.available(storage, txn, "updated")?;
-    // An unchanged value is the stored datum, kept in place.
-    let carried = crate::sql::toast::CarriedForms::of_stored_row(
-        row.bytes(),
-        &schema[..definition.n_columns],
-        &old_values[..definition.n_columns],
-        true,
-    )?;
     store_row(
         storage,
         txn,
@@ -83161,6 +83373,7 @@ pub(crate) fn apply_replication_update(
         ColumnSet::EMPTY,
         Some(&old_values[..definition.n_columns]),
         Some(&mut new_values[..definition.n_columns]),
+        forms,
     )?;
     Ok(())
 }
@@ -83446,6 +83659,7 @@ pub(crate) fn decode_binary_input<'a>(
                 storage,
                 slot,
                 value,
+                crate::sql::toast::DatumForm::Unknown,
                 crate::sql::eval::DomainCoercion::Input,
                 txid,
                 arena,
@@ -83588,6 +83802,7 @@ pub(crate) fn decode_text_input<'a>(
             storage,
             slot,
             decode_builtin(base)?,
+            crate::sql::toast::DatumForm::Unknown,
             coercion,
             txid,
             arena,
@@ -83621,6 +83836,7 @@ pub(crate) fn coerce_binary_input_null<'a>(
             storage,
             slot,
             Datum::Null,
+            crate::sql::toast::DatumForm::Unknown,
             crate::sql::eval::DomainCoercion::Input,
             txid,
             arena,
@@ -84078,6 +84294,7 @@ fn decode_binary_array<'a>(
                         })?,
                     )?,
                     value,
+                    crate::sql::toast::DatumForm::Unknown,
                     crate::sql::eval::DomainCoercion::Input,
                     txid,
                     arena,
@@ -88474,6 +88691,11 @@ fn merge_target<'a>(
                                     arena,
                                 );
                                 merge_lock_outcome!(lock);
+                                let pair_forms =
+                                    match definition_row_forms(pair_bytes, row_definition, arena) {
+                                        Ok(forms) => forms,
+                                        Err(error) => return sql_fail(error),
+                                    };
                                 if !match fire_partition_row_triggers(
                                     storage,
                                     txn,
@@ -88488,6 +88710,7 @@ fn merge_target<'a>(
                                     ColumnSet::EMPTY,
                                     Some(pair_physical),
                                     None,
+                                    trigger_firing::ImageForms::delete(pair_forms),
                                 ) {
                                     Ok(run) => run,
                                     Err(error) => return sql_fail(error),
@@ -88558,6 +88781,7 @@ fn merge_target<'a>(
                                     ColumnSet::EMPTY,
                                     Some(physical_deleted),
                                     None,
+                                    trigger_firing::ImageForms::delete(pair_forms),
                                 ) {
                                     return sql_fail(error);
                                 }
@@ -88725,6 +88949,26 @@ fn merge_target<'a>(
                                 physical_new[..row_definition.n_columns]
                                     .copy_from_slice(pair_physical);
                                 row_layout.overlay(&new_values, &mut physical_new);
+                                let mut pair_schema = [ColType::Bool; MAX_COLUMNS];
+                                row_definition.schema(&mut pair_schema);
+                                let pair_schema = &pair_schema[..row_definition.n_columns];
+                                let (pair_forms, pair_carried) = match stored_row_forms(
+                                    pair_bytes,
+                                    pair_schema,
+                                    arena,
+                                )
+                                .and_then(|forms| {
+                                    crate::sql::toast::CarriedForms::of_stored_row(
+                                        pair_bytes,
+                                        pair_schema,
+                                        pair_physical,
+                                        true,
+                                    )
+                                    .map(|carried| (forms, carried))
+                                }) {
+                                    Ok(forms) => forms,
+                                    Err(error) => return sql_fail(error),
+                                };
                                 if !match fire_partition_row_triggers(
                                     storage,
                                     txn,
@@ -88739,6 +88983,7 @@ fn merge_target<'a>(
                                     row_layout.column_set(action_update_columns),
                                     Some(pair_physical),
                                     Some(&mut physical_new[..row_definition.n_columns]),
+                                    trigger_firing::ImageForms::update(pair_forms, &pair_carried),
                                 ) {
                                     Ok(run) => run,
                                     Err(error) => return sql_fail(error),
@@ -88800,6 +89045,10 @@ fn merge_target<'a>(
                                         new_definition,
                                         new_layout.generated,
                                         &mut persisted[..new_definition.n_columns],
+                                        trigger_firing::ImageForms::update(
+                                            pair_forms,
+                                            &pair_carried.moved(),
+                                        ),
                                         arena,
                                         services,
                                         responder,
@@ -88959,11 +89208,9 @@ fn merge_target<'a>(
                                 // passes on; a row moving to another
                                 // partition is inserted there.
                                 let in_place = updated_table == target_tables[j];
-                                let mut pair_schema = [ColType::Bool; MAX_COLUMNS];
-                                row_definition.schema(&mut pair_schema);
                                 let carried = match crate::sql::toast::CarriedForms::of_stored_row(
                                     pair_bytes,
-                                    &pair_schema[..row_definition.n_columns],
+                                    pair_schema,
                                     pair_physical,
                                     in_place,
                                 ) {
@@ -89074,6 +89321,7 @@ fn merge_target<'a>(
                                         updated_table,
                                         new_definition,
                                         &mut persisted[..new_definition.n_columns],
+                                        trigger_firing::ImageForms::update(pair_forms, &carried),
                                         arena,
                                         services,
                                         responder,
@@ -89093,6 +89341,7 @@ fn merge_target<'a>(
                                         new_layout.column_set(action_update_columns),
                                         Some(pair_physical),
                                         Some(&mut persisted[..new_definition.n_columns]),
+                                        trigger_firing::ImageForms::update(pair_forms, &carried),
                                     )
                                     .map(|_| ())
                                 };
@@ -90580,6 +90829,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                 ColumnSet::EMPTY,
                 None,
                 Some(&mut row_arr[..def.n_columns]),
+                trigger_firing::ImageForms::insert(&carried),
             )? {
                 return Ok(None);
             }
@@ -90701,6 +90951,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                 ColumnSet::EMPTY,
                 None,
                 Some(&mut row_arr[..def.n_columns]),
+                trigger_firing::ImageForms::insert(&carried),
             )?;
             let logical_values = partition_insert::logical_insert_values(
                 mapping,
@@ -90821,6 +91072,7 @@ where
                 ColumnSet::EMPTY,
                 None,
                 Some(&mut values[..definition.n_columns]),
+                trigger_firing::ImageForms::insert(carried),
             ) {
                 Ok(run) => run,
                 Err(error) => return Ok(Err(error)),
@@ -91116,6 +91368,7 @@ where
                 ColumnSet::EMPTY,
                 None,
                 Some(&mut values[..definition.n_columns]),
+                trigger_firing::ImageForms::insert(carried),
             ) {
                 return Ok(Err(error));
             }
@@ -92427,6 +92680,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         event,
                         Some(&old[..def.n_columns]),
                         Some(new),
+                        trigger_firing::ImageForms::UNRECORDED,
                     ) {
                         Ok(true) => {}
                         Ok(false) => continue,
@@ -92655,6 +92909,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         event,
                         Some(&old[..def.n_columns]),
                         None,
+                        trigger_firing::ImageForms::UNRECORDED,
                     ) {
                         Ok(true) => {}
                         Ok(false) => continue,
@@ -92864,6 +93119,7 @@ fn fire_view_row_trigger<'a, Definition0: crate::storage::DefinitionBacking>(
     event: u8,
     old: Option<&[Datum<'a>]>,
     new: Option<&mut [Datum<'a>]>,
+    forms: trigger_firing::ImageForms<'_>,
 ) -> Result<bool, SqlError> {
     fire_row_triggers(
         TriggerExecContext {
@@ -92884,6 +93140,7 @@ fn fire_view_row_trigger<'a, Definition0: crate::storage::DefinitionBacking>(
         ColumnSet::EMPTY,
         old,
         new,
+        forms,
     )
 }
 
@@ -92919,6 +93176,7 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
         event,
         None,
         Some(values),
+        trigger_firing::ImageForms::UNRECORDED,
     ) {
         Ok(fired) => fired,
         Err(error) => return Ok(Err(error)),
@@ -97123,6 +97381,10 @@ pub(crate) fn update<'a>(
                     Ok(carried) => carried,
                     Err(error) => return sql_fail(error),
                 };
+                let old_forms = match stored_row_forms(row_bytes, row_layout.schema, arena) {
+                    Ok(forms) => forms,
+                    Err(error) => return sql_fail(error),
+                };
                 if !match fire_partition_row_triggers(
                     storage,
                     txn,
@@ -97137,6 +97399,7 @@ pub(crate) fn update<'a>(
                     row_layout.column_set(updated_columns),
                     Some(old_transition),
                     Some(new_physical),
+                    trigger_firing::ImageForms::update(old_forms, &carried),
                 ) {
                     Ok(run) => run,
                     Err(error) => return sql_fail(error),
@@ -97199,6 +97462,7 @@ pub(crate) fn update<'a>(
                         new_definition,
                         new_layout.generated,
                         &mut persisted[..new_definition.n_columns],
+                        trigger_firing::ImageForms::update(old_forms, &carried.clone().moved()),
                         arena,
                         services,
                         responder,
@@ -97415,6 +97679,7 @@ pub(crate) fn update<'a>(
                     updated_columns,
                     Some(&old_transition[..def.n_columns]),
                     Some(&mut new_values[..def.n_columns]),
+                    trigger_firing::ImageForms::UNRECORDED,
                 ) {
                     return sql_fail(error);
                 }
@@ -97585,6 +97850,18 @@ pub(crate) fn update<'a>(
             }
             let mut logical_new = [Datum::Null; MAX_COLUMNS];
             new_layout.project(&new_physical, &mut logical_new);
+            // The AFTER triggers read both rows as they are stored.
+            let stored_forms =
+                match stored_row_forms(row_bytes, row_layout.schema, arena).and_then(|old| {
+                    stored_row_forms(new_bytes, new_layout.schema, arena).map(|new| (old, new))
+                }) {
+                    Ok(forms) => forms,
+                    Err(error) => return sql_fail(error),
+                };
+            let stored_forms = trigger_firing::ImageForms {
+                old: trigger_firing::RowForms::Stored(stored_forms.0),
+                new: trigger_firing::RowForms::Stored(stored_forms.1),
+            };
             let after = if target_table != row_table {
                 partition_update::fire_after_move(
                     storage,
@@ -97595,6 +97872,7 @@ pub(crate) fn update<'a>(
                     target_table,
                     new_definition,
                     &mut new_physical[..new_definition.n_columns],
+                    stored_forms,
                     arena,
                     services,
                     responder,
@@ -97614,6 +97892,7 @@ pub(crate) fn update<'a>(
                     new_layout.column_set(updated_columns),
                     Some(&physical_old[..row_definition.n_columns]),
                     Some(&mut new_physical[..new_definition.n_columns]),
+                    stored_forms,
                 )
                 .map(|_| ())
             };
@@ -98668,6 +98947,7 @@ pub(crate) fn delete<'a>(
                     ColumnSet::EMPTY,
                     Some(&old_values[..def.n_columns]),
                     None,
+                    trigger_firing::ImageForms::UNRECORDED,
                 ) {
                     Ok(run) => run,
                     Err(error) => return sql_fail(error),
@@ -98744,6 +99024,7 @@ pub(crate) fn delete<'a>(
                     ColumnSet::EMPTY,
                     Some(&old_transition[..def.n_columns]),
                     None,
+                    trigger_firing::ImageForms::UNRECORDED,
                 ) {
                     return sql_fail(error);
                 }
@@ -98824,6 +99105,7 @@ pub(crate) fn delete<'a>(
                     .next()
                     .is_some();
             let mut old_physical = [Datum::Null; MAX_COLUMNS];
+            let mut old_forms: &[crate::storage::StoredForm] = &[];
             if !statement.returning.is_empty() || row_referenced || row_has_triggers {
                 let bytes = match retained_rows.bytes(row_table, rowid) {
                     Ok(bytes) => bytes,
@@ -98832,6 +99114,10 @@ pub(crate) fn delete<'a>(
                 if let Err(error) = rowenc::decode(bytes, layout.schema, &mut old_physical) {
                     return sql_fail(error);
                 }
+                old_forms = match stored_row_forms(bytes, layout.schema, arena) {
+                    Ok(forms) => forms,
+                    Err(error) => return sql_fail(error),
+                };
                 if !match fire_partition_row_triggers(
                     storage,
                     txn,
@@ -98846,6 +99132,7 @@ pub(crate) fn delete<'a>(
                     ColumnSet::EMPTY,
                     Some(&old_physical[..row_definition.n_columns]),
                     None,
+                    trigger_firing::ImageForms::delete(old_forms),
                 ) {
                     Ok(run) => run,
                     Err(error) => return sql_fail(error),
@@ -98902,6 +99189,7 @@ pub(crate) fn delete<'a>(
                     ColumnSet::EMPTY,
                     Some(&old_physical[..row_definition.n_columns]),
                     None,
+                    trigger_firing::ImageForms::delete(old_forms),
                 )
             {
                 return sql_fail(error);
@@ -112121,10 +112409,13 @@ fn coerce_assignment<'a>(
     let value = match cast.defined {
         Some(cast) => {
             let catalog = super::query::storage_catalog(storage, arena, txid);
+            // An assignment's value reaches its cast without how it was
+            // held.
             super::eval::CatalogAccess::execute_bound_cast(
                 &catalog,
                 cast,
                 value,
+                crate::sql::toast::DatumForm::Unknown,
                 column.type_mod,
                 cast_input_collation,
                 arena,
@@ -112311,6 +112602,7 @@ pub(crate) fn coerce_routine_argument<'a>(
             storage,
             target,
             value,
+            crate::sql::toast::DatumForm::Unknown,
             crate::sql::eval::DomainCoercion::Assignment,
             txid,
             arena,
@@ -112957,6 +113249,7 @@ fn coerce_composite_value_inner<'a>(
                     storage,
                     domain,
                     value,
+                    crate::sql::toast::DatumForm::Unknown,
                     if encoding == CompositeEncoding::ExplicitCast {
                         crate::sql::eval::DomainCoercion::Explicit
                     } else {
@@ -113479,6 +113772,7 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                     })?,
                 )?,
                 value,
+                crate::sql::toast::DatumForm::Unknown,
                 coercion,
                 txid,
                 arena,

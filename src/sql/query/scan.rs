@@ -1082,9 +1082,17 @@ mod tests {
             (Box, Adjacent),
             (Inet, Contains),
             (TsVector, Eq),
+            (TsVector, TextSearchMatchAlias),
             (TsQuery, TextSearchMatch),
         ] {
             assert!(!super::gist_supports_operator(class, operator));
+        }
+        // GIN's `tsvector_ops` serves `@@` and `@@@` (strategies 1 and 2).
+        for operator in [TextSearchMatch, TextSearchMatchAlias] {
+            assert!(super::gin_supports_operator(
+                crate::sql::types::GinOperatorClass::TsVector,
+                operator
+            ));
         }
     }
 
@@ -1989,6 +1997,7 @@ fn is_inclusion_operator(operator: BinaryOp) -> bool {
             | BinaryOp::NetContainedEq
             | BinaryOp::NetContainsEq
             | BinaryOp::TextSearchMatch
+            | BinaryOp::TextSearchMatchAlias
             | BinaryOp::JsonExists
             | BinaryOp::JsonExistsAny
             | BinaryOp::JsonExistsAll
@@ -2079,7 +2088,11 @@ fn gin_supports_operator(class: crate::sql::types::GinOperatorClass, operator: B
             operator,
             BinaryOp::Eq | BinaryOp::Contains | BinaryOp::ContainedBy | BinaryOp::Overlaps
         ),
-        GinOperatorClass::TsVector => operator == BinaryOp::TextSearchMatch,
+        // `tsvector_ops` lists `@@@` as strategy 2 beside `@@`.
+        GinOperatorClass::TsVector => matches!(
+            operator,
+            BinaryOp::TextSearchMatch | BinaryOp::TextSearchMatchAlias
+        ),
         GinOperatorClass::Jsonb => matches!(
             operator,
             BinaryOp::Contains

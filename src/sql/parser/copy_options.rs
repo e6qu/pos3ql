@@ -10,7 +10,7 @@ use crate::stack_format;
 
 /// An option argument as PostgreSQL's `copy_generic_opt_arg` reads it.
 #[derive(Clone, Copy)]
-enum Argument<'a> {
+pub(super) enum Argument<'a> {
     Absent,
     /// A word, string or boolean keyword.
     Text(&'a str),
@@ -24,7 +24,7 @@ enum Argument<'a> {
 
 impl<'a> Argument<'a> {
     /// PostgreSQL's `defGetString`, or `None` for a missing argument.
-    fn text(self) -> Option<&'a str> {
+    pub(super) fn text(self) -> Option<&'a str> {
         match self {
             Self::Text(text) | Self::Integer(text) | Self::Number(text) => Some(text),
             Self::Star => Some("*"),
@@ -199,7 +199,7 @@ impl<'a> Parser<'a> {
 
     /// PostgreSQL's `opt_boolean_or_string`: `TRUE`, `FALSE`, `ON`, a string
     /// or any word that is not a reserved keyword.
-    fn copy_option_word(&mut self) -> Result<&'a str, ParseError> {
+    pub(super) fn copy_option_word(&mut self) -> Result<&'a str, ParseError> {
         let word = match self.peeked {
             Tok::Str(text) | Tok::QuotedIdent(text) => text,
             Tok::Ident(word @ ("true" | "false" | "on")) => word,
@@ -744,7 +744,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn unpositioned(
+pub(super) fn unpositioned(
     sqlstate: &'static str,
     message: core::fmt::Arguments<'_>,
     at: usize,
@@ -761,12 +761,12 @@ fn unpositioned(
 }
 
 /// PostgreSQL's ICONST: an integer literal that fits `int4`.
-fn integer_constant(text: &str) -> bool {
+pub(super) fn integer_constant(text: &str) -> bool {
     crate::sql::eval::parse_int_literal(text).is_some_and(|value| i32::try_from(value).is_ok())
 }
 
 /// PostgreSQL's `defGetBoolean`.
-fn boolean(argument: Argument<'_>) -> Option<bool> {
+pub(super) fn boolean(argument: Argument<'_>) -> Option<bool> {
     match argument {
         Argument::Absent => Some(true),
         Argument::Integer("0") => Some(false),

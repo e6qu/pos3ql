@@ -1436,6 +1436,17 @@ default ordering keep only `null_frac`, `avg_width` and an approximate
 can leave `reltuples` changed, and `relhasindex` can stay true after `DROP
 INDEX` until `VACUUM`.
 
+`ANALYZE (SKIP_LOCKED)` passes over a table another transaction has locked:
+for example, while a prepared transaction holds `LOCK TABLE t IN ACCESS
+EXCLUSIVE MODE`, `ANALYZE (SKIP_LOCKED) t` warns `skipping analyze of "t" ---
+lock not available` (`55P03`) and completes. A named table's partitions and a
+database-wide `ANALYZE`'s tables are skipped without a warning, as in
+PostgreSQL. `BUFFER_USAGE_LIMIT` is checked as PostgreSQL checks it (0, or
+128 kB through 16 GB) and has no other effect: it sizes PostgreSQL's
+shared-buffer ring, which pos3ql does not have. `ANALYZE VERBOSE` fails with
+`0A000`, since its report of sampled pages, timing and buffer usage is not
+reproduced.
+
 Background maintenance runs between client messages and while idle, yields to
 queries while it waits for storage, and never removes data active readers,
 prepared transactions or backups need. At 85% heap use eligible writes can wait

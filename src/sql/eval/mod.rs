@@ -3283,7 +3283,8 @@ pub trait CatalogAccess {
     /// Aggregate and JSON conversion definitions use this boundary so a later
     /// rename cannot turn a validated dependency into an unresolved text lookup.
     /// `argument_forms` says how the caller holds each argument, which the
-    /// routine is passed unchanged.
+    /// routine is passed unchanged; the result comes with how the routine
+    /// holds it.
     #[expect(
         clippy::too_many_arguments,
         reason = "a bound support call carries its arguments' values, forms and types"
@@ -3297,7 +3298,7 @@ pub trait CatalogAccess {
         _input_collation: super::ast::Collation,
         _access: RoutineCallAccess,
         _arena: &'a Arena,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
+    ) -> Result<Option<(Datum<'a>, crate::sql::toast::DatumForm)>, SqlError> {
         Ok(None)
     }
     /// JSON's Other category may use a function cast after array/composite
@@ -3328,10 +3329,13 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
+    /// Runs a selected cast of `value`, held as `form`, which a cast
+    /// function is passed unchanged.
     fn execute_bound_cast<'a>(
         &self,
         _cast: &BoundCast,
         _value: Datum<'a>,
+        _form: crate::sql::toast::DatumForm,
         _target_type_mod: i32,
         _input_collation: super::ast::Collation,
         _arena: &'a Arena,
@@ -4008,9 +4012,10 @@ pub trait CatalogAccess {
     fn enum_creation_of_name(&self, _type_name: &str) -> Option<crate::storage::TypeCreation> {
         None
     }
-    /// Casts to a catalog-defined domain, enum, or its automatically-created
-    /// array type. `Ok(None)` means the name is not a visible user-defined
-    /// type; `Some` contains the fully coerced and validated value.
+    /// Casts `value`, held as `form`, to a catalog-defined domain, enum, or
+    /// its automatically-created array type. `Ok(None)` means the name is not
+    /// a visible user-defined type; `Some` contains the fully coerced and
+    /// validated value.
     fn cast_user_type<'a>(
         &self,
         _type_name: &str,
@@ -4018,6 +4023,7 @@ pub trait CatalogAccess {
         _coercion: DomainCoercion,
         _arena: &'a Arena,
         _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+        _form: crate::sql::toast::DatumForm,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
@@ -9158,8 +9164,14 @@ fn eval_full_inner<'a>(
             // resolve and validate there.
             if ColType::from_sql_name(type_name).is_none() {
                 if let Some(cat) = hooks.catalog
-                    && let Some(value) =
-                        cat.cast_user_type(type_name, v, coercion, arena, hooks.sequences)?
+                    && let Some(value) = cat.cast_user_type(
+                        type_name,
+                        v,
+                        coercion,
+                        arena,
+                        hooks.sequences,
+                        crate::sql::toast::held_form(operand, row, hooks.catalog, &v)?,
+                    )?
                 {
                     return Ok(value);
                 }
@@ -11327,9 +11339,17 @@ fn execute_array_constructor<'a>(
     let element = plan.element;
     let vals = super::array::alloc_items(arena, plan.inputs.len())?;
     for (target, input) in vals.iter_mut().zip(plan.inputs) {
-        let value = match input.nested {
-            Some(nested) => execute_array_constructor(nested, arena, params, row, hooks)?,
-            None => eval_full(input.expression, arena, params, row, hooks)?,
+        let (value, form) = match input.nested {
+            Some(nested) => (
+                execute_array_constructor(nested, arena, params, row, hooks)?,
+                crate::sql::toast::DatumForm::Formed,
+            ),
+            None => {
+                let value = eval_full(input.expression, arena, params, row, hooks)?;
+                let form =
+                    crate::sql::toast::held_form(input.expression, row, hooks.catalog, &value)?;
+                (value, form)
+            }
         };
         let value = match input.cast {
             Some(cast) => {
@@ -11342,6 +11362,7 @@ fn execute_array_constructor<'a>(
                     .execute_bound_cast(
                         cast,
                         value,
+                        form,
                         plan.target_type_mod,
                         coercion_input_collation(input.expression, row, hooks.catalog)?,
                         arena,
@@ -11364,6 +11385,7 @@ fn execute_array_constructor<'a>(
                         plan.coercion,
                         arena,
                         hooks.sequences,
+                        crate::sql::toast::DatumForm::Unknown,
                     )?
                     .ok_or_else(|| {
                         sql_err!(
@@ -11476,6 +11498,7 @@ fn coerce_array_constructor_element<'a>(
                 coercion,
                 arena,
                 hooks.sequences,
+                crate::sql::toast::DatumForm::Unknown,
             )?
             .ok_or_else(|| {
                 sql_err!(
@@ -15201,6 +15224,7 @@ pub(crate) fn input_error<'a>(
             DomainCoercion::Input,
             arena,
             hooks.sequences,
+            crate::sql::toast::DatumForm::Unknown,
         ) {
             Ok(Some(_)) => return Ok(None),
             Ok(None) => None,

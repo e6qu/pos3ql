@@ -203,6 +203,9 @@ pub(crate) struct AggState<'a> {
     custom: Option<(i32, &'a crate::storage::AggregateRoutine)>,
     custom_moving: bool,
     custom_state_initialized: bool,
+    /// How a catalog-defined aggregate holds its state (`best`): the datum
+    /// its transition function returned, as that function held it.
+    custom_state_form: DatumForm,
     custom_transition_strict: bool,
     custom_inverse_strict: bool,
     custom_direct_initialized: bool,
@@ -743,6 +746,7 @@ impl Default for AggState<'_> {
             custom: None,
             custom_moving: false,
             custom_state_initialized: false,
+            custom_state_form: DatumForm::Unknown,
             custom_transition_strict: false,
             custom_inverse_strict: false,
             custom_direct_initialized: false,
@@ -1057,6 +1061,7 @@ impl<'a> AggState<'a> {
                     crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                     arena,
                 )?
+                .map(|(value, _)| value)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_FUNCTION,
@@ -1076,6 +1081,7 @@ impl<'a> AggState<'a> {
                     crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                     arena,
                 )?
+                .map(|(value, _)| value)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_FUNCTION,
@@ -1096,28 +1102,30 @@ impl<'a> AggState<'a> {
             }
             if current.is_null() {
                 self.best = Some(incoming);
+                // A partial state does not keep how it was held.
+                self.custom_state_form = DatumForm::Unknown;
                 self.custom_state_initialized = true;
                 return Ok(());
             }
         }
-        self.best = Some(
-            catalog
-                .call_routine_oid(
-                    partial.combine_oid,
-                    &[current, incoming],
-                    &[DatumForm::Unknown; 2],
-                    &[self.custom_state_oid, self.custom_state_oid],
-                    self.custom_input_collation,
-                    crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
-                    arena,
-                )?
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        "aggregate combine function no longer exists"
-                    )
-                })?,
-        );
+        let (state, form) = catalog
+            .call_routine_oid(
+                partial.combine_oid,
+                &[current, incoming],
+                &[DatumForm::Unknown; 2],
+                &[self.custom_state_oid, self.custom_state_oid],
+                self.custom_input_collation,
+                crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
+                arena,
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "aggregate combine function no longer exists"
+                )
+            })?;
+        self.best = Some(state);
+        self.custom_state_form = form;
         self.custom_state_initialized = true;
         Ok(())
     }
@@ -1229,6 +1237,8 @@ impl<'a> AggState<'a> {
             )),
         };
         self.best = held.0[0].load(arena)?;
+        // A held state does not keep how it was held.
+        self.custom_state_form = DatumForm::Unknown;
         self.sum_numeric = numeric(held.0[1].load(arena)?)?;
         self.sum_sq_numeric = numeric(held.0[2].load(arena)?)?;
         Ok(())
@@ -1427,7 +1437,10 @@ impl<'a> AggState<'a> {
                 self.sum_interval_micros = reader.i128();
                 self.sum_interval_infinity = reader.u8() as i8;
             }
-            FixedState::Value => self.best = reader.value(),
+            FixedState::Value => {
+                self.best = reader.value();
+                self.custom_state_form = DatumForm::Unknown;
+            }
             FixedState::Reference => {}
             FixedState::Bool => {
                 self.bool_acc = match reader.u8() {
@@ -1728,6 +1741,8 @@ impl<'a> AggState<'a> {
                     txid,
                     None,
                 )?);
+                // An initial condition's input forms a new datum.
+                self.custom_state_form = DatumForm::Formed;
                 self.custom_state_initialized = true;
             }
             return Ok(());
@@ -1932,6 +1947,7 @@ impl<'a> AggState<'a> {
         }
         self.custom_moving = true;
         self.best = None;
+        self.custom_state_form = DatumForm::Unknown;
         self.custom_state_initialized = false;
         self.custom_transition_strict =
             support_function_strict(storage, moving.transition_oid, txid)?;
@@ -1952,6 +1968,8 @@ impl<'a> AggState<'a> {
                 txid,
                 None,
             )?);
+            // An initial condition's input forms a new datum.
+            self.custom_state_form = DatumForm::Formed;
             self.custom_state_initialized = true;
         }
         Ok(true)
@@ -1982,6 +2000,7 @@ impl<'a> AggState<'a> {
             .expect("moving aggregate contract selected");
         let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut forms = [DatumForm::Unknown; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        forms[0] = self.custom_state_form;
         for (index, expression) in args.iter().enumerate() {
             values[index] = eval_full(expression, arena, params, row, hooks)?;
             forms[index + 1] =
@@ -2003,11 +2022,10 @@ impl<'a> AggState<'a> {
         argument_type_oids[0] = self.custom_moving_state_oid;
         argument_type_oids[1..1 + args.len()]
             .copy_from_slice(&self.custom_argument_oids[..args.len()]);
-        let state = catalog
+        let (state, form) = catalog
             .call_routine_oid(
                 moving.inverse_oid,
                 &arguments[..1 + args.len()],
-                // The state is kept without how it is held.
                 &forms[..1 + args.len()],
                 &argument_type_oids[..1 + args.len()],
                 self.custom_input_collation,
@@ -2024,6 +2042,7 @@ impl<'a> AggState<'a> {
             return Ok(false);
         }
         self.best = Some(state);
+        self.custom_state_form = form;
         self.custom_state_initialized = true;
         Ok(true)
     }
@@ -2304,13 +2323,20 @@ impl<'a> AggState<'a> {
                     self.order_collations_mut()[transition_expressions.len() + index] = collation;
                 }
             }
-            let encoded = crate::sql::exec::encode_projected_pub(
-                &tuple[..transition_expressions.len()
-                    + if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
-                        sort_spec.len()
-                    } else {
-                        0
-                    }],
+            // A sorted input keeps how it was held, as the sort passes its
+            // datum on.
+            let width = transition_expressions.len()
+                + if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+                    sort_spec.len()
+                } else {
+                    0
+                };
+            let mut tuple_forms = [DatumForm::Formed; crate::storage::MAX_ROUTINE_ARGUMENTS * 2];
+            tuple_forms[..transition_expressions.len()]
+                .copy_from_slice(&forms[..transition_expressions.len()]);
+            let encoded = crate::sql::exec::encode_projected_held(
+                &tuple[..width],
+                &tuple_forms[..width],
                 arena,
             )?;
             self.push_ordered(encoded, arena)?;
@@ -2352,6 +2378,7 @@ impl<'a> AggState<'a> {
             }
             if !self.custom_state_initialized {
                 self.best = values.first().copied();
+                self.custom_state_form = forms.first().copied().unwrap_or(DatumForm::Unknown);
                 self.custom_state_initialized = true;
                 return Ok(());
             }
@@ -2364,9 +2391,9 @@ impl<'a> AggState<'a> {
         })?;
         let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut argument_type_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        // The state is kept without how it is held.
         let mut argument_forms = [DatumForm::Unknown; crate::storage::MAX_ROUTINE_ARGUMENTS];
         arguments[0] = self.best.unwrap_or(Datum::Null);
+        argument_forms[0] = self.custom_state_form;
         arguments[1..1 + values.len()].copy_from_slice(values);
         argument_forms[1..1 + values.len()].copy_from_slice(forms);
         argument_type_oids[0] = if self.custom_moving {
@@ -2376,7 +2403,7 @@ impl<'a> AggState<'a> {
         };
         argument_type_oids[1..1 + values.len()]
             .copy_from_slice(&self.custom_argument_oids[..values.len()]);
-        let state = catalog
+        let (state, form) = catalog
             .call_routine_oid(
                 transition_oid,
                 &arguments[..1 + values.len()],
@@ -2399,6 +2426,7 @@ impl<'a> AggState<'a> {
             ));
         }
         self.best = Some(state);
+        self.custom_state_form = form;
         self.custom_state_initialized = true;
         Ok(())
     }
@@ -3548,14 +3576,15 @@ impl<'a> AggState<'a> {
                     continue;
                 }
                 let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                let mut forms = [DatumForm::Unknown; crate::storage::MAX_ROUTINE_ARGUMENTS];
                 for (index, value) in values.iter_mut().enumerate().take(argument_count) {
                     *value = crate::sql::exec::decode_projected_col_record(row, index, arena)?;
+                    forms[index] = crate::sql::exec::projected_datum_form(row, index);
                 }
-                // A sorted input is passed on without how it was held.
                 self.apply_custom_transition(
                     aggregate.transition_oid,
                     &values[..argument_count],
-                    &crate::sql::toast::UNRECORDED_ARGUMENTS[..argument_count],
+                    &forms[..argument_count],
                     arena,
                     catalog,
                 )?;
@@ -3582,6 +3611,10 @@ impl<'a> AggState<'a> {
         })?;
         let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut argument_type_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        // The state is passed as it is held; a direct argument is kept
+        // without how it was held, and an extra argument is NULL.
+        let mut argument_forms = [DatumForm::Unknown; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        argument_forms[0] = self.custom_state_form;
         let mut count = 0usize;
         arguments[count] = state;
         argument_type_oids[count] = if self.custom_moving {
@@ -3611,12 +3644,13 @@ impl<'a> AggState<'a> {
             .call_routine_oid(
                 final_function.function_oid,
                 &arguments[..count],
-                &crate::sql::toast::UNRECORDED_ARGUMENTS[..count],
+                &argument_forms[..count],
                 &argument_type_oids[..count],
                 self.custom_input_collation,
                 crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                 arena,
             )?
+            .map(|(value, _)| value)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,

@@ -563,6 +563,7 @@ struct Carried {
 /// into a row it writes. A written value keeps a form only when it is that
 /// very datum, as `toast_tuple_init` sees the datum it is handed: a value a
 /// trigger, cast or expression formed anew is formed again.
+#[derive(Clone)]
 pub(crate) struct CarriedForms {
     entries: [Carried; crate::storage::MAX_COLUMNS],
     count: usize,
@@ -702,6 +703,29 @@ impl CarriedForms {
         column: usize,
         meta: &crate::storage::ColumnMeta,
     ) -> Option<crate::storage::rowenc::StoredForm> {
+        self.passed_form(value, column, meta, true)
+    }
+
+    /// The form the datum `value` has in column `column` (`meta`) of the
+    /// tuple `heap_form_tuple` forms of the row written, before TOAST
+    /// stores it (a `BEFORE` row trigger's `NEW`): `None` for a value
+    /// formed anew. A datum saved out of line keeps its TOAST pointer.
+    pub(crate) fn tuple_form_of(
+        &self,
+        value: &crate::sql::types::Datum<'_>,
+        column: usize,
+        meta: &crate::storage::ColumnMeta,
+    ) -> Option<crate::storage::rowenc::StoredForm> {
+        self.passed_form(value, column, meta, false)
+    }
+
+    fn passed_form(
+        &self,
+        value: &crate::sql::types::Datum<'_>,
+        column: usize,
+        meta: &crate::storage::ColumnMeta,
+        fetch: bool,
+    ) -> Option<crate::storage::rowenc::StoredForm> {
         use crate::sql::types::ColType;
         use crate::storage::rowenc::StoredForm;
         if self.count == 0 {
@@ -723,8 +747,10 @@ impl CarriedForms {
                 )
             {
                 StoredForm::Unmodelled
-            } else {
+            } else if fetch {
                 carried.form.fetched()
+            } else {
+                carried.form
             };
             if found.is_none() || in_place {
                 found = Some(form);

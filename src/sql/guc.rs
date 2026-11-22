@@ -4507,18 +4507,10 @@ pub(crate) fn parse_unitless_int(value: &str) -> Option<i32> {
         .then_some(number as i32)
 }
 
-/// Parses an integer setting as PostgreSQL's `parse_int` and
-/// `parse_and_validate_value` do: decimal, octal or hexadecimal integers,
-/// fractional or exponent values rounded to the nearest integer, and an
-/// optional case-sensitive unit converted to the base unit.
-/// https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/misc/guc.c#L2780
-fn parse_int_setting(setting: IntSetting, value: &str) -> Result<i32, SqlError> {
-    let invalid = |hint: &'static str| {
-        if !hint.is_empty() {
-            super::eval::stash_diagnostic(None, Some(crate::sql::eval::DiagnosticText::copy(hint)));
-        }
-        invalid_setting_value(setting.name, value)
-    };
+/// PostgreSQL's `parse_int`: the integer `value` in `unit`, or the hint its
+/// failure carries.
+fn parse_int_value(setting_unit: SettingUnit, value: &str) -> Result<i32, Option<&'static str>> {
+    let invalid = |hint: &'static str| (!hint.is_empty()).then_some(hint);
     let bytes = value.as_bytes();
     let start = bytes
         .iter()
@@ -4543,7 +4535,7 @@ fn parse_int_setting(setting: IntSetting, value: &str) -> Result<i32, SqlError> 
         end += 1;
     }
     if end < bytes.len() {
-        if setting.unit == SettingUnit::None {
+        if setting_unit == SettingUnit::None {
             return Err(invalid(""));
         }
         let rest = &value[end..];
@@ -4552,11 +4544,11 @@ fn parse_int_setting(setting: IntSetting, value: &str) -> Result<i32, SqlError> 
             .position(|byte| byte.is_ascii_whitespace())
             .unwrap_or(rest.len());
         let (unit, trailing) = rest.split_at(unit_length);
-        let table = setting.unit.table();
+        let table = setting_unit.table();
         let index = (unit_length <= 9 && trailing.trim_start().is_empty())
             .then(|| table.iter().position(|(name, _)| *name == unit))
             .flatten()
-            .ok_or_else(|| invalid(setting.unit.hint()))?;
+            .ok_or_else(|| invalid(setting_unit.hint()))?;
         number *= table[index].1;
         // A fractional value rounds to the next smaller unit, if there is one.
         if let Some(&(_, smaller)) = table.get(index + 1) {
@@ -4567,7 +4559,27 @@ fn parse_int_setting(setting: IntSetting, value: &str) -> Result<i32, SqlError> 
     if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&number) {
         return Err(invalid("Value exceeds integer range."));
     }
-    let number = number as i32;
+    Ok(number as i32)
+}
+
+/// A size in kilobytes as PostgreSQL's `parse_int` reads it with
+/// `GUC_UNIT_KB`, or the hint its failure carries.
+pub(crate) fn parse_kilobytes(value: &str) -> Result<i32, Option<&'static str>> {
+    parse_int_value(SettingUnit::Kilobytes, value)
+}
+
+/// Parses an integer setting as PostgreSQL's `parse_int` and
+/// `parse_and_validate_value` do: decimal, octal or hexadecimal integers,
+/// fractional or exponent values rounded to the nearest integer, and an
+/// optional case-sensitive unit converted to the base unit.
+/// https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/misc/guc.c#L2780
+fn parse_int_setting(setting: IntSetting, value: &str) -> Result<i32, SqlError> {
+    let number = parse_int_value(setting.unit, value).map_err(|hint| {
+        if let Some(hint) = hint {
+            super::eval::stash_diagnostic(None, Some(crate::sql::eval::DiagnosticText::copy(hint)));
+        }
+        invalid_setting_value(setting.name, value)
+    })?;
     if !(setting.min..=setting.max).contains(&number) {
         let unit = setting.unit.base_name();
         return Err(sql_err!(

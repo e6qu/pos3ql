@@ -3021,7 +3021,8 @@ fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
                     eval::RoutineCallAccess::Caller,
                     &arena
                 )
-                .unwrap(),
+                .unwrap()
+                .map(|(value, _)| value),
             Some(Datum::Int4(3))
         );
         assert_eq!(
@@ -3035,7 +3036,8 @@ fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
                     eval::RoutineCallAccess::Caller,
                     &arena
                 )
-                .unwrap(),
+                .unwrap()
+                .map(|(value, _)| value),
             Some(Datum::Int4(6))
         );
         assert_eq!(
@@ -3049,7 +3051,8 @@ fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
                     eval::RoutineCallAccess::Caller,
                     &arena
                 )
-                .unwrap(),
+                .unwrap()
+                .map(|(value, _)| value),
             Some(Datum::Null)
         );
     });

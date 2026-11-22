@@ -82,6 +82,7 @@ impl<'a> SqlJsonWriter<'_, 'a> {
                             crate::sql::eval::RoutineCallAccess::Caller,
                             self.arena,
                         )?
+                        .map(|(value, _)| value)
                         .ok_or_else(|| {
                             sql_err!(
                                 sqlstate::UNDEFINED_FUNCTION,
@@ -392,6 +393,7 @@ pub(crate) fn sql_json_cast<'a>(
             crate::sql::eval::DomainCoercion::Input,
             arena,
             hooks.sequences,
+            crate::sql::toast::DatumForm::Unknown,
         )? {
             return Ok(value);
         }
@@ -620,6 +622,7 @@ pub(crate) fn populate_record_from_json<'a>(
             crate::sql::eval::DomainCoercion::Input,
             arena,
             hooks.sequences,
+            crate::sql::toast::DatumForm::Unknown,
         )?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))
 }
@@ -769,6 +772,7 @@ pub(crate) fn json_value_to_type<'a>(
                 crate::sql::eval::DomainCoercion::Input,
                 arena,
                 hooks.sequences,
+                crate::sql::toast::DatumForm::Unknown,
             )?
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type does not exist"))?
     } else if let Some(ctype) = crate::sql::types::ColType::from_oid(type_oid) {
@@ -788,6 +792,7 @@ pub(crate) fn json_value_to_type<'a>(
                 crate::sql::eval::DomainCoercion::Input,
                 arena,
                 hooks.sequences,
+                crate::sql::toast::DatumForm::Unknown,
             )?
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type does not exist"))?
     };

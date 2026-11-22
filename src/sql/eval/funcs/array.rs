@@ -157,6 +157,7 @@ pub(crate) fn coerce_compatible_arguments<'a>(
                         crate::sql::eval::DomainCoercion::Assignment,
                         arena,
                         hooks.sequences,
+                        crate::sql::toast::DatumForm::Unknown,
                     )
                     // An array's text is input, which fails at the literal.
                     .map_err(|error| match args[index] {
@@ -481,6 +482,7 @@ pub(crate) fn dispatch<'a>(
                                     crate::sql::eval::DomainCoercion::Assignment,
                                     arena,
                                     hooks.sequences,
+                                    crate::sql::toast::DatumForm::Unknown,
                                 )?
                                 .ok_or_else(|| {
                                     sql_err!(

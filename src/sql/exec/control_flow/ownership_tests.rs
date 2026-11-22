@@ -513,7 +513,10 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
         let mut status =
             TriggerExecutionStatus::new(&arena, &code, &locals, 0, &pool, &pool).unwrap();
         drop(status.control_frames.take().unwrap());
-        let mut values = [Datum::Text("outside"), Datum::Int4(0)];
+        let mut values = [
+            LocalSlot::formed(Datum::Text("outside")),
+            LocalSlot::formed(Datum::Int4(0)),
+        ];
         for success in [false, true] {
             // Calls share the reusable numeric workspace, while each call has
             // its own control stack and completion position.
@@ -561,7 +564,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             assert_eq!(scope.len(), 4);
             assert_eq!(scope[3].name.as_str(), "j");
             assert_eq!(scope[3].scope, PlpgsqlScope::frame(3));
-            current[1] = Datum::Int4(41);
+            current[1] = LocalSlot::formed(Datum::Int4(41));
             status.set_found(false);
             let inner = frames.pop();
             frames.finish(inner, &locals, &mut values, &mut status, success);
@@ -581,7 +584,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
                     .iter()
                     .all(|local| local.name == SqlName::EMPTY)
             );
-            assert!(workspace.values.iter().all(Datum::is_null));
+            assert!(workspace.values.iter().all(|slot| slot.value.is_null()));
             status.numeric_frames.restore(workspace);
         }
     });
@@ -630,7 +633,10 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
             TriggerExecutionStatus::new(&workspace, &code, &locals, 0, &pool, &pool).unwrap();
         let mut retained = status.control_frames.take().unwrap();
 
-        let mut values = [Datum::Text("outside counter"), Datum::Text("before")];
+        let mut values = [
+            LocalSlot::formed(Datum::Text("outside counter")),
+            LocalSlot::formed(Datum::Text("before")),
+        ];
         {
             let mut frames = retained.execution(&workspace, &code).unwrap();
             frames.start(program.body);
@@ -653,7 +659,9 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
             };
             frames.enter(entry);
             let (_, current, _) = frames.scope(&locals, &mut values);
-            current[1] = Datum::Text(workspace.alloc_str("changed once before waiting").unwrap());
+            current[1] = LocalSlot::formed(Datum::Text(
+                workspace.alloc_str("changed once before waiting").unwrap(),
+            ));
             let TriggerStatement::While(program) = program.block.statements[0] else {
                 panic!("while loop")
             };
@@ -834,6 +842,7 @@ fn row_loop_resources_release_once_on_pop_and_owner_drop() {
                     &row_pool,
                     TriggerForRows {
                         values: &[Datum::Text("owned row")],
+                        forms: super::super::ForRowForms::NotCarried,
                         empty: Datum::Null,
                         width: 1,
                     },
@@ -1338,10 +1347,10 @@ fn lexical_variable_values_types_and_domains_select_one_binding() {
         SqlName::parse("state_domain").unwrap(),
     ));
     let values = [
-        Datum::Int4(1),
-        Datum::Int4(42),
-        Datum::Int4(7),
-        Datum::Int4(8),
+        LocalSlot::formed(Datum::Int4(1)),
+        LocalSlot::formed(Datum::Int4(42)),
+        LocalSlot::formed(Datum::Int4(7)),
+        LocalSlot::formed(Datum::Int4(8)),
     ];
     crate::mem::guard::forbid_alloc(|| {
         for (index, local) in locals.iter().enumerate() {
@@ -1353,7 +1362,7 @@ fn lexical_variable_values_types_and_domains_select_one_binding() {
                 local.name.as_str(),
             )
             .unwrap();
-            assert_eq!(selected.value, values[index]);
+            assert_eq!(values[index], selected.value);
             assert_eq!(selected.ctype, ColType::Int4);
             assert_eq!(selected.user_type.is_some(), index == 2);
             if let Some(domain) = selected.user_type {
@@ -1410,7 +1419,10 @@ fn lexical_variable_values_types_and_domains_select_one_binding() {
         ];
         let selected = plpgsql_variable(
             &declarations,
-            &[Datum::Int4(7), Datum::Text("body local")],
+            &[
+                LocalSlot::formed(Datum::Int4(7)),
+                LocalSlot::formed(Datum::Text("body local")),
+            ],
             invocation,
             Some(false),
             "value",
@@ -1608,9 +1620,10 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
         let mut execution =
             ExecutionFrame::new(&workspace, &code, &locals, 1, &controls, &rows).unwrap();
         execution.status.set_output_locals(&[0], locals.len());
-        execution.values[0] = Datum::Text(workspace.alloc_str("outside counter").unwrap());
+        execution.values[0] =
+            LocalSlot::formed(Datum::Text(workspace.alloc_str("outside counter").unwrap()));
         let large = workspace.alloc_slice_with(4096, |_| b'z').unwrap();
-        execution.values[1] = Datum::Text(core::str::from_utf8(large).unwrap());
+        execution.values[1] = LocalSlot::formed(Datum::Text(core::str::from_utf8(large).unwrap()));
         execution.status.found = Some(true);
         execution.status.row_count = 37;
         execution.initialization = execution_frame::Initialization::Complete;
@@ -1641,7 +1654,7 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
             };
             let (locals, values, _) = frames.scope(&execution.locals, &mut execution.values);
             let changed = workspace.alloc_slice_with(128, |_| b'a').unwrap();
-            values[1] = Datum::Text(core::str::from_utf8(changed).unwrap());
+            values[1] = LocalSlot::formed(Datum::Text(core::str::from_utf8(changed).unwrap()));
             let Step::Enter(entry) = start_numeric_loop(
                 inner,
                 1,
@@ -1659,7 +1672,7 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
             frames.enter(entry);
             let (_, values, _) = frames.scope(&execution.locals, &mut execution.values);
             let changed = workspace.alloc_slice_with(256, |_| b'b').unwrap();
-            values[1] = Datum::Text(core::str::from_utf8(changed).unwrap());
+            values[1] = LocalSlot::formed(Datum::Text(core::str::from_utf8(changed).unwrap()));
             frames.last_mut().next = 1;
         }
         execution.status.control_frames = Some(retained);
@@ -1716,7 +1729,7 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
         assert_eq!(execution.locals[1].type_mod, 4128);
         assert_eq!(execution.values[0], Datum::Text("outside counter"));
         assert!(
-            matches!(execution.values[1], Datum::Text(value) if value.len() == 4096 && value.bytes().all(|byte| byte == b'z'))
+            matches!(execution.values[1].value, Datum::Text(value) if value.len() == 4096 && value.bytes().all(|byte| byte == b'z'))
         );
         assert_eq!(
             execution.initialization,
@@ -1737,7 +1750,7 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
         assert_eq!(current[2], Datum::Int4(1));
         assert_eq!(current[3], Datum::Int4(1));
         assert!(
-            matches!(current[1], Datum::Text(value) if value.len() == 256 && value.bytes().all(|byte| byte == b'b'))
+            matches!(current[1].value, Datum::Text(value) if value.len() == 256 && value.bytes().all(|byte| byte == b'b'))
         );
         let inner = frames.pop();
         frames.finish(
@@ -1757,7 +1770,7 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
         );
         assert_eq!(execution.values[0], Datum::Text("outside counter"));
         assert!(
-            matches!(execution.values[1], Datum::Text(value) if value.len() == 256 && value.bytes().all(|byte| byte == b'b'))
+            matches!(execution.values[1].value, Datum::Text(value) if value.len() == 256 && value.bytes().all(|byte| byte == b'b'))
         );
         let root = frames.pop();
         frames.finish(
@@ -1818,8 +1831,8 @@ fn failed_frame_capture_preserves_live_scopes_and_drop_returns_paused_capacity()
         ];
         let mut execution =
             ExecutionFrame::new(&workspace, &code, &locals, 0, &controls, &rows).unwrap();
-        execution.values[0] = Datum::Text("outside counter");
-        execution.values[1] = Datum::Text("ordinary value");
+        execution.values[0] = LocalSlot::formed(Datum::Text("outside counter"));
+        execution.values[1] = LocalSlot::formed(Datum::Text("ordinary value"));
         execution.initialization = execution_frame::Initialization::Complete;
         let mut retained = execution.status.control_frames.take().unwrap();
         {
@@ -1845,7 +1858,7 @@ fn failed_frame_capture_preserves_live_scopes_and_drop_returns_paused_capacity()
             frames.enter(entry);
             let (_, values, _) = frames.scope(&execution.locals, &mut execution.values);
             let marker = workspace.alloc_slice_with(512, |_| b'q').unwrap();
-            values[1] = Datum::Text(core::str::from_utf8(marker).unwrap());
+            values[1] = LocalSlot::formed(Datum::Text(core::str::from_utf8(marker).unwrap()));
         }
         execution.status.control_frames = Some(retained);
         let held = rows.lease::<u8>(1536).unwrap();
@@ -1863,7 +1876,7 @@ fn failed_frame_capture_preserves_live_scopes_and_drop_returns_paused_capacity()
             assert_eq!(values[0], Datum::Text("outside counter"));
             assert_eq!(values[2], Datum::Int4(1));
             assert!(
-                matches!(values[1], Datum::Text(value) if value.len() == 512 && value.bytes().all(|byte| byte == b'q'))
+                matches!(values[1].value, Datum::Text(value) if value.len() == 512 && value.bytes().all(|byte| byte == b'q'))
             );
         }
         execution.status.control_frames = Some(retained);
@@ -1914,7 +1927,8 @@ fn declaration_capture_is_failure_preserving_and_repeated_pauses_share_metadata(
         }];
         let mut execution =
             ExecutionFrame::new(&workspace, &code, &declarations, 0, &controls, &rows).unwrap();
-        execution.values[0] = Datum::Text(workspace.alloc_str("live value").unwrap());
+        execution.values[0] =
+            LocalSlot::formed(Datum::Text(workspace.alloc_str("live value").unwrap()));
         execution.initialization = execution_frame::Initialization::Coerce(0);
         let free = controls.lease::<u8>(4096).err().unwrap().free_bytes;
         let held = controls.lease::<u8>(free).unwrap();

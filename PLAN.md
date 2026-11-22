@@ -490,24 +490,47 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   subquery passes on (PostgreSQL keeps its one-byte header). The result of
   a user-defined function is taken as formed anew, though PostgreSQL may
   return a stored datum it read.
-- [ ] PL/pgSQL forms as PostgreSQL 18.6 keeps them (measured 2026-11-22): a
-  variable filled by `:=`, `SELECT INTO`, `FOR` or `FETCH`, `NEW` and `OLD`
-  fields and a record's fields hold the datum as passed (`datumTransfer`):
-  a stored `'short'` reads 6, a compressed value its compressed size, an
-  out-of-line one its saved size (a record field read in an expression is
-  fetched in line, the record as a whole holds its stored tuple). A value an
-  expression forms keeps its four-byte header: `y := 'lit'` reads 7,
-  `z := v || ''` 9 and `v := (SELECT s ...)` 9, where pos3ql reports the
-  packed 4, 6 and 6 today; a value TOAST may have stored otherwise is
-  refused (`0A000`). Needs a form slot beside each local, carried through
-  scope construction, `SavedValues` and trigger rows.
-- [ ] Composite forms not carried yet: storing a composite value that holds
-  a compressed or out-of-line field (`0A000`; PostgreSQL stores the datum as
-  formed), the one-byte header a short composite gets when a sort or a
-  materialized CTE forms it into a tuple, and a derived table's whole-row
-  output PostgreSQL pulls up into the outer query (a field of it reads the
-  stored column there). A whole-row reference, `ROW(...)` and a field of
-  either already keep their values' stored forms (`987`).
+- [x] PL/pgSQL variables keep the datum they are given (`datumTransfer`):
+  each variable's slot records how it holds its value. A simple
+  expression's result keeps the header the expression gave it (`y := 'lit'`
+  reads 7, `z := v || ''` 9), a copy of a variable keeps that variable's
+  form, and a query's result (`SELECT INTO`, an expression with a subquery,
+  a `FOR` or `FETCH` row, a procedure's outputs) is read from a result
+  tuple, which packs a short value (`SELECT 'lit' INTO a` reads 4) and
+  keeps a stored value's TOAST form when the query carries it (`SELECT big
+  INTO w` reads 44); a record keeps its fields' forms. A `FOR` loop over a
+  static or `EXECUTE` query keeps each row's forms in its scalar, record or
+  target-list variables (`FOR v IN SELECT big` reads 44) (`992`).
+- [ ] PL/pgSQL forms not carried yet: a parameter's (the caller's
+  argument expression is not traced through routine input preparation and
+  the saved invocation log: a short value is taken as packed, a longer one
+  is `0A000`), a long value a `FETCH` row or a `RETURNS TABLE` query passes
+  on, a long value a query forms anew for `SELECT INTO` or a `FOR` loop
+  (`FOR v IN SELECT big || ''` reads 3004; query results report a formed
+  value and one whose form they do not carry alike, so it is `0A000`), and `NEW` and `OLD` columns TOAST may store otherwise (`0A000`;
+  PostgreSQL reads a `BEFORE` trigger's `NEW` as formed, 3004, and an
+  `AFTER` trigger's as stored, 44; the firing path and queued `AFTER`
+  events carry row values without forms).
+- [ ] Composite forms not carried yet: the one-byte header a short
+  composite gets when a sort or a materialized CTE forms it into a tuple, a
+  derived table's whole-row output PostgreSQL pulls up into the outer query
+  (a field of it reads the stored column there), and a composite column
+  TOAST compresses as a whole: pglz reads the datum's bytes, whose header
+  holds the row type's OID, which pos3ql assigns differently, so its form is
+  unmodelled and `pg_column_size` of it is `0A000`. A whole-row reference,
+  `ROW(...)`, a field of either, and a stored composite with its fields
+  (nested composites and array elements included) keep their stored forms
+  (`987`, `990`). Not yet: a stored composite passed on through a derived
+  table, sort or materialized CTE keeps its packed one-byte header in
+  PostgreSQL (pos3ql reports the four-byte one); a field of an array element
+  (`(v[1]).a`) and the fields of a whole row an aggregate such as `array_agg`
+  collects have unmodelled forms (`0A000`); a table row type stored before
+  `ALTER TABLE ... DROP COLUMN` keeps the dropped value, whose type the
+  table no longer records: a fixed-width by-value one is sized by the
+  layout the table keeps, any other is `0A000`; an array of composites
+  inside a stored composite whose elements hold compressed fields is
+  refused (`0A000`), as is binary logical replication of an array of a
+  named composite type.
 - [ ] A short value a subquery PostgreSQL does not materialize passes on
   (`(SELECT a || '' x ... LIMIT 5) s`, a subquery without `FROM`) keeps its
   four-byte header; `pg_column_size` reports the packed one-byte form today.
@@ -551,6 +574,9 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 
 #### Constant folding, literals and positions
 
+- [ ] A PL/pgSQL `CALL` whose argument holds a subquery reports the error
+  with `CONTEXT: SQL statement "CALL ..."`; PostgreSQL positions it in the
+  statement (`QUERY:` with a `LINE` caret) under the `at CALL` context.
 - [ ] Fold aggregate arguments, window specifications, `FROM` subqueries,
   `MERGE` into a view, join conditions inside a parenthesized join and custom
   plan parameters; fold a routine's statement once per session.

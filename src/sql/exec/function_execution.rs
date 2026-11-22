@@ -100,9 +100,11 @@ impl ReturnBinding {
             (
                 Self::OutputValue(local),
                 None | Some(TriggerFlow::Return(TriggerReturnValue::Void)),
-            ) => Ok(FunctionOutput::Scalar(
-                local.map_or(Datum::Null, |index| execution.values[index]),
-            )),
+            ) => {
+                Ok(FunctionOutput::Scalar(local.map_or(Datum::Null, |index| {
+                    execution.values[index].value
+                })))
+            }
             (
                 Self::OutputRecord(outputs),
                 None | Some(TriggerFlow::Return(TriggerReturnValue::Void)),
@@ -126,7 +128,7 @@ impl ReturnBinding {
                         type_mod: -1,
                         value: output
                             .local
-                            .map_or(Datum::Null, |index| execution.values[index]),
+                            .map_or(Datum::Null, |index| execution.values[index].value),
                     };
                 }
                 Ok(FunctionOutput::Scalar(Datum::Record(fields)))
@@ -658,7 +660,7 @@ fn run_body<'a>(
     code: &CompiledProgram<'a>,
     invocation: TriggerInvocation<'a>,
     context: &mut TriggerExecContext<'_, 'a, '_>,
-    seeded: &[Datum<'a>],
+    seeded: &[LocalSlot<'a>],
     boundary: super::super::txn::StatementMark,
     retained: bool,
 ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
@@ -703,9 +705,9 @@ fn seeded_arguments<'a>(
     parameters: &[RoutineParameterDef],
     inputs: &[Datum<'a>],
     arena: &'a Arena,
-) -> Result<&'a [Datum<'a>], SqlError> {
+) -> Result<&'a [LocalSlot<'a>], SqlError> {
     let seeded = arena
-        .alloc_slice_with(parameter_variable_count(parameters), |_| Datum::Null)
+        .alloc_slice_with(parameter_variable_count(parameters), |_| LocalSlot::NULL)
         .map_err(|_| super::super::query::arena_full_pub())?;
     seed_routine_parameters(parameters, inputs, seeded)?;
     Ok(seeded)

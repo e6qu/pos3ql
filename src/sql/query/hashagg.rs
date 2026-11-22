@@ -819,8 +819,9 @@ impl GroupKeys for ProjectedKeys<'_> {
 
     fn entry_len(&mut self, row: &[u8]) -> Result<usize, SqlError> {
         // A composite value's fields are sized through the catalog.
+        let catalog = crate::sql::query::storage_catalog(self.storage, self.arena, self.txid);
         let sizing = crate::sql::query::postgres_memory::Sizing {
-            catalog: Some((self.storage, self.txid)),
+            catalog: Some(&catalog),
             scratch: self.arena,
         };
         crate::sql::query::postgres_memory::projected_tuple_len(

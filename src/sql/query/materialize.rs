@@ -1632,7 +1632,12 @@ pub(crate) fn finalize_projected_row<'a>(
             SelectItem::Expr { expression, .. } => {
                 if d.postponed[i] {
                     out[slot] = eval_full(expression, arena, params, &row, hooks)?;
-                    forms[slot] = crate::sql::toast::passed_form(expression, &row, &out[slot])?;
+                    forms[slot] = crate::sql::toast::passed_form(
+                        expression,
+                        &row,
+                        hooks.catalog,
+                        &out[slot],
+                    )?;
                 }
                 slot += 1;
             }

@@ -624,9 +624,22 @@ pub(super) fn resolve_generated(
 ) -> Result<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>, SqlError> {
     let expression = crate::sql::parser::parse_expr(text, arena)?;
     if expression.contains_subquery() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use subquery in column generation expression"
+        // The expression's text lies in the statement; the error points at
+        // the subquery there.
+        let (positioned, copies) = crate::sql::parser::parse_positioned_expression(text, arena)?;
+        let subquery = positioned.first_subquery().unwrap_or(positioned);
+        return Err(crate::sql::error_position::with_analysis_of_parsed(
+            text,
+            Some(copies),
+            || {
+                crate::sql::error_position::at_node(
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot use subquery in column generation expression"
+                    ),
+                    subquery,
+                )
+            },
         ));
     }
     if expression
@@ -666,10 +679,13 @@ pub(super) fn resolve_default(
     let Some(expression) = default else {
         return Ok(ColumnDefault::None);
     };
-    if expression.contains_subquery() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use subquery in DEFAULT expression"
+    if let Some(subquery) = expression.first_subquery() {
+        return Err(crate::sql::error_position::at_node(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot use subquery in DEFAULT expression"
+            ),
+            subquery,
         ));
     }
     let mut reference = None;
@@ -1674,9 +1690,12 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
         | Expr::QuantifiedSubquery { .. }
         | Expr::Exists(_)
         | Expr::ArraySubquery(_) => {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "cannot use subquery in check constraint"
+            return Err(crate::sql::error_position::at_node(
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot use subquery in check constraint"
+                ),
+                expression,
             ));
         }
         Expr::Unary { operand, .. }

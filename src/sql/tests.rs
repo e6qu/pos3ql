@@ -63038,7 +63038,7 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
         .creation();
     let record = crate::mem::guard::forbid_alloc(|| {
         crate::sql::exec::decode_stored_composite_text(
-            "(old,old)",
+            crate::sql::types::CompositeSpelling::plain("(old,old)"),
             composite_slot,
             2,
             &engine.storage,

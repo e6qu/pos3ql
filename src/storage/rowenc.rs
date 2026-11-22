@@ -35,7 +35,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
                 physical_fields,
                 text,
                 ..
-            } => physical_field_count_len(*physical_fields) + 4 + text.len(),
+            } => physical_field_count_len(*physical_fields) + 4 + text.raw().len(),
             Datum::Int2Vector { raw, .. } | Datum::OidVector { raw, .. } => 8 + raw.len(),
             Datum::Regtype { name, .. } => 8 + name.len(),
             Datum::RegObject { name, .. } => 12 + name.len(),
@@ -143,14 +143,16 @@ fn varlena_length(word: &[u8]) -> (usize, usize) {
     )
 }
 
-/// Whether `value`'s encoding begins with the length word a form record
-/// hangs off: the types PostgreSQL stores as varlenas that TOAST can
-/// compress or move out of line. A `tsquery` (`typstorage` plain) is
-/// always stored as `heap_form_tuple` forms it.
+/// Whether `value`'s encoding has the length word a form record hangs off:
+/// the types PostgreSQL stores as varlenas that TOAST can compress or move
+/// out of line. A `tsquery` (`typstorage` plain) is always stored as
+/// `heap_form_tuple` forms it.
 pub(crate) const fn carries_stored_form(value: &Datum<'_>) -> bool {
     matches!(
         value,
         Datum::Text(_)
+            | Datum::Composite { .. }
+            | Datum::CompositeText { .. }
             | Datum::Bpchar(_)
             | Datum::Json { .. }
             | Datum::Xml(_)
@@ -184,6 +186,7 @@ pub(crate) const fn column_carries_stored_form(column: ColType) -> bool {
             | ColType::Bit { .. }
             | ColType::Array(_)
             | ColType::Bytea
+            | ColType::Composite(_)
     )
 }
 
@@ -234,6 +237,7 @@ pub(crate) fn encode_with_forms(values: &[Datum], forms: &[StoredForm], out: &mu
                 text,
                 ..
             } => {
+                let text = text.raw();
                 let prefix = encode_physical_field_count(*physical_fields, rest);
                 rest[prefix..prefix + 4].copy_from_slice(&(text.len() as u32).to_le_bytes());
                 rest[prefix + 4..prefix + 4 + text.len()].copy_from_slice(text.as_bytes());
@@ -454,8 +458,14 @@ pub(crate) fn encode_with_forms(values: &[Datum], forms: &[StoredForm], out: &mu
             .filter(|form| *form != StoredForm::Inline)
         {
             assert!(carries_stored_form(v), "a stored form needs a length word");
-            let word = u32::from_le_bytes(rest[..4].try_into().expect("length word"));
-            rest[..4].copy_from_slice(&(word | STORED_FORM_FLAG).to_le_bytes());
+            let at = match v {
+                Datum::CompositeText {
+                    physical_fields, ..
+                } => physical_field_count_len(*physical_fields),
+                _ => 0,
+            };
+            let word = u32::from_le_bytes(rest[at..at + 4].try_into().expect("length word"));
+            rest[at..at + 4].copy_from_slice(&(word | STORED_FORM_FLAG).to_le_bytes());
             let (kind, size) = match form {
                 StoredForm::Inline => unreachable!("filtered"),
                 StoredForm::Compressed(size) => (1, size),
@@ -519,9 +529,19 @@ pub(crate) fn stored_form(
 
 /// The form an encoded value of type `ctype`, `value` bytes long, records.
 fn form_record(value: &[u8], ctype: ColType) -> Result<StoredForm, SqlError> {
+    let word_at = match ctype {
+        ColType::Composite(_) => {
+            decode_physical_field_count(value)
+                .ok_or_else(|| sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt row encoding"))?
+                .1
+        }
+        _ => 0,
+    };
     if !column_carries_stored_form(ctype)
-        || value.len() < STORED_FORM_BYTES + 4
-        || u32::from_le_bytes(value[..4].try_into().expect("length word")) & STORED_FORM_FLAG == 0
+        || value.len() < word_at + 4 + STORED_FORM_BYTES
+        || u32::from_le_bytes(value[word_at..word_at + 4].try_into().expect("length word"))
+            & STORED_FORM_FLAG
+            == 0
     {
         return Ok(StoredForm::Inline);
     }
@@ -722,7 +742,8 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         ColType::Composite(_) => {
             let (_, prefix) = decode_physical_field_count(bytes).ok_or_else(corrupt)?;
             let length = bytes.get(prefix..prefix + 4).ok_or_else(corrupt)?;
-            Some(prefix + 4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+            let (length, form_bytes) = varlena_length(length);
+            Some(prefix + 4 + length + form_bytes)
         }
     };
     let length = fixed.expect("all stored types have a length");
@@ -1255,12 +1276,14 @@ pub(crate) fn decode<'a>(
                     decode_physical_field_count(bytes.get(at..).ok_or_else(corrupt)?)
                         .ok_or_else(corrupt)?;
                 at += consumed;
-                let length = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let len = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+                let (len, form_bytes) = varlena_length(bytes.get(at..at + 4).ok_or_else(corrupt)?);
                 at += 4;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
-                at += len;
-                let text = core::str::from_utf8(raw).map_err(|_| corrupt())?;
+                at += len + form_bytes;
+                let text = crate::sql::types::CompositeSpelling::parse(
+                    core::str::from_utf8(raw).map_err(|_| corrupt())?,
+                )
+                .ok_or_else(corrupt)?;
                 out[i] = Datum::CompositeText {
                     slot: slot.ok_or_else(corrupt)?,
                     physical_fields,
@@ -1337,7 +1360,7 @@ mod tests {
                     Datum::CompositeText {
                         slot: crate::storage::TypeCreation::parse(2).unwrap(),
                         physical_fields: fields,
-                        text: &text,
+                        text: crate::sql::types::CompositeSpelling::plain(&text),
                     },
                     Datum::Int4(42),
                     Datum::Text("after"),
@@ -1378,6 +1401,53 @@ mod tests {
             17
         );
         assert!(decode_physical_field_count(&[255, 255, 127]).is_none());
+    }
+
+    #[test]
+    fn composites_keep_their_spelled_field_forms_and_their_own_form() {
+        let slot = crate::storage::TypeCreation::parse(2).unwrap();
+        let spelling =
+            crate::sql::types::CompositeSpelling::parse("(1,abc,x)\x003:c44;2.0:u;").unwrap();
+        let values = [
+            Datum::CompositeText {
+                slot,
+                physical_fields: 3 | COMPOSITE_MEMBER_IDENTITIES,
+                text: spelling,
+            },
+            Datum::Text("after"),
+        ];
+        let schema = [ColType::Composite(Some(slot)), ColType::Text];
+        let forms = [StoredForm::Unmodelled, StoredForm::Inline];
+        let mut bytes = vec![0u8; encoded_len_with_forms(&values, &forms)];
+        encode_with_forms(&values, &forms, &mut bytes);
+        let mut decoded = [Datum::Null; 2];
+        decode(&bytes, &schema, &mut decoded).unwrap();
+        let Datum::CompositeText { text, .. } = decoded[0] else {
+            panic!("composite decodes as its spelling");
+        };
+        assert_eq!(text.raw(), spelling.raw());
+        assert_eq!(text.text(), "(1,abc,x)");
+        assert_eq!(
+            text.forms().map(|(_, form)| form).collect::<Vec<_>>(),
+            [StoredForm::Compressed(44), StoredForm::Unmodelled]
+        );
+        assert!(text.forms().next().unwrap().0.is(&[3]));
+        assert_eq!(decoded[1], Datum::Text("after"));
+        let mut read = [StoredForm::Inline; 2];
+        stored_forms(&bytes, &schema, &mut read).unwrap();
+        assert_eq!(read, forms);
+        for malformed in [
+            "(1)\0",
+            "(1)\0x:c4;",
+            "(1)\x000:c04;",
+            "(1)\x000:q4;",
+            "(1)\x000:u4;",
+        ] {
+            assert!(
+                crate::sql::types::CompositeSpelling::parse(malformed).is_none(),
+                "{malformed:?} is rejected"
+            );
+        }
     }
 
     #[test]

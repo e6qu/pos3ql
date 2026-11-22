@@ -2024,6 +2024,7 @@ impl<'b> Responder<'b> {
                     });
                 }
                 Datum::CompositeText { text, .. } => {
+                    let text = text.text();
                     m.i32(text.len() as i32);
                     m.bytes(text.as_bytes());
                 }

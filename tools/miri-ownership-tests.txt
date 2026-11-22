@@ -77,6 +77,7 @@ sql::exec::control_flow::ownership_tests::positions_resolve_the_same_source_afte
 sql::exec::control_flow::ownership_tests::procedural_identifier_sources_keep_quoted_names_without_retaining_lexer_scratch
 sql::exec::loop_rows::ownership_tests::loop_value_capacity_errors_name_the_shared_pool_and_release_reservations
 sql::exec::loop_rows::ownership_tests::loop_values_keep_names_types_arrays_and_null_rows_after_source_reset
+sql::exec::loop_rows::ownership_tests::loop_values_keep_the_forms_their_query_carried
 sql::exec::numeric_loops::ownership_tests::every_procedural_branch_reserves_exact_numeric_scope_capacity
 sql::exec::numeric_loops::ownership_tests::nested_frames_reuse_backing_and_release_references_before_scratch_rewinds
 sql::exec::numeric_loops::ownership_tests::reservation_failure_names_statement_memory_without_heap_growth

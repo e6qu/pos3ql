@@ -1845,6 +1845,7 @@ mod control_flow;
 mod diagnostics;
 mod execution_frame;
 mod local_values;
+pub(crate) use local_values::{LocalForm, LocalSlot};
 mod loop_rows;
 mod numeric_loops;
 mod set_rows;
@@ -24428,9 +24429,20 @@ fn validate_trigger_when(
 ) -> Result<(), SqlError> {
     let expression = super::parser::parse_expr(source, arena)?;
     if expression.contains_subquery() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use subquery in trigger WHEN condition"
+        let (positioned, copies) = super::parser::parse_positioned_expression(source, arena)?;
+        let subquery = positioned.first_subquery().unwrap_or(positioned);
+        return Err(crate::sql::error_position::with_analysis_of_parsed(
+            source,
+            Some(copies),
+            || {
+                crate::sql::error_position::at_node(
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot use subquery in trigger WHEN condition"
+                    ),
+                    subquery,
+                )
+            },
         ));
     }
     let mut reference_error = None;
@@ -24941,13 +24953,16 @@ fn execute_plpgsql_call<'a>(
             "too many procedure arguments"
         ));
     }
-    if arguments
+    if let Some(subquery) = arguments
         .iter()
-        .any(|argument| argument.contains_subquery())
+        .find_map(|argument| argument.first_subquery())
     {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use subquery in CALL argument"
+        return Err(crate::sql::error_position::at_node(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot use subquery in CALL argument"
+            ),
+            subquery,
         ));
     }
     let arena = context.arena;
@@ -29998,19 +30013,22 @@ fn declare_routine_parameters(
 fn seed_routine_parameters<'a>(
     parameters: &[RoutineParameterDef],
     inputs: &[Datum<'a>],
-    values: &mut [Datum<'a>],
+    values: &mut [LocalSlot<'a>],
 ) -> Result<usize, SqlError> {
     let count = parameter_variable_count(parameters);
-    values[..count].fill(Datum::Null);
+    values[..count].fill(LocalSlot::NULL);
     let mut input_index = 0usize;
     for (value, parameter) in values.iter_mut().zip(parameters) {
         if parameter.mode.is_input() {
-            *value = inputs.get(input_index).copied().ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "routine inputs do not match its parameters"
-                )
-            })?;
+            *value = LocalSlot {
+                value: inputs.get(input_index).copied().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine inputs do not match its parameters"
+                    )
+                })?,
+                form: LocalForm::Passed,
+            };
             input_index += 1;
         }
     }
@@ -31734,10 +31752,10 @@ fn procedure_seeded_values<'a>(
     routine: &crate::storage::RoutineDef,
     inputs: &'a [Datum<'a>],
     arena: &'a Arena,
-) -> Result<&'a [Datum<'a>], SqlError> {
+) -> Result<&'a [LocalSlot<'a>], SqlError> {
     let seeded = arena
         .alloc_slice_with(parameter_variable_count(routine.parameters()), |_| {
-            Datum::Null
+            LocalSlot::NULL
         })
         .map_err(|_| super::query::arena_full_pub())?;
     seed_routine_parameters(routine.parameters(), inputs, seeded)?;
@@ -31756,7 +31774,7 @@ fn procedure_output_values<'a>(
             continue;
         }
         outputs[output_count] = parameter_slot(&execution.locals, index, parameter)
-            .map_or(Datum::Null, |slot| execution.values[slot]);
+            .map_or(Datum::Null, |slot| execution.values[slot].value);
         output_count += 1;
     }
     output_count
@@ -32347,9 +32365,9 @@ struct PlpgsqlVariable<'a> {
     value: Datum<'a>,
     ctype: ColType,
     user_type: Option<crate::storage::UserTypeName>,
-    /// A special variable PL/pgSQL forms (`FOUND`, `TG_*`, `SQLSTATE`,
-    /// `SQLERRM`), never a datum read from a stored row.
-    formed: bool,
+    /// How the variable holds its datum; a special variable PL/pgSQL forms
+    /// (`FOUND`, `TG_*`, `SQLSTATE`, `SQLERRM`) holds it as formed.
+    form: LocalForm,
 }
 
 impl<'a> PlpgsqlVariable<'a> {
@@ -32366,13 +32384,13 @@ impl<'a> PlpgsqlVariable<'a> {
 /// `record` has none until it is assigned.
 fn plpgsql_row_variable(
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'_>],
+    values: &[LocalSlot<'_>],
     name: &str,
 ) -> Option<crate::sql::eval::RowVariable> {
     use crate::sql::eval::RowVariable;
     let index = plpgsql_slot(locals, |local| local.name.as_str() == name)?;
     let local = locals[index];
-    match values[index] {
+    match values[index].value {
         Datum::Null => match (local.record_shape, local.ctype) {
             (Some(PlpgsqlRecordShape::Table { row_type, .. }), _) => {
                 Some(RowVariable::Declared(row_type))
@@ -32390,7 +32408,7 @@ fn plpgsql_row_variable(
 
 fn plpgsql_variable<'a>(
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
+    values: &[LocalSlot<'a>],
     invocation: TriggerInvocation<'a>,
     found: Option<bool>,
     name: &str,
@@ -32408,15 +32426,15 @@ fn plpgsql_variable<'a>(
             }),
             ctype: ColType::Text,
             user_type: None,
-            formed: true,
+            form: LocalForm::Formed,
         });
     }
     if let Some(index) = local {
         return Some(PlpgsqlVariable {
-            value: values[index],
+            value: values[index].value,
             ctype: locals[index].ctype,
             user_type: locals[index].user_type,
-            formed: false,
+            form: values[index].form,
         });
     }
     if let Some(field) = plpgsql_context_field(invocation.program_kind, name) {
@@ -32424,14 +32442,14 @@ fn plpgsql_variable<'a>(
             value: invocation.value(field),
             ctype: field.ctype(),
             user_type: None,
-            formed: true,
+            form: LocalForm::Formed,
         });
     }
     TriggerStatusVariable::parse(name).map(|_| PlpgsqlVariable {
         value: found.map(Datum::Bool).unwrap_or(Datum::Null),
         ctype: ColType::Bool,
         user_type: None,
-        formed: true,
+        form: LocalForm::Formed,
     })
 }
 
@@ -32471,7 +32489,7 @@ fn plpgsql_record_index(locals: &[TriggerLocalDecl], qualifier: &str) -> Option<
 
 fn plpgsql_labeled_variable<'a>(
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
+    values: &[LocalSlot<'a>],
     invocation: TriggerInvocation<'a>,
     found: Option<bool>,
     qualifier: &str,
@@ -32479,10 +32497,10 @@ fn plpgsql_labeled_variable<'a>(
 ) -> Option<PlpgsqlVariable<'a>> {
     if let Some(index) = plpgsql_labeled_index(locals, qualifier, name) {
         return Some(PlpgsqlVariable {
-            value: values[index],
+            value: values[index].value,
             ctype: locals[index].ctype,
             user_type: locals[index].user_type,
-            formed: false,
+            form: values[index].form,
         });
     }
     // The routine's label also names FOUND and its context variables.
@@ -32497,7 +32515,7 @@ fn plpgsql_labeled_variable<'a>(
 
 struct TriggerLocalScope<'t, 'a> {
     locals: &'t [TriggerLocalDecl],
-    values: &'t [Datum<'a>],
+    values: &'t [LocalSlot<'a>],
     found: Option<bool>,
     invocation: TriggerInvocation<'a>,
     transition: &'t TriggerTransition<'t, 't, 'a>,
@@ -32678,16 +32696,29 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
-        if self
-            .named(qualifier, name)
-            .is_some_and(|variable| variable.formed)
-        {
-            return Ok(None);
+        match self.named(qualifier, name).map(|variable| variable.form) {
+            Some(LocalForm::Formed) => return Ok(None),
+            Some(LocalForm::Stored(form)) => return Ok(Some(form)),
+            Some(LocalForm::Passed) | None => {}
         }
-        // This row does not keep its values' stored forms.
+        // A record variable holds its fields as the row it was given did.
+        let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
+        if let Some(index) = self.record_index(qualifier, name)
+            && let Datum::Record(fields) | Datum::Composite { fields, .. } =
+                self.values[index].value
+            && let Some(field) = fields.iter().find(|field| field.name == name)
+        {
+            return Ok(Some(field.form));
+        }
+        // A parameter or a trigger row's column.
         Ok(crate::sql::toast::unknown_form(
             &self.lookup(qualifier, name)?,
         ))
+    }
+
+    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.named(qualifier, name)
+            .is_some_and(|variable| variable.form == LocalForm::Formed)
     }
 
     fn procedural_variable(
@@ -32699,7 +32730,7 @@ where
         let answers = self.named(qualifier, name).is_some()
             || self
                 .record_index(qualifier, name)
-                .and_then(|index| match self.values[index] {
+                .and_then(|index| match self.values[index].value {
                     Datum::Record(fields) | Datum::Composite { fields, .. } => Some(fields),
                     _ => None,
                 })
@@ -32793,10 +32824,10 @@ where
         let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
         let index = self.record_index(qualifier, name)?;
         PlpgsqlVariable {
-            value: self.values[index],
+            value: self.values[index].value,
             ctype: self.locals[index].ctype,
             user_type: self.locals[index].user_type,
-            formed: false,
+            form: self.values[index].form,
         }
         .record_field(name)
         .map(|field| field.type_oid)
@@ -32813,7 +32844,7 @@ where
         let Some(index) = self.record_index(Some(qualifier), name) else {
             return Ok(());
         };
-        if !self.values[index].is_null() {
+        if !self.values[index].value.is_null() {
             return Ok(());
         }
         let local = self.locals[index];
@@ -32882,7 +32913,7 @@ where
         if let Some(qualifier) = qualifier
             && let Some(index) = self.record_index(Some(qualifier), name)
         {
-            let fields = match self.values[index] {
+            let fields = match self.values[index].value {
                 Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
                 // A row-typed variable that was never assigned reads its
                 // fields as NULL; `check_unassigned_row_field` checks the
@@ -32960,14 +32991,15 @@ where
                 (ctype, _) => ctype,
             })
             .or_else(|| {
-                self.record_index(qualifier, name)
-                    .and_then(|index| match self.values[index] {
+                self.record_index(qualifier, name).and_then(|index| {
+                    match self.values[index].value {
                         Datum::Record(fields) | Datum::Composite { fields, .. } => fields
                             .iter()
                             .find(|field| field.name == name)
                             .and_then(|field| ColType::from_oid(field.type_oid)),
                         _ => None,
-                    })
+                    }
+                })
             })
             .or_else(|| self.transition.col_type(qualifier, name))
     }
@@ -33147,7 +33179,7 @@ fn detached_trigger_datum<'a>(value: Datum<'_>, arena: &'a Arena) -> Result<Datu
 pub(crate) struct TriggerDmlSnapshot<'a> {
     definition: crate::storage::RelationDefinition<'a>,
     locals: &'a [TriggerLocalDecl],
-    values: &'a [Datum<'a>],
+    values: &'a [LocalSlot<'a>],
     invocation: TriggerInvocation<'a>,
     found: Option<bool>,
     old: TriggerRecordValue<'a, 'a>,
@@ -33185,16 +33217,19 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
-        if self
-            .named(qualifier, name)
-            .is_some_and(|variable| variable.formed)
-        {
-            return Ok(None);
+        match self.named(qualifier, name).map(|variable| variable.form) {
+            Some(LocalForm::Formed) => Ok(None),
+            Some(LocalForm::Stored(form)) => Ok(Some(form)),
+            // A parameter, a record field or a trigger row's column.
+            Some(LocalForm::Passed) | None => Ok(crate::sql::toast::unknown_form(
+                &self.lookup(qualifier, name)?,
+            )),
         }
-        // This row does not keep its values' stored forms.
-        Ok(crate::sql::toast::unknown_form(
-            &self.lookup(qualifier, name)?,
-        ))
+    }
+
+    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.named(qualifier, name)
+            .is_some_and(|variable| variable.form == LocalForm::Formed)
     }
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -33309,10 +33344,14 @@ fn snapshot_trigger_dml_scope<'a>(
         .alloc_slice_copy(scope.locals)
         .map_err(|_| super::query::arena_full_pub())?;
     let values = arena
-        .alloc_slice_with(scope.values.len(), |_| Datum::Null)
+        .alloc_slice_with(scope.values.len(), |_| LocalSlot::NULL)
         .map_err(|_| super::query::arena_full_pub())?;
+    // A copy of a variable's datum keeps how the variable holds it.
     for (index, value) in values.iter_mut().enumerate() {
-        *value = detached_trigger_datum(scope.values[index], arena)?;
+        *value = LocalSlot {
+            value: detached_trigger_datum(scope.values[index].value, arena)?,
+            form: scope.values[index].form,
+        };
     }
     let copy_record =
         |record: TriggerRecordValue<'_, 'a>| -> Result<TriggerRecordValue<'a, 'a>, SqlError> {
@@ -37519,7 +37558,7 @@ fn execute_static_rewritten_write<'a>(
     captured: &'a [super::cursor::CursorLocal<'a>],
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     into: Option<PlpgsqlInto<'a>>,
     status: &mut TriggerExecutionStatus<'a>,
     mut progress: Option<&mut RowProgress>,
@@ -38028,11 +38067,11 @@ fn trigger_exception_matches(condition: TriggerExceptionCondition, error: &SqlEr
 fn allocate_plpgsql_local_values<'a>(
     pool: &std::sync::Arc<LeasePool>,
     count: usize,
-) -> Result<MutableSlice<Datum<'a>>, SqlError> {
+) -> Result<MutableSlice<local_values::LocalSlot<'a>>, SqlError> {
     let mut values = pool.lease(count).map_err(control_flow::execution_full)?;
     for _ in 0..count {
         values
-            .push_reserved(Datum::Null)
+            .push_reserved(local_values::LocalSlot::NULL)
             .map_err(control_flow::execution_full)?;
     }
     Ok(values)
@@ -38463,7 +38502,7 @@ fn field_path_expression<'a>(
 fn plpgsql_field_path_assignment<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
+    values: &[LocalSlot<'a>],
     assignment: TriggerLocalAssignment<'a>,
 ) -> Result<TriggerLocalAssignment<'a>, SqlError> {
     let name = assignment.name;
@@ -38539,7 +38578,7 @@ fn plpgsql_field_path_assignment<'a>(
     let storage = context.storage();
     let txid = context.txn.txid;
     let catalog = super::query::storage_catalog(storage, arena, txid);
-    let record_fields = match (values[record], local.ctype) {
+    let record_fields = match (values[record].value, local.ctype) {
         (Datum::Record(fields) | Datum::Composite { fields, .. }, _) => Some(fields),
         (Datum::Null, ColType::Composite(Some(_))) => {
             let type_oid = storage
@@ -38674,13 +38713,67 @@ fn trigger_record_path_assignment<'a>(
     }))
 }
 
+/// How a variable assigned `value`, the result of `expression` over
+/// `scope`, holds it: a simple expression's result as the expression gave
+/// it, and an expression with a subquery, which PL/pgSQL runs as a query,
+/// as its result tuple holds it.
+fn assigned_local_form(
+    expression: &Expr<'_>,
+    scope: &dyn ColumnLookup<'_>,
+    value: &Datum<'_>,
+) -> Result<LocalForm, SqlError> {
+    use crate::sql::toast::{passed_form, reads_stored_datum};
+    if expression.contains_subquery() {
+        return Ok(LocalForm::Stored(passed_form(
+            expression, scope, None, value,
+        )?));
+    }
+    Ok(match reads_stored_datum(expression, scope, value)? {
+        Some(true) => LocalForm::Stored(passed_form(expression, scope, None, value)?),
+        Some(false) => LocalForm::Formed,
+        None => LocalForm::Stored(crate::storage::StoredForm::Unmodelled),
+    })
+}
+
+/// A variable assigned `value`, a column of a query's result row holding it
+/// in `form`: SPI's result tuple packs a short value, and a value TOAST may
+/// store otherwise keeps a form only the row carries.
+fn result_tuple_slot(value: Datum<'_>, form: crate::storage::StoredForm) -> LocalSlot<'_> {
+    let form = match form {
+        crate::storage::StoredForm::Inline => {
+            crate::sql::toast::unknown_form(&value).unwrap_or(crate::storage::StoredForm::Inline)
+        }
+        form => form,
+    };
+    LocalSlot {
+        value,
+        form: LocalForm::Stored(form),
+    }
+}
+
+impl<'a> LocalSlot<'a> {
+    /// This slot after converting its value to `converted`: a conversion
+    /// that formed a new datum holds it as formed.
+    fn converted(self, converted: Datum<'a>) -> Self {
+        Self {
+            value: converted,
+            form: if crate::sql::toast::same_datum_identity(&self.value, &converted) {
+                self.form
+            } else {
+                LocalForm::Formed
+            },
+        }
+    }
+}
+
 fn assign_trigger_local<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
-    values: &mut [Datum<'a>],
+    values: &mut [LocalSlot<'a>],
     target: PlpgsqlVariableName,
-    value: Datum<'a>,
+    assigned: LocalSlot<'a>,
 ) -> Result<(), SqlError> {
+    let value = assigned.value;
     let index = match trigger_local_index(locals, target) {
         Ok(index) => index,
         // `r.f := ...` names field `f` of row variable `r` when no block
@@ -38714,14 +38807,14 @@ fn assign_trigger_local<'a>(
         context.seq_session(),
         context.txn.txid,
     );
-    values[index] = coerce_plpgsql_local(
+    values[index] = assigned.converted(coerce_plpgsql_local(
         locals[index],
         value,
         context.storage(),
         context.txn.txid,
         context.arena,
         &sequences,
-    )?;
+    )?);
     Ok(())
 }
 
@@ -38883,14 +38976,15 @@ fn assign_plpgsql_into_target<'a>(
     definition: crate::storage::RelationDefinition<'_>,
     records: &mut TriggerRows<'_, 'a>,
     locals: &[TriggerLocalDecl],
-    values: &mut [Datum<'a>],
+    values: &mut [LocalSlot<'a>],
     target: PlpgsqlVariableName,
     resolved: PlpgsqlIntoTarget,
-    value: Datum<'a>,
+    assigned: LocalSlot<'a>,
 ) -> Result<(), SqlError> {
+    let value = assigned.value;
     let (record, column) = match resolved {
         PlpgsqlIntoTarget::Local(_) => {
-            return assign_trigger_local(context, locals, values, target, value);
+            return assign_trigger_local(context, locals, values, target, assigned);
         }
         PlpgsqlIntoTarget::TriggerRecord(record) => {
             // A query that returns no row leaves the record's structure.
@@ -38974,7 +39068,7 @@ fn assign_trigger_record_column<'a>(
     definition: crate::storage::RelationDefinition<'_>,
     records: &mut TriggerRows<'_, 'a>,
     locals: &[TriggerLocalDecl],
-    local_values: &[Datum<'a>],
+    local_values: &[LocalSlot<'a>],
     found: Option<bool>,
     invocation: TriggerInvocation<'a>,
     record: TriggerRecordName,
@@ -39420,7 +39514,7 @@ pub(super) fn trigger_record_row<'a>(
 fn assign_trigger_record_field<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
-    values: &mut [Datum<'a>],
+    values: &mut [LocalSlot<'a>],
     record: usize,
     field: SqlName,
     value: Datum<'a>,
@@ -39462,7 +39556,8 @@ fn assign_trigger_record_field<'a>(
             .map(|fields| &*fields)
             .map_err(|_| super::query::arena_full_pub())
     };
-    let current: &[RecordField<'a>] = match (values[record], local.record_shape, local.ctype) {
+    let current: &[RecordField<'a>] = match (values[record].value, local.record_shape, local.ctype)
+    {
         (Datum::Record(fields) | Datum::Composite { fields, .. }, _, _) => fields,
         (Datum::Null, Some(PlpgsqlRecordShape::Table { slot, .. }), _) => {
             let definition = storage.table_def(usize::from(slot), txid);
@@ -39562,7 +39657,7 @@ fn assign_trigger_record_field<'a>(
         locals,
         values,
         PlpgsqlVariableName::qualified(local.label, local.name),
-        Datum::Record(&*fields),
+        LocalSlot::formed(Datum::Record(&*fields)),
     )
 }
 
@@ -39714,7 +39809,7 @@ fn trigger_condition<'a>(
     old: TriggerRecordValue<'_, 'a>,
     new: TriggerRecordValue<'_, 'a>,
     locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
+    values: &[LocalSlot<'a>],
     found: Option<bool>,
     continuation: Option<&mut Option<super::query::RoutineInvocationState>>,
 ) -> Result<bool, SqlError> {
@@ -39769,10 +39864,40 @@ fn trigger_loop_integer(value: Datum<'_>, arena: &Arena, bound: &str) -> Result<
 
 struct TriggerForRows<'a> {
     values: &'a [Datum<'a>],
+    /// How each value holds its datum.
+    forms: ForRowForms<'a>,
     empty: Datum<'a>,
     /// How many columns a scalar variable's query returns: it takes the
     /// first, and `strict_multi_assignment` reports a mismatch.
     width: usize,
+}
+
+/// The form a query's result row carries for column `index`: a result row
+/// that carries none holds each value as tuple forming gave it.
+fn form_at(carried: &[crate::storage::StoredForm], index: usize) -> crate::storage::StoredForm {
+    carried
+        .get(index)
+        .copied()
+        .unwrap_or(crate::storage::StoredForm::Inline)
+}
+
+/// The TOAST forms of a `FOR` loop's scalar values.
+#[derive(Clone, Copy)]
+enum ForRowForms<'a> {
+    /// The form of each value, read from a query's result tuple.
+    Carried(&'a [crate::storage::StoredForm]),
+    /// Values whose source does not carry their forms: record rows, which
+    /// keep their fields' forms, array elements and returned rows.
+    NotCarried,
+}
+
+impl ForRowForms<'_> {
+    fn get(self, index: usize) -> crate::storage::StoredForm {
+        match self {
+            Self::Carried(forms) => forms[index],
+            Self::NotCarried => crate::storage::StoredForm::Inline,
+        }
+    }
 }
 
 #[expect(
@@ -39793,6 +39918,7 @@ where
     'result: 'query,
 {
     let mut rows = ArenaList::new(result_arena);
+    let mut forms = ArenaList::new(result_arena);
     let mut width = 1;
     super::query::select_into_rows(
         storage,
@@ -39802,18 +39928,23 @@ where
         params,
         Some(scope),
         Some(sequence),
-        &mut |values, _| {
+        &mut |values, carried| {
             // PostgreSQL assigns the first column; others are left over.
             width = values.len();
             let value = detached_trigger_datum(
                 values.first().copied().unwrap_or(Datum::Null),
                 result_arena,
             )?;
-            rows.push(value).map_err(|_| super::query::arena_full_pub())
+            rows.push(value)
+                .map_err(|_| super::query::arena_full_pub())?;
+            forms
+                .push(form_at(carried, 0))
+                .map_err(|_| super::query::arena_full_pub())
         },
     )?;
     Ok(TriggerForRows {
         values: rows.as_slice(),
+        forms: ForRowForms::Carried(forms.as_slice()),
         empty: Datum::Null,
         width,
     })
@@ -39871,7 +40002,8 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
             ));
         }
         let mut rows = ArenaList::new(arena);
-        execute_bound_plpgsql_dynamic_query(context, query, &mut |values, _| {
+        let mut row_forms = ArenaList::new(arena);
+        execute_bound_plpgsql_dynamic_query(context, query, &mut |values, carried| {
             if values.len() != width {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -39888,7 +40020,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 }; MAX_PROJ];
                 for index in 0..width {
                     row_fields[index] = RecordField {
-                        form: crate::storage::StoredForm::Inline,
+                        form: form_at(carried, index),
                         name: fields[index].0,
                         type_oid: fields[index].1,
                         type_mod: fields[index].2,
@@ -39902,6 +40034,9 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
             } else {
                 detached_trigger_datum(values[0], arena)?
             };
+            row_forms
+                .push(form_at(carried, 0))
+                .map_err(|_| super::query::arena_full_pub())?;
             rows.push(value).map_err(|_| super::query::arena_full_pub())
         })?;
         let empty = if record_target && rows.as_slice().is_empty() {
@@ -39920,6 +40055,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
         };
         Ok(TriggerForRows {
             values: rows.as_slice(),
+            forms: ForRowForms::Carried(row_forms.as_slice()),
             empty,
             width: if record_target { 1 } else { width },
         })
@@ -40021,6 +40157,7 @@ fn resume_for_dml_rows<'a>(
     }
     Ok(TriggerForRows {
         values,
+        forms: ForRowForms::NotCarried,
         empty: *empty,
         width: 1,
     })
@@ -40141,6 +40278,7 @@ fn for_dml_rows<'a>(
         }
         Ok(TriggerForRows {
             values: rows.as_slice(),
+            forms: ForRowForms::NotCarried,
             empty,
             width: 1,
         })
@@ -40183,7 +40321,7 @@ where
         params,
         Some(scope),
         Some(sequence),
-        &mut |values, _| {
+        &mut |values, carried| {
             if values.len() != width {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -40199,7 +40337,7 @@ where
             }; MAX_PROJ];
             for index in 0..width {
                 fields[index] = RecordField {
-                    form: crate::storage::StoredForm::Inline,
+                    form: form_at(carried, index),
                     name: result_arena
                         .alloc_str(columns[index].name)
                         .map_err(|_| super::query::arena_full_pub())?,
@@ -40236,6 +40374,7 @@ where
     };
     Ok(TriggerForRows {
         values: rows.as_slice(),
+        forms: ForRowForms::NotCarried,
         empty,
         width: 1,
     })
@@ -40580,7 +40719,7 @@ fn execute_trigger_step<'a>(
     records: &mut TriggerRows<'_, 'a>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     statement: TriggerStatement<'a>,
     child_scope: PlpgsqlScope,
     status: &mut TriggerExecutionStatus<'a>,
@@ -40590,7 +40729,7 @@ fn execute_trigger_step<'a>(
     // `exec_stmt_open` and `exec_stmt_forc` do.
     if let TriggerStatement::CursorOpen(open) = statement
         && let Ok(local) = trigger_local_index(locals, open.variable)
-        && let Datum::Text(name) = local_values[local]
+        && let Datum::Text(name) = local_values[local].value
         && let PlpgsqlExecHost::Routine { cursors, .. } = &context.host
         && cursors.exists(name)
     {
@@ -40727,7 +40866,7 @@ fn execute_trigger_step_in<'a>(
     records: &mut TriggerRows<'_, 'a>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     statement: TriggerStatement<'a>,
     child_scope: PlpgsqlScope,
     status: &mut TriggerExecutionStatus<'a>,
@@ -40985,7 +41124,7 @@ fn execute_trigger_step_in<'a>(
                                     .map_err(|_| super::query::arena_full_pub())?;
                                 for (value, output) in values.iter_mut().zip(status.outputs.iter())
                                 {
-                                    *value = local_values[output.local];
+                                    *value = local_values[output.local].value;
                                 }
                                 values
                             }
@@ -41295,6 +41434,10 @@ fn execute_trigger_step_in<'a>(
                                 },
                             )?
                         };
+                        let assigned = LocalSlot {
+                            value,
+                            form: assigned_local_form(assignment.expression, &scope, &value)?,
+                        };
                         in_procedural_query(
                             statement,
                             crate::sql::error_context::QueryMode::Assignment,
@@ -41305,7 +41448,7 @@ fn execute_trigger_step_in<'a>(
                                     locals,
                                     local_values,
                                     assignment.name,
-                                    value,
+                                    assigned,
                                 )
                                 .map_err(|error| {
                                     // A kept plan resolves the target field
@@ -41354,6 +41497,10 @@ fn execute_trigger_step_in<'a>(
                         &scope,
                         retained_parent.then_some(&mut status.pending_query),
                     )?;
+                    let assigned = LocalSlot {
+                        value,
+                        form: assigned_local_form(assignment.expression, &scope, &value)?,
+                    };
                     if locals.iter().any(|local| assignment.name.names(local)) {
                         if let Datum::Record(fields) | Datum::Composite { fields, .. } = value
                             && let Ok(index) = trigger_local_index(locals, assignment.name)
@@ -41370,7 +41517,7 @@ fn execute_trigger_step_in<'a>(
                             locals,
                             local_values,
                             assignment.name,
-                            value,
+                            assigned,
                         )?;
                     } else if assignment.name.label.is_none()
                         && TriggerStatusVariable::parse(assignment.name.name.as_str()).is_some()
@@ -41399,7 +41546,7 @@ fn execute_trigger_step_in<'a>(
                             locals,
                             local_values,
                             assignment.name,
-                            value,
+                            assigned,
                         )?;
                     }
 
@@ -41435,7 +41582,7 @@ fn execute_trigger_step_in<'a>(
                                 statement.variable.name.as_str()
                             ));
                         }
-                        let assign_name = local_values[local].is_null();
+                        let assign_name = local_values[local].value.is_null();
                         if assign_name && locals[local].constant {
                             return Err(sql_err!(
                                 sqlstate::ERROR_IN_ASSIGNMENT,
@@ -41444,7 +41591,7 @@ fn execute_trigger_step_in<'a>(
                             ));
                         }
                         let generated;
-                        let name = match local_values[local] {
+                        let name = match local_values[local].value {
                             Datum::Text(name) => {
                                 if context.host.cursors().exists(name) {
                                     return Err(sql_err!(
@@ -41717,7 +41864,7 @@ fn execute_trigger_step_in<'a>(
                                 locals,
                                 local_values,
                                 statement.variable,
-                                Datum::Text(name),
+                                LocalSlot::formed(Datum::Text(name)),
                             )?;
                         }
 
@@ -41825,7 +41972,7 @@ fn execute_trigger_step_in<'a>(
                                 statement.variable.name.as_str()
                             ));
                         }
-                        let Datum::Text(name) = local_values[local] else {
+                        let Datum::Text(name) = local_values[local].value else {
                             return Err(sql_err!(
                                 sqlstate::NULL_VALUE_NOT_ALLOWED,
                                 "cursor variable \"{}\" is null",
@@ -42002,7 +42149,10 @@ fn execute_trigger_step_in<'a>(
                                     local_values,
                                     target,
                                     targets[index],
-                                    values[index],
+                                    result_tuple_slot(
+                                        values[index],
+                                        crate::storage::StoredForm::Inline,
+                                    ),
                                 )?;
                             }
                         }
@@ -42034,7 +42184,7 @@ fn execute_trigger_step_in<'a>(
                                     variable.name.as_str()
                                 ));
                             }
-                            let Datum::Text(name) = local_values[local] else {
+                            let Datum::Text(name) = local_values[local].value else {
                                 return Err(sql_err!(
                                     sqlstate::NULL_VALUE_NOT_ALLOWED,
                                     "cursor variable \"{}\" is null",
@@ -42159,7 +42309,7 @@ fn execute_trigger_step_in<'a>(
                     super::guc::PlpgsqlExtraCheck::TooManyRows,
                 )?;
                 let mut source_width = 0usize;
-                let (selected, row_count) = execute_procedural_query(
+                let (selected, selected_forms, row_count) = execute_procedural_query(
                     context,
                     // The main query reads the snapshot its WITH writes ran
                     // under, so it does not see their changes.
@@ -42167,6 +42317,7 @@ fn execute_trigger_step_in<'a>(
                     continuation,
                     |storage, sequence| {
                         let mut selected = [Datum::Null; MAX_COLUMNS];
+                        let mut selected_forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
                         let mut found = false;
                         let mut row_count = 0usize;
                         super::query::consume_query_rows(
@@ -42190,7 +42341,7 @@ fn execute_trigger_step_in<'a>(
                                     emit,
                                 )
                             },
-                            &mut |values, _| {
+                            &mut |values, forms| {
                                 if record_target && values.len() != record_width {
                                     return Err(sql_err!(
                                         sqlstate::INTERNAL_ERROR,
@@ -42210,7 +42361,10 @@ fn execute_trigger_step_in<'a>(
                                             MAX_PROJ];
                                         for (index, value) in values.iter().copied().enumerate() {
                                             row_fields[index] = RecordField {
-                                                form: crate::storage::StoredForm::Inline,
+                                                form: forms
+                                                    .get(index)
+                                                    .copied()
+                                                    .unwrap_or(crate::storage::StoredForm::Inline),
                                                 name: fields[index].0,
                                                 type_oid: fields[index].1,
                                                 type_mod: fields[index].2,
@@ -42224,11 +42378,16 @@ fn execute_trigger_step_in<'a>(
                                     } else {
                                         // Extra columns are ignored and missing
                                         // ones leave their targets NULL.
-                                        for (slot, value) in selected[..statement.targets.len()]
+                                        for (index, (slot, value)) in selected
+                                            [..statement.targets.len()]
                                             .iter_mut()
                                             .zip(values.iter().copied())
+                                            .enumerate()
                                         {
                                             *slot = detached_trigger_datum(value, arena)?;
+                                            if let Some(form) = forms.get(index) {
+                                                selected_forms[index] = *form;
+                                            }
                                         }
                                     }
                                     found = true;
@@ -42249,7 +42408,7 @@ fn execute_trigger_step_in<'a>(
                                 .map_err(|_| super::query::arena_full_pub())?;
                             selected[0] = Datum::Record(empty);
                         }
-                        Ok((selected, row_count))
+                        Ok((selected, selected_forms, row_count))
                     },
                 )?;
                 finish_plpgsql_dml_ctes(context, written, dml_ctes)?;
@@ -42300,7 +42459,7 @@ fn execute_trigger_step_in<'a>(
                             local_values,
                             statement.targets[index],
                             *resolved,
-                            selected[index],
+                            result_tuple_slot(selected[index], selected_forms[index]),
                         )?;
                     }
                     Ok(())
@@ -42869,7 +43028,11 @@ fn execute_trigger_step_in<'a>(
                             locals,
                             local_values,
                             PlpgsqlVariableName::plain(*name),
-                            outputs.values[usize::from(output)],
+                            // A procedure's outputs come back as a tuple.
+                            result_tuple_slot(
+                                outputs.values[usize::from(output)],
+                                crate::storage::StoredForm::Inline,
+                            ),
                         )?;
                     }
                 }
@@ -43175,7 +43338,13 @@ fn execute_trigger_step_in<'a>(
                                 .map_err(|_| super::query::arena_full_pub())?,
                         ),
                     };
-                    assign_trigger_local(context, locals, local_values, assignment.target, value)?;
+                    assign_trigger_local(
+                        context,
+                        locals,
+                        local_values,
+                        assignment.target,
+                        LocalSlot::formed(value),
+                    )?;
                 }
 
                 Ok(None)
@@ -43214,7 +43383,13 @@ fn execute_trigger_step_in<'a>(
                         Some(field) => exception.text(field, context.arena)?.unwrap_or(""),
                         None => "",
                     });
-                    assign_trigger_local(context, locals, local_values, assignment.target, value)?;
+                    assign_trigger_local(
+                        context,
+                        locals,
+                        local_values,
+                        assignment.target,
+                        LocalSlot::formed(value),
+                    )?;
                 }
 
                 Ok(None)
@@ -44440,6 +44615,7 @@ fn execute_trigger_step_in<'a>(
                                     }
                                     TriggerForRows {
                                         values: &*values,
+                                        forms: ForRowForms::NotCarried,
                                         empty: Datum::Null,
                                         width: 1,
                                     }
@@ -44752,12 +44928,12 @@ fn cursor_statement_effect<'s, 'a, 'b>(
     invocation: &TriggerInvocation<'a>,
     operation: CursorReceiptOperation,
     changed: &[CursorOutputSlot],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     records: &mut TriggerRows<'_, 'a>,
     status: &mut TriggerExecutionStatus<'a>,
     execute: impl FnOnce(
         &mut TriggerExecContext<'s, 'a, 'b>,
-        &mut [Datum<'a>],
+        &mut [LocalSlot<'a>],
         &mut TriggerRows<'_, 'a>,
         &mut TriggerExecutionStatus<'a>,
         &mut bool,
@@ -44969,16 +45145,19 @@ impl CursorOutputSlot {
 
     fn read<'a>(
         self,
-        local_values: &[Datum<'a>],
+        local_values: &[LocalSlot<'a>],
         records: &mut TriggerRows<'_, 'a>,
     ) -> Result<Datum<'a>, SqlError> {
         match self {
-            Self::Local(index) => local_values.get(index).copied().ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "cursor output local is unavailable"
-                )
-            }),
+            Self::Local(index) => local_values
+                .get(index)
+                .map(|slot| slot.value)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "cursor output local is unavailable"
+                    )
+                }),
             Self::Assigned(name) => Ok(Datum::Bool(records.record_mut(name).row().is_some())),
             Self::Field(name, column) => Ok(records
                 .record_mut(name)
@@ -44989,12 +45168,15 @@ impl CursorOutputSlot {
 
     fn write<'a>(
         self,
-        local_values: &mut [Datum<'a>],
+        local_values: &mut [LocalSlot<'a>],
         records: &mut TriggerRows<'_, 'a>,
         value: Datum<'a>,
     ) -> Result<(), SqlError> {
         match (self, value) {
-            (Self::Local(index), value) => local_values[index] = value,
+            // A fetched row's column, read from the cursor's result tuple.
+            (Self::Local(index), value) => {
+                local_values[index] = result_tuple_slot(value, crate::storage::StoredForm::Inline);
+            }
             (Self::Assigned(_), Datum::Bool(true)) => {}
             (Self::Assigned(name), Datum::Bool(false)) => records.record_mut(name).set_row(None),
             (Self::Field(name, column), value) => records.record_mut(name).set_field(column, value),
@@ -45097,7 +45279,7 @@ fn finish_dynamic_into<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     new_row: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     statement: PlpgsqlDynamicSelectInto<'a>,
     arguments: &[Datum<'a>],
     selected: &[Datum<'a>],
@@ -45158,7 +45340,7 @@ fn finish_dynamic_into<'a>(
                 local_values,
                 target,
                 resolved,
-                value,
+                result_tuple_slot(value, crate::storage::StoredForm::Inline),
             )?;
         }
         Ok(())
@@ -45366,7 +45548,7 @@ fn finish_static_returning<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     targets: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     into: Option<PlpgsqlInto<'a>>,
     returns: bool,
     selected: &[Datum<'a>],
@@ -45400,7 +45582,7 @@ fn store_static_returning<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     targets: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     into: Option<PlpgsqlInto<'a>>,
     returns: bool,
     selected: &[Datum<'a>],
@@ -45453,7 +45635,7 @@ fn store_static_returning<'a>(
             local_values,
             target,
             resolved,
-            value,
+            result_tuple_slot(value, crate::storage::StoredForm::Inline),
         )?;
     }
     Ok(())
@@ -45469,7 +45651,7 @@ fn finish_resumed_static_write<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     targets: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
-    local_values: &mut [Datum<'a>],
+    local_values: &mut [LocalSlot<'a>],
     into: Option<PlpgsqlInto<'a>>,
     returns: bool,
     rows: u64,
@@ -45511,7 +45693,7 @@ fn finish_resumed_static_write<'a>(
 enum StrictParameters<'s, 'a> {
     Variables {
         locals: &'s [TriggerLocalDecl],
-        values: &'s [Datum<'a>],
+        values: &'s [LocalSlot<'a>],
     },
     Arguments(&'s [Datum<'a>]),
 }
@@ -45736,7 +45918,7 @@ fn strict_parameters_detail(
                             item(
                                 &mut detail,
                                 format_args!("{}", local.name.as_str()),
-                                values[index],
+                                values[index].value,
                             )?;
                         }
                     }
@@ -63070,9 +63252,14 @@ pub fn create_table_as(
     {
         let rows_bytes = computed;
         for bytes in rows_bytes.iter() {
+            // A named composite decodes with its fields and their forms.
+            let mut decoded = [Datum::Null; MAX_COLUMNS];
+            if let Err(error) = projected::decode_projected_row_into(bytes, arena, &mut decoded) {
+                return sql_fail(error);
+            }
             let mut values = [Datum::Null; MAX_COLUMNS];
             for (i, slot) in values.iter_mut().enumerate().take(n_cols) {
-                let v = decode_projected_pub(bytes, i);
+                let v = decoded[i];
                 match coerce_assignment(
                     v,
                     &def.columns()[i],
@@ -63364,9 +63551,14 @@ pub fn refresh_materialized_view(
     }
     let n_cols = def.n_columns;
     for bytes in rows_bytes.iter() {
+        // A named composite decodes with its fields and their forms.
+        let mut decoded = [Datum::Null; MAX_COLUMNS];
+        if let Err(error) = projected::decode_projected_row_into(bytes, arena, &mut decoded) {
+            return sql_fail(error);
+        }
         let mut values = [Datum::Null; MAX_COLUMNS];
         for (i, slot_v) in values.iter_mut().enumerate().take(n_cols) {
-            let v = decode_projected_pub(bytes, i);
+            let v = decoded[i];
             match coerce_assignment(
                 v,
                 &def.columns()[i],
@@ -73209,10 +73401,13 @@ pub fn create_statistics(
                 ExtendedStatisticsKey::Column(table_definition.columns()[column].name)
             }
             StatisticsKey::Expression(expression) => {
-                if expression.expression.contains_subquery() {
-                    return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "cannot use subquery in statistics expression"
+                if let Some(subquery) = expression.expression.first_subquery() {
+                    return sql_fail(crate::sql::error_position::at_node(
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "cannot use subquery in statistics expression"
+                        ),
+                        subquery,
                     ));
                 }
                 if let Err(error) = infer_type_catalog(
@@ -79632,7 +79827,8 @@ impl CopyFilter {
             ));
         }
         // PostgreSQL analyses the condition in the statement's text.
-        crate::sql::error_position::with_analysis(|| validate_copy_predicate(predicate, def))?;
+        let read =
+            crate::sql::error_position::with_analysis(|| validate_copy_predicate(predicate, def))?;
         // The predicate is analysed with the statement, before any data is
         // read: its functions resolve and its literals run their inputs.
         let mark = arena.mark();
@@ -79670,12 +79866,18 @@ impl CopyFilter {
         if let Some(ctype) = crate::sql::eval::static_type_pub(predicate, &row)
             && ctype != ColType::Bool
         {
-            return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "argument of COPY WHERE must be type boolean, not type {}",
-                ctype.name()
-            ));
+            return Err(crate::sql::error_position::with_analysis(|| {
+                crate::sql::error_position::at_expression(
+                    sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "argument of WHERE must be type boolean, not type {}",
+                        ctype.name()
+                    ),
+                    predicate,
+                )
+            }));
         }
+        read.check_generated(def)?;
         let source = statement
             .where_text
             .expect("COPY WHERE AST retains its parsed source");
@@ -79739,7 +79941,7 @@ impl CopyFilter {
             Datum::Null => Ok(false),
             _ => Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
-                "argument of COPY WHERE must be type boolean, not type {}",
+                "argument of WHERE must be type boolean, not type {}",
                 crate::sql::eval::static_type_pub(predicate, &row)
                     .map(ColType::name)
                     .unwrap_or("unknown")
@@ -79748,13 +79950,58 @@ impl CopyFilter {
     }
 }
 
-/// COPY WHERE is a row-local predicate. PostgreSQL rejects both subqueries
-/// and generated columns before accepting any CopyData.
+/// COPY WHERE is a row-local predicate. PostgreSQL's analysis rejects
+/// subqueries, aggregates and window functions as it reaches them, then a
+/// predicate other than boolean, then one reading a generated column, before
+/// accepting any CopyData.
 fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
     expression: &Expr,
     def: &crate::storage::TableDefinition<Definition0>,
+) -> Result<CopyPredicateColumns, SqlError> {
+    let mut columns = CopyPredicateColumns {
+        read: crate::storage::ColumnSet::EMPTY,
+        whole_row: false,
+    };
+    copy_predicate_node(expression, def, &mut columns)?;
+    Ok(columns)
+}
+
+/// The columns a COPY WHERE predicate reads.
+#[derive(Clone, Copy)]
+struct CopyPredicateColumns {
+    read: crate::storage::ColumnSet,
+    whole_row: bool,
+}
+
+impl CopyPredicateColumns {
+    /// `DoCopy`'s check: the first generated column the predicate reads,
+    /// every column for a whole-row reference.
+    fn check_generated<Definition0: crate::storage::DefinitionBacking>(
+        self,
+        def: &crate::storage::TableDefinition<Definition0>,
+    ) -> Result<(), SqlError> {
+        let generated = def.columns().iter().enumerate().find(|(index, column)| {
+            column.default.is_generated() && (self.whole_row || self.read.contains(*index))
+        });
+        match generated {
+            Some((_, column)) => Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "generated columns are not supported in COPY FROM WHERE conditions"
+                ),
+                format_args!("Column \"{}\" is a generated column.", column.name.as_str()),
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
+fn copy_predicate_node<Definition0: crate::storage::DefinitionBacking>(
+    expression: &Expr,
+    def: &crate::storage::TableDefinition<Definition0>,
+    columns: &mut CopyPredicateColumns,
 ) -> Result<(), SqlError> {
-    let column = |qualifier: Option<&str>, name: &str| -> Result<(), SqlError> {
+    let mut column = |qualifier: Option<&str>, name: &str| -> Result<(), SqlError> {
         if let Some(qualifier) = qualifier
             && !crate::sql::eval::qualifier_answers_target(
                 crate::storage::RelationDefinition::from_definition(def),
@@ -79769,6 +80016,11 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
             ));
         }
         let Some(index) = def.column_index(name) else {
+            // A bare table name is the whole row.
+            if qualifier.is_none() && name == def.name.as_str() {
+                columns.whole_row = true;
+                return Ok(());
+            }
             return Err(crate::sql::column_suggestion::missing_relation_column(
                 qualifier,
                 name,
@@ -79776,13 +80028,7 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
                 def.columns(),
             ));
         };
-        if def.columns()[index].default.is_generated() {
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "cannot use generated column \"{}\" in COPY WHERE",
-                name
-            ));
-        }
+        columns.read.insert(index);
         Ok(())
     };
     match expression {
@@ -79809,18 +80055,29 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. }
         | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use subquery in COPY WHERE"
+        | Expr::ArraySubquery(_) => Err(crate::sql::error_position::at_node(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot use subquery in COPY FROM WHERE condition"
+            ),
+            expression,
         )),
-        Expr::Call { over: Some(_), .. } => Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use window function in COPY WHERE"
+        Expr::Call { over: Some(_), .. } => Err(crate::sql::error_position::at_expression(
+            sql_err!(
+                sqlstate::WINDOWING_ERROR,
+                "window functions are not allowed in COPY FROM WHERE conditions"
+            ),
+            expression,
         )),
-        Expr::Call { name, .. } if expression.is_aggregate() => Err(sql_err!(
-            sqlstate::GROUPING_ERROR,
-            "aggregate functions are not allowed in COPY WHERE"
-        )),
+        Expr::Call { .. } if expression.is_aggregate() => {
+            Err(crate::sql::error_position::at_expression(
+                sql_err!(
+                    sqlstate::GROUPING_ERROR,
+                    "aggregate functions are not allowed in COPY FROM WHERE conditions"
+                ),
+                expression,
+            ))
+        }
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::BoundDefault {
@@ -79830,9 +80087,14 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::Field { base: operand, .. }
-        | Expr::RecordFieldIndex { base: operand, .. }
-        | Expr::Subscript { base: operand, .. } => validate_copy_predicate(operand, def),
+        | Expr::RecordFieldIndex { base: operand, .. } => {
+            copy_predicate_node(operand, def, columns)
+        }
         Expr::Binary { left, right, .. }
+        | Expr::Subscript {
+            base: left,
+            index: right,
+        }
         | Expr::Match {
             operand: left,
             pattern: right,
@@ -79843,8 +80105,8 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
             array: right,
             ..
         } => {
-            validate_copy_predicate(left, def)?;
-            validate_copy_predicate(right, def)
+            copy_predicate_node(left, def, columns)?;
+            copy_predicate_node(right, def, columns)
         }
         Expr::Like {
             operand,
@@ -79852,27 +80114,27 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
             escape,
             ..
         } => {
-            validate_copy_predicate(operand, def)?;
-            validate_copy_predicate(pattern, def)?;
+            copy_predicate_node(operand, def, columns)?;
+            copy_predicate_node(pattern, def, columns)?;
             if let Some(escape) = escape {
-                validate_copy_predicate(escape, def)?;
+                copy_predicate_node(escape, def, columns)?;
             }
             Ok(())
         }
         Expr::Slice { base, lower, upper } => {
-            validate_copy_predicate(base, def)?;
+            copy_predicate_node(base, def, columns)?;
             if let Some(lower) = lower {
-                validate_copy_predicate(lower, def)?;
+                copy_predicate_node(lower, def, columns)?;
             }
             if let Some(upper) = upper {
-                validate_copy_predicate(upper, def)?;
+                copy_predicate_node(upper, def, columns)?;
             }
             Ok(())
         }
         Expr::InList { operand, list, .. } => {
-            validate_copy_predicate(operand, def)?;
+            copy_predicate_node(operand, def, columns)?;
             for expression in *list {
-                validate_copy_predicate(expression, def)?;
+                copy_predicate_node(expression, def, columns)?;
             }
             Ok(())
         }
@@ -79883,29 +80145,29 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
             ..
         } => {
             if let Some(operand) = operand {
-                validate_copy_predicate(operand, def)?;
+                copy_predicate_node(operand, def, columns)?;
             }
             for (when, then) in *whens {
-                validate_copy_predicate(when, def)?;
-                validate_copy_predicate(then, def)?;
+                copy_predicate_node(when, def, columns)?;
+                copy_predicate_node(then, def, columns)?;
             }
             if let Some(otherwise) = otherwise {
-                validate_copy_predicate(otherwise, def)?;
+                copy_predicate_node(otherwise, def, columns)?;
             }
             Ok(())
         }
         Expr::Call { args, filter, .. } => {
             for argument in *args {
-                validate_copy_predicate(argument, def)?;
+                copy_predicate_node(argument, def, columns)?;
             }
             if let Some(filter) = filter {
-                validate_copy_predicate(filter, def)?;
+                copy_predicate_node(filter, def, columns)?;
             }
             Ok(())
         }
         Expr::Array(items) => {
             for item in *items {
-                validate_copy_predicate(item, def)?;
+                copy_predicate_node(item, def, columns)?;
             }
             Ok(())
         }
@@ -79919,8 +80181,11 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
         | Expr::BitLit(_)
         | Expr::Param(_)
         | Expr::DefaultMarker
-        | Expr::WholeRow(_)
         | Expr::RecursiveState { .. } => Ok(()),
+        Expr::WholeRow(_) => {
+            columns.whole_row = true;
+            Ok(())
+        }
     }
 }
 
@@ -83266,9 +83531,7 @@ fn decode_binary_array<'a>(
                         ..
                     } => Datum::CompositeText {
                         slot: composite_slot,
-                        physical_fields: storage
-                            .require_row_type_definition(composite_slot, txid)?
-                            .physical_field_count() as u16,
+                        physical_fields: stored_physical_fields(composite_slot, storage, txid)?,
                         text: composite_storage_text(value, composite_slot, storage, txid, arena)?,
                     },
                     value => value,
@@ -83287,16 +83550,8 @@ fn decode_binary_array<'a>(
                 };
                 Datum::CompositeText {
                     slot,
-                    physical_fields: (storage
-                        .require_row_type_definition(slot, txid)?
-                        .physical_field_count() as u16)
-                        | COMPOSITE_MEMBER_IDENTITIES,
-                    text: arena.alloc_str_display(value).map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "composite array element exceeds statement arena"
-                        )
-                    })?,
+                    physical_fields: stored_physical_fields(slot, storage, txid)?,
+                    text: composite_storage_text(value, slot, storage, txid, arena)?,
                 }
             }
             _ => value,
@@ -83890,7 +84145,7 @@ pub(crate) fn binary_field_plan<'a>(
             text,
         } => {
             let decoded =
-                decode_stored_composite_text(text, *slot, *physical_fields, storage, txid, arena)?;
+                decode_stored_composite_text(*text, *slot, *physical_fields, storage, txid, arena)?;
             binary_field_plan(&decoded, storage, txid, arena)
         }
         Datum::Record(fields) | Datum::Composite { fields, .. } => {
@@ -89630,7 +89885,12 @@ fn merge_insert_values<
                 &hooks,
             )?;
             // A source column's datum keeps its stored form.
-            let form = crate::sql::toast::passed_form(expression, source_ctx, &row[targets[i]])?;
+            let form = crate::sql::toast::passed_form(
+                expression,
+                source_ctx,
+                hooks.catalog,
+                &row[targets[i]],
+            )?;
             carried.carry(&row[targets[i]], form, None)?;
             explicit[targets[i]] = true;
         }
@@ -93728,8 +93988,12 @@ where
                     )
                     .and_then(|value| {
                         // A stored datum the row reads keeps its form.
-                        let form =
-                            crate::sql::toast::passed_form(expression, &value_scope, &value)?;
+                        let form = crate::sql::toast::passed_form(
+                            expression,
+                            &value_scope,
+                            hooks.catalog,
+                            &value,
+                        )?;
                         carried.carry(&value, form, None)?;
                         Ok(value)
                     }) {
@@ -106276,8 +106540,9 @@ fn alter_table_relation(
                 }
                 // The rewritten table's columns, not yet installed, decide
                 // the stored forms.
+                let catalog = crate::sql::query::storage_catalog(&*storage, arena, txn.txid);
                 let sizing = crate::sql::query::postgres_memory::Sizing {
-                    catalog: Some((&*storage, txn.txid)),
+                    catalog: Some(&catalog),
                     scratch: arena,
                 };
                 match encode_row_as(
@@ -110289,7 +110554,7 @@ pub(crate) fn encode_table_row<'a>(
         definition.columns(),
         definition.has_toast,
         &crate::sql::query::postgres_memory::Sizing {
-            catalog: Some((storage, txid)),
+            catalog: Some(&crate::sql::query::storage_catalog(storage, arena, txid)),
             scratch: arena,
         },
         values,
@@ -111262,7 +111527,7 @@ fn coerce_column_value<'a>(
                 physical_fields: 0,
                 text,
             } if actual == slot => {
-                decode_retained_composite_text(text, slot, storage, txid, arena, sequences)?
+                decode_retained_composite_text(text, slot, 0, storage, txid, arena, sequences)?
             }
             value @ Datum::CompositeText { slot: actual, .. } if actual == slot => {
                 return Ok(value);
@@ -111284,10 +111549,7 @@ fn coerce_column_value<'a>(
         let text = composite_storage_text(typed, slot, storage, txid, arena)?;
         return Ok(Datum::CompositeText {
             slot,
-            physical_fields: (storage
-                .require_row_type_definition(slot, txid)?
-                .physical_field_count() as u16)
-                | COMPOSITE_MEMBER_IDENTITIES,
+            physical_fields: stored_physical_fields(slot, storage, txid)?,
             text,
         });
     }
@@ -111384,10 +111646,18 @@ pub(crate) fn coerce_routine_argument<'a>(
     match argument.ctype {
         ColType::Composite(slot) => match value {
             Datum::CompositeText {
-                slot: actual, text, ..
-            } if Some(actual) == slot => {
-                decode_retained_composite_text(text, actual, storage, txid, arena, sequences)
-            }
+                slot: actual,
+                physical_fields,
+                text,
+            } if Some(actual) == slot => decode_retained_composite_text(
+                text,
+                actual,
+                physical_fields,
+                storage,
+                txid,
+                arena,
+                sequences,
+            ),
             value => coerce_composite_value(value, slot, storage, txid, arena, sequences),
         },
         ColType::Enum(slot) => coerce_enum_value(value, slot, storage, txid, arena),
@@ -111447,7 +111717,7 @@ fn composite_persistent_value<'a>(
             )
         }
         Datum::Composite { slot, .. } => {
-            Datum::Text(composite_storage_text(value, slot, storage, txid, arena)?)
+            array_member_spelling(composite_storage_text(value, slot, storage, txid, arena)?)?
         }
         Datum::CompositeText {
             slot,
@@ -111456,7 +111726,7 @@ fn composite_persistent_value<'a>(
         } => {
             let value =
                 decode_stored_composite_text(text, slot, physical_fields, storage, txid, arena)?;
-            Datum::Text(composite_storage_text(value, slot, storage, txid, arena)?)
+            array_member_spelling(composite_storage_text(value, slot, storage, txid, arena)?)?
         }
         Datum::Array { element, raw } => {
             let shape = crate::sql::array::shape(raw).expect("array datum invariant");
@@ -111480,6 +111750,20 @@ fn composite_persistent_value<'a>(
         }
         value => value,
     })
+}
+
+/// The text of a composite member of an array a composite holds, which
+/// spells no field forms.
+fn array_member_spelling(
+    spelling: crate::sql::types::CompositeSpelling<'_>,
+) -> Result<Datum<'_>, SqlError> {
+    if spelling.has_forms() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "storing a composite holding an array of composites with compressed fields is not supported"
+        ));
+    }
+    Ok(Datum::Text(spelling.text()))
 }
 
 fn decode_composite_stored_field<'a>(
@@ -111529,7 +111813,7 @@ fn decode_composite_stored_field<'a>(
             )
         }
         ColType::Composite(slot) => decode_stored_composite_text(
-            text,
+            crate::sql::types::CompositeSpelling::plain(text),
             crate::storage::TypeCreation::require(slot)?,
             crate::storage::MAX_COMPOSITE_FIELDS as u16
                 | if encoding == CompositeEncoding::Members {
@@ -111637,13 +111921,14 @@ pub(crate) fn enum_array_from_members<'a>(
 /// Renders a composite in stable physical-attribute order for persistence.
 /// Runtime composites expose active fields only; this boundary reinstates
 /// dropped slots as NULL so a later attribute change cannot shift old data.
+/// The spelling keeps each field's TOAST form, nested composites' included.
 fn composite_storage_text<'a>(
     value: Datum<'a>,
     slot: crate::storage::TypeCreation,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
-) -> Result<&'a str, SqlError> {
+) -> Result<crate::sql::types::CompositeSpelling<'a>, SqlError> {
     let Datum::Composite { fields: active, .. } = value else {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
@@ -111676,15 +111961,35 @@ fn composite_storage_text<'a>(
                 "composite active layout does not match its catalog definition"
             )
         })?;
-        // The durable composite text keeps its fields as formed.
-        if source.form != crate::storage::StoredForm::Inline {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "storing a composite value that holds a compressed or out-of-line field is not supported"
-            ));
-        }
         *out = *source;
-        out.value = composite_persistent_value(out.value, storage, txid, arena)?;
+        out.value = match out.value {
+            // A nested composite keeps its spelling, forms included.
+            Datum::Composite { slot, .. } => Datum::CompositeText {
+                slot,
+                physical_fields: stored_physical_fields(slot, storage, txid)?,
+                text: composite_storage_text(out.value, slot, storage, txid, arena)?,
+            },
+            Datum::CompositeText {
+                slot,
+                physical_fields,
+                text,
+            } => {
+                let value = decode_stored_composite_text(
+                    text,
+                    slot,
+                    physical_fields,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+                Datum::CompositeText {
+                    slot,
+                    physical_fields: stored_physical_fields(slot, storage, txid)?,
+                    text: composite_storage_text(value, slot, storage, txid, arena)?,
+                }
+            }
+            value => composite_persistent_value(value, storage, txid, arena)?,
+        };
         active_index += 1;
     }
     if active_index != active.len() {
@@ -111693,17 +111998,94 @@ fn composite_storage_text<'a>(
             "composite has more active values than its catalog definition"
         ));
     }
-    arena
-        .alloc_str_display(Datum::Composite {
-            slot,
-            fields: physical,
-        })
+    let raw = arena
+        .alloc_str_display(SpelledComposite { slot, physical })
         .map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "composite exceeds statement arena"
             )
-        })
+        })?;
+    Ok(crate::sql::types::CompositeSpelling::parse(raw)
+        .expect("a composite spells well-formed form entries"))
+}
+
+/// The physical field count a composite of type `slot` stores, its enum
+/// leaves holding member identities.
+pub(crate) fn stored_physical_fields(
+    slot: crate::storage::TypeCreation,
+    storage: &Storage,
+    txid: u32,
+) -> Result<u16, SqlError> {
+    Ok((storage
+        .require_row_type_definition(slot, txid)?
+        .physical_field_count() as u16)
+        | COMPOSITE_MEMBER_IDENTITIES)
+}
+
+/// A [`crate::sql::types::CompositeSpelling`] of the composite whose
+/// physical fields are `physical`, nested composites as spellings.
+struct SpelledComposite<'v> {
+    slot: crate::storage::TypeCreation,
+    physical: &'v [RecordField<'v>],
+}
+
+impl core::fmt::Display for SpelledComposite<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::storage::StoredForm;
+        write!(
+            f,
+            "{}",
+            Datum::Composite {
+                slot: self.slot,
+                fields: self.physical,
+            }
+        )?;
+        let mut separated = false;
+        let mut separate = |f: &mut core::fmt::Formatter<'_>| {
+            if core::mem::replace(&mut separated, true) {
+                Ok(())
+            } else {
+                f.write_str("\0")
+            }
+        };
+        for (index, field) in self.physical.iter().enumerate() {
+            match field.form {
+                StoredForm::Inline => {}
+                StoredForm::Compressed(size) => {
+                    separate(f)?;
+                    write!(f, "{index}:c{size};")?;
+                }
+                StoredForm::External {
+                    saved,
+                    compressed: false,
+                } => {
+                    separate(f)?;
+                    write!(f, "{index}:x{saved};")?;
+                }
+                StoredForm::External {
+                    saved,
+                    compressed: true,
+                } => {
+                    separate(f)?;
+                    write!(f, "{index}:X{saved};")?;
+                }
+                StoredForm::Unmodelled => {
+                    separate(f)?;
+                    write!(f, "{index}:u;")?;
+                }
+            }
+            if let Datum::CompositeText { text, .. } = field.value
+                && let Some((_, entries)) = text.raw().split_once('\0')
+            {
+                for entry in entries.split_terminator(';') {
+                    separate(f)?;
+                    write!(f, "{index}.{entry};")?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Converts an anonymous row constructor into one catalog-defined composite.
@@ -111942,25 +112324,32 @@ fn coerce_composite_value_inner<'a>(
 /// leak into type coercion as separate attributes.
 /// Decodes a composite retained in its text form before the type gained
 /// fields: the text may name fewer fields than the type now has.
+/// Decodes a retained composite spelling: with a physical field count, it
+/// lists fields by attribute number, else the type's active fields.
 fn decode_retained_composite_text<'a>(
-    text: &'a str,
+    text: crate::sql::types::CompositeSpelling<'a>,
     slot: crate::storage::TypeCreation,
+    physical_fields: u16,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
-    decode_composite_text_inner(
-        text,
+    let mut value = decode_composite_text_inner(
+        text.text(),
         slot,
         CompositeTextSource::Retained {
-            physical_fields: None,
+            physical_fields: (physical_fields != 0).then_some(physical_fields as usize),
         },
         storage,
         txid,
         arena,
         sequences,
-    )
+    )?;
+    for (path, form) in text.forms() {
+        value = with_field_form(value, path, form, storage, txid, arena)?;
+    }
+    Ok(value)
 }
 
 pub(crate) fn decode_composite_text<'a>(
@@ -112099,24 +112488,153 @@ fn parse_record_literal<'a>(
 }
 
 pub(crate) fn decode_stored_composite_text<'a>(
-    text: &'a str,
+    text: crate::sql::types::CompositeSpelling<'a>,
     slot: crate::storage::TypeCreation,
     physical_fields: u16,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    decode_composite_text_inner(
-        text,
-        slot,
-        CompositeTextSource::Retained {
-            physical_fields: (physical_fields != 0).then_some(physical_fields as usize),
-        },
-        storage,
-        txid,
-        arena,
-        None,
-    )
+    decode_retained_composite_text(text, slot, physical_fields, storage, txid, arena, None)
+}
+
+/// The fields of a stored composite by physical attribute, a dropped
+/// attribute's included as the tuple keeps it: what the datum's stored size
+/// counts. A spelling without a physical layout lists the active fields.
+pub(crate) fn stored_composite_physical_fields<'a>(
+    text: crate::sql::types::CompositeSpelling<'a>,
+    slot: crate::storage::TypeCreation,
+    physical_fields: u16,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [RecordField<'a>], SqlError> {
+    let Datum::Composite { fields: active, .. } =
+        decode_stored_composite_text(text, slot, physical_fields, storage, txid, arena)?
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "catalog materializes named composites"
+        ));
+    };
+    let definition = storage.require_row_type_definition(slot, txid)?;
+    let stored = usize::from(physical_fields & !COMPOSITE_MEMBER_IDENTITIES);
+    if physical_fields == 0 || definition.fields().take(stored).all(|field| !field.dropped) {
+        return Ok(active);
+    }
+    let encoding = if physical_fields & COMPOSITE_MEMBER_IDENTITIES != 0 {
+        CompositeEncoding::Members
+    } else {
+        CompositeEncoding::Legacy
+    };
+    let mut raw_values = [None; crate::storage::MAX_COMPOSITE_FIELDS];
+    let count = parse_record_literal(text.text(), stored, true, &mut raw_values, arena)?;
+    let fields = arena
+        .alloc_slice_with(count, |_| RecordField {
+            form: crate::storage::StoredForm::Inline,
+            name: "",
+            type_oid: 0,
+            type_mod: -1,
+            value: Datum::Null,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut active = active.iter();
+    for (index, (out, field)) in fields.iter_mut().zip(definition.fields()).enumerate() {
+        if field.dropped {
+            out.value = match (raw_values[index], definition.dropped_relation_layout(index)) {
+                (None, _) => Datum::Null,
+                // A relation keeps only a dropped attribute's layout; a
+                // fixed-width value is sized by it alone.
+                (Some(_), Some(layout)) => dropped_attribute_placeholder(layout)?,
+                (Some(raw), None) => decode_composite_stored_field(
+                    Datum::Text(raw),
+                    field.ctype,
+                    encoding,
+                    storage,
+                    txid,
+                    arena,
+                )?,
+            };
+            if let Some((_, form)) = text.forms().find(|(path, _)| path.is(&[index])) {
+                out.form = form;
+            }
+        } else if let Some(field) = active.next() {
+            *out = *field;
+        }
+    }
+    Ok(fields)
+}
+
+/// A value of the layout a relation's dropped attribute keeps, standing for
+/// the stored value whose type is gone: a by-value datum of that width and
+/// alignment sizes as the stored one does, whatever it held.
+fn dropped_attribute_placeholder(
+    layout: crate::sql::type_layouts::PhysicalLayout,
+) -> Result<Datum<'static>, SqlError> {
+    match (layout.length, layout.by_value, layout.alignment) {
+        (1, true, b'c') => Ok(Datum::Bool(false)),
+        (2, true, b's') => Ok(Datum::Int2(0)),
+        (4, true, b'i') => Ok(Datum::Int4(0)),
+        (8, true, b'd') => Ok(Datum::Int8(0)),
+        _ => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "sizing a composite that holds the value of a dropped variable-width or by-reference table column is not supported"
+        )),
+    }
+}
+
+/// `value`, a composite, with the field at `path` held in `form`. A field
+/// dropped since the composite was stored has no value to hold it.
+fn with_field_form<'a>(
+    value: Datum<'a>,
+    path: crate::sql::types::CompositeFieldPath<'_>,
+    form: crate::storage::StoredForm,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let (slot, fields) = match value {
+        Datum::Composite { slot, fields } => (slot, fields),
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => {
+            let decoded =
+                decode_stored_composite_text(text, slot, physical_fields, storage, txid, arena)?;
+            return with_field_form(decoded, path, form, storage, txid, arena);
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a stored composite field form names a field that is not a composite"
+            ));
+        }
+    };
+    let (physical, nested) = path.split_first();
+    let Some(active) = storage
+        .require_row_type_definition(slot, txid)?
+        .active_fields()
+        .position(|field| usize::from(field.attribute_number) == physical + 1)
+    else {
+        return Ok(value);
+    };
+    let fields = arena
+        .alloc_slice_copy(fields)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let field = fields.get_mut(active).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "composite active layout does not match its catalog definition"
+        )
+    })?;
+    match nested {
+        None => field.form = form,
+        Some(nested) => {
+            field.value = with_field_form(field.value, nested, form, storage, txid, arena)?;
+        }
+    }
+    Ok(Datum::Composite { slot, fields })
 }
 
 /// Where composite text comes from: a client literal names exactly the
@@ -112301,7 +112819,7 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                     physical_fields: 0,
                     text,
                 } if actual == slot => {
-                    decode_retained_composite_text(text, slot, storage, txid, arena, sequences)?
+                    decode_retained_composite_text(text, slot, 0, storage, txid, arena, sequences)?
                 }
                 Datum::CompositeText { slot: actual, .. } if actual == slot => value,
                 Datum::Text(text) => {
@@ -112316,10 +112834,7 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                 value @ Datum::CompositeText { .. } => value,
                 value @ Datum::Composite { .. } => Datum::CompositeText {
                     slot,
-                    physical_fields: (storage
-                        .require_row_type_definition(slot, txid)?
-                        .physical_field_count() as u16)
-                        | COMPOSITE_MEMBER_IDENTITIES,
+                    physical_fields: stored_physical_fields(slot, storage, txid)?,
                     text: composite_storage_text(value, slot, storage, txid, arena)?,
                 },
                 _ => unreachable!("composite coercion returns a composite datum"),

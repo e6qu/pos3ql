@@ -20,7 +20,7 @@ fn procedural_parameter_staging_uses_named_parameters_instead_of_all_declaration
     ] {
         let mut config = test_config(&format!("owned-parameter-slots-{mode:?}"));
         config.transaction_mode = mode;
-        let value_slots = 130 * core::mem::size_of::<Datum<'static>>();
+        let value_slots = 130 * core::mem::size_of::<crate::sql::exec::LocalSlot<'static>>();
         // Admit the original source, one local array and control metadata,
         // without room for a second declaration-sized parameter staging array.
         config.execution_control_bytes = (value_slots + source_bytes + 1024).next_multiple_of(64);

@@ -1000,6 +1000,10 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for EnclosingRow<'_, 'a> {
         self.0.stored_form(qualifier, name)
     }
 
+    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.0.holds_formed_datum(qualifier, name)
+    }
+
     fn resolve_column_type_unsuggested(
         &self,
         qualifier: Option<&str>,
@@ -1112,10 +1116,12 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for RoutineVariables<'_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
-        // This row does not keep its values' stored forms.
-        Ok(crate::sql::toast::unknown_form(
-            &self.lookup(qualifier, name)?,
-        ))
+        self.lookup(qualifier, name)?;
+        self.0.stored_form(qualifier, name)
+    }
+
+    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.names(qualifier, name) && self.0.holds_formed_datum(qualifier, name)
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'b>, SqlError> {
@@ -1206,6 +1212,13 @@ pub trait ColumnLookup<'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, SqlError>;
+
+    /// Whether the column holds a datum an expression formed, with the
+    /// four-byte varlena header it gave it, rather than one read from a
+    /// tuple: a PL/pgSQL variable a simple expression assigned.
+    fn holds_formed_datum(&self, _qualifier: Option<&str>, _name: &str) -> bool {
+        false
+    }
 
     /// [`Self::lookup`] for a caller that may still find the column in an
     /// enclosing scope: a missing column's spelling suggestion is left to the
@@ -3032,9 +3045,36 @@ pub trait CatalogAccess {
         &self,
         _slot: crate::storage::TypeCreation,
         _physical_fields: u16,
-        _text: &'a str,
+        _text: crate::sql::types::CompositeSpelling<'a>,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "named composite catalog access is unavailable"
+        ))
+    }
+    /// The physical attribute index of the active field `name` of the named
+    /// composite `slot`, and the field's own named composite type when it
+    /// has one; `None` when it has no such field.
+    fn composite_field(
+        &self,
+        _slot: crate::storage::TypeCreation,
+        _name: &str,
+    ) -> Result<Option<(usize, Option<crate::storage::TypeCreation>)>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "named composite catalog access is unavailable"
+        ))
+    }
+    /// The fields a stored composite keeps by physical attribute, dropped
+    /// attributes included, for sizing the datum.
+    fn stored_composite_fields<'a>(
+        &self,
+        _slot: crate::storage::TypeCreation,
+        _physical_fields: u16,
+        _text: crate::sql::types::CompositeSpelling<'a>,
+        _arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "named composite catalog access is unavailable"
@@ -11366,12 +11406,27 @@ fn coerce_array_constructor_element<'a>(
     }
     match value {
         Datum::Bpchar(text) if ct == ColType::Bpchar => Ok(Datum::Text(text)),
-        Datum::Composite { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
-            Ok(Datum::CompositeText {
-                slot,
-                physical_fields: 0,
-                text: arena.alloc_str_display(value).map_err(|_| arena_full())?,
-            })
+        // The catalog spells the element with its fields' forms.
+        Datum::Composite { slot, fields } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
+            match hooks.catalog {
+                Some(catalog) => catalog.composite_array_element(value, slot, arena),
+                None if fields
+                    .iter()
+                    .any(|field| field.form != crate::storage::StoredForm::Inline) =>
+                {
+                    Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "named composite catalog access is unavailable"
+                    ))
+                }
+                None => Ok(Datum::CompositeText {
+                    slot,
+                    physical_fields: 0,
+                    text: crate::sql::types::CompositeSpelling::plain(
+                        arena.alloc_str_display(value).map_err(|_| arena_full())?,
+                    ),
+                }),
+            }
         }
         value @ Datum::CompositeText { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
             Ok(value)

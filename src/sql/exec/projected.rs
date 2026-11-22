@@ -434,7 +434,7 @@ pub fn projected_value_len(v: &Datum) -> Result<usize, SqlError> {
             physical_fields,
             text,
             ..
-        } => 4 + physical_field_count_len(*physical_fields) + 4 + text.len(),
+        } => 4 + physical_field_count_len(*physical_fields) + 4 + text.raw().len(),
     })
 }
 
@@ -911,6 +911,7 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             physical_fields,
             text,
         } => {
+            let text = text.raw();
             out[0] = 203;
             out[1..5].copy_from_slice(&slot.to_le_bytes());
             let prefix = encode_physical_field_count(*physical_fields, &mut out[5..]);
@@ -1349,8 +1350,11 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             let length_at = at + 4 + prefix;
             let len =
                 u32::from_le_bytes(bytes[length_at..length_at + 4].try_into().unwrap()) as usize;
-            let text = core::str::from_utf8(&bytes[length_at + 4..length_at + 4 + len])
-                .expect("projected composite text was encoded from valid UTF-8");
+            let text = crate::sql::types::CompositeSpelling::parse(
+                core::str::from_utf8(&bytes[length_at + 4..length_at + 4 + len])
+                    .expect("projected composite text was encoded from valid UTF-8"),
+            )
+            .expect("projected composite text was encoded from a spelling");
             (
                 Datum::CompositeText {
                     slot,

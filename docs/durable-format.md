@@ -517,6 +517,7 @@ Labels follow PostgreSQL's
 |---|---|
 | Row enum value | High bit of the u32 label length marks a following u32 member identity |
 | Composite field count | Bit 15 marks enum leaves holding member ordinals (nested records and arrays included) |
+| Composite text | PostgreSQL record text, then optionally a NUL and `<path>:<form>;` entries for fields TOAST left compressed: the path is physical attribute indexes from the outer composite joined by `.`, the form `c`, `x` or `X` with a size, or `u` |
 | Frozen enum default | Tag 201 (member identity) or 202 (label binding), each with a four-byte type stamp; tags 12/42 rejected |
 | Cached array default | Tag 200 with an eight-byte element descriptor, which also names a domain over an enum or composite array; tags 21/41 rejected |
 | Spill values | Arrays use the eight-byte descriptor; named scalars carry a four-byte stamp |
@@ -526,8 +527,9 @@ Labels follow PostgreSQL's
 ### Stored row values
 
 A table row is a two-byte column count, a null bitmap, then each non-null
-value. A variable-width value starts with a four-byte length word. When bit 31
-of that word is set, five bytes follow the value: the form PostgreSQL's TOAST
+value. A variable-width value has a four-byte length word: first, or after
+a composite's field count. When bit 31 of that word is set, five bytes
+follow the value: the form PostgreSQL's TOAST
 stores it in (`heap_toast_insert_or_update`) and a four-byte size. Kind `1` is
 compressed in line with that `VARSIZE`, `2` and `3` are saved out of line
 uncompressed or compressed with that many bytes saved, and `4` is a form the

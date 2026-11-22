@@ -37,6 +37,7 @@ fn loop_values_keep_names_types_arrays_and_null_rows_after_source_reset() {
                         raw,
                     },
                 ],
+                forms: ForRowForms::NotCarried,
                 empty: Datum::Record(fields),
                 width: 1,
             },
@@ -97,6 +98,7 @@ fn loop_value_capacity_errors_name_the_shared_pool_and_release_reservations() {
                 values: &[Datum::Text(
                     "a value which cannot fit inside the sixty-four byte pool",
                 )],
+                forms: ForRowForms::NotCarried,
                 empty: Datum::Null,
                 width: 1,
             },
@@ -107,5 +109,39 @@ fn loop_value_capacity_errors_name_the_shared_pool_and_release_reservations() {
         assert!(error.message.as_str().contains("row_work_bytes"));
         assert!(error.message.as_str().contains("row_work_leases"));
         assert_eq!(pool.lease::<u8>(64).unwrap().capacity(), 64);
+    });
+}
+
+#[test]
+fn loop_values_keep_the_forms_their_query_carried() {
+    let mut budget = Budget::new(1 << 18);
+    let pool = LeasePool::new(&mut budget, Purpose::ROW_WORK, 16384, 4).unwrap();
+    let mut source = Arena::new(&mut budget, "loop form source", 1 << 16).unwrap();
+    let output = Arena::new(&mut budget, "loop form output", 1 << 16).unwrap();
+    let long = source.alloc_str(&"a".repeat(3000)).unwrap();
+    let forms = [
+        crate::storage::StoredForm::Compressed(44),
+        crate::storage::StoredForm::Inline,
+    ];
+    let rows = crate::mem::guard::forbid_alloc(|| {
+        LoopRows::capture(
+            &pool,
+            TriggerForRows {
+                values: &[Datum::Text(long), Datum::Text(long)],
+                forms: ForRowForms::Carried(&forms),
+                empty: Datum::Null,
+                width: 1,
+            },
+        )
+        .unwrap()
+    });
+    source.reset();
+    crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(rows.form(0), crate::storage::StoredForm::Compressed(44));
+        assert_eq!(rows.form(1), crate::storage::StoredForm::Inline);
+        let Datum::Text(text) = rows.value(0, &output).unwrap() else {
+            panic!("text row")
+        };
+        assert_eq!(text.len(), 3000);
     });
 }

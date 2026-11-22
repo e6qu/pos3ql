@@ -128,6 +128,7 @@ impl Engine {
         if self.result_stream_bytes == 0 {
             return Err(SpoolReason::Capacity);
         }
+        let reader_bytes = ResultStream::query_bytes(self.result_stream_bytes);
         let mark = self.work.mark();
         // A UNION ALL statement, as opposed to a UNION ALL in FROM.
         let mut set_query = false;
@@ -140,6 +141,7 @@ impl Engine {
                             &self.storage,
                             txid,
                             select,
+                            reader_bytes,
                             &self.work,
                         )
                     })
@@ -156,6 +158,7 @@ impl Engine {
                                 &self.storage,
                                 txid,
                                 select,
+                                reader_bytes,
                                 &self.work,
                             )
                         })
@@ -178,6 +181,7 @@ impl Engine {
                             &self.storage,
                             txid,
                             select,
+                            reader_bytes,
                             &self.work,
                         )
                         .map(|source| (source, text.len()))
@@ -194,7 +198,7 @@ impl Engine {
         // runs in the general executor first and promotes when its output
         // overflows: retained readers do not yet reproduce every analysis
         // check and wait of that executor.
-        let opens = matches!(source, Ok(Some(query::StreamSource::Appended(_)))) && set_query;
+        let opens = matches!(source, Ok(Some(query::StreamSource::Appended { .. }))) && set_query;
         let positions = match source {
             // Conservative: every resident entry and every saved generation.
             Ok(Some(query::StreamSource::Table(table))) => {
@@ -205,15 +209,21 @@ impl Engine {
             }
             // A generator retains only its next value.
             Ok(Some(query::StreamSource::Generated)) => Some(0),
-            Ok(Some(query::StreamSource::Join(tables) | query::StreamSource::Appended(tables))) => {
-                tables.iter().flatten().try_fold(0usize, |total, &table| {
+            // Plus the records of a join plan's nodes, as the reader keeps
+            // them.
+            Ok(Some(
+                query::StreamSource::Join { tables, plan_bytes }
+                | query::StreamSource::Appended { tables, plan_bytes },
+            )) => tables
+                .iter()
+                .flatten()
+                .try_fold(plan_bytes, |total, &table| {
                     crate::storage::RowCursor::position_bytes(
                         self.storage.resident_row_entries(table),
                         self.max_spill_generations_per_table,
                     )
                     .and_then(|bytes| total.checked_add(bytes))
-                })
-            }
+                }),
             _ => return Err(SpoolReason::Shape),
         };
         // Plus the copied text, its parse tree and the bound scope.
@@ -399,7 +409,13 @@ impl Engine {
             responder.capture(header, |capture| {
                 let Some((format, names, count)) = copy_format else {
                     return query
-                        .prepare_source(&self.storage, txid, capture, query::RetainedUse::Stream)
+                        .prepare_source(
+                            &self.storage,
+                            txid,
+                            capture,
+                            query::RetainedUse::Stream,
+                            &self.work,
+                        )
                         .map(|ready| (ready, None))
                         .map_err(stream_capacity);
                 };
@@ -410,6 +426,7 @@ impl Engine {
                             txid,
                             capture,
                             query::RetainedUse::Stream,
+                            &self.work,
                         )
                     })
                     .map_err(stream_capacity)?;

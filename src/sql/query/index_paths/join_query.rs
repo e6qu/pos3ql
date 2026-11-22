@@ -1626,8 +1626,9 @@ fn join_comparison(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
 /// relations numbered in written order, and each outer join's range table
 /// entry after those of the joins inside it, as parse analysis numbers
 /// them.
-struct ChainBuilder<'t, 'a> {
-    tree: &'t mut Tree<'a>,
+struct ChainBuilder<'t, 'p, 'a> {
+    /// The tree, in the planning memory.
+    tree: &'t mut Tree<'p>,
     next: u8,
     rtindex: u8,
     /// Each join's node and condition, inner joins' first; one per
@@ -1637,7 +1638,7 @@ struct ChainBuilder<'t, 'a> {
     arena: &'a Arena,
 }
 
-impl<'a> ChainBuilder<'_, 'a> {
+impl<'a> ChainBuilder<'_, '_, 'a> {
     fn source(&mut self, node: NodeId, on: &'a Expr<'a>) -> Option<()> {
         *self.sources.get_mut(self.source_count)? = (node, on);
         self.source_count += 1;
@@ -1731,11 +1732,14 @@ pub(crate) fn modeled_join<'a>(
     scope: &QueryScope<'a>,
     params: &[Datum<'a>],
     arena: &'a Arena,
+    planning: &Arena,
 ) -> Result<Option<ModeledJoin<'a>>, SqlError> {
     let Some(written) = statement.from.as_ref() else {
         return Ok(None);
     };
-    let modeled = modeled_join_written(storage, txid, statement, written, scope, params, arena)?;
+    let modeled = modeled_join_written(
+        storage, txid, statement, written, scope, params, arena, planning,
+    )?;
     // A `USING` or `NATURAL` join beside a parenthesized join, or one in a
     // parenthesized join nested in another, that the search does not read
     // would run in pos3ql's own join order.
@@ -1842,6 +1846,7 @@ fn unread_parenthesized_using<'a>(
 }
 
 /// [`modeled_join`] of the written FROM `written`.
+#[allow(clippy::too_many_arguments)]
 fn modeled_join_written<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -1850,9 +1855,12 @@ fn modeled_join_written<'a>(
     scope: &QueryScope<'a>,
     params: &[Datum<'a>],
     arena: &'a Arena,
+    planning: &Arena,
 ) -> Result<Option<ModeledJoin<'a>>, SqlError> {
     let Some(from) = nested_members(written, arena)? else {
-        let modeled = modeled_join_over(storage, txid, statement, written, scope, params, arena)?;
+        let modeled = modeled_join_over(
+            storage, txid, statement, written, scope, params, arena, planning,
+        )?;
         if modeled.is_none()
             && scope.has_full_merged()
             && (0..scope.n)
@@ -1902,8 +1910,9 @@ fn modeled_join_written<'a>(
         entries[leaf..leaf + count].fill(table as u8);
         leaf += count;
     }
-    let Some(mut model) =
-        modeled_join_over(storage, txid, statement, from, &members, params, arena)?
+    let Some(mut model) = modeled_join_over(
+        storage, txid, statement, from, &members, params, arena, planning,
+    )?
     else {
         return Ok(None);
     };
@@ -1938,7 +1947,7 @@ impl<'a> PlannedJoin<'a> {
         arena: &'a Arena,
     ) -> Result<Option<&ModeledJoin<'a>>, SqlError> {
         if self.0.get().is_none() {
-            let planned = modeled_join(storage, txid, statement, scope, params, arena)?;
+            let planned = modeled_join(storage, txid, statement, scope, params, arena, arena)?;
             let _ = self.0.set(planned);
         }
         Ok(self.0.get().and_then(Option::as_ref))
@@ -1956,7 +1965,7 @@ pub(crate) fn models_join<'a>(
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
     let mark = arena.mark();
-    let modeled = modeled_join(storage, txid, statement, scope, params, arena)
+    let modeled = modeled_join(storage, txid, statement, scope, params, arena, arena)
         .map(|planned| planned.is_some());
     // SAFETY: the answer and its error hold no arena data, and planning
     // writes into nothing that outlives it.
@@ -2032,6 +2041,7 @@ fn nested_members<'a>(
 /// [`modeled_join`] of the base relations `from` (the written FROM, or its
 /// parenthesized joins' members) resolved by `scope`, its join tree as
 /// written.
+#[allow(clippy::too_many_arguments)]
 fn modeled_join_over<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -2040,6 +2050,7 @@ fn modeled_join_over<'a>(
     scope: &QueryScope<'a>,
     params: &[Datum<'a>],
     arena: &'a Arena,
+    planning: &Arena,
 ) -> Result<Option<ModeledJoin<'a>>, SqlError> {
     let statement = flatten_merged_statement(scope, statement, arena)?;
     let n = scope.n;
@@ -2589,7 +2600,7 @@ fn modeled_join_over<'a>(
     // The join tree as written: each comma-separated item a chain of joins
     // (each join's range table entry numbered in written order), then the
     // `FROM` list holding the `WHERE` conditions.
-    let Some(mut tree) = Tree::new(n, max_relations, arena) else {
+    let Some(mut tree) = Tree::new(n, max_relations, planning) else {
         return Err(crate::sql::eval::arena_full());
     };
     tree.enable_hashagg = value("enable_hashagg") != 0.0;
@@ -2676,7 +2687,7 @@ fn modeled_join_over<'a>(
     tree.root = root;
     // The conditions: each join's `ON`, then `WHERE`.
     let qual_capacity = tree.quals.len();
-    let quals = per_relation(arena, qual_capacity + 1, &Expr::Null)?;
+    let quals = per_relation(planning, qual_capacity + 1, &Expr::Null)?;
     let mut constants = Constants {
         held: per_relation(arena, qual_capacity + 1, (&Expr::Null, ColType::Int4))?,
         count: 0,
@@ -2684,7 +2695,7 @@ fn modeled_join_over<'a>(
     let mut expressions = Expressions::new(storage, txid, arena);
     // The written left and right operands of each full join's equality
     // clause, in pairs, which a `COALESCE` above it must name in order.
-    let full_clauses = per_relation(arena, 2 * (qual_capacity + 1), (0u8, 0u16))?;
+    let full_clauses = per_relation(planning, 2 * (qual_capacity + 1), (0u8, 0u16))?;
     let mut full_clause_count = 0;
     let sources = joined.iter().map(|&(node, on)| (Some(node), on)).chain(
         statement
@@ -5367,9 +5378,12 @@ fn modeled_join_over<'a>(
             geqo: super::joins::GeqoSettings::current(),
         },
     };
-    let Ok(plan) = super::joins::search(&problem, &reader, arena)? else {
+    // The search works in the planning memory; the plan it chose is copied
+    // out of it.
+    let Ok(plan) = super::joins::search(&problem, &reader, planning)? else {
         return Ok(None);
     };
+    let plan = plan.copy_into(arena, planning)?;
     // A hashed unique-ified relation returns its groups in its hash table's
     // order, by the hash values only some key types have here.
     // The type of a class member.

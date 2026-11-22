@@ -11,6 +11,7 @@ fn loop_values_keep_names_types_arrays_and_null_rows_after_source_reset() {
     let text = source.alloc_str("retained text").unwrap();
     let fields = source
         .alloc_slice_copy(&[RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: source.alloc_str("amount").unwrap(),
             type_oid: crate::sql::types::oid::INT4,
             type_mod: -1,

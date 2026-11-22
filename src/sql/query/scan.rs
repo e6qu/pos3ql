@@ -5554,6 +5554,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     ) -> Result<Option<&'v [crate::sql::types::RecordField<'v>]>, SqlError> {
         if let Some(alias) = self.scope.using_alias(table) {
             let mut fields = [crate::sql::types::RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: 0,
                 type_mod: -1,
@@ -5582,6 +5583,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         // catalog (its lifetime is unrelated to the row's `'v`).
         let cols = self.scope.source_columns(source);
         let mut fields = [crate::sql::types::RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -5613,6 +5615,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         let columns = self.scope.source_columns(source);
         let fields = arena
             .alloc_slice_with(source.n_columns, |index| crate::sql::types::RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: columns[index].ctype.oid(),
                 type_mod: columns[index].type_mod,

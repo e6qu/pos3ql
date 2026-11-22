@@ -70,7 +70,17 @@ pub(crate) const fn restore_query(source: &str) -> TsQuery<'_> {
     TsQuery(source)
 }
 
-const MAX_QUERY_DEPTH: usize = 64;
+/// The parenthesis nesting PostgreSQL 18.6's `tsquery` input (`makepol`)
+/// reaches under its default `max_stack_depth` (2048kB) before
+/// `check_stack_depth` fails, measured against the reference server.
+const QUERY_MAX_PAREN_DEPTH: usize = 9_329;
+/// The operator nesting PostgreSQL 18.6's `tsquery` output (`infix`)
+/// reaches under the same limit, measured the same way: every `tsquery`
+/// value here is kept as its output text, so no deeper tree exists and
+/// every traversal of one stays within the query thread's stack.
+const QUERY_MAX_OUTPUT_DEPTH: usize = 14_520;
+/// `STACKDEPTH`: the operators `makepol` holds pending at one nesting level.
+const QUERY_OPERATOR_STACK: usize = 32;
 // Text input reserves one byte for PostgreSQL's internal terminator. Binary
 // input carries that terminator separately and can fill the 11-bit field.
 const MAX_TEXT_LEXEME_BYTES: usize = 2_046;
@@ -578,6 +588,8 @@ struct QueryParser<'a> {
     arena: &'a Arena,
     at: usize,
     depth: usize,
+    /// The operators `makepol` would hold pending at this nesting level.
+    pending: usize,
     max_lexeme_bytes: usize,
     enforce_operand_storage: bool,
     operand_bytes: usize,
@@ -620,10 +632,24 @@ impl<'a> QueryParser<'a> {
         Ok(self.query)
     }
 
+    /// `pushOpStack`: an operator waits for its right operand.
+    fn push_operator(&mut self) -> Result<(), SqlError> {
+        if self.pending == QUERY_OPERATOR_STACK {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "tsquery stack too small"
+            ));
+        }
+        self.pending += 1;
+        Ok(())
+    }
+
     fn parse_or(&mut self) -> Result<u32, SqlError> {
         let mut left = self.parse_and()?;
         while self.consume(b'|') {
+            self.push_operator()?;
             let right = self.parse_and()?;
+            self.pending -= 1;
             left = self.query.push(QueryNode::Or(left, right))?;
         }
         Ok(left)
@@ -632,7 +658,9 @@ impl<'a> QueryParser<'a> {
     fn parse_and(&mut self) -> Result<u32, SqlError> {
         let mut left = self.parse_phrase()?;
         while self.consume(b'&') {
+            self.push_operator()?;
             let right = self.parse_phrase()?;
+            self.pending -= 1;
             left = self.query.push(QueryNode::And(left, right))?;
         }
         Ok(left)
@@ -666,7 +694,9 @@ impl<'a> QueryParser<'a> {
                 None
             };
             let Some(distance) = distance else { break };
+            self.push_operator()?;
             let right = self.parse_unary()?;
+            self.pending -= 1;
             left = self.query.push(QueryNode::Phrase {
                 left,
                 right,
@@ -678,7 +708,9 @@ impl<'a> QueryParser<'a> {
 
     fn parse_unary(&mut self) -> Result<u32, SqlError> {
         if self.consume(b'!') {
+            self.push_operator()?;
             let child = self.parse_unary()?;
+            self.pending -= 1;
             return self.query.push(QueryNode::Not(child));
         }
         self.parse_primary()
@@ -688,13 +720,16 @@ impl<'a> QueryParser<'a> {
         self.skip_ws();
         if self.consume(b'(') {
             self.depth += 1;
-            if self.depth > MAX_QUERY_DEPTH {
-                return Err(capacity("tsquery nesting"));
+            if self.depth > QUERY_MAX_PAREN_DEPTH {
+                return Err(crate::sql::stack_depth::stack_depth_exceeded());
             }
+            // Each nesting level is a new `makepol` with its own stack.
+            let pending = core::mem::replace(&mut self.pending, 0);
             let node = self.parse_or()?;
             if !self.consume(b')') {
                 return Err(syntax("tsquery", self.source));
             }
+            self.pending = pending;
             self.depth -= 1;
             return Ok(node);
         }
@@ -812,6 +847,7 @@ fn parse_query_with_limit<'a>(
         arena,
         at: 0,
         depth: 0,
+        pending: 0,
         max_lexeme_bytes,
         enforce_operand_storage,
         operand_bytes: 0,
@@ -830,15 +866,24 @@ fn query_precedence(node: QueryNode<'_>) -> u8 {
     }
 }
 
+/// `infix`: an operator binding less tightly than its parent is
+/// parenthesized, and so is a phrase that is a phrase's right operand, since
+/// the phrase operator depends on order.
 fn write_query_node(
     query: &Query<'_>,
     index: u32,
     parent_precedence: u8,
+    right_of_phrase: bool,
     out: &mut ArenaText<'_>,
+    depth: usize,
 ) -> Result<(), SqlError> {
+    if depth > QUERY_MAX_OUTPUT_DEPTH {
+        return Err(crate::sql::stack_depth::stack_depth_exceeded());
+    }
     let node = query.node(index).ok_or_else(|| syntax("tsquery", ""))?;
     let precedence = query_precedence(node);
-    let parens = precedence < parent_precedence;
+    let parens = precedence < parent_precedence
+        || (right_of_phrase && matches!(node, QueryNode::Phrase { .. }));
     if parens {
         out.push_str("( ")?;
     }
@@ -863,23 +908,23 @@ fn write_query_node(
         }
         QueryNode::Not(child) => {
             out.push_byte(b'!')?;
-            write_query_node(query, child, precedence, out)?;
+            write_query_node(query, child, precedence, false, out, depth + 1)?;
         }
         QueryNode::And(left, right) | QueryNode::Or(left, right) => {
-            write_query_node(query, left, precedence, out)?;
+            write_query_node(query, left, precedence, false, out, depth + 1)?;
             out.push_str(if matches!(node, QueryNode::And(..)) {
                 " & "
             } else {
                 " | "
             })?;
-            write_query_node(query, right, precedence, out)?;
+            write_query_node(query, right, precedence, false, out, depth + 1)?;
         }
         QueryNode::Phrase {
             left,
             right,
             distance,
         } => {
-            write_query_node(query, left, precedence, out)?;
+            write_query_node(query, left, precedence, false, out, depth + 1)?;
             if distance == 1 {
                 out.push_str(" <-> ")?;
             } else {
@@ -887,7 +932,7 @@ fn write_query_node(
                 write_u16(out, distance)?;
                 out.push_str("> ")?;
             }
-            write_query_node(query, right, precedence, out)?;
+            write_query_node(query, right, precedence, true, out, depth + 1)?;
         }
     }
     if parens {
@@ -907,7 +952,7 @@ pub fn canonical_query<'a>(source: &'a str, arena: &'a Arena) -> Result<&'a str,
         .and_then(|n| n.checked_add(query.nodes.len() * 8))
         .ok_or_else(|| capacity("tsquery"))?;
     let mut out = ArenaText::new(arena, output_capacity, "tsquery")?;
-    write_query_node(&query, root, 0, &mut out)?;
+    write_query_node(&query, root, 0, false, &mut out, 0)?;
     Ok(out.finish())
 }
 
@@ -927,7 +972,7 @@ fn format_query<'a>(query: &Query<'_>, arena: &'a Arena) -> Result<&'a str, SqlE
         })
         .ok_or_else(|| capacity("tsquery"))?;
     let mut out = ArenaText::new(arena, output_capacity, "tsquery")?;
-    write_query_node(query, root, 0, &mut out)?;
+    write_query_node(query, root, 0, false, &mut out, 0)?;
     Ok(out.finish())
 }
 
@@ -2116,7 +2161,7 @@ pub(crate) fn explicit_text_to_query_with<'a>(
         return Ok("");
     };
     let mut normalized = Query::empty(arena);
-    let result = normalize_explicit_node(&parsed, root, &mut normalized, arena, &mut normalize, 0)?;
+    let result = normalize_explicit_node(&parsed, root, &mut normalized, arena, &mut normalize)?;
     normalized.root = result.root;
     format_query(&normalized, arena)
 }
@@ -2179,11 +2224,8 @@ fn normalize_explicit_node<'a>(
     target: &mut Query<'a>,
     arena: &'a Arena,
     normalize: &mut dyn FnMut(u8, &str, &'a Arena) -> Result<TextSearchLexeme<'a>, SqlError>,
-    depth: usize,
 ) -> Result<NormalizedQueryNode, SqlError> {
-    if depth == MAX_QUERY_DEPTH {
-        return Err(capacity("tsquery nesting"));
-    }
+    crate::sql::stack_depth::check_stack_depth()?;
     let result = match source.node(index).ok_or_else(|| syntax("tsquery", ""))? {
         QueryNode::Lexeme {
             text,
@@ -2203,8 +2245,7 @@ fn normalize_explicit_node<'a>(
             }
         }
         QueryNode::Not(child) => {
-            let child =
-                normalize_explicit_node(source, child, target, arena, normalize, depth + 1)?;
+            let child = normalize_explicit_node(source, child, target, arena, normalize)?;
             NormalizedQueryNode {
                 root: child
                     .root
@@ -2215,9 +2256,8 @@ fn normalize_explicit_node<'a>(
             }
         }
         QueryNode::And(left, right) | QueryNode::Or(left, right) => {
-            let left = normalize_explicit_node(source, left, target, arena, normalize, depth + 1)?;
-            let right =
-                normalize_explicit_node(source, right, target, arena, normalize, depth + 1)?;
+            let left = normalize_explicit_node(source, left, target, arena, normalize)?;
+            let right = normalize_explicit_node(source, right, target, arena, normalize)?;
             let root = match (left.root, right.root) {
                 (Some(left), Some(right)) => Some(target.push(
                     if matches!(source.node(index), Some(QueryNode::And(..))) {
@@ -2248,9 +2288,8 @@ fn normalize_explicit_node<'a>(
             right,
             distance,
         } => {
-            let left = normalize_explicit_node(source, left, target, arena, normalize, depth + 1)?;
-            let right =
-                normalize_explicit_node(source, right, target, arena, normalize, depth + 1)?;
+            let left = normalize_explicit_node(source, left, target, arena, normalize)?;
+            let right = normalize_explicit_node(source, right, target, arena, normalize)?;
             let root = match (left.root, right.root) {
                 (Some(left_root), Some(right_root)) => Some(
                     target.push(QueryNode::Phrase {
@@ -2336,8 +2375,17 @@ fn websearch_to_query<'a>(
     arena: &'a Arena,
     normalize: &mut dyn FnMut(u8, &str, &'a Arena) -> Result<TextSearchLexeme<'a>, SqlError>,
 ) -> Result<&'a str, SqlError> {
-    let mut groups = ArenaList::new(arena);
-    let mut current: Option<&'a str> = None;
+    /// One term: its query, whether it is negated, and whether `or` ends
+    /// the group before it.
+    #[derive(Clone, Copy)]
+    struct Term<'a> {
+        query: &'a str,
+        negated: bool,
+        new_group: bool,
+    }
+    let mut terms = ArenaList::new(arena);
+    let mut new_group = false;
+    let mut raw_len = 0usize;
     let mut at = 0usize;
     let bytes = source.as_bytes();
     while at < bytes.len() {
@@ -2355,9 +2403,7 @@ fn websearch_to_query<'a>(
                 .is_none_or(|byte| byte.is_ascii_whitespace())
         {
             at += 2;
-            if let Some(query) = current.take() {
-                groups.push(query).map_err(|_| arena_full("tsquery"))?;
-            }
+            new_group = terms.len() > 0;
             continue;
         }
         let negated = bytes[at] == b'-';
@@ -2388,29 +2434,40 @@ fn websearch_to_query<'a>(
             }
             (begin, at, QueryInput::Phrase)
         };
-        let mut term = text_to_query_normalized(&source[begin..end], mode, arena, normalize)?;
+        let term = text_to_query_normalized(&source[begin..end], mode, arena, normalize)?;
         if term.is_empty() {
             continue;
         }
-        if negated {
-            term = not_query(term, arena)?;
+        raw_len = raw_len.saturating_add(term.len()).saturating_add(16);
+        terms
+            .push(Term {
+                query: term,
+                negated,
+                new_group,
+            })
+            .map_err(|_| arena_full("tsquery"))?;
+        new_group = false;
+    }
+    let terms = terms.as_slice();
+    if terms.is_empty() {
+        return Ok("");
+    }
+    // The terms of a group are and-ed, the groups or-ed, each grouped as
+    // the node it becomes; the whole is parsed once.
+    let mut raw = ArenaText::new(arena, raw_len.saturating_add(4), "tsquery")?;
+    raw.push_str("( ")?;
+    for (index, term) in terms.iter().enumerate() {
+        if term.new_group {
+            raw.push_str(" ) | ( ")?;
+        } else if index > 0 {
+            raw.push_str(" & ")?;
         }
-        current = Some(match current {
-            Some(left) => and_queries(left, term, arena)?,
-            None => term,
-        });
+        raw.push_str(if term.negated { "!( " } else { "( " })?;
+        raw.push_str(term.query)?;
+        raw.push_str(" )")?;
     }
-    if let Some(query) = current {
-        groups.push(query).map_err(|_| arena_full("tsquery"))?;
-    }
-    let mut result: Option<&'a str> = None;
-    for group in groups.as_slice() {
-        result = Some(match result {
-            Some(left) => combine_queries(left, group, " | ", arena)?,
-            None => group,
-        });
-    }
-    Ok(result.unwrap_or(""))
+    raw.push_str(" )")?;
+    canonical_query(raw.finish(), arena)
 }
 
 pub fn strip_vector<'a>(source: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
@@ -3155,11 +3212,14 @@ pub fn phrase_queries_distance<'a>(
         left.len().saturating_add(right.len()).saturating_add(16),
         "tsquery",
     )?;
+    // Each operand is grouped as the node it becomes.
+    raw.push_str("( ")?;
     raw.push_str(left)?;
-    raw.push_str(" <")?;
+    raw.push_str(" ) <")?;
     write_u16(&mut raw, distance)?;
-    raw.push_str("> ")?;
+    raw.push_str("> ( ")?;
     raw.push_str(right)?;
+    raw.push_str(" )")?;
     canonical_query(raw.finish(), arena)
 }
 
@@ -3262,14 +3322,19 @@ fn combine_queries<'a>(
     if right.is_empty() {
         return canonical_query(left, arena);
     }
+    // Each operand is grouped as the node it becomes.
     let mut raw = ArenaText::new(
         arena,
-        left.len().saturating_add(right.len()).saturating_add(8),
+        left.len().saturating_add(right.len()).saturating_add(16),
         "tsquery",
     )?;
+    raw.push_str("( ")?;
     raw.push_str(left)?;
+    raw.push_str(" )")?;
     raw.push_str(operator)?;
+    raw.push_str("( ")?;
     raw.push_str(right)?;
+    raw.push_str(" )")?;
     canonical_query(raw.finish(), arena)
 }
 

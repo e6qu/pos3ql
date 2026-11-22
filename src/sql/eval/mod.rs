@@ -1483,6 +1483,45 @@ fn whole_row_value<'a>(
     }
 }
 
+/// The fields of a whole-row reference to `table` holding the TOAST forms
+/// their stored values keep: `toast_build_flattened_tuple` fetches a value
+/// saved out of line back in line and keeps a compressed one compressed. A
+/// field whose form the row cannot name is [`StoredForm::Unmodelled`].
+///
+/// [`StoredForm::Unmodelled`]: crate::storage::StoredForm::Unmodelled
+pub(crate) fn whole_row_formed_fields<'a>(
+    row: &dyn ColumnLookup<'a>,
+    table: &str,
+    fields: &'a [RecordField<'a>],
+    arena: &'a Arena,
+) -> Result<&'a [RecordField<'a>], SqlError> {
+    use crate::storage::StoredForm;
+    let form_of = |field: &RecordField<'a>| {
+        if field.form != StoredForm::Inline || !crate::sql::toast::may_be_toasted(&field.value) {
+            return field.form;
+        }
+        match row.stored_form(Some(table), field.name) {
+            Ok(form) => form.unwrap_or(StoredForm::Inline).fetched(),
+            Err(_) => StoredForm::Unmodelled,
+        }
+    };
+    if fields.iter().all(|field| form_of(field) == field.form) {
+        return Ok(fields);
+    }
+    let formed = arena
+        .alloc_slice_with(fields.len(), |at| RecordField {
+            form: form_of(&fields[at]),
+            ..fields[at]
+        })
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "whole-row value exceeds the statement arena"
+            )
+        })?;
+    Ok(formed)
+}
+
 /// Static type identity retained until a context decides how PostgreSQL
 /// resolves an unconstrained expression.
 #[derive(Clone, Copy)]
@@ -7324,6 +7363,7 @@ fn materialize_acl_value<'a>(
         Datum::Record(fields) => {
             let materialized = arena
                 .alloc_slice_with(fields.len(), |_| RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "",
                     type_oid: 0,
                     type_mod: -1,
@@ -7341,6 +7381,7 @@ fn materialize_acl_value<'a>(
         Datum::Composite { slot, fields } => {
             let materialized = arena
                 .alloc_slice_with(fields.len(), |_| RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "",
                     type_oid: 0,
                     type_mod: -1,
@@ -8502,7 +8543,12 @@ fn eval_full_inner<'a>(
             Some(fields) if row.whole_row_is_scalar(table) => {
                 Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
             }
-            Some(fields) => Ok(whole_row_value(row, hooks.catalog, table, fields)),
+            Some(fields) => Ok(whole_row_value(
+                row,
+                hooks.catalog,
+                table,
+                whole_row_formed_fields(row, table, fields, arena)?,
+            )),
             None => Ok(Datum::Null), // outer-join null row
         },
         Expr::Bool(b) => Ok(Datum::Bool(b)),
@@ -8531,7 +8577,12 @@ fn eval_full_inner<'a>(
                     Ok(Some(fields)) if row.whole_row_is_scalar(name) => {
                         Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
                     }
-                    Ok(Some(fields)) => Ok(whole_row_value(row, hooks.catalog, name, fields)),
+                    Ok(Some(fields)) => Ok(whole_row_value(
+                        row,
+                        hooks.catalog,
+                        name,
+                        whole_row_formed_fields(row, name, fields, arena)?,
+                    )),
                     Ok(None) => Ok(Datum::Null),
                     Err(_) => Err(crate::sql::error_position::column_reference(
                         e, qualifier, name,
@@ -12512,12 +12563,14 @@ fn call<'a>(
             let fields = arena
                 .alloc_slice_copy(&[
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "x",
                         type_oid,
                         type_mod: -1,
                         value,
                     },
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "n",
                         type_oid: super::types::oid::INT4,
                         type_mod: -1,
@@ -12829,12 +12882,14 @@ fn call<'a>(
             let fields = arena
                 .alloc_slice_copy(&[
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "key",
                         type_oid: super::types::oid::TEXT,
                         type_mod: -1,
                         value: Datum::Text(key),
                     },
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "value",
                         type_oid: value_oid,
                         type_mod: -1,
@@ -12872,24 +12927,28 @@ fn call<'a>(
             let fields = arena
                 .alloc_slice_copy(&[
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "grantor",
                         type_oid: super::types::oid::OID,
                         type_mod: -1,
                         value: Datum::Oid(value.grantor),
                     },
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "grantee",
                         type_oid: super::types::oid::OID,
                         type_mod: -1,
                         value: Datum::Oid(value.grantee),
                     },
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "privilege_type",
                         type_oid: super::types::oid::TEXT,
                         type_mod: -1,
                         value: Datum::Text(value.privilege),
                     },
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "is_grantable",
                         type_oid: super::types::oid::BOOL,
                         type_mod: -1,
@@ -12935,12 +12994,14 @@ fn call<'a>(
             let fields = arena
                 .alloc_slice_copy(&[
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "option_name",
                         type_oid: super::types::oid::TEXT,
                         type_mod: -1,
                         value: option_name,
                     },
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "option_value",
                         type_oid: super::types::oid::TEXT,
                         type_mod: -1,
@@ -13019,12 +13080,14 @@ fn call<'a>(
             let fields = arena
                 .alloc_slice_copy(&[
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "last_value",
                         type_oid: super::types::oid::INT8,
                         type_mod: -1,
                         value: Datum::Int8(last_value),
                     },
                     super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "is_called",
                         type_oid: super::types::oid::BOOL,
                         type_mod: -1,
@@ -13864,7 +13927,8 @@ pub fn record_star_expand<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
     if let Expr::WholeRow(table) = base {
-        return row.whole_row_expansion_fields(table, arena);
+        let fields = row.whole_row_expansion_fields(table, arena)?;
+        return whole_row_formed_fields(row, table, fields, arena);
     }
     if let Expr::Column {
         qualifier: None,
@@ -13874,7 +13938,8 @@ pub fn record_star_expand<'a>(
             .lookup(None, name)
             .is_err_and(|error| error.sqlstate == sqlstate::UNDEFINED_COLUMN)
     {
-        return row.whole_row_expansion_fields(name, arena);
+        let fields = row.whole_row_expansion_fields(name, arena)?;
+        return whole_row_formed_fields(row, name, fields, arena);
     }
     match eval_full(base, arena, params, row, hooks)? {
         Datum::Record(fields) | Datum::Composite { fields, .. } => Ok(fields),

@@ -39589,7 +39589,9 @@ impl Storage {
                 &mut |row| {
                     let mut decoded = [Datum::Null; MAX_COLUMNS];
                     rowenc::decode(sample_rows[row], &schema[..n_columns], &mut decoded)?;
-                    Ok(decoded[column])
+                    let mut forms = [rowenc::StoredForm::Inline; MAX_COLUMNS];
+                    rowenc::stored_forms(sample_rows[row], &schema[..n_columns], &mut forms)?;
+                    Ok((decoded[column], forms[column]))
                 },
                 arena,
             )?;
@@ -39653,7 +39655,7 @@ impl Storage {
                     kept,
                     index_total,
                     true,
-                    &mut |row| Ok(keyed[row * width + at]),
+                    &mut |row| Ok((keyed[row * width + at], rowenc::StoredForm::Inline)),
                     arena,
                 )?;
                 let record = AnalyzedColumn::of_index(indexes.stamp(index), key.attribute, image)?
@@ -39690,7 +39692,9 @@ impl Storage {
                 &mut |row| {
                     let mut decoded = [Datum::Null; MAX_COLUMNS];
                     rowenc::decode(inherited_rows[row], &schema[..n_columns], &mut decoded)?;
-                    Ok(decoded[column])
+                    let mut forms = [rowenc::StoredForm::Inline; MAX_COLUMNS];
+                    rowenc::stored_forms(inherited_rows[row], &schema[..n_columns], &mut forms)?;
+                    Ok((decoded[column], forms[column]))
                 },
                 arena,
             )?;
@@ -39860,7 +39864,7 @@ impl Storage {
         sampled: usize,
         total_rows: u64,
         computed: bool,
-        value_at: &mut dyn FnMut(usize) -> Result<Datum<'w>, SqlError>,
+        value_at: &mut dyn FnMut(usize) -> Result<(Datum<'w>, rowenc::StoredForm), SqlError>,
         arena: &'w crate::mem::arena::Arena,
     ) -> Result<(ColumnStatistics, &'w [u8]), SqlError> {
         const REGISTERS: usize = 64;
@@ -39907,7 +39911,7 @@ impl Storage {
         let mut registers = [0u8; REGISTERS];
         for row in 0..sampled {
             crate::sql::query::check_timeout()?;
-            let value = value_at(row)?;
+            let (value, form) = value_at(row)?;
             if value.is_null() {
                 null_count += 1;
                 continue;
@@ -39920,10 +39924,19 @@ impl Storage {
             }
             if varlena {
                 let raw = statistics::scalar::raw_value_length(&value);
-                total_width += if computed {
-                    raw + 4
-                } else {
-                    statistics::scalar::stored_value_width(raw)
+                // `VARSIZE_ANY` of the datum as stored: a compressed value's
+                // compressed size, a value saved out of line its pointer's.
+                total_width += match form {
+                    rowenc::StoredForm::Compressed(size) => size as usize,
+                    rowenc::StoredForm::External { .. } => crate::sql::toast::TOAST_POINTER_SIZE,
+                    rowenc::StoredForm::Unmodelled => {
+                        return Err(crate::sql_err!(
+                            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                            "ANALYZE of a value whose TOAST form is not modelled is not supported"
+                        ));
+                    }
+                    rowenc::StoredForm::Inline if computed => raw + 4,
+                    rowenc::StoredForm::Inline => statistics::scalar::stored_value_width(raw),
                 } as f64;
                 if raw + 4 > statistics::scalar::WIDTH_THRESHOLD {
                     toowide_count += 1;
@@ -39946,7 +39959,7 @@ impl Storage {
             let elements = match ctype {
                 ColType::Array(element) if element.to_coltype().has_builtin_ordering() => {
                     statistics::elements::compute(
-                        value_at,
+                        &mut |row| value_at(row).map(|(value, _)| value),
                         sampled,
                         target,
                         element,
@@ -40042,8 +40055,12 @@ impl Storage {
             };
             // `compute_tsvector_stats`: the most common lexemes.
             if ctype == ColType::TsVector
-                && let Some(set) =
-                    statistics::elements::compute_lexemes(value_at, sampled, target, arena)?
+                && let Some(set) = statistics::elements::compute_lexemes(
+                    &mut |row| value_at(row).map(|(value, _)| value),
+                    sampled,
+                    target,
+                    arena,
+                )?
             {
                 let length = statistics::distribution::encoded_len(&[], &[], Some(&set));
                 let bytes = arena

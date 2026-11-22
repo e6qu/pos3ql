@@ -262,6 +262,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         let width = self.scope.qualified_star_columns(table)?;
         let fields = arena
             .alloc_slice_with(width, |_| crate::sql::types::RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: 0,
                 type_mod: -1,

@@ -262,6 +262,7 @@ fn composite_slot_witness<'a>(
         )
     })?;
     let mut fields = [RecordField {
+        form: crate::storage::StoredForm::Inline,
         name: "",
         type_oid: 0,
         type_mod: -1,
@@ -271,6 +272,7 @@ fn composite_slot_witness<'a>(
     let mut count = 0;
     for field in definition.active_fields() {
         fields[count] = RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: arena
                 .alloc_str(field.name.as_str())
                 .map_err(|_| arena_full())?,
@@ -343,6 +345,7 @@ fn scope_record_witness<'a>(
         let source = scope.source(table_name)?;
         let columns = scope.source_columns(source);
         let mut fields = [RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -351,6 +354,7 @@ fn scope_record_witness<'a>(
         let mut collations = [Collation::None; MAX_PROJ];
         for (index, column) in columns.iter().enumerate() {
             fields[index] = RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: scope.defs.column_name(source.table, source.first + index),
                 type_oid: storage
                     .routine_type_oid(column.ctype, column.user_type, txid)
@@ -474,6 +478,7 @@ fn external_list_subquery<'a>(
                 values[0]
             } else {
                 let mut fields = [RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "",
                     type_oid: 0,
                     type_mod: -1,
@@ -481,6 +486,7 @@ fn external_list_subquery<'a>(
                 }; MAX_PROJ];
                 for (column, field) in fields.iter_mut().enumerate().take(row_arity) {
                     *field = RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "",
                         type_oid: row_witness_fields
                             .and_then(|fields| fields.get(column))
@@ -1514,6 +1520,7 @@ fn row_subquery_witness<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<Datum<'a>, SqlError> {
     let mut fields = [RecordField {
+        form: crate::storage::StoredForm::Inline,
         name: "",
         type_oid: 0,
         type_mod: -1,
@@ -1535,6 +1542,7 @@ fn row_subquery_witness<'a>(
         for (index, column) in columns[..count].iter().enumerate() {
             let value = catalog_type_witness(storage, txid, column.type_oid)?;
             fields[index] = RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: column.name,
                 type_oid: column.type_oid,
                 type_mod: column.type_mod,
@@ -1563,6 +1571,7 @@ fn row_subquery_witness<'a>(
         )?;
         for (index, column) in columns[..count].iter().enumerate() {
             fields[index] = RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: column.name,
                 type_oid: column.type_oid,
                 type_mod: column.type_mod,
@@ -1587,6 +1596,7 @@ fn row_subquery_witness<'a>(
             subquery_item_type(storage, txid, expression, scope.as_ref(), outer, arena)?;
         let generated = stack_format!(12, "f{}", index + 1);
         fields[index] = RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: match alias {
                 Some(alias) => alias,
                 None => arena
@@ -4195,6 +4205,7 @@ fn run_scalar_record_subquery<'a>(
                 ));
             }
             let mut fields = [RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: 0,
                 type_mod: -1,
@@ -4202,6 +4213,7 @@ fn run_scalar_record_subquery<'a>(
             }; MAX_PROJ];
             for (column, field_value) in row.iter().copied().enumerate() {
                 fields[column] = RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: witness_fields[column].name,
                     type_oid: witness_fields[column].type_oid,
                     type_mod: witness_fields[column].type_mod,
@@ -4275,6 +4287,7 @@ fn run_record_subquery<'a>(
                 ));
             }
             let mut fields = [RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: 0,
                 type_mod: -1,
@@ -4282,6 +4295,7 @@ fn run_record_subquery<'a>(
             }; MAX_PROJ];
             for (column, value) in values.iter().copied().enumerate() {
                 fields[column] = RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: witness_fields[column].name,
                     type_oid: witness_fields[column].type_oid,
                     type_mod: witness_fields[column].type_mod,
@@ -5050,7 +5064,7 @@ fn set_record_rows<'a>(
     }
     let record = |values: &mut dyn FnMut(usize) -> Result<Datum<'a>, SqlError>|
      -> Result<Datum<'a>, SqlError> {
-        let mut fields = [RecordField {
+        let mut fields = [RecordField { form: crate::storage::StoredForm::Inline,
             name: "",
             type_oid: 0,
             type_mod: -1,
@@ -5058,7 +5072,7 @@ fn set_record_rows<'a>(
         }; MAX_PROJ];
         for (column, field) in fields[..target.len()].iter_mut().enumerate() {
             let value = values(column)?;
-            *field = RecordField {
+            *field = RecordField { form: crate::storage::StoredForm::Inline,
                 name: names[column],
                 type_oid: target[column].oid(),
                 type_mod: -1,

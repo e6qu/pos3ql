@@ -1219,6 +1219,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 for (value, encoded) in values.iter_mut().zip(rows) {
                     let fields = arena
                         .alloc_slice_with(names.len(), |index| crate::sql::types::RecordField {
+                            form: crate::storage::StoredForm::Inline,
                             name: names[index],
                             type_oid: types[index].oid(),
                             type_mod: -1,
@@ -1249,6 +1250,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 for (value, encoded) in values.iter_mut().zip(rows) {
                     let decoded = arena
                         .alloc_slice_with(fields.len(), |index| crate::sql::types::RecordField {
+                            form: crate::storage::StoredForm::Inline,
                             name: fields[index].0,
                             type_oid: fields[index].1.oid(),
                             type_mod: -1,
@@ -1280,6 +1282,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 let error = crate::sql::eval::input_error(input, type_name, arena, hooks)?;
                 let fields = arena
                     .alloc_slice_with(4, |index| crate::sql::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: ["message", "detail", "hint", "sql_error_code"][index],
                         type_oid: crate::sql::types::oid::TEXT,
                         type_mod: -1,
@@ -1402,6 +1405,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 for (value, row) in values.iter_mut().zip(rows) {
                     let fields = arena
                         .alloc_slice_with(4, |index| crate::sql::types::RecordField {
+                            form: crate::storage::StoredForm::Inline,
                             name: PARTITION_TREE_COLUMNS[index].0,
                             type_oid: PARTITION_TREE_COLUMNS[index].1.oid(),
                             type_mod: -1,
@@ -1469,6 +1473,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     let row = tsvector_unnest_values(&parsed, index, arena)?;
                     let fields = arena
                         .alloc_slice_with(3, |field| crate::sql::types::RecordField {
+                            form: crate::storage::StoredForm::Inline,
                             name: ["lexeme", "positions", "weights"][field],
                             type_oid: [
                                 crate::sql::types::oid::TEXT,
@@ -1551,6 +1556,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             for (value, encoded) in values.iter_mut().zip(rows) {
                 let decoded = arena
                     .alloc_slice_with(columns.len(), |_| crate::sql::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "",
                         type_oid: 0,
                         type_mod: -1,
@@ -1559,6 +1565,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     .map_err(|_| arena_full())?;
                 for (index, column) in columns.iter().enumerate() {
                     decoded[index] = crate::sql::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: arena
                             .alloc_str(column.name.as_str())
                             .map_err(|_| arena_full())?,
@@ -1839,6 +1846,7 @@ fn builtin_table_function_values<'a, R: ColumnLookup<'a>>(
         }
         let fields = arena
             .alloc_slice_with(columns.len(), |_| crate::sql::types::RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: 0,
                 type_mod: -1,
@@ -1847,6 +1855,7 @@ fn builtin_table_function_values<'a, R: ColumnLookup<'a>>(
             .map_err(|_| arena_full())?;
         for (index, (field, column)) in fields.iter_mut().zip(columns).enumerate() {
             *field = crate::sql::types::RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: arena
                     .alloc_str(column.name.as_str())
                     .map_err(|_| arena_full())?,

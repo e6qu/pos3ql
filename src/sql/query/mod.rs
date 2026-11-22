@@ -1998,6 +1998,7 @@ impl<'a> RoutineResultShape<'a> {
         }
         let fields = arena
             .alloc_slice_with(columns.len(), |_| super::types::RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "",
                 type_oid: super::types::oid::UNKNOWN,
                 type_mod: -1,
@@ -2066,6 +2067,7 @@ impl<'a> RoutineResultShape<'a> {
             Self::Composite { .. } => {
                 let fields = arena
                     .alloc_slice_with(values.len(), |index| super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "",
                         type_oid: if values[index].is_null() {
                             super::types::oid::UNKNOWN
@@ -5012,6 +5014,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 let field_oid = field_type_oid(column.ctype, column.user_type)?;
                 columns
                     .push(super::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name,
                         type_oid: field_oid,
                         type_mod: -1,
@@ -5036,6 +5039,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             let name = arena.alloc_str(column.name).map_err(|_| arena_full())?;
             columns
                 .push(super::types::RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name,
                     type_oid: column.type_oid,
                     type_mod: column.type_mod,
@@ -6543,6 +6547,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let fields = arena
             .alloc_slice_with(definition.active_field_count(), |_| {
                 super::types::RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "",
                     type_oid: super::types::oid::UNKNOWN,
                     type_mod: -1,

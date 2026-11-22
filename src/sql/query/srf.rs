@@ -610,7 +610,7 @@ fn publication_int2vector<'a>(
 }
 
 fn publication_table_rows<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     arguments: &[Datum<'a>],
@@ -862,7 +862,7 @@ impl ProjectSet<'_> {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
     items: &'a [SelectItem<'a>],
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -881,7 +881,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
 
     fn visit<'a, R: ColumnLookup<'a>>(
         expression: &'a Expr<'a>,
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
@@ -957,7 +957,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
     #[allow(clippy::too_many_arguments)]
     fn materialize_call<'a, R: ColumnLookup<'a>>(
         expression: &'a Expr<'a>,
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
@@ -1039,7 +1039,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
     #[allow(clippy::too_many_arguments)]
     fn materialize_direct<'a, R: ColumnLookup<'a>>(
         expression: &'a Expr<'a>,
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
@@ -1789,7 +1789,7 @@ fn builtin_table_function_values<'a, R: ColumnLookup<'a>>(
     args: &'a [&'a Expr<'a>],
     variadic: bool,
     source_position: crate::sql::ast::SourcePosition,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -4867,7 +4867,7 @@ fn scalar_function_row<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -4975,7 +4975,7 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
 #[allow(clippy::too_many_arguments)]
 fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -7834,7 +7834,7 @@ fn json_table_behavior<'a, C: ColumnLookup<'a>>(
 #[allow(clippy::too_many_arguments)]
 fn rows_from_base_rows_outer<'a, C: ColumnLookup<'a>>(
     functions: &'a [TableRef<'a>],
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],

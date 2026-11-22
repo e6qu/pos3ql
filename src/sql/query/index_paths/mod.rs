@@ -66,7 +66,7 @@ pub(crate) fn has_indexes(storage: &Storage, txid: u32, slot: usize) -> bool {
 /// is read too, so no index-only scan serves it.
 #[expect(clippy::too_many_arguments, reason = "the write's parts are explicit")]
 pub(crate) fn write_scan_path<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     target: crate::sql::ast::QualName<'a>,
     alias: Option<&'a str>,
@@ -83,7 +83,7 @@ pub(crate) fn write_scan_path<'a>(
 /// reads, and the shape of its scan: the new values and the row identity
 /// it returns.
 pub(crate) fn write_shape<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     target: crate::sql::ast::QualName<'a>,
     alias: Option<&'a str>,

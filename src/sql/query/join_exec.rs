@@ -1024,7 +1024,7 @@ type Row<'a> = &'a [Option<BaseRow<'a>>];
 struct Runner<'r, 'a> {
     cx: JoinContext<'r, 'a>,
     /// The statement's storage, which the scan nodes it makes borrow.
-    storage: &'a Storage,
+    storage: &'r Storage,
     /// Each path's kept hash table or store, which a rescan reads again
     /// (`ExecReScanHashJoin`, `ExecReScanMaterial`).
     built: &'a [core::cell::Cell<Option<Built<'a>>>],
@@ -1457,7 +1457,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
 pub(super) fn scan_statement_source<'a>(
     statement: &'a crate::sql::ast::Select<'a>,
     recycle_rows: bool,
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a crate::sql::ast::FromClause<'a>,
     txid: u32,
@@ -1523,7 +1523,7 @@ pub(super) fn scan_statement_source<'a>(
 /// PostgreSQL's order.
 #[allow(clippy::too_many_arguments)]
 fn run_modeled_sorted<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     model: &ModeledJoin<'a>,
@@ -1683,7 +1683,7 @@ fn run_modeled_sorted<'a>(
 /// returns false.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_modeled<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     model: &ModeledJoin<'a>,

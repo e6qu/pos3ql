@@ -89,7 +89,7 @@ impl core::fmt::Display for JsonObjectAggregateDisplay<'_> {
 /// Returns per-node result datums in the arena.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fold_aggregates<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,

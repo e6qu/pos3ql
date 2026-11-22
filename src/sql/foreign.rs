@@ -1745,7 +1745,7 @@ pub(crate) struct KeptForeignScan {
 /// the kept rows again and continues the same cursor, so remote rows, their
 /// volatile values and the remote commands are those of one scan.
 pub(crate) fn stream_rows<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     stream: &ForeignStream<'a>,
     txid: u32,
     arena: &'a Arena,
@@ -1902,7 +1902,7 @@ fn push_row<'a>(
 /// Reads a foreign table's rows: every column, or the remote query a
 /// `SELECT`'s plan pushed, whose unfetched columns read as `NULL`.
 pub(crate) fn materialize<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     table_slot: usize,
     txid: u32,
     arena: &'a Arena,

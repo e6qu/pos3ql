@@ -9385,10 +9385,11 @@ where
             subquery_expressions[subquery_expression_count] = Some(expression);
             subquery_expression_count += 1;
         }
-        let subqueries = super::query::subquery_hooks(
+        let subqueries = super::query::data_change_subquery_hooks(
             &subquery_expressions[..subquery_expression_count],
             storage,
             txn.txid,
+            txn.command_id(),
             arena,
             params,
             Some(&crate::sql::sequence::SeqEval::new(
@@ -33027,7 +33028,7 @@ struct TriggerQueryExecution<'params, 'session, 'result> {
     reason = "trigger INSERT source and assignment context"
 )]
 fn materialize_trigger_insert_source<'result, 'query>(
-    storage: &'query Storage,
+    storage: &Storage,
     statement: &Insert<'_>,
     select: &'query Select<'query>,
     casts: &[PlannedAssignmentCast<'_>],
@@ -39779,7 +39780,7 @@ struct TriggerForRows<'a> {
     reason = "query materialization retains explicit query/result lifetimes and live evaluation context"
 )]
 fn materialize_trigger_for_query<'result, 'query>(
-    storage: &'query Storage,
+    storage: &Storage,
     query: &'query Select<'query>,
     query_arena: &'query Arena,
     result_arena: &'result Arena,
@@ -40151,7 +40152,7 @@ fn for_dml_rows<'a>(
     reason = "query materialization retains explicit query/result lifetimes and live evaluation context"
 )]
 fn materialize_trigger_for_record_query<'result, 'query>(
-    storage: &'query Storage,
+    storage: &Storage,
     query: &'query Select<'query>,
     query_arena: &'query Arena,
     result_arena: &'result Arena,
@@ -85262,7 +85263,7 @@ fn merge_source_columns(
 /// expands an unqualified star in that order; qualified names retain their
 /// ordinary namespaces and output aliases map to the target shape.
 pub fn describe_merge_returning<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &crate::sql::ast::Merge<'a>,
     arena: &'a Arena,
@@ -85295,7 +85296,7 @@ pub fn describe_merge_returning<'a>(
     reason = "description explicitly selects SQL identities or protocol types"
 )]
 pub(crate) fn describe_dml_from_returning<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     table: crate::sql::ast::QualName<'a>,
     alias: Option<&'a str>,
@@ -85327,7 +85328,7 @@ pub(crate) fn describe_dml_from_returning<'a>(
     reason = "description explicitly selects SQL identities or protocol types"
 )]
 fn describe_joined_returning<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     target: crate::sql::ast::TableRef<'a>,
     items: &[crate::sql::ast::TableRef<'a>],
@@ -90976,7 +90977,9 @@ pub(crate) fn instead_of_view_dml<'a>(
         view_expressions,
         storage,
         txn.txid,
-        Some(txn.command_id()),
+        super::query::DeferredRuns::DataChange {
+            command: txn.command_id(),
+        },
         arena,
         params,
         None,
@@ -90989,7 +90992,9 @@ pub(crate) fn instead_of_view_dml<'a>(
         Ok(subqueries) => subqueries,
         Err(error) => return sql_fail(error),
     };
-    let view_queries = super::query::DmlSubqueries::new(storage, txn.txid, txn.command_id());
+    // The view's correlated subqueries run as of the statement's command,
+    // through each row's own storage borrow.
+    let view_command = txn.command_id();
     let selected: usize;
     let outcome = match statement {
         Stmt::Insert(insert) => {
@@ -91295,6 +91300,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                             let sequences =
                                 crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
                             let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                            let view_queries =
+                                super::query::DmlSubqueries::new(storage, txn.txid, view_command);
                             let hooks = EvalHooks {
                                 catalog: Some(&catalog),
                                 sequences: Some(&sequences),
@@ -91476,6 +91483,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                         let sequences =
                             crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
                         let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                        let view_queries =
+                            super::query::DmlSubqueries::new(storage, txn.txid, view_command);
                         let hooks = super::eval::EvalHooks {
                             catalog: Some(&catalog),
                             sequences: Some(&sequences),
@@ -91532,6 +91541,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                         let sequences =
                             crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
                         let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                        let view_queries =
+                            super::query::DmlSubqueries::new(storage, txn.txid, view_command);
                         let hooks = EvalHooks {
                             catalog: Some(&catalog),
                             sequences: Some(&sequences),
@@ -91781,6 +91792,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                         let sequences =
                             crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
                         let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                        let view_queries =
+                            super::query::DmlSubqueries::new(storage, txn.txid, view_command);
                         let hooks = EvalHooks {
                             catalog: Some(&catalog),
                             sequences: Some(&sequences),
@@ -95434,7 +95447,9 @@ pub(crate) fn update<'a>(
         &subquery_expressions[..subquery_expression_count],
         storage,
         txn.txid,
-        Some(txn.command_id()),
+        super::query::DeferredRuns::DataChange {
+            command: txn.command_id(),
+        },
         arena,
         params,
         outer,
@@ -97278,7 +97293,9 @@ pub(crate) fn delete<'a>(
         &[statement.where_clause],
         storage,
         txn.txid,
-        Some(txn.command_id()),
+        super::query::DeferredRuns::DataChange {
+            command: txn.command_id(),
+        },
         arena,
         params,
         outer,
@@ -108183,7 +108200,7 @@ struct LoopQualification<'q, 'a, Definition: crate::storage::DefinitionBacking> 
     from: Option<&'a crate::sql::ast::FromClause<'a>>,
     where_clause: Option<&'a Expr<'a>>,
     params: &'q [Datum<'a>],
-    subs: &'q super::eval::SubqueryValues<'a, 'a>,
+    subs: &'q super::eval::SubqueryValues<'q, 'a>,
     row_security: Option<super::query::RowSecurityPlan<'a>>,
     outer: Option<&'q dyn ColumnLookup<'a>>,
     seq_session: &'q crate::sql::guc::SeqSession,
@@ -108920,7 +108937,7 @@ struct WriteTreeOrder {
 /// when PostgreSQL scans the members without index paths.
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
 fn tree_write_orders<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     table_index: usize,
     def: &crate::storage::TableDef,
     alias: Option<&str>,

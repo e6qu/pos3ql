@@ -1063,7 +1063,7 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
         }
     }
 
-    fn statement_subqueries(&self) -> crate::sql::eval::StatementScope<'a> {
+    fn statement_subqueries(&self) -> crate::sql::eval::StatementScope<'_, 'a> {
         self.enclosing
             .map(|enclosing| enclosing.statement_subqueries())
             .unwrap_or_default()
@@ -1260,7 +1260,10 @@ pub(crate) struct ScopeSource {
 pub(crate) struct ScopeTypes<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 
 /// Schema construction can inspect a caller's columns without retaining values
-/// whose lifetime belongs to that caller's row scratch.
+/// whose lifetime belongs to that caller's row scratch: a type-only view of
+/// them at any lifetime, its values read as NULL. A description of a query
+/// run for a row reads the row's types this way, so describing it borrows
+/// neither the row's values nor storage for as long as they live.
 pub(crate) struct OuterColumnTypes<'s, 'row>(pub(crate) &'s dyn ColumnLookup<'row>);
 
 /// The declared types of an enclosing level known only by type, such as a
@@ -1363,6 +1366,44 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.0.lookup(qualifier, name).map(|_| Datum::Null)
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'a>, SqlError> {
+        self.0
+            .lookup_unsuggested(qualifier, name)
+            .map(|_| Datum::Null)
+    }
+
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.0.resolve_column_type_unsuggested(qualifier, name)
+    }
+
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        self.0.procedural_variable(qualifier, name)
+    }
+
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        self.0.column_identity(qualifier, name)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        self.0.whole_row_present(table)
+    }
+
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        self.0.whole_row_relation(table)
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
@@ -2621,16 +2662,8 @@ impl<'d> QueryScope<'d> {
                         "a foreign query with parameters is read only as a stream"
                     ));
                 }
-                // SAFETY: `Storage` outlives the statement; the fetch keeps
-                // no reference to it and returns its rows as arena bytes.
-                let run_storage: &'d Storage = unsafe { &*core::ptr::from_ref(storage) };
                 let rows = crate::sql::foreign::materialize(
-                    run_storage,
-                    slot,
-                    txid,
-                    arena,
-                    sequences,
-                    pushed,
+                    storage, slot, txid, arena, sequences, pushed,
                 )?;
                 self.derived[source] = Some(rows);
                 return Ok(());
@@ -2741,32 +2774,12 @@ impl<'d> QueryScope<'d> {
         let _block = super::instrument::enter(super::instrument::Segment::Derived(
             u16::try_from(position).unwrap_or(u16::MAX),
         ));
-        // SAFETY: `Storage` outlives the statement; the derived table's run
-        // keeps no reference to it, and its rows are encoded into the arena
-        // below.
-        let run_storage: &'a Storage = unsafe { &*core::ptr::from_ref(storage) };
         let select_rows = |emit: &mut crate::sql::query::RowSink<'_>| match order {
-            super::group::RowOrder::Observed => select_into_rows(
-                run_storage,
-                txid,
-                sub,
-                arena,
-                params,
-                outer,
-                sequences,
-                emit,
-            ),
+            super::group::RowOrder::Observed => {
+                select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
+            }
             super::group::RowOrder::Unobserved => super::group::with_unobserved_order(sub, || {
-                select_into_rows(
-                    run_storage,
-                    txid,
-                    sub,
-                    arena,
-                    params,
-                    outer,
-                    sequences,
-                    emit,
-                )
+                select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
             }),
         };
         if storage.spill_attached() {
@@ -3359,15 +3372,12 @@ impl<'d> QueryScope<'d> {
             sequences,
             ..crate::sql::eval::NO_HOOKS
         };
-        // SAFETY: `Storage` outlives the statement; the function's run keeps
-        // no reference to it and returns its rows as arena bytes.
-        let run_storage: &'a Storage = unsafe { &*core::ptr::from_ref(storage) };
         let rows: &'a [&'a [u8]] = if !materialize {
             &[]
         } else if outer.is_some() {
             table_func_rows_outer(
                 tref,
-                run_storage,
+                storage,
                 txid,
                 arena,
                 params,
@@ -3379,7 +3389,7 @@ impl<'d> QueryScope<'d> {
         } else {
             table_func_rows_outer(
                 tref,
-                run_storage,
+                storage,
                 txid,
                 arena,
                 params,

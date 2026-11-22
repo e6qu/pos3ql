@@ -1498,7 +1498,7 @@ fn passes_columns(
 /// them (the views read) merged into the statement, as PostgreSQL's
 /// `pull_up_subqueries` does for the joined relations.
 pub(super) fn pull_up_sources<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Stmt<'a>,
     arena: &'a Arena,

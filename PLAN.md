@@ -256,7 +256,12 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   relation's scan and its nodes' records (about 18 KB for an analyzed
   table joined with itself, which a stream's estimate counts exactly). No
   node keeps a `Storage` or `Arena` argument between calls, and a scan
-  captures its index's statistics counter for each read. A reader opens
+  captures its index's statistics counter for each read. A storage borrow
+  has its own lifetime throughout the executor, apart from the statement's
+  memory, and nothing extends one: a reader keeps only its subqueries'
+  cached values and runs them through each call's storage, and a data
+  change's subqueries run through the storage of the catalog evaluating
+  them, since the statement writes between evaluations. A reader opens
   with a `Storage` borrow its type does not carry, so the compiler rejects
   a node or scope that keeps one: a scope records each table's OID and
   whether it has descendants, and a view's row type, as it resolves them,

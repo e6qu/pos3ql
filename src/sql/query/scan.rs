@@ -4000,7 +4000,7 @@ fn indexed_candidates<'a>(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn ordered_indexed_candidates<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     plan: OrderedIndexAccessPlan<'a>,
@@ -4035,7 +4035,7 @@ pub(super) fn ordered_indexed_candidates<'a>(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dml_indexed_candidates<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     slot: usize,
     definition: &TableDef,
     alias: Option<&str>,
@@ -5690,7 +5690,7 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         }
     }
 
-    fn statement_subqueries(&self) -> crate::sql::eval::StatementScope<'a> {
+    fn statement_subqueries(&self) -> crate::sql::eval::StatementScope<'_, 'a> {
         let inner = self.inner.statement_subqueries();
         if inner.is_empty() {
             self.outer
@@ -6030,7 +6030,7 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
 /// through the ordinary executor; a set-returning function evaluates its
 /// arguments against the outer row. Rows are projected-encoded into `arena`.
 fn materialize_lateral<'a, C: ColumnLookup<'a>>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     tref: &'a crate::sql::ast::TableRef<'a>,
     arena: &'a Arena,
@@ -6103,7 +6103,7 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
 /// the arguments runs once for the statement, in its slot; a correlated one
 /// runs for each outer row.
 fn with_lateral_argument_hooks<'a, C: ColumnLookup<'a>, R>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     outer: &C,
     base_hooks: &EvalHooks<'_, 'a>,
@@ -6132,7 +6132,7 @@ fn with_lateral_argument_hooks<'a, C: ColumnLookup<'a>, R>(
     reason = "lateral input keeps its caller evaluation context"
 )]
 fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     tref: &'a crate::sql::ast::TableRef<'a>,
     width: usize,
@@ -6293,7 +6293,7 @@ enum LateralRows<'a> {
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     tref: &'a crate::sql::ast::TableRef<'a>,
     width: usize,
@@ -6392,7 +6392,7 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
 /// row's recheck runs the source again with the row's latest version.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn first_lateral_row<'a, C: ColumnLookup<'a>>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     tref: &'a crate::sql::ast::TableRef<'a>,
     width: usize,
@@ -6428,7 +6428,7 @@ pub(super) fn first_lateral_row<'a, C: ColumnLookup<'a>>(
 }
 
 fn consume_external_lateral_run<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     run: crate::sql::external::ExternalRun,
     arena: &'a Arena,
     recycle_rows: bool,
@@ -6668,7 +6668,7 @@ fn combine_external_match_runs(
 /// Source scan with an explicit complete-row or proven-column PAX read mode.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_source_with_pax_columns<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -6703,7 +6703,7 @@ pub(super) fn scan_source_with_pax_columns<'a>(
 /// read mode.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_source_recycling_with_pax_columns<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -6738,7 +6738,7 @@ pub(super) fn scan_source_recycling_with_pax_columns<'a>(
 /// Rejected candidates are still reclaimed immediately.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_source_recycling_retaining_match_with_pax_columns<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -6776,7 +6776,7 @@ pub(super) fn scan_source_recycling_retaining_match_with_pax_columns<'a>(
 /// object reads and makes the no-sort guarantee explicit at this boundary.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_source_recycling_with_indexed_candidates<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -8428,7 +8428,7 @@ impl<'a> TreeMember<'a> {
 
 /// The scan of a partition or inheritance tree under its chosen path.
 struct TreeScan<'s, 'h, 'a> {
-    storage: &'a Storage,
+    storage: &'s Storage,
     txid: u32,
     scope: &'s QueryScope<'a>,
     logical: &'s crate::storage::TableDef,
@@ -8446,7 +8446,7 @@ struct TreeScan<'s, 'h, 'a> {
 impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        storage: &'a Storage,
+        storage: &'s Storage,
         txid: u32,
         scope: &'s QueryScope<'a>,
         logical: &'s crate::storage::TableDef,
@@ -8492,7 +8492,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
     ) -> Result<
         (
             TreeMember<'a>,
-            Option<crate::storage::IndexStatisticsCapture<'a>>,
+            Option<crate::storage::IndexStatisticsCapture<'s>>,
         ),
         SqlError,
     > {
@@ -8556,7 +8556,7 @@ impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
     ) -> Result<
         (
             &'a [u64],
-            Option<crate::storage::IndexStatisticsCapture<'a>>,
+            Option<crate::storage::IndexStatisticsCapture<'s>>,
         ),
         SqlError,
     > {
@@ -9404,7 +9404,7 @@ fn count_leaf(nodes: &[DepthNodes], passed: bool) {
 
 #[allow(clippy::too_many_arguments)]
 fn scan_source_mode<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -9678,7 +9678,7 @@ fn scan_source_mode<'a>(
     /// rows return with the probe side NULL, in the build source's row order.
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_plan<'a>(
-        storage: &'a Storage,
+        storage: &Storage,
         scope: &QueryScope<'a>,
         txid: u32,
         where_clause: Option<&'a Expr<'a>>,
@@ -10698,7 +10698,7 @@ fn scan_source_mode<'a>(
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     fn candidate_matches<'a>(
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         scope: &QueryScope<'a>,
         arena: &'a Arena,
@@ -10792,7 +10792,7 @@ fn scan_source_mode<'a>(
     // the statement arena and passed through each level.
     #[allow(clippy::too_many_arguments)]
     fn level<'a>(
-        storage: &'a Storage,
+        storage: &Storage,
         scope: &QueryScope<'a>,
         from: &'a FromClause<'a>,
         txid: u32,
@@ -11528,7 +11528,7 @@ fn scan_source_mode<'a>(
                         let mut members = [None::<TreeMember<'a>>; 256];
                         // The index each member's seek reads, whose statistics
                         // its rows count.
-                        let mut seeks: [Option<crate::storage::IndexStatisticsCapture<'a>>; 256] =
+                        let mut seeks: [Option<crate::storage::IndexStatisticsCapture<'_>>; 256] =
                             core::array::from_fn(|_| None);
                         let mut count = 0usize;
                         for chosen in tree.members {
@@ -13049,7 +13049,7 @@ type MemberRowVisitor<'v, 'a> =
 /// returns whether every row was visited.
 #[allow(clippy::too_many_arguments)]
 fn for_each_member_row<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     leaf: usize,
     physical: &crate::storage::TableDef,

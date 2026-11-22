@@ -294,7 +294,7 @@ impl<'a> BlockTargets<'a> {
 
     #[expect(clippy::too_many_arguments, reason = "plan context")]
     fn build(
-        storage: &'a Storage,
+        storage: &Storage,
         txid: u32,
         statement: &'a Select<'a>,
         scope: Option<&'a QueryScope<'_>>,

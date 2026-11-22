@@ -111,7 +111,7 @@ fn window_pax_columns<'a>(
 /// existing grouped and window executors compose.
 pub(crate) fn rewrite_grouped_windows<'a>(
     statement: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     scope: Option<&QueryScope<'a>>,
@@ -2289,7 +2289,7 @@ fn window_figures<'a>(
     clippy::needless_range_loop
 )]
 pub(crate) fn project_window_rows<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     from: &'a FromClause<'a>,
@@ -2297,7 +2297,7 @@ pub(crate) fn project_window_rows<'a>(
     win_nodes: &[&'a Expr<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
+    base: &SubqueryValues<'_, 'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     // Enclosing query's row, when this window query is a correlated subquery's
@@ -3155,7 +3155,7 @@ fn grow_slots<'a, T: Copy>(
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn external_window_source<'a>(
     statement: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -3209,7 +3209,7 @@ fn external_window_source<'a>(
 /// holds at most one window partition at a time.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn external_window_into<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     from: &'a FromClause<'a>,
@@ -3217,7 +3217,7 @@ pub(crate) fn external_window_into<'a>(
     win_nodes: &[&'a Expr<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
+    base: &SubqueryValues<'_, 'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -3870,7 +3870,7 @@ pub(crate) fn external_window_into<'a>(
 /// BY, then pages with LIMIT/OFFSET and emits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn window_select<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     from: &'a FromClause<'a>,
@@ -3878,7 +3878,7 @@ pub(crate) fn window_select<'a>(
     win_nodes: &[&'a Expr<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
+    base: &SubqueryValues<'_, 'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     limit: u64,

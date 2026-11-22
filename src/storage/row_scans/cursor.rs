@@ -516,6 +516,7 @@ mod tests {
                             crate::pg::respond::CursorRowOutput::Save(&mut rows)
                         ),
                         crate::sql::query::RetainedUse::Cursor,
+                        &work,
                     )
                     .unwrap()
             );

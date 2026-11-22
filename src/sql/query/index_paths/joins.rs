@@ -837,11 +837,22 @@ struct Rel {
 
 /// No relation: the end of a hash chain.
 const NO_REL: u32 = u32::MAX;
-/// Hash chains of the relations one search builds (`join_rel_hash`).
+/// Hash chains of the relations one search builds (`join_rel_hash`), at
+/// most: a search of `n` relations builds at most `2^n - 1`, so a smaller
+/// one takes a chain per relation it can build.
 const REL_BUCKETS: usize = 4096;
 
-fn rel_bucket(relids: Relids) -> usize {
-    ((relids & BASE_RELIDS).hash() % REL_BUCKETS as u64) as usize
+/// The hash chains a search of `n` relations keeps.
+fn rel_buckets(n: usize) -> usize {
+    if n >= REL_BUCKETS.trailing_zeros() as usize {
+        REL_BUCKETS
+    } else {
+        1 << n
+    }
+}
+
+fn rel_bucket(relids: Relids, buckets: usize) -> usize {
+    ((relids & BASE_RELIDS).hash() % buckets as u64) as usize
 }
 
 /// The chosen plan: every path the search built, and the cheapest of the
@@ -865,6 +876,92 @@ pub(crate) struct JoinPlan<'a> {
 }
 
 impl JoinPlan<'_> {
+    /// The plan copied into `arena`, working in `scratch`: the search's
+    /// working memory, where it was built, can then be released. Of the
+    /// relations the search built, only those a target list of the chosen
+    /// paths' relations reaches are kept.
+    pub(crate) fn copy_into<'b>(
+        &self,
+        arena: &'b Arena,
+        scratch: &Arena,
+    ) -> Result<JoinPlan<'b>, SqlError> {
+        let kept = scratch
+            .alloc_slice_with(self.firsts.len(), |_| false)
+            .map_err(|_| arena_full())?;
+        let pending = scratch
+            .alloc_slice_with(self.firsts.len(), |_| 0usize)
+            .map_err(|_| arena_full())?;
+        let mut waiting = 0;
+        let reach =
+            |relids: Relids, kept: &mut [bool], pending: &mut [usize], waiting: &mut usize| {
+                if let Some(at) = self
+                    .firsts
+                    .iter()
+                    .position(|(built, _)| *built == relids & BASE_RELIDS)
+                    && !kept[at]
+                {
+                    kept[at] = true;
+                    pending[*waiting] = at;
+                    *waiting += 1;
+                }
+            };
+        for path in self.paths {
+            reach(path.relids, kept, pending, &mut waiting);
+        }
+        while waiting > 0 {
+            waiting -= 1;
+            let (_, (outer, inner)) = self.firsts[pending[waiting]];
+            if inner != Relids::EMPTY {
+                reach(outer, kept, pending, &mut waiting);
+                reach(inner, kept, pending, &mut waiting);
+            }
+        }
+        let mut firsts = self
+            .firsts
+            .iter()
+            .zip(kept.iter())
+            .filter_map(|(first, &kept)| kept.then_some(*first));
+        let firsts = arena
+            .alloc_slice_with(kept.iter().filter(|&&kept| kept).count(), |_| {
+                firsts.next().expect("a kept relation")
+            })
+            .map_err(|_| arena_full())?;
+        let classes = arena
+            .alloc_slice_with(self.classes.len(), |_| EquivalenceClass {
+                members: &[],
+                has_const: false,
+            })
+            .map_err(|_| arena_full())?;
+        for (class, held) in classes.iter_mut().zip(self.classes) {
+            *class = EquivalenceClass {
+                members: arena
+                    .alloc_slice_copy(held.members())
+                    .map_err(|_| arena_full())?,
+                has_const: held.has_const,
+            };
+        }
+        Ok(JoinPlan {
+            paths: arena
+                .alloc_slice_copy(self.paths)
+                .map_err(|_| arena_full())?,
+            member_keys: arena
+                .alloc_slice_copy(self.member_keys)
+                .map_err(|_| arena_full())?,
+            clauses: arena
+                .alloc_slice_copy(self.clauses)
+                .map_err(|_| arena_full())?,
+            classes,
+            top: self.top,
+            upper: self.upper,
+            settings: self.settings,
+            firsts,
+            needed: arena
+                .alloc_slice_copy(self.needed)
+                .map_err(|_| arena_full())?,
+            removed: self.removed,
+        })
+    }
+
     pub(crate) fn path(&self, id: u32) -> &Path {
         &self.paths[id as usize]
     }
@@ -1255,7 +1352,7 @@ pub(crate) fn search<'a>(
         materials: ArenaList::new(arena),
         member_keys: ArenaList::new(arena),
         rels: ArenaChunks::new(arena, SEARCH_CHUNK),
-        rel_buckets: arena_slice(arena, REL_BUCKETS, |_| NO_REL)?,
+        rel_buckets: arena_slice(arena, rel_buckets(n), |_| NO_REL)?,
         levels: arena
             .alloc_owned_slice_with(n + 1, |_| ArenaList::new(arena))
             .map_err(|_| arena_full())?,
@@ -1609,7 +1706,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     /// `find_join_rel`: the relation of `relids`' base relations.
     fn find_rel(&self, relids: Relids) -> Option<usize> {
         let base = relids & BASE_RELIDS;
-        let mut at = self.rel_buckets[rel_bucket(base)];
+        let mut at = self.rel_buckets[rel_bucket(base, self.rel_buckets.len())];
         while at != NO_REL {
             let rel = self.rels.entry(at as usize);
             if rel.relids & BASE_RELIDS == base {
@@ -1627,7 +1724,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
 
     /// Adds a relation not yet built (`add_join_rel`).
     fn insert_rel(&mut self, mut rel: Rel) -> Result<(), SqlError> {
-        let bucket = rel_bucket(rel.relids);
+        let bucket = rel_bucket(rel.relids, self.rel_buckets.len());
         rel.next = self.rel_buckets[bucket];
         self.rel_buckets[bucket] = self.rels.len() as u32;
         self.rels.push(rel).map_err(|_| arena_full())
@@ -1659,7 +1756,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     fn restore_joins(&mut self, saved: SavedJoins) -> Result<(), SqlError> {
         for at in (saved.rels..self.rels.len()).rev() {
             let rel = self.rels.get(at);
-            let bucket = rel_bucket(rel.relids);
+            let bucket = rel_bucket(rel.relids, self.rel_buckets.len());
             self.rel_buckets[bucket] = rel.next;
         }
         self.rels.truncate(saved.rels);

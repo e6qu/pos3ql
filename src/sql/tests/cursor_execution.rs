@@ -3443,6 +3443,43 @@ fn join_cursors_evaluate_rows_per_fetch_and_materialize_scrolled_output() {
 }
 
 #[test]
+fn modeled_nested_loop_cursors_read_their_plan_as_they_fetch() {
+    use crate::sql::cursor::FetchMotion;
+    let config = test_config("cursor-modeled-nested-loops");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // PostgreSQL 18.6 plans these joins as a nested loop over a
+    // `Materialize` of `jb`'s scan, and returns the rows below.
+    session.success(
+        &mut engine,
+        "CREATE TABLE ja(id int, v text); INSERT INTO ja VALUES (1,'a'),(2,'b'),(3,'c'); \
+         CREATE TABLE jb(k int, w text); INSERT INTO jb VALUES (1,'x'),(3,'y'); \
+         ANALYZE ja, jb; BEGIN; \
+         DECLARE p SCROLL CURSOR FOR SELECT ja.id, jb.w FROM ja JOIN jb \
+         ON jb.k <= ja.id AND jb.k >= ja.id",
+        true,
+    );
+    // The plan's pull nodes read it as the cursor fetches.
+    let (slot, _) = session
+        .cursors
+        .read_request("p", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("retained modeled join cursor");
+    assert_eq!(session.cursors.produced_rows(slot), 0);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "FETCH ALL FROM p; FETCH ABSOLUTE 1 FROM p; FETCH NEXT FROM p; \
+             FETCH PRIOR FROM p; COMMIT; \
+             SELECT ja.id, jb.w FROM ja LEFT JOIN jb ON jb.k <= ja.id AND jb.k >= ja.id",
+            true
+        )),
+        ["1|x", "3|y", "1|x", "3|y", "1|x", "1|x", "2|NULL", "3|y"]
+    );
+}
+
+#[test]
 fn cursor_queries_run_at_their_first_read_with_the_opening_snapshot() {
     let config = test_config("cursor-opening-snapshot");
     let mut budget = test_engine_budget(&config, 1 << 29);

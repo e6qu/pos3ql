@@ -114,7 +114,7 @@ mod definition_pool;
 mod index_bindings;
 mod index_statistics;
 use index_statistics::IndexCounterSlot;
-pub(crate) use index_statistics::IndexStatisticsCapture;
+pub(crate) use index_statistics::{IndexStatisticsCapture, IndexStatisticsTicket};
 mod key_preparation;
 pub(crate) use index_bindings::{IndexRelationKind, IndexRelationSource};
 use index_bindings::{IndexTableBinding, PendingIndexTable};

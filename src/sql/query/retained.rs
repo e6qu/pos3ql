@@ -100,11 +100,19 @@ pub(crate) enum StreamSource {
     Generated,
     /// A join: the read positions of its physical tables; literal and
     /// generated items retain their rows or next value. Its first row may
-    /// read a whole level (a hash build, an inner rescan).
-    Join([Option<usize>; MAX_RETAINED_SOURCES]),
+    /// read a whole level (a hash build, an inner rescan). A plan
+    /// PostgreSQL's join search chose also keeps its nodes' records:
+    /// `plan_bytes` of the reader's memory.
+    Join {
+        tables: [Option<usize>; MAX_RETAINED_SOURCES],
+        plan_bytes: usize,
+    },
     /// A `UNION ALL` read as one appended stream: the read positions of
-    /// every query's physical tables.
-    Appended([Option<usize>; MAX_RETAINED_SOURCES]),
+    /// every query's physical tables, and its joins' records.
+    Appended {
+        tables: [Option<usize>; MAX_RETAINED_SOURCES],
+        plan_bytes: usize,
+    },
 }
 
 /// One ORDER BY key of a sorted locking cursor: a source column.
@@ -1468,8 +1476,20 @@ fn reader_grouping<'a>(
     )
 }
 
+/// How a retained reader reads a joined FROM clause.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "returned once while a reader opens, never stored"
+)]
+enum JoinReader<'a> {
+    /// Nested-loop and hash levels in FROM order.
+    Levels(join::JoinShape<'a>),
+    /// The plan PostgreSQL's join search chose, run by its pull nodes.
+    Modeled,
+}
+
 /// Resolves a joined FROM clause for a retained reader: its scope with
-/// literal items encoded, and its admitted join shape.
+/// literal items encoded, and how it is read.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn retained_join_scope<'a>(
     storage: &'a Storage,
@@ -1480,10 +1500,11 @@ fn retained_join_scope<'a>(
     self_sorts: bool,
     groups_itself: bool,
     arena: &'a Arena,
+    planning: &Arena,
 ) -> Result<
     Option<(
         QueryScope<'a>,
-        join::JoinShape<'a>,
+        JoinReader<'a>,
         &'a Select<'a>,
         Option<grouping::AggregateNodes<'a>>,
     )>,
@@ -1531,10 +1552,45 @@ fn retained_join_scope<'a>(
     {
         return Ok(None);
     }
-    // A join PostgreSQL's join search plans runs in the general executor,
-    // which follows that plan.
-    if super::index_paths::join_query::models_join(storage, txid, statement, &scope, &[], arena)? {
-        return Ok(None);
+    // A join PostgreSQL's join search plans runs that plan: here when its
+    // pull nodes run every node of it, else in the general executor. The
+    // answer is planned in the planning memory alone.
+    let mark = planning.mark();
+    let modeled =
+        QueryScope::resolve_schema_with_join_conditions(storage, from, txid, planning, None)
+            .and_then(|planned_scope| {
+                super::index_paths::join_query::modeled_join(
+                    storage,
+                    txid,
+                    statement,
+                    &planned_scope,
+                    params.unwrap_or(&[]),
+                    planning,
+                    planning,
+                )
+                .map(|model| model.map(|model| (model, planned_scope)))
+            })
+            .and_then(|model| {
+                let Some((model, planned_scope)) = model else {
+                    return Ok(None);
+                };
+                Ok(Some(
+                    super::join_exec::pulls(&model)
+                        && model.scope(&planned_scope).n <= MAX_RETAINED_SOURCES
+                        && pulled_join_admitted(
+                            statement,
+                            aggregates.is_some(),
+                            storage,
+                            txid,
+                            planning,
+                        )?,
+                ))
+            });
+    // SAFETY: the answer holds no planning data, and nothing allocated
+    // since the mark outlives this check: the scope was resolved before it.
+    unsafe { planning.rewind_to(mark) };
+    if let Some(pulled) = modeled? {
+        return Ok(pulled.then_some((scope, JoinReader::Modeled, statement, aggregates)));
     }
     let Some(shape) = join::join_shape(storage, txid, from, statement.where_clause, &scope, arena)?
     else {
@@ -1559,7 +1615,35 @@ fn retained_join_scope<'a>(
             }
         }
     }
-    Ok(Some((scope, shape, statement, aggregates)))
+    Ok(Some((
+        scope,
+        JoinReader::Levels(shape),
+        statement,
+        aggregates,
+    )))
+}
+
+/// Whether a modeled join's reader runs `statement` around its pull nodes:
+/// the plan evaluates the whole `WHERE` clause, so it may not call a
+/// routine that hands off or read a subquery; the rows leave the join in
+/// its order, unsorted and ungrouped.
+fn pulled_join_admitted<'a>(
+    statement: &'a Select<'a>,
+    grouped: bool,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    if grouped || sort::sorts(statement) {
+        return Ok(false);
+    }
+    if !statement_sublinks(statement, storage, txid, arena)?.is_some_and(|links| links.is_empty()) {
+        return Ok(false);
+    }
+    let catalog = storage_catalog(storage, arena, txid);
+    Ok(!statement.where_clause.is_some_and(|condition| {
+        super::super::eval::routine_input_handoff(condition, Some(&catalog))
+    }))
 }
 
 /// Encodes a literal VALUES source's rows in the reader's memory.
@@ -2312,7 +2396,7 @@ impl<'a> RetainedSelect<'a> {
     pub(crate) fn rewind(&mut self, state_arena: &Arena) -> Result<(), SqlError> {
         // A join's outer levels hold rows for their inner levels between
         // fetches; the join drops them itself.
-        if !self.rewindable() || self.plan.join().is_none() && self.has_pending() {
+        if !self.rewindable() || self.plan.scan().is_some() && self.has_pending() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "retained cursor input cannot be rewound here"
@@ -2613,6 +2697,12 @@ impl<'a> RetainedSelect<'a> {
         if matches!(self.plan.state, ReaderState::Eliminated) {
             return tables;
         }
+        if let Some(modeled) = self.plan.modeled() {
+            for (target, table) in tables.iter_mut().zip(modeled.tables(&self.scope)) {
+                *target = Some(table);
+            }
+            return tables;
+        }
         match self.plan.join() {
             Some(joins) => {
                 for (target, (table, source)) in tables.iter_mut().zip(joins.tables()) {
@@ -2646,6 +2736,10 @@ impl<'a> RetainedSelect<'a> {
         !matches!(self.plan.state, ReaderState::Eliminated)
             && (self.scope.slots[..self.scope.n].contains(&table)
                 || self
+                    .plan
+                    .modeled()
+                    .is_some_and(|modeled| modeled.tables(&self.scope).any(|read| read == table))
+                || self
                     .branches()
                     .iter()
                     .any(|branch| branch.uses_table(table)))
@@ -2665,34 +2759,91 @@ impl<'a> RetainedSelect<'a> {
     /// fixed generator state. Literal and `FROM`-less sources are excluded:
     /// their output is bounded by the statement itself. Scope resolution
     /// borrows `arena`; the caller rewinds it.
+    /// What a stream reading `statement` retains, probed in `arena`; a
+    /// join plan's nodes are built in a block of `reader_bytes`, the most
+    /// a stream's reader holds, to count what they keep.
     pub(crate) fn stream_source(
         storage: &'a Storage,
         txid: u32,
         statement: &'a Select<'a>,
+        reader_bytes: usize,
         arena: &'a Arena,
     ) -> Result<Option<StreamSource>, SqlError> {
         let Some(from) = statement.from.as_ref() else {
             return Ok(None);
         };
         if let Some(leaves) = appended_leaves(statement, arena)? {
-            return Self::appended_source(storage, txid, statement, leaves, arena);
+            return Self::appended_source(storage, txid, statement, leaves, reader_bytes, arena);
         }
         if statement_sublinks(statement, storage, txid, arena)?.is_none() {
             return Ok(None);
         }
         if !from.joins.is_empty() {
-            let Some((scope, shape, ..)) =
-                retained_join_scope(storage, txid, statement, from, None, true, true, arena)?
+            let Some((scope, reader, statement, _)) = retained_join_scope(
+                storage, txid, statement, from, None, true, true, arena, arena,
+            )?
             else {
                 return Ok(None);
             };
             let mut tables = [None; MAX_RETAINED_SOURCES];
-            for (table, item) in shape.items.iter().enumerate().take(scope.n) {
-                if matches!(item, Some(join::ItemShape::Table)) {
-                    tables[table] = Some(scope.slots[table]);
+            let mut plan_bytes = 0;
+            match reader {
+                JoinReader::Levels(shape) => {
+                    for (table, item) in shape.items.iter().enumerate().take(scope.n) {
+                        if matches!(item, Some(join::ItemShape::Table)) {
+                            tables[table] = Some(scope.slots[table]);
+                        }
+                    }
+                }
+                JoinReader::Modeled => {
+                    // The nodes' records, built in a block as large as the
+                    // reader's memory and planned outside it, as the
+                    // reader builds them; a plan they do not fit in is
+                    // larger than any stream.
+                    let resident = arena
+                        .alloc_front_block(reader_bytes.max(1))
+                        .map_err(|_| arena_full())?;
+                    let built = super::index_paths::join_query::modeled_join(
+                        storage,
+                        txid,
+                        statement,
+                        &scope,
+                        &[],
+                        resident,
+                        arena,
+                    )
+                    .and_then(|model| {
+                        model
+                            .map(|model| {
+                                super::join_exec::ModeledPull::new(
+                                    storage,
+                                    txid,
+                                    model,
+                                    &scope,
+                                    &[],
+                                    resident,
+                                )
+                            })
+                            .transpose()
+                    });
+                    let modeled = match built {
+                        Ok(Some(modeled)) => modeled,
+                        Ok(None) => return Ok(None),
+                        Err(error) if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED => {
+                            return Ok(Some(StreamSource::Join {
+                                tables,
+                                plan_bytes: usize::MAX,
+                            }));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    for (target, table) in tables.iter_mut().zip(modeled.tables(&scope)) {
+                        *target = Some(table);
+                    }
+                    plan_bytes = resident.used();
                 }
             }
-            return Ok(Some(StreamSource::Join(tables)));
+            return Ok(Some(StreamSource::Join { tables, plan_bytes }));
         }
         let generated = from.joins.is_empty()
             && from.base.is_function_source()
@@ -2812,6 +2963,7 @@ impl<'a> RetainedSelect<'a> {
         txid: u32,
         statement: &'a Select<'a>,
         leaves: &'a [&'a Select<'a>],
+        reader_bytes: usize,
         arena: &'a Arena,
     ) -> Result<Option<StreamSource>, SqlError> {
         if leaves.len() > MAX_RETAINED_SOURCES {
@@ -2827,6 +2979,7 @@ impl<'a> RetainedSelect<'a> {
         }
         let mut tables = [None; MAX_RETAINED_SOURCES];
         let mut count = 0;
+        let mut plan_bytes = 0usize;
         for leaf in leaves {
             // An appended query runs no subqueries of its own.
             if !branch_admitted(storage, txid, leaf, arena)?
@@ -2835,13 +2988,19 @@ impl<'a> RetainedSelect<'a> {
             {
                 return Ok(None);
             }
-            let leaf_tables = match Self::stream_source(storage, txid, leaf, arena)? {
+            let leaf_tables = match Self::stream_source(storage, txid, leaf, reader_bytes, arena)? {
                 Some(StreamSource::Table(table)) => {
                     [Some(table), None, None, None, None, None, None, None]
                 }
                 Some(StreamSource::Generated) => [None; MAX_RETAINED_SOURCES],
-                Some(StreamSource::Join(tables)) => tables,
-                Some(StreamSource::Appended(_)) | None => return Ok(None),
+                Some(StreamSource::Join {
+                    tables,
+                    plan_bytes: bytes,
+                }) => {
+                    plan_bytes = plan_bytes.saturating_add(bytes);
+                    tables
+                }
+                Some(StreamSource::Appended { .. }) | None => return Ok(None),
             };
             for table in leaf_tables.into_iter().flatten() {
                 let Some(target) = tables.get_mut(count) else {
@@ -2879,15 +3038,19 @@ impl<'a> RetainedSelect<'a> {
                 return Ok(None);
             }
         }
-        Ok(Some(StreamSource::Appended(tables)))
+        Ok(Some(StreamSource::Appended { tables, plan_bytes }))
     }
 
+    /// Opens the reader of `statement` in `arena`, planning a join in
+    /// `planning`, which the reader does not borrow.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         storage: &'a Storage,
         txid: u32,
         statement: &'a Select<'a>,
         params: &[Datum<'a>],
         arena: &'a Arena,
+        planning: &Arena,
         responder: &mut Responder<'_>,
         reader_use: RetainedUse,
     ) -> Result<Option<Self>, SqlError> {
@@ -2897,6 +3060,7 @@ impl<'a> RetainedSelect<'a> {
             statement,
             params,
             arena,
+            planning,
             responder,
             RetainedMode::Cursor,
             reader_use,
@@ -2975,11 +3139,14 @@ impl<'a> RetainedSelect<'a> {
         responder: &mut Responder<'_>,
         statement_use: StatementUse,
     ) -> Result<Option<Self>, SqlError> {
+        // A statement plans in its own arena, which it reclaims when it
+        // ends.
         let reader = RetainedSelect::open_mode(
             storage,
             txid,
             statement,
             params,
+            arena,
             arena,
             responder,
             RetainedMode::Statement,
@@ -3008,6 +3175,7 @@ impl<'a> RetainedSelect<'a> {
         statement: &'a Select<'a>,
         params: &[Datum<'a>],
         arena: &'a Arena,
+        planning: &Arena,
         responder: &mut Responder<'_>,
         mode: RetainedMode,
         reader_use: RetainedUse,
@@ -3054,7 +3222,7 @@ impl<'a> RetainedSelect<'a> {
             {
                 let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
                 if super::index_paths::join_query::models_join(
-                    storage, txid, pulled, &scope, params, arena,
+                    storage, txid, pulled, &scope, params, planning,
                 )? {
                     return Ok(None);
                 }
@@ -3070,6 +3238,7 @@ impl<'a> RetainedSelect<'a> {
                 from,
                 params,
                 arena,
+                planning,
                 responder,
                 mode,
                 self_sorts,
@@ -3513,6 +3682,7 @@ impl<'a> RetainedSelect<'a> {
                     leaf,
                     params,
                     arena,
+                    planning,
                     responder,
                     RetainedMode::Branch,
                     RetainedUse::Stream,
@@ -3651,6 +3821,7 @@ impl<'a> RetainedSelect<'a> {
         from: &'a FromClause<'a>,
         params: &[Datum<'a>],
         arena: &'a Arena,
+        planning: &Arena,
         responder: &mut Responder<'_>,
         mode: RetainedMode,
         self_sorts: bool,
@@ -3658,7 +3829,7 @@ impl<'a> RetainedSelect<'a> {
         sublinks: &'a [&'a Expr<'a>],
         handoff_only: bool,
     ) -> Result<Option<Self>, SqlError> {
-        let Some((scope, shape, statement, aggregates)) = retained_join_scope(
+        let Some((scope, reader, statement, aggregates)) = retained_join_scope(
             storage,
             txid,
             statement,
@@ -3667,6 +3838,7 @@ impl<'a> RetainedSelect<'a> {
             self_sorts,
             groups_itself,
             arena,
+            planning,
         )?
         else {
             return Ok(None);
@@ -3771,6 +3943,8 @@ impl<'a> RetainedSelect<'a> {
                 reorder_qual(predicate, &scope, arena)
             })
             .transpose()?;
+        // A modeled join's plan evaluates the whole condition.
+        let predicate = predicate.filter(|_| matches!(reader, JoinReader::Levels(_)));
         let (predicate, eliminated) = match predicate {
             Some(predicate)
                 if mode != RetainedMode::Statement && row_independent(predicate, &scope) =>
@@ -3869,22 +4043,53 @@ impl<'a> RetainedSelect<'a> {
         } else {
             bounds
         };
-        for (table, item) in shape.items.iter().enumerate().take(scope.n) {
-            if mode == RetainedMode::Statement && matches!(item, Some(join::ItemShape::Table)) {
+        let lock = |table: usize| {
+            if mode == RetainedMode::Statement {
                 storage.lock_table(
                     txid,
-                    scope.slots[table],
+                    table,
                     crate::sql::ast::TableLockMode::AccessShare,
                     false,
                 )?;
             }
-        }
-        if !eliminated {
-            scan::validate_materialized_view_reads(storage, &scope, None, arena, txid)?;
-        }
-        let joins = join::open_levels(
-            storage, txid, from, &scope, &shape, demand, &columns, eliminated, arena,
-        )?;
+            Ok::<_, SqlError>(())
+        };
+        let leaf = match reader {
+            JoinReader::Levels(shape) => {
+                for (table, item) in shape.items.iter().enumerate().take(scope.n) {
+                    if matches!(item, Some(join::ItemShape::Table)) {
+                        lock(scope.slots[table])?;
+                    }
+                }
+                if !eliminated {
+                    scan::validate_materialized_view_reads(storage, &scope, None, arena, txid)?;
+                }
+                PlanNode::Join(join::open_levels(
+                    storage, txid, from, &scope, &shape, demand, &columns, eliminated, arena,
+                )?)
+            }
+            JoinReader::Modeled => {
+                // Planned for the folded statement and its parameters, as
+                // the general executor plans it; the search works in the
+                // planning memory and the reader keeps the chosen plan.
+                let Some(model) = super::index_paths::join_query::modeled_join(
+                    storage, txid, statement, &scope, params, arena, planning,
+                )?
+                else {
+                    return Ok(None);
+                };
+                if !super::join_exec::pulls(&model) {
+                    return Ok(None);
+                }
+                let modeled = super::join_exec::ModeledPull::new(
+                    storage, txid, model, &scope, params, arena,
+                )?;
+                for table in modeled.tables(&scope) {
+                    lock(table)?;
+                }
+                PlanNode::Modeled(modeled)
+            }
+        };
         let sort = if self_sorts && aggregates.is_none() {
             Some(sort::SortState::new(
                 storage, txid, statement, items, &scope, &columns, arena,
@@ -3904,14 +4109,7 @@ impl<'a> RetainedSelect<'a> {
         )?;
         let description = describe(&description[..width], mode, arena, responder)?;
         let above = sort.map(PlanNode::Sort).or(grouping.map(PlanNode::Group));
-        let plan = PlanTree::new(
-            PlanNode::Join(joins),
-            predicate,
-            above,
-            items,
-            bounds,
-            eliminated,
-        )?;
+        let plan = PlanTree::new(leaf, predicate, above, items, bounds, eliminated)?;
         Ok(Some(Self {
             scope,
             plan,

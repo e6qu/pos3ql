@@ -6963,6 +6963,7 @@ fn plan_pulled_select<'a>(
             scope,
             &[],
             arena,
+            arena,
         )?,
         _ => None,
     };

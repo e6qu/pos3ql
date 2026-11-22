@@ -171,6 +171,7 @@ fn run(engine: &mut Engine, kind: ScanKind, bounds: &[i32]) -> (Vec<Vec<i32>>, u
                 let _snapshot = storage.nested_statement_snapshot(storage.lsn());
                 crate::mem::guard::forbid_alloc(|| {
                     node.next(
+                        storage,
                         crate::storage::CursorScratch::Statement,
                         &arena,
                         &params,

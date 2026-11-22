@@ -108541,11 +108541,14 @@ pub(super) fn collect_matches<'a>(
         }
         storage.record_serializable_read(txid, leaf);
         let access = indexed.as_ref().filter(|_| leaf == table_index);
+        let statistics = access
+            .map(|access| access.statistics(storage))
+            .transpose()?;
         if access.is_none_or(|access| access.scan_executed()) {
             storage.record_relation_scan(
                 txid,
                 leaf,
-                access.map(|access| access.statistics()),
+                statistics.as_ref(),
                 access.map_or(0, |access| access.index_entries()),
                 crate::sql::datetime::now_micros(),
             )?;
@@ -108575,11 +108578,7 @@ pub(super) fn collect_matches<'a>(
             if reached_all && let Some(pages) = pages {
                 pages.reach(rowid);
             }
-            storage.record_relation_tuple_read(
-                txid,
-                leaf,
-                access.map(|access| access.statistics()),
-            )?;
+            storage.record_relation_tuple_read(txid, leaf, statistics.as_ref())?;
             let snapshot = loc.snapshot();
             if let Some(image) = row_matches(
                 storage,

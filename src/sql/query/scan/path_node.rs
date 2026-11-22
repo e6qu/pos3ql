@@ -10,6 +10,10 @@
 //! read, returns to the caller with that state intact; the same call resumes
 //! it without counting anything twice. A rescan finds the candidates again
 //! for the new outer row and reuses the node's storage for them.
+//!
+//! The node holds no `Storage` reference: every call takes the storage it
+//! reads, so a retained reader that keeps the node between calls borrows
+//! none. An index's statistics counter is captured for each read only.
 
 use super::*;
 use crate::storage::{CandidateCursor, Candidates, CursorScratch, RowCursor};
@@ -22,8 +26,9 @@ struct CandidateRows<'a> {
     cursor: CandidateCursor,
     rowids: &'a mut [u64],
     len: usize,
-    /// The index whose statistics each row read counts in.
-    statistics: Option<crate::storage::IndexStatisticsCapture<'a>>,
+    /// The index whose statistics each row read counts in, captured
+    /// again for each read.
+    index: Option<crate::storage::IndexStatisticsTicket>,
 }
 
 /// Where the rows of the running execution come from.
@@ -56,7 +61,6 @@ struct ExecutionLoops<'a>(instrument::Loop, instrument::Loop, instrument::Loops<
 
 /// The scan of one plain table by its chosen path.
 pub(crate) struct PathScan<'a> {
-    storage: &'a Storage,
     txid: u32,
     slot: usize,
     scope: QueryScope<'a>,
@@ -195,7 +199,6 @@ impl<'a> PathScan<'a> {
             )
         };
         Ok(Self {
-            storage,
             txid,
             slot,
             scope,
@@ -279,8 +282,10 @@ impl<'a> PathScan<'a> {
     /// outer relations the condition reads, the same for every call of one
     /// execution. A failed call, a storage wait among them, keeps the
     /// execution's position: the same call resumes it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn next(
         &mut self,
+        storage: &Storage,
         mut scratch: CursorScratch<'_>,
         arena: &'a Arena,
         params: &[Datum<'a>],
@@ -288,7 +293,7 @@ impl<'a> PathScan<'a> {
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<bool, SqlError> {
         if self.state == State::Opening {
-            self.open(arena, params, hooks, outer)?;
+            self.open(storage, arena, params, hooks, outer)?;
         }
         loop {
             if self.state == State::Done {
@@ -297,7 +302,7 @@ impl<'a> PathScan<'a> {
             }
             // A row the condition rejects releases its bytes.
             let mark = arena.mark();
-            let read = self.read_row(&mut scratch, arena);
+            let read = self.read_row(storage, &mut scratch, arena);
             let passed = match read.and_then(|found| {
                 if !found {
                     return Ok(None);
@@ -335,6 +340,7 @@ impl<'a> PathScan<'a> {
     /// loops started and nothing counted twice.
     fn open(
         &mut self,
+        storage: &Storage,
         arena: &'a Arena,
         params: &[Datum<'a>],
         hooks: &EvalHooks<'_, 'a>,
@@ -358,7 +364,7 @@ impl<'a> PathScan<'a> {
             ));
         }
         let mark = arena.mark();
-        let found = self.find_rows(arena, params, hooks, outer);
+        let found = self.find_rows(storage, arena, params, hooks, outer);
         // SAFETY: the candidates are copied into the node's tail storage;
         // nothing else the search allocated is kept.
         unsafe { arena.rewind_to(mark) };
@@ -380,13 +386,14 @@ impl<'a> PathScan<'a> {
     /// statistics once nothing can wait any more.
     fn find_rows(
         &mut self,
+        storage: &Storage,
         arena: &'a Arena,
         params: &[Datum<'a>],
         hooks: &EvalHooks<'_, 'a>,
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<Rows, SqlError> {
         use super::super::index_paths::ScanKind;
-        let (storage, txid, slot) = (self.storage, self.txid, self.slot);
+        let (txid, slot) = (self.txid, self.slot);
         // The rows an index finds for the outer row's keys, a superset the
         // condition filters. `EXPLAIN ANALYZE` counts the path's own reads:
         // the rows an index finds for the path's own index conditions,
@@ -508,10 +515,14 @@ impl<'a> PathScan<'a> {
                 None
             };
         if access.as_ref().is_none_or(|access| access.scan_executed) {
+            let statistics = access
+                .as_ref()
+                .map(|access| access.statistics(storage))
+                .transpose()?;
             storage.record_relation_scan(
                 txid,
                 slot,
-                access.as_ref().map(|access| &access.statistics),
+                statistics.as_ref(),
                 access.as_ref().map_or(0, |access| access.index_entries),
                 crate::sql::datetime::now_micros(),
             )?;
@@ -520,7 +531,7 @@ impl<'a> PathScan<'a> {
             cursor: CandidateCursor::open(storage, slot, txid),
             rowids: &mut [],
             len: 0,
-            statistics: None,
+            index: None,
         });
         if fill > rows.rowids.len() {
             rows.rowids = arena
@@ -531,7 +542,7 @@ impl<'a> PathScan<'a> {
             *rowid = found[order.map_or(position, |order| order[position])];
         }
         rows.len = fill;
-        rows.statistics = access.map(|access| access.statistics);
+        rows.index = access.map(|access| access.statistics_ticket());
         rows.cursor = CandidateCursor::open(storage, slot, txid);
         Ok(Rows::Candidates)
     }
@@ -540,11 +551,12 @@ impl<'a> PathScan<'a> {
     /// once none is left.
     fn read_row(
         &mut self,
+        storage: &Storage,
         scratch: &mut CursorScratch<'_>,
         arena: &'a Arena,
     ) -> Result<bool, SqlError> {
-        let (storage, txid, slot) = (self.storage, self.txid, self.slot);
-        let (rowid, statistics, representation) = match self.rows {
+        let (txid, slot) = (self.txid, self.slot);
+        let (rowid, index, representation) = match self.rows {
             Rows::Sequential => {
                 let cursor = self
                     .sequential
@@ -571,13 +583,16 @@ impl<'a> PathScan<'a> {
                 };
                 (
                     row.rowid,
-                    rows.statistics.as_ref(),
+                    rows.index,
                     crate::storage::SpilledRowRepresentation::Encoded(row.bytes),
                 )
             }
             Rows::None | Rows::Empty => return Ok(false),
         };
-        storage.record_relation_tuple_read(txid, slot, statistics)?;
+        let statistics = index
+            .map(|ticket| storage.recapture_index_statistics(ticket))
+            .transpose()?;
+        storage.record_relation_tuple_read(txid, slot, statistics.as_ref())?;
         let n_columns = self.schema.len();
         let encoded = match representation {
             crate::storage::SpilledRowRepresentation::Encoded(bytes) => {

@@ -151,7 +151,23 @@ pub(crate) struct IndexStatisticsCapture<'a> {
     source: IndexStatisticsSource,
 }
 
+/// Where a captured index's counter is, without a reference to its
+/// storage: a scan keeps it between reads and captures the counter again
+/// for each read, which fails if the counter went to another index.
+#[derive(Clone, Copy)]
+pub(crate) struct IndexStatisticsTicket {
+    position: CounterPosition,
+    source: IndexStatisticsSource,
+}
+
 impl IndexStatisticsCapture<'_> {
+    pub(crate) fn ticket(&self) -> IndexStatisticsTicket {
+        IndexStatisticsTicket {
+            position: self.position,
+            source: self.source,
+        }
+    }
+
     pub(super) fn table_identity(&self) -> (DatabaseOid, u64) {
         (self.source.database, self.source.table.created_at())
     }
@@ -277,6 +293,32 @@ impl Storage {
             }),
         })?;
         Ok(admission)
+    }
+
+    /// The counter `ticket` names, captured again.
+    pub(crate) fn recapture_index_statistics(
+        &self,
+        ticket: IndexStatisticsTicket,
+    ) -> Result<IndexStatisticsCapture<'_>, SqlError> {
+        let mut statistics = self.cumulative_statistics();
+        let entry = &mut statistics.indexes[ticket.position.slot];
+        if entry.generation != ticket.position.generation || entry.source != Some(ticket.source) {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "index statistics source changed"
+            ));
+        }
+        entry.readers = entry.readers.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "index statistics reader count exhausted"
+            )
+        })?;
+        Ok(IndexStatisticsCapture {
+            statistics: &self.cumulative_statistics,
+            position: ticket.position,
+            source: ticket.source,
+        })
     }
 
     pub(crate) fn capture_index_statistics(

@@ -8,6 +8,7 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::toast::DatumForm;
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::storage::rowenc::StoredForm;
@@ -45,6 +46,10 @@ pub(crate) fn encode_projected_formed<'a>(
 const STORED_FORM_TAG: u8 = 60;
 /// A form kind byte and its `u32` size.
 const STORED_FORM_RECORD: usize = 5;
+/// Form kinds of a value a call passes on ([`DatumForm`]) beyond the
+/// [`StoredForm`] kinds: formed by an expression, and held unrecorded.
+const FORMED_KIND: u8 = 5;
+const UNKNOWN_KIND: u8 = 6;
 
 fn form_record(form: StoredForm) -> [u8; STORED_FORM_RECORD] {
     let (kind, size) = match form {
@@ -65,14 +70,26 @@ fn form_record(form: StoredForm) -> [u8; STORED_FORM_RECORD] {
     record
 }
 
-/// The form a projected value whose tag is at `tag_at` carries.
+/// The form a projected value whose tag is at `tag_at` carries: a value a
+/// call passes on as formed has no TOAST form, and one held unrecorded an
+/// unmodelled one.
 pub(crate) fn projected_stored_form_at(bytes: &[u8], tag_at: usize) -> StoredForm {
+    match projected_datum_form_at(bytes, tag_at) {
+        DatumForm::Stored(form) => form,
+        DatumForm::Formed => StoredForm::Inline,
+        DatumForm::Unknown => StoredForm::Unmodelled,
+    }
+}
+
+/// How a projected value whose tag is at `tag_at` is held: as a tuple
+/// holds it unless its form record says otherwise.
+fn projected_datum_form_at(bytes: &[u8], tag_at: usize) -> DatumForm {
     if bytes[tag_at] != STORED_FORM_TAG {
-        return StoredForm::Inline;
+        return DatumForm::Stored(StoredForm::Inline);
     }
     let record = &bytes[tag_at + 1..tag_at + 1 + STORED_FORM_RECORD];
     let size = u32::from_le_bytes(record[1..].try_into().expect("form size"));
-    match record[0] {
+    DatumForm::Stored(match record[0] {
         1 => StoredForm::Compressed(size),
         2 => StoredForm::External {
             saved: size,
@@ -83,8 +100,82 @@ pub(crate) fn projected_stored_form_at(bytes: &[u8], tag_at: usize) -> StoredFor
             compressed: true,
         },
         4 => StoredForm::Unmodelled,
+        FORMED_KIND => return DatumForm::Formed,
+        UNKNOWN_KIND => return DatumForm::Unknown,
         kind => unreachable!("projected form kind {kind} was never encoded"),
+    })
+}
+
+/// How column `col` of a projected row [`encode_projected_held_into`]
+/// wrote holds its value.
+pub(crate) fn projected_datum_form(bytes: &[u8], col: usize) -> DatumForm {
+    projected_datum_form_at(bytes, ProjectedValue::column_tag_at(bytes, col))
+}
+
+/// The form record of a value a call passes on held as `form`: none for a
+/// value held as a tuple holds it, and none for NULL.
+fn held_record(value: &Datum, form: DatumForm) -> Option<[u8; STORED_FORM_RECORD]> {
+    match form {
+        _ if value.is_null() => None,
+        DatumForm::Stored(form) => carried_form(value, Some(&form)).map(form_record),
+        DatumForm::Formed => Some([FORMED_KIND, 0, 0, 0, 0]),
+        DatumForm::Unknown => Some([UNKNOWN_KIND, 0, 0, 0, 0]),
     }
+}
+
+/// [`projected_row_len`] of values a call passes on, each held as `forms`
+/// says.
+pub(crate) fn projected_row_len_held(
+    values: &[Datum],
+    forms: &[DatumForm],
+) -> Result<usize, SqlError> {
+    debug_assert_eq!(values.len(), forms.len());
+    let count = u16::try_from(values.len()).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "projected row has too many columns"
+        )
+    })?;
+    let mut len = size_of_val(&count);
+    for (value, form) in values.iter().zip(forms) {
+        let record = held_record(value, *form).map_or(0, |_| 1 + STORED_FORM_RECORD);
+        len = len
+            .checked_add(projected_value_len(value)? + record)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "projected row is too large"
+                )
+            })?;
+    }
+    Ok(len)
+}
+
+/// Encodes values a call passes on with how each is held, which
+/// [`projected_datum_form`] reads back, into `out` of
+/// [`projected_row_len_held`] bytes.
+pub(crate) fn encode_projected_held_into(
+    values: &[Datum],
+    forms: &[DatumForm],
+    out: &mut [u8],
+) -> Result<usize, SqlError> {
+    let len = projected_row_len_held(values, forms)?;
+    if out.len() < len {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "projected row of {} bytes exceeds its buffer of {}",
+            len,
+            out.len()
+        ));
+    }
+    let count = u16::try_from(values.len()).expect("projected_row_len_held checked the count");
+    out[..2].copy_from_slice(&count.to_le_bytes());
+    let mut at = 2usize;
+    for (value, form) in values.iter().zip(forms) {
+        at += write_record_value(value, held_record(value, *form), &mut out[at..]);
+    }
+    debug_assert_eq!(at, len);
+    Ok(at)
 }
 
 /// The form column `col` of a projected row carries.
@@ -286,10 +377,23 @@ pub(crate) fn encode_projected_by_into<'a>(
 
 /// Writes `value` with the form record it carries, if any.
 fn write_formed_value(value: &Datum, form: StoredForm, out: &mut [u8]) -> usize {
+    write_record_value(
+        value,
+        carried_form(value, Some(&form)).map(form_record),
+        out,
+    )
+}
+
+/// Writes `value` after its form `record`, if any.
+fn write_record_value(
+    value: &Datum,
+    record: Option<[u8; STORED_FORM_RECORD]>,
+    out: &mut [u8],
+) -> usize {
     let mut at = 0;
-    if let Some(form) = carried_form(value, Some(&form)) {
+    if let Some(record) = record {
         out[0] = STORED_FORM_TAG;
-        out[1..=STORED_FORM_RECORD].copy_from_slice(&form_record(form));
+        out[1..=STORED_FORM_RECORD].copy_from_slice(&record);
         at = 1 + STORED_FORM_RECORD;
     }
     at + write_projected_value(value, &mut out[at..])
@@ -1807,6 +1911,11 @@ fn restore_projected_record<'a>(
     scalar: Datum<'a>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    // A record restores past the form record it may carry.
+    if tag == STORED_FORM_TAG {
+        let inner = at + STORED_FORM_RECORD;
+        return restore_projected_record(bytes, bytes[inner], inner + 1, scalar, arena);
+    }
     if matches!(tag, 19 | 51) {
         let text_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
         return decode_record_tail(

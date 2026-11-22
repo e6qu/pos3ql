@@ -4101,8 +4101,8 @@ fn external_materialized_select<'a>(
         None,
         limit,
         offset,
-        &mut |values, _forms, _rowids| match super::emit_data_row(
-            storage, txid, arena, responder, values,
+        &mut |values, forms, _rowids| match super::emit_data_row(
+            storage, txid, arena, responder, values, forms,
         ) {
             Ok(Ok(())) => Ok(true),
             Ok(Err(error)) => Err(error),
@@ -4274,7 +4274,9 @@ pub(crate) fn materialized_select<'a>(
         limit,
         offset,
         &stages,
-        &mut |values, _| match super::emit_data_row(storage, txid, arena, responder, values) {
+        &mut |values, forms| match super::emit_data_row(
+            storage, txid, arena, responder, values, forms,
+        ) {
             Ok(Ok(())) => Ok(true),
             Ok(Err(error)) => Err(error),
             Err(_) => {

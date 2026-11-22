@@ -1905,6 +1905,41 @@ impl CursorPool {
         super::exec::decode_projected_row_into(bytes, arena, values)
     }
 
+    /// The TOAST forms the values of row `row` of cursor `name` carry into
+    /// `forms`: `FETCH ... INTO` holds each as the cursor's result tuple
+    /// did.
+    pub(crate) fn row_forms(
+        &self,
+        name: &str,
+        row: u32,
+        forms: &mut [crate::storage::rowenc::StoredForm],
+    ) -> Result<usize, SqlError> {
+        let at = self.find(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_CURSOR,
+                "cursor \"{}\" does not exist",
+                name
+            )
+        })?;
+        let slot = &self.slots[at];
+        let (offset, length) = *slot
+            .spans
+            .get(row as usize)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "cursor row index is invalid"))?;
+        let bytes = &slot.rows.readable()[offset as usize..offset as usize + length as usize];
+        let width = super::exec::projected_row_width(bytes);
+        let capacity = forms.len();
+        let forms = forms.get_mut(..width).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "cursor row has more than {} columns",
+                capacity
+            )
+        })?;
+        super::exec::projected_stored_forms(bytes, forms);
+        Ok(width)
+    }
+
     /// CLOSE name — false when no such cursor exists.
     /// Closes cursor `name`; `false` when no such cursor is open. A cursor
     /// a `FOR` loop reads is pinned and cannot be closed.

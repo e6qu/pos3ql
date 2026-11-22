@@ -196,7 +196,16 @@ pub fn set_query<'a>(
                 Err(error) => return sql_fail(error),
             };
         }
-        match super::emit_data_row(storage, txid, arena, responder, &out[..n_cols]) {
+        let mut forms = [StoredForm::Inline; MAX_PROJ];
+        exec::projected_stored_forms(row, &mut forms[..n_cols]);
+        match super::emit_data_row(
+            storage,
+            txid,
+            arena,
+            responder,
+            &out[..n_cols],
+            &forms[..n_cols],
+        ) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return sql_fail(error),
             Err(wire) => return Err(wire),
@@ -1146,12 +1155,15 @@ fn external_set_query<'a>(
                             Err(error) => return sql_fail(error),
                         };
                     }
+                    let mut forms = [StoredForm::Inline; MAX_PROJ];
+                    exec::projected_stored_forms(context.row, &mut forms[..target.len()]);
                     match super::emit_data_row(
                         storage,
                         txid,
                         arena,
                         responder,
                         &values[..target.len()],
+                        &forms[..target.len()],
                     ) {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => return sql_fail(error),

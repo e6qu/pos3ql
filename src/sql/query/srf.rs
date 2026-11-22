@@ -6513,10 +6513,19 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     context: super::RoutineInputContext::Table,
                 },
                 &mut |argument| {
-                    let value =
-                        crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?;
+                    let (value, form) = crate::sql::eval::routine_argument(
+                        argument,
+                        arena,
+                        params,
+                        &[],
+                        columns,
+                        &hooks,
+                    )?;
                     let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-                    crate::sql::exec::decode_projected_col_record(encoded, 0, arena)
+                    Ok((
+                        crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?,
+                        form,
+                    ))
                 },
                 arena,
             )?
@@ -6528,6 +6537,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 return Ok(&[]);
             };
             let input_collation = routine_params.input_collation;
+            let routine_forms = routine_params.forms;
             let routine_params = routine_params.values;
             composite = routine_composite_result(routine, storage, txid)?;
             if let crate::storage::RoutineLanguage::Native(native) = routine.language
@@ -6547,6 +6557,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         routine_slot,
                         routine,
                         &routine_params[..routine.argument_count],
+                        &routine_forms[..routine.argument_count],
                         input_collation,
                         crate::sql::eval::RoutineCallAccess::Caller,
                         tref.func_source_position
@@ -6592,6 +6603,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         .resolve_rows(
                             routine,
                             &routine_params[..routine.argument_count],
+                            &routine_forms[..routine.argument_count],
                             statement_arena,
                             tref.func_source_position.get(),
                             input_collation,
@@ -6678,6 +6690,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         .resolve_rows(
                             routine,
                             &routine_params[..routine.argument_count],
+                            &routine_forms[..routine.argument_count],
                             statement_arena,
                             tref.func_source_position.get(),
                             input_collation,

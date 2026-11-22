@@ -2701,7 +2701,8 @@ pub(super) fn grouped_select<'a>(
                 Err(error) => return sql_fail(error),
             };
         }
-        match super::emit_data_row(storage, txid, arena, responder, &out[..width]) {
+        // Grouped output rows do not carry their keys' forms.
+        match super::emit_data_row(storage, txid, arena, responder, &out[..width], &[]) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return sql_fail(error),
             Err(wire) => return Err(wire),

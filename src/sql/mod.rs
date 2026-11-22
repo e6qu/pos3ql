@@ -3549,8 +3549,9 @@ impl TriggerCursorRead<'_, '_> {
             return Ok(true);
         }
         let mut projected = crate::mem::arena::ArenaList::new(arena);
+        let mut projected_forms = crate::mem::arena::ArenaList::new(arena);
         for index in 0..query.items_len() {
-            let values = query.evaluate_item(
+            let (values, forms) = query.evaluate_item(
                 index,
                 storage,
                 txid,
@@ -3567,6 +3568,11 @@ impl TriggerCursorRead<'_, '_> {
                     ));
                 }
                 projected.push(*value).map_err(|_| eval::arena_full())?;
+            }
+            for form in forms {
+                projected_forms
+                    .push(*form)
+                    .map_err(|_| eval::arena_full())?;
             }
         }
         if self.cursors.plan_owner(self.at)? != self.owner {
@@ -3586,8 +3592,15 @@ impl TriggerCursorRead<'_, '_> {
         };
         let mut capture = Responder::for_cursor(description, sink);
         capture.set_render(self.render);
-        query::emit_data_row(storage, txid, arena, &mut capture, projected.as_slice())
-            .map_err(|_| cursor_result_too_large())??;
+        query::emit_data_row(
+            storage,
+            txid,
+            arena,
+            &mut capture,
+            projected.as_slice(),
+            projected_forms.as_slice(),
+        )
+        .map_err(|_| cursor_result_too_large())??;
         Ok(true)
     }
 
@@ -19034,6 +19047,7 @@ impl Engine {
                 }
                 let skipped = source.skip_statement_row();
                 let mut projected = crate::mem::arena::ArenaList::new(frame);
+                let mut projected_forms = crate::mem::arena::ArenaList::new(frame);
                 for index in 0..source.statement_items_len() {
                     let values = self.execute_retained_expression(
                         frame,
@@ -19073,6 +19087,11 @@ impl Engine {
                             return Ok(Err(eval::arena_full()));
                         }
                     }
+                    for form in values.1 {
+                        if projected_forms.push(*form).is_err() {
+                            return Ok(Err(eval::arena_full()));
+                        }
+                    }
                 }
                 if skipped {
                     return Ok(Ok(false));
@@ -19084,6 +19103,7 @@ impl Engine {
                     frame,
                     responder,
                     projected.as_slice(),
+                    projected_forms.as_slice(),
                 )? {
                     Ok(()) => Ok(Ok(true)),
                     Err(error) => Ok(Err(error)),
@@ -21342,6 +21362,12 @@ impl Engine {
             Ok(arguments) => arguments,
             Err(_) => return Ok(Err(query::arena_full_pub())),
         };
+        let forms = match arena.alloc_slice_with(pending.argument_count, |index| {
+            exec::projected_datum_form(encoded_arguments, index)
+        }) {
+            Ok(forms) => forms,
+            Err(_) => return Ok(Err(query::arena_full_pub())),
+        };
         for (index, argument) in arguments
             .iter_mut()
             .enumerate()
@@ -21376,6 +21402,7 @@ impl Engine {
                     routine,
                     pending.input_collation,
                     arguments,
+                    forms,
                     arena,
                     responder,
                     &environment,
@@ -22049,6 +22076,7 @@ impl Engine {
         variadic: bool,
         arena: &'a Arena,
         params: &[Datum],
+        param_forms: &[crate::sql::toast::DatumForm],
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
@@ -22122,7 +22150,9 @@ impl Engine {
                     variadic,
                     context: query::RoutineInputContext::Procedure,
                 },
-                &mut |argument| eval::eval_full(argument, arena, params, &NoColumns, &hooks),
+                &mut |argument| {
+                    eval::routine_argument(argument, arena, params, param_forms, &NoColumns, &hooks)
+                },
                 arena,
             ) {
                 Ok(Some(values)) => values,
@@ -22135,6 +22165,7 @@ impl Engine {
                 Err(error) => return Ok(Err(error)),
             };
             let input_collation = completed.input_collation;
+            let completed_forms = completed.forms;
             let completed = completed.values;
             let routine = &declared;
             let owner = match self
@@ -22219,6 +22250,7 @@ impl Engine {
                             routine,
                             input_collation,
                             &completed[..declared.argument_count],
+                            &completed_forms[..declared.argument_count],
                             arena,
                             responder,
                             &mut output_values,
@@ -24688,6 +24720,7 @@ impl Engine {
                 } else {
                     None
                 };
+                // A client's bound parameters are formed by their types' input.
                 let outcome = self.execute_call(
                     *name,
                     arguments,
@@ -24695,6 +24728,7 @@ impl Engine {
                     *variadic,
                     arena,
                     params,
+                    &[],
                     txn,
                     sqlprep,
                     cursors,
@@ -28871,6 +28905,7 @@ impl Engine {
                 }
                 let count = cursors.execution_parts(at).0.items_len();
                 let mut projected = crate::mem::arena::ArenaList::new(frame);
+                let mut projected_forms = crate::mem::arena::ArenaList::new(frame);
                 for index in 0..count {
                     let values = self.execute_retained_expression(
                         frame,
@@ -28898,10 +28933,15 @@ impl Engine {
                             )
                         },
                     )?;
-                    let values = match values {
+                    let (values, forms) = match values {
                         Ok(values) => values,
                         Err(error) => return Ok(Err(error)),
                     };
+                    for form in forms {
+                        if projected_forms.push(*form).is_err() {
+                            return Ok(Err(eval::arena_full()));
+                        }
+                    }
                     for value in values {
                         if projected.len() == MAX_PROJ {
                             return Ok(Err(sql_err!(
@@ -28929,6 +28969,7 @@ impl Engine {
                         frame,
                         responder,
                         projected.as_slice(),
+                        projected_forms.as_slice(),
                     ) {
                         Ok(Ok(())) => Ok(Ok(true)),
                         Ok(Err(error)) => Ok(Err(error)),
@@ -28957,6 +28998,7 @@ impl Engine {
                     frame,
                     &mut capture,
                     projected.as_slice(),
+                    projected_forms.as_slice(),
                 )? {
                     Ok(()) => Ok(Ok(true)),
                     Err(error) => Ok(Err(error)),
@@ -29499,12 +29541,15 @@ impl Engine {
                             let result = {
                                 let mut values = [Datum::Null; crate::pg::respond::MAX_RESULT_COLS];
                                 match cursors.copy_row(name, row, arena, &mut values) {
+                                    // A fetched row goes to the client, which
+                                    // never sees forms.
                                     Ok(width) => query::emit_data_row(
                                         &self.storage,
                                         txn.txid,
                                         arena,
                                         responder,
                                         &values[..width],
+                                        &[],
                                     ),
                                     Err(error) => Ok(Err(error)),
                                 }

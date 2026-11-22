@@ -192,6 +192,7 @@ fn pending_calls_own_nested_arguments_and_types_after_scratch_release_and_arena_
                     ),
                     arguments: PendingRoutineInvocation::capture_arguments(
                         &[Datum::Record(fields)],
+                        &[crate::sql::toast::DatumForm::Formed],
                         &original,
                     )
                     .unwrap(),
@@ -294,10 +295,14 @@ fn pending_call_argument_exhaustion_and_borrow_failures_preserve_the_owner() {
             Datum::Text("saved argument")
         );
         assert_eq!(
-            PendingRoutineInvocation::capture_arguments(&[Datum::Text("x")], &tiny)
-                .err()
-                .unwrap()
-                .sqlstate,
+            PendingRoutineInvocation::capture_arguments(
+                &[Datum::Text("x")],
+                &[crate::sql::toast::DatumForm::Formed],
+                &tiny,
+            )
+            .err()
+            .unwrap()
+            .sqlstate,
             "54000"
         );
     });

@@ -29,7 +29,10 @@ impl LoopRows {
         // NULL.
         let formed = |index: usize| match index {
             0 => (rows.empty, crate::storage::StoredForm::Inline),
-            row => (rows.values[row - 1], rows.forms.get(row - 1)),
+            row => (
+                rows.values[row - 1],
+                rows.forms.get(row - 1, &rows.values[row - 1]),
+            ),
         };
         let encoded_len = |index: usize| projected_row_len_by(1, |_| Ok(formed(index)));
         let mut length = offsets.checked_add(encoded_len(0)?).ok_or_else(too_large)?;

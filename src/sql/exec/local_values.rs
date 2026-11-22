@@ -1,6 +1,7 @@
 //! Saved values own reusable byte ranges independently of every statement arena.
 
 use super::*;
+use crate::sql::toast::DatumForm;
 pub(super) struct SavedValues {
     bytes: MutableSlice<u8>,
     length: usize,
@@ -22,6 +23,47 @@ impl SavedValues {
 
     pub(super) fn replace(&mut self, values: &[Datum<'_>]) -> Result<(), SqlError> {
         self.replace_indexed(values.len(), |index| values[index])
+    }
+
+    /// Saves a routine's inputs with how each holds its value, which
+    /// [`Self::held_forms`] reads back.
+    pub(super) fn replace_held(
+        &mut self,
+        values: &[Datum<'_>],
+        forms: &[DatumForm],
+    ) -> Result<(), SqlError> {
+        if values.len() != forms.len() {
+            return Err(layout_changed());
+        }
+        let length = projected_row_len_held(values, forms)?;
+        let capacity = length
+            .checked_next_power_of_two()
+            .ok_or_else(full)?
+            .min(self.bytes.max_entries())
+            .max(length);
+        self.bytes.reserve_exact(capacity).map_err(exhausted)?;
+        const ZEROES: [u8; 4096] = [0; 4096];
+        while self.bytes.len() < length {
+            super::super::query::check_timeout()?;
+            let count = (length - self.bytes.len()).min(ZEROES.len());
+            self.bytes
+                .extend_from_slice(&ZEROES[..count])
+                .map_err(exhausted)?;
+        }
+        encode_projected_held_into(values, forms, &mut self.bytes[..length])?;
+        self.length = length;
+        self.width = Some(values.len());
+        Ok(())
+    }
+
+    /// How each saved input holds its value, into `forms`.
+    pub(super) fn held_forms(&self, forms: &mut [DatumForm]) -> Result<(), SqlError> {
+        let width = self.width.ok_or_else(inactive)?;
+        let forms = forms.get_mut(..width).ok_or_else(layout_changed)?;
+        for (column, form) in forms.iter_mut().enumerate() {
+            *form = projected_datum_form(&self.bytes[..self.length], column);
+        }
+        Ok(())
     }
 
     /// Reads already evaluated values by index, without staging a maximum-width
@@ -202,27 +244,11 @@ impl ExpressionProgress {
     }
 }
 
-/// How a PL/pgSQL variable holds its datum, which `pg_column_size` reads.
-/// PL/pgSQL keeps the datum it is given (`datumTransfer`): a simple
-/// expression's result as the expression formed it, and a query's result as
-/// SPI's result tuple holds it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LocalForm {
-    /// Formed by an expression: a four-byte varlena header, uncompressed.
-    Formed,
-    /// Read from a tuple: a short value packed, a stored datum in the TOAST
-    /// form it was stored in.
-    Stored(StoredForm),
-    /// Passed in by a caller whose expression is not traced: a short value
-    /// is taken as packed and a longer one as not modelled.
-    Passed,
-}
-
 /// A PL/pgSQL variable's value and how it holds it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LocalSlot<'a> {
     pub(crate) value: Datum<'a>,
-    pub(crate) form: LocalForm,
+    pub(crate) form: DatumForm,
 }
 
 // The execution control pool's documented per-variable cost: a 32-byte
@@ -232,13 +258,13 @@ const _: () = assert!(core::mem::size_of::<LocalSlot<'static>>() == 40);
 impl<'a> LocalSlot<'a> {
     pub(crate) const NULL: Self = Self {
         value: Datum::Null,
-        form: LocalForm::Formed,
+        form: DatumForm::Formed,
     };
 
     pub(crate) const fn formed(value: Datum<'a>) -> Self {
         Self {
             value,
-            form: LocalForm::Formed,
+            form: DatumForm::Formed,
         }
     }
 }

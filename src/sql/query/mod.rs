@@ -1711,11 +1711,20 @@ pub(crate) fn read_write_query<'a>(
 }
 
 impl PendingRoutineInvocation {
+    /// Saves a call's arguments with how each holds its value (`forms`),
+    /// which the routine's parameters keep.
     fn capture_arguments(
         values: &[Datum<'_>],
+        forms: &[crate::sql::toast::DatumForm],
         arena: &Arena,
     ) -> Result<crate::mem::arena::FrozenArenaSliceHandle<u8>, SqlError> {
-        let length = super::exec::projected_row_len(values)?;
+        let forms = forms.get(..values.len()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "pending routine arguments lost their forms"
+            )
+        })?;
+        let length = super::exec::projected_row_len_held(values, forms)?;
         let handle = arena.retain_slice_with(length, |_| 0u8).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1725,7 +1734,7 @@ impl PendingRoutineInvocation {
         let mut bytes = arena
             .retained_slice_mut(handle)
             .map_err(|_| inactive_pending_call())?;
-        super::exec::encode_projected_into(values, &mut bytes)?;
+        super::exec::encode_projected_held_into(values, forms, &mut bytes)?;
         drop(bytes);
         arena
             .freeze_retained_slice(handle)
@@ -2894,7 +2903,7 @@ impl RoutineInvocationState {
                     block: source.block,
                     row,
                 }),
-                arguments: PendingRoutineInvocation::capture_arguments(&[], statement_arena)?,
+                arguments: PendingRoutineInvocation::capture_arguments(&[], &[], statement_arena)?,
                 argument_count: 0,
             }));
             Ok::<_, SqlError>(())
@@ -3172,6 +3181,7 @@ impl RoutineInvocationState {
         &self,
         routine: &crate::storage::RoutineDef,
         arguments: &[Datum],
+        forms: &[crate::sql::toast::DatumForm],
         statement_arena: &Arena,
         query_arena: &'query Arena,
         source_position: Option<InvocationSite>,
@@ -3196,7 +3206,11 @@ impl RoutineInvocationState {
                             )
                         })?,
                 ),
-                arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
+                arguments: PendingRoutineInvocation::capture_arguments(
+                    arguments,
+                    forms,
+                    statement_arena,
+                )?,
                 argument_count: arguments.len(),
             })
         };
@@ -3267,7 +3281,11 @@ impl RoutineInvocationState {
             input_collation: super::ast::Collation::None,
             access: super::eval::RoutineCallAccess::Caller,
             target: PendingRoutineTarget::Intrinsic(oid),
-            arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
+            arguments: PendingRoutineInvocation::capture_arguments(
+                arguments,
+                &crate::sql::toast::UNRECORDED_ARGUMENTS,
+                statement_arena,
+            )?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(
@@ -3338,7 +3356,11 @@ impl RoutineInvocationState {
                 access: super::eval::RoutineCallAccess::Caller,
                 target: PendingRoutineTarget::Trigger(firing.call),
                 constant_arguments: false,
-                arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
+                arguments: PendingRoutineInvocation::capture_arguments(
+                    arguments,
+                    &crate::sql::toast::UNRECORDED_ARGUMENTS,
+                    statement_arena,
+                )?,
                 argument_count: arguments.len(),
             }));
             Ok(())
@@ -3434,6 +3456,7 @@ impl RoutineInvocationState {
         &self,
         routine: &crate::storage::RoutineDef,
         arguments: &[Datum],
+        forms: &[crate::sql::toast::DatumForm],
         statement_arena: &Arena,
         source_position: Option<usize>,
         input_collation: super::ast::Collation,
@@ -3474,7 +3497,11 @@ impl RoutineInvocationState {
                         )
                     })?,
             ),
-            arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
+            arguments: PendingRoutineInvocation::capture_arguments(
+                arguments,
+                forms,
+                statement_arena,
+            )?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(
@@ -4345,6 +4372,8 @@ pub(crate) fn execute_operator_function<'a>(
             slot,
             &storage.routine_for(slot, txid),
             &[left, right],
+            // An operator's operands reach it evaluated, without their forms.
+            &crate::sql::toast::UNRECORDED_ARGUMENTS,
             collation,
             super::eval::RoutineCallAccess::Caller,
             input_progress::invocation_site(),
@@ -4380,6 +4409,7 @@ pub(crate) fn execute_index_comparison<'a>(
             slot,
             &storage.routine_for(slot, txid),
             &[left, right],
+            &crate::sql::toast::UNRECORDED_ARGUMENTS,
             super::ast::Collation::None,
             super::eval::RoutineCallAccess::Caller,
             input_progress::invocation_site(),
@@ -4479,7 +4509,33 @@ pub(super) struct RoutineCallInputs<'call, 'expression> {
 
 pub(super) struct CompletedRoutineInputs<'a> {
     pub values: &'a [Datum<'a>],
+    /// How each input holds its value.
+    pub forms: &'a [crate::sql::toast::DatumForm],
     pub input_collation: super::ast::Collation,
+}
+
+/// How an input holding its value as `form`, of type `source`, holds it
+/// once converted to its parameter's type `expected`: a binary-coercible
+/// conversion relabels the datum, a cast function or type I/O forms a new
+/// one, and a literal of unknown type is formed by the type's input. A
+/// user-defined cast's function or a domain's conversion may return either,
+/// which is not modelled.
+fn coerced_input_form(
+    form: crate::sql::toast::DatumForm,
+    source: i32,
+    expected: i32,
+) -> crate::sql::toast::DatumForm {
+    use crate::sql::toast::DatumForm;
+    if source == expected || super::catalog::builtin_binary_cast(source, expected) {
+        form
+    } else if source == super::types::oid::UNKNOWN
+        || super::catalog::builtin_cast_context(source, expected).is_some()
+        || super::catalog::builtin_io_cast(source, expected)
+    {
+        DatumForm::Formed
+    } else {
+        DatumForm::Unknown
+    }
 }
 
 impl StorageCatalog<'_, '_, '_, '_> {
@@ -4492,7 +4548,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
         slot: usize,
         declared: &mut crate::storage::RoutineDef,
         inputs: RoutineCallInputs<'_, 'a>,
-        evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
+        evaluate: &mut dyn FnMut(
+            &'a Expr<'a>,
+        )
+            -> Result<(Datum<'a>, crate::sql::toast::DatumForm), SqlError>,
         arena: &'a Arena,
     ) -> Result<Option<CompletedRoutineInputs<'a>>, SqlError> {
         use super::eval::CatalogAccess as _;
@@ -4718,11 +4777,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 })?;
             Ok((argument, expected))
         };
-        let coerce_input = |value,
+        let coerce_input = |(value, form): (Datum<'a>, crate::sql::toast::DatumForm),
                             source,
                             argument: crate::storage::RoutineArgumentDef,
                             expected,
                             input_collation| {
+            let form = coerced_input_form(form, source, expected);
             if source != expected
                 && let Some(value) = self.execute_defined_cast(
                     source,
@@ -4735,7 +4795,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     None,
                 )?
             {
-                return Ok(value);
+                return Ok((value, form));
             }
             super::exec::coerce_routine_argument(
                 value,
@@ -4745,6 +4805,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 arena,
                 None,
             )
+            .map(|value| (value, form))
         };
         let classify_input = |expression: &Expr<'_>, source, expected| -> Result<bool, SqlError> {
             // CALL evaluates ordinary expressions at execution time. Unknown
@@ -4814,7 +4875,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 }
                 let source = argument_type_oids[call_index];
                 if constant_input(expression, source, expected, input_index, Some(call_index))? {
-                    let value = input_progress::value(
+                    let value = input_progress::held_value(
                         input_progress::InputSite::Argument {
                             routine: crate::storage::routine_oid(routine),
                             parameter: input_index,
@@ -4838,14 +4899,14 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     )?;
                     constant_values[call_index] = Some(value);
                     // A null array member does not make the array null.
-                    constant_null |= !expanded_variadic && value.is_null();
+                    constant_null |= !expanded_variadic && value.0.is_null();
                 }
             }
             if let Some(expression) = default_expressions[input_index] {
                 let (argument, expected) = input_contract(input_index, false)?;
                 let source = input_type_oids[input_index];
                 if constant_input(expression, source, expected, input_index, None)? {
-                    let value = input_progress::value(
+                    let value = input_progress::held_value(
                         input_progress::InputSite::Argument {
                             routine: crate::storage::routine_oid(routine),
                             parameter: input_index,
@@ -4868,7 +4929,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         },
                     )?;
                     constant_defaults[input_index] = Some(value);
-                    constant_null |= value.is_null();
+                    constant_null |= value.0.is_null();
                 }
             }
         }
@@ -4879,6 +4940,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
         }
         let completed = arena
             .alloc_slice_with(declared.argument_count, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        let completed_forms = arena
+            .alloc_slice_with(declared.argument_count, |_| {
+                crate::sql::toast::DatumForm::Formed
+            })
             .map_err(|_| arena_full())?;
         let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         // PostgreSQL orders named inputs and inserted defaults by the declared
@@ -4902,7 +4968,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 }
                 let value = match constant_values[call_index] {
                     Some(value) => value,
-                    None => input_progress::value(
+                    None => input_progress::held_value(
                         input_progress::InputSite::Argument {
                             routine: crate::storage::routine_oid(routine),
                             parameter: input_index,
@@ -4927,10 +4993,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 };
                 supplied = true;
                 if expanded_variadic {
-                    variadic_values[variadic_count] = value;
+                    variadic_values[variadic_count] = value.0;
                     variadic_count += 1;
                 } else {
-                    completed[input_index] = value;
+                    (completed[input_index], completed_forms[input_index]) = value;
                 }
             }
             if expanded_variadic && supplied {
@@ -4940,38 +5006,41 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         "variadic parameter is not an array"
                     ));
                 };
+                // The call forms the variadic array.
                 completed[input_index] = Datum::Array {
                     element,
                     raw: super::array::build(&variadic_values[..variadic_count], arena)?,
                 };
+                completed_forms[input_index] = crate::sql::toast::DatumForm::Formed;
             } else if supplied {
                 continue;
             } else if let Some(expression) = default_expressions[input_index] {
-                completed[input_index] = match constant_defaults[input_index] {
-                    Some(value) => value,
-                    None => input_progress::value(
-                        input_progress::InputSite::Argument {
-                            routine: crate::storage::routine_oid(routine),
-                            parameter: input_index,
-                            written: None,
-                            source: input_type_oids[input_index],
-                            target: expected,
-                        },
-                        arena,
-                        || {
-                            coerce_input(
-                                evaluate(expression)?,
-                                input_type_oids[input_index],
-                                argument,
-                                expected,
-                                default_collations[input_index].map_or(
-                                    super::ast::Collation::None,
-                                    super::eval::DerivedCollation::input_collation,
-                                ),
-                            )
-                        },
-                    )?,
-                };
+                (completed[input_index], completed_forms[input_index]) =
+                    match constant_defaults[input_index] {
+                        Some(value) => value,
+                        None => input_progress::held_value(
+                            input_progress::InputSite::Argument {
+                                routine: crate::storage::routine_oid(routine),
+                                parameter: input_index,
+                                written: None,
+                                source: input_type_oids[input_index],
+                                target: expected,
+                            },
+                            arena,
+                            || {
+                                coerce_input(
+                                    evaluate(expression)?,
+                                    input_type_oids[input_index],
+                                    argument,
+                                    expected,
+                                    default_collations[input_index].map_or(
+                                        super::ast::Collation::None,
+                                        super::eval::DerivedCollation::input_collation,
+                                    ),
+                                )
+                            },
+                        )?,
+                    };
             } else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -4984,6 +5053,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         }
         Ok(Some(CompletedRoutineInputs {
             values: completed,
+            forms: completed_forms,
             input_collation: call_collation.map_or(
                 super::ast::Collation::None,
                 super::eval::DerivedCollation::input_collation,
@@ -5260,6 +5330,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     slot,
                     &routine,
                     &arguments[..routine.argument_count],
+                    // A cast's value reaches its function without its form.
+                    &crate::sql::toast::UNRECORDED_ARGUMENTS,
                     input_collation,
                     super::eval::RoutineCallAccess::Caller,
                     input_progress::invocation_site(),
@@ -5430,6 +5502,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             function,
             &self.storage.routine_for(function, self.txid),
             &coerced[..expected_count],
+            &crate::sql::toast::UNRECORDED_ARGUMENTS,
             input_collation,
             super::eval::RoutineCallAccess::Caller,
             input_progress::invocation_site(),
@@ -5458,6 +5531,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         slot: usize,
         routine: &crate::storage::RoutineDef,
         arguments: &[Datum<'a>],
+        forms: &[crate::sql::toast::DatumForm],
         input_collation: super::ast::Collation,
         access: super::eval::RoutineCallAccess,
         source_position: Option<InvocationSite>,
@@ -5516,6 +5590,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             return invocations.resolve(
                 routine,
                 arguments,
+                forms,
                 self.statement_arena
                     .expect("routine invocation state has statement arena"),
                 arena,
@@ -5531,6 +5606,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     invocations.resolve(
                         routine,
                         arguments,
+                        forms,
                         statement_arena,
                         arena,
                         source_position,
@@ -7087,7 +7163,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             &'a Expr<'a>,
         )
             -> Result<Option<super::eval::DerivedCollation>, SqlError>,
-        evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
+        evaluate: &mut dyn FnMut(
+            &'a Expr<'a>,
+        )
+            -> Result<(Datum<'a>, crate::sql::toast::DatumForm), SqlError>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         with_call_arguments(
@@ -7133,7 +7212,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                             .alloc_slice_with(arguments.len(), |_| Datum::Null)
                             .map_err(|_| arena_full())?;
                         for (value, expression) in values.iter_mut().zip(arguments) {
-                            *value = evaluate(expression)?;
+                            *value = evaluate(expression)?.0;
                         }
                         return self
                             .execute_catalog_operator(
@@ -7192,6 +7271,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     slot,
                     routine,
                     &completed.values[..declared.argument_count],
+                    &completed.forms[..declared.argument_count],
                     completed.input_collation,
                     super::eval::RoutineCallAccess::Caller,
                     input_progress::invocation_site(),
@@ -7307,10 +7387,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     "bound support function polymorphic contract does not match its arguments"
                 )
             })?;
+        // A support function's arguments are evaluated values whose forms
+        // its caller does not keep.
         self.execute_routine(
             slot,
             &routine,
             arguments,
+            &crate::sql::toast::UNRECORDED_ARGUMENTS,
             input_collation,
             access,
             input_progress::invocation_site(),
@@ -9526,13 +9609,16 @@ fn sql_fail(e: SqlError) -> Outcome {
 
 /// The sole query-result wire boundary. Composite values are stored in rows as
 /// canonical text, so binary output materializes them before the retryable
-/// responder writes the PostgreSQL send representation.
+/// responder writes the PostgreSQL send representation. `forms` holds the
+/// TOAST forms the producer carries for `values` (empty when it carries
+/// none); a SQL cursor keeps them with its rows for `FETCH ... INTO`.
 pub(crate) fn emit_data_row(
     storage: &Storage,
     txid: u32,
     arena: &Arena,
     responder: &mut Responder,
     values: &[Datum],
+    forms: &[StoredForm],
 ) -> Outcome {
     let rows = match responder.cursor_row_output() {
         crate::pg::respond::CursorRowOutput::Wire => None,
@@ -9549,7 +9635,15 @@ pub(crate) fn emit_data_row(
         ));
     }
     if let Some(rows) = rows {
-        let len = match super::exec::projected_row_len(values) {
+        let form_at = |index: usize| {
+            let value = values[index];
+            let form = forms
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| crate::sql::toast::uncarried_form(&value));
+            Ok((value, form))
+        };
+        let len = match super::exec::projected_row_len_by(values.len(), form_at) {
             Ok(len) => len,
             Err(error) => return sql_fail(error),
         };
@@ -9564,7 +9658,9 @@ pub(crate) fn emit_data_row(
             return sql_fail(super::cursor_result_too_large());
         }
         // Publish the row boundary only after every typed value is encoded.
-        if let Err(error) = super::exec::encode_projected_into(values, &mut out[4..total]) {
+        if let Err(error) =
+            super::exec::encode_projected_by_into(values.len(), form_at, &mut out[4..total])
+        {
             return sql_fail(error);
         }
         out[..4].copy_from_slice(&length.to_le_bytes());
@@ -15508,7 +15604,14 @@ pub(crate) fn select_query_resumable<'a>(
                         &mut forms,
                         None,
                     )?;
-                    match emit_data_row(storage, txid, arena, responder, &projected[..n]) {
+                    match emit_data_row(
+                        storage,
+                        txid,
+                        arena,
+                        responder,
+                        &projected[..n],
+                        &forms[..n],
+                    ) {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => return Err(error),
                         Err(wire) => {
@@ -16157,6 +16260,7 @@ pub(crate) fn constant_select_resumable<'a>(
                 arena,
                 responder,
                 &vals[..statement.items.len()],
+                &[],
             ) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => return sql_fail(error),
@@ -16488,7 +16592,8 @@ pub(crate) fn constant_select_resumable<'a>(
                 Err(error) => return sql_fail(error),
             };
         }
-        match emit_data_row(storage, txid, arena, responder, &values[..width]) {
+        // A FROM-less select's rows do not carry their values' forms.
+        match emit_data_row(storage, txid, arena, responder, &values[..width], &[]) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return sql_fail(error),
             Err(wire) => return Err(wire),

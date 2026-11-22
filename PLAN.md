@@ -482,8 +482,9 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   `EXPLAIN (ANALYZE, BUFFERS)` of writing a row TOAST compresses, and
   `pg_column_size` of a short value an aggregate, window function or
   subquery passes on (PostgreSQL keeps its one-byte header). The result of
-  a user-defined function is taken as formed anew, though PostgreSQL may
-  return a stored datum it read.
+  a user-defined function is taken as formed anew where its size feeds a
+  plan (PostgreSQL may return a stored datum it read); `pg_column_size` of
+  it is `0A000`.
 - [x] PL/pgSQL variables keep the datum they are given (`datumTransfer`):
   each variable's slot records how it holds its value. A simple
   expression's result keeps the header the expression gave it (`y := 'lit'`
@@ -495,16 +496,26 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   INTO w` reads 44); a record keeps its fields' forms. A `FOR` loop over a
   static or `EXECUTE` query keeps each row's forms in its scalar, record or
   target-list variables (`FOR v IN SELECT big` reads 44) (`992`).
-- [ ] PL/pgSQL forms not carried yet: a parameter's (the caller's
-  argument expression is not traced through routine input preparation and
-  the saved invocation log: a short value is taken as packed, a longer one
-  is `0A000`), a long value a `FETCH` row or a `RETURNS TABLE` query passes
-  on, a long value a query forms anew for `SELECT INTO` or a `FOR` loop
-  (`FOR v IN SELECT big || ''` reads 3004; query results report a formed
-  value and one whose form they do not carry alike, so it is `0A000`), and `NEW` and `OLD` columns TOAST may store otherwise (`0A000`;
-  PostgreSQL reads a `BEFORE` trigger's `NEW` as formed, 3004, and an
-  `AFTER` trigger's as stored, 44; the firing path and queued `AFTER`
-  events carry row values without forms).
+- [x] A routine's parameters hold the datums their caller's arguments
+  give (`psize(s)` reads 6, `psize('lit')` 7, `psize(big)` 44): routine
+  input preparation, retained inputs, the saved invocation log and
+  suspended calls keep each argument's form (formed, read from a tuple, or
+  unrecorded), a binary-coercible conversion keeps it and a cast function
+  forms a new datum (`psize(c)` of a `char(3)` reads 6). Query results
+  report a value they formed (`Inline`) apart from one whose form they do
+  not carry (`Unmodelled`): `SELECT big || '' INTO w`, a `FOR` loop over
+  it, `EXECUTE ... INTO` and `FETCH` read 3004, and a cursor's rows keep
+  the forms its query gave them (`992`).
+- [ ] PL/pgSQL forms not carried yet (each `0A000` where the form
+  decides a size): an argument a user-defined cast, operator or support
+  function, a domain conversion or `EXECUTE 'CALL p($1)' USING` passes on
+  (PostgreSQL keeps the caller's datum, 44), a procedure's output
+  parameters returned to `CALL`, the datum a user-defined function returns
+  (PostgreSQL passes a returned parameter on unchanged), and `NEW` and
+  `OLD` columns TOAST may store otherwise (PostgreSQL reads a `BEFORE`
+  trigger's `NEW` as formed, 3004, and an `AFTER` trigger's as stored, 44;
+  the firing path, the movable engine firings and queued `AFTER` events
+  carry row values without forms).
 - [ ] Composite forms not carried yet: the one-byte header a short
   composite gets when a sort or a materialized CTE forms it into a tuple, a
   derived table's whole-row output PostgreSQL pulls up into the outer query

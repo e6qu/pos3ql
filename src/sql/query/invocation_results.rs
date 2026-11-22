@@ -272,6 +272,7 @@ mod ownership_tests {
                     let text = scratch.alloc_str("saved text").unwrap();
                     let fields = scratch
                         .alloc_slice_copy(&[super::super::super::types::RecordField {
+                            form: crate::storage::StoredForm::Inline,
                             name: field,
                             type_oid: super::super::super::types::oid::TEXT,
                             type_mod: -1,

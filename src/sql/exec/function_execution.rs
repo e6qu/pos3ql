@@ -109,6 +109,7 @@ impl ReturnBinding {
             ) => {
                 let fields = arena
                     .alloc_slice_with(outputs.len(), |_| RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: "",
                         type_oid: 0,
                         type_mod: -1,
@@ -117,6 +118,7 @@ impl ReturnBinding {
                     .map_err(|_| super::super::query::arena_full_pub())?;
                 for (field, output) in fields.iter_mut().zip(outputs.iter()) {
                     *field = RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: arena
                             .alloc_str(output.name.as_str())
                             .map_err(|_| super::super::query::arena_full_pub())?,

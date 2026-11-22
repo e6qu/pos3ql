@@ -890,6 +890,7 @@ mod tests {
         let mut source = String::from("SELECT $1, $2");
         let mut text = String::from("captured");
         let fields = [crate::sql::types::RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "label",
             type_oid: crate::sql::types::oid::TEXT,
             type_mod: -1,
@@ -1014,6 +1015,7 @@ mod tests {
         let mut query = CursorQuery::new(&mut budget, 64 << 10).unwrap();
         let mut text = String::from("opening value");
         let fields = [RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "label",
             type_oid: oid::TEXT,
             type_mod: -1,
@@ -1091,6 +1093,7 @@ mod tests {
         let fields: Vec<_> = names
             .iter()
             .map(|name| RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name,
                 type_oid: oid::TEXT,
                 type_mod: -1,

@@ -486,13 +486,16 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   passes on). pos3ql refuses such a variable's `pg_column_size` once it may
   be toasted (`0A000`). The forms must survive a suspended routine's saved
   values.
-- [ ] A whole-row reference or `ROW(...)` over a stored row keeps its
-  compressed values compressed (`toast_build_flattened_tuple`); its
-  `pg_column_size` counts them uncompressed today. `ANALYZE`'s `avg_width`
-  of a compressed or out-of-line column counts the formed width.
-- [ ] A `tsquery` nested more than 64 operators deep (`to_tsquery` of 65
-  `&`-joined words) fails with `54000`; PostgreSQL bounds it only by
-  `max_stack_depth`.
+- [ ] Composite forms not carried yet: storing a composite value that holds
+  a compressed or out-of-line field (`0A000`; PostgreSQL stores the datum as
+  formed), the one-byte header a short composite gets when a sort or a
+  materialized CTE forms it into a tuple, and a derived table's whole-row
+  output PostgreSQL pulls up into the outer query (a field of it reads the
+  stored column there). A whole-row reference, `ROW(...)` and a field of
+  either already keep their values' stored forms (`987`).
+- [ ] A short value a subquery PostgreSQL does not materialize passes on
+  (`(SELECT a || '' x ... LIMIT 5) s`, a subquery without `FROM`) keeps its
+  four-byte header; `pg_column_size` reports the packed one-byte form today.
 - [ ] A btree index entry wider than 2704 bytes after `index_form_tuple`
   compresses it fails with `index row size ... exceeds btree version 4
   maximum` in PostgreSQL; pos3ql indexes it.
@@ -520,7 +523,7 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   index-only scans (`idx_tup_fetch`), and partition index scans read only
   for their order.
 - [ ] Range and multirange histograms; `compute_distinct_stats` for types
-  without an ordering; widths of compressed values; the binary form of a
+  without an ordering; the binary form of a
   composite value inside a statistics array (sent as text today).
 - [ ] Hash value types without a PostgreSQL size (arrays, `jsonb`, ranges,
   records) in a `Hash` node report pos3ql's bytes.

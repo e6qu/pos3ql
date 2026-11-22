@@ -165,12 +165,14 @@ fn slot_record<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let fields = [
         crate::sql::types::RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: "slot_name",
             type_oid: oid::NAME,
             type_mod: -1,
             value: Datum::Text(name),
         },
         crate::sql::types::RecordField {
+            form: crate::storage::StoredForm::Inline,
             name: lsn_name,
             type_oid: oid::PG_LSN,
             type_mod: -1,

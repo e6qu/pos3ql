@@ -601,18 +601,21 @@ fn object_address_record<'a>(
     let fields = arena
         .alloc_slice_copy(&[
             crate::sql::types::RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "classid",
                 type_oid: crate::sql::types::oid::OID,
                 type_mod: -1,
                 value: Datum::Oid(class_id as u32),
             },
             crate::sql::types::RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "objid",
                 type_oid: crate::sql::types::oid::OID,
                 type_mod: -1,
                 value: Datum::Oid(object_id as u32),
             },
             crate::sql::types::RecordField {
+                form: crate::storage::StoredForm::Inline,
                 name: "objsubid",
                 type_oid: crate::sql::types::oid::INT4,
                 type_mod: -1,
@@ -643,12 +646,14 @@ fn identify_object_record<'a>(
         arena
             .alloc_slice_copy(&[
                 crate::sql::types::RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "type",
                     type_oid: crate::sql::types::oid::TEXT,
                     type_mod: -1,
                     value: Datum::Text(object_type),
                 },
                 crate::sql::types::RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "object_names",
                     type_oid: crate::sql::types::oid::TEXT_ARRAY,
                     type_mod: -1,
@@ -662,6 +667,7 @@ fn identify_object_record<'a>(
                     },
                 },
                 crate::sql::types::RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "object_args",
                     type_oid: crate::sql::types::oid::TEXT_ARRAY,
                     type_mod: -1,
@@ -680,12 +686,14 @@ fn identify_object_record<'a>(
         arena
             .alloc_slice_copy(&[
                 crate::sql::types::RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "type",
                     type_oid: crate::sql::types::oid::TEXT,
                     type_mod: -1,
                     value: Datum::Text(object_type),
                 },
                 crate::sql::types::RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "schema",
                     type_oid: crate::sql::types::oid::TEXT,
                     type_mod: -1,
@@ -697,6 +705,7 @@ fn identify_object_record<'a>(
                     },
                 },
                 crate::sql::types::RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "name",
                     type_oid: crate::sql::types::oid::TEXT,
                     type_mod: -1,
@@ -708,6 +717,7 @@ fn identify_object_record<'a>(
                     },
                 },
                 crate::sql::types::RecordField {
+                    form: crate::storage::StoredForm::Inline,
                     name: "identity",
                     type_oid: crate::sql::types::oid::TEXT,
                     type_mod: -1,
@@ -1580,6 +1590,7 @@ pub(crate) fn dispatch<'a>(
                 let columns = crate::sql::catalog::available_extension_function_columns(versions);
                 let fields = arena
                     .alloc_slice_with(columns.len(), |field| crate::sql::types::RecordField {
+                        form: crate::storage::StoredForm::Inline,
                         name: columns[field].0,
                         type_oid: columns[field].1.oid(),
                         value: values[field],

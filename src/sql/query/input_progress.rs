@@ -1455,6 +1455,7 @@ mod tests {
                     let field = scratch.alloc_str("payload").unwrap();
                     let fields = scratch
                         .alloc_slice_copy(&[crate::sql::types::RecordField {
+                            form: crate::storage::StoredForm::Inline,
                             name: field,
                             type_oid: crate::sql::types::oid::TEXT,
                             type_mod: -1,

@@ -271,11 +271,44 @@ pub(crate) fn varlena_payload(sizing: Option<&Sizing<'_>>, value: &Datum<'_>) ->
                 if field.value.is_null() {
                     Some(None)
                 } else {
-                    stored(sizing, Some(field.type_oid), &field.value).map(Some)
+                    field_stored(sizing, field).map(Some)
                 }
             }))? - 4
         }
         _ => return None,
+    })
+}
+
+/// The stored form of a composite datum's non-null `field` in the TOAST
+/// form it holds it in: a compressed varlena is stored whole with its
+/// four-byte header, a TOAST pointer with its one-byte header.
+fn field_stored(
+    sizing: Option<&Sizing<'_>>,
+    field: &crate::sql::types::RecordField<'_>,
+) -> Option<Stored> {
+    use crate::storage::StoredForm;
+    let formed = stored(sizing, Some(field.type_oid), &field.value)?;
+    let unpacked = |layout: crate::sql::type_layouts::PhysicalLayout| {
+        crate::sql::type_layouts::PhysicalLayout {
+            storage: b'p',
+            ..layout
+        }
+    };
+    Some(match field.form {
+        StoredForm::Inline => formed,
+        StoredForm::Compressed(size) => Stored {
+            layout: unpacked(formed.layout),
+            payload: size as usize - 4,
+        },
+        StoredForm::External { .. } => Stored {
+            layout: crate::sql::type_layouts::PhysicalLayout {
+                alignment: b'c',
+                storage: b'x',
+                ..formed.layout
+            },
+            payload: crate::sql::toast::TOAST_POINTER_SIZE - 1,
+        },
+        StoredForm::Unmodelled => return None,
     })
 }
 

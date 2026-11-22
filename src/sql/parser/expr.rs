@@ -1191,6 +1191,7 @@ impl<'a> Parser<'a> {
                 self.arena_expr(Expr::DefaultMarker)
             }
             Tok::Ident("case") => {
+                let case_at = self.peek_at;
                 self.advance()?;
                 let operand = if self.peeked == Tok::Ident("when") {
                     None
@@ -1223,12 +1224,16 @@ impl<'a> Parser<'a> {
                     None
                 };
                 self.expect_ident("end")?;
-                self.arena_expr(Expr::Case {
-                    operand,
-                    whens: whens.as_slice(),
-                    otherwise,
-                    origin: crate::sql::ast::CaseOrigin::Written,
-                })
+                // PostgreSQL locates a `CASE` at its keyword.
+                self.arena_expr_at(
+                    Expr::Case {
+                        operand,
+                        whens: whens.as_slice(),
+                        otherwise,
+                        origin: crate::sql::ast::CaseOrigin::Written,
+                    },
+                    case_at,
+                )
             }
             Tok::Ident("true") => {
                 self.advance()?;

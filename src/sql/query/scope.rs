@@ -625,10 +625,17 @@ pub(crate) enum LazyCte<'a> {
     Deferred(crate::sql::ast::DeferredCteQuery<'a>),
 }
 
+/// A stored table's relation oid (its rows' `tableoid`) and whether
+/// partitions or inheritance children read with it.
+#[derive(Clone, Copy)]
+struct TableIdentity {
+    oid: u32,
+    has_descendants: bool,
+}
+
 /// The resolved FROM clause: per table, its exposed name (alias or table
 /// name), definition, and storage slot.
 pub struct QueryScope<'d> {
-    storage: &'d Storage,
     txid: u32,
     type_sources: Option<crate::storage::StatementFileLease>,
     pub names: &'d mut [&'d str],
@@ -686,6 +693,11 @@ pub struct QueryScope<'d> {
     /// The row type of a physical relation source; its whole-row reference
     /// has that type rather than an anonymous record.
     row_types: &'d mut [Option<crate::storage::TypeCreation>],
+    /// A view's row type, which a whole-row reference to it has.
+    view_row_types: &'d mut [Option<crate::storage::TypeCreation>],
+    /// Each stored table's identity, read as the table was added: the scope
+    /// keeps no `Storage` reference.
+    table_identities: &'d mut [Option<TableIdentity>],
     pub n: usize,
     /// USING/NATURAL-merged join columns (see `MergedColumn`).
     pub merged: &'d mut [MergedColumn<'d>],
@@ -1195,14 +1207,6 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
         self.target().collation(qualifier, name)
     }
 
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
-        let own = left_items(self).record_field_collation(base, field);
-        if own != crate::sql::ast::Collation::None && self.visible_from < self.preceding {
-            return own;
-        }
-        self.target().record_field_collation(base, field)
-    }
-
     fn column_user_type(&self, qualifier: Option<&str>, name: &str) -> Option<UserTypeName> {
         if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
             return left_items(self).column_user_type(qualifier, name);
@@ -1453,11 +1457,6 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
             .unwrap_or(crate::sql::ast::Collation::None)
     }
 
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
-        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.0))
-            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
-    }
-
     fn column_user_type(&self, qualifier: Option<&str>, name: &str) -> Option<UserTypeName> {
         match self.0.find_column(qualifier, name).ok()? {
             ResolvedColumn::Table(table, column) => {
@@ -1477,9 +1476,15 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
 }
 
 impl<'d> QueryScope<'d> {
-    /// The catalog the scope's names resolve against.
-    pub(super) const fn catalog(&self) -> (&'d Storage, u32) {
-        (self.storage, self.txid)
+    /// Records the view entry `self.n` reads, with the view's row type,
+    /// which a whole-row reference to the entry has.
+    fn set_view_access(&mut self, storage: &Storage, view: Option<u16>) {
+        self.view_accesses[self.n] = view;
+        self.view_row_types[self.n] = view.map(|view| {
+            storage.relation_row_type_creation(crate::storage::RowTypeRelation::View(usize::from(
+                view,
+            )))
+        });
     }
 
     pub(super) fn set_target_aliases(
@@ -1493,7 +1498,7 @@ impl<'d> QueryScope<'d> {
     /// Describe correlated RETURNING expressions without adding OLD and NEW
     /// as separate, ambiguous sources of unqualified columns.
     pub(crate) fn for_returning(
-        storage: &'d Storage,
+        storage: &Storage,
         definition: RelationDefinition<'_>,
         alias: Option<&'d str>,
         output_aliases: &[&'d str],
@@ -1558,7 +1563,7 @@ impl<'d> QueryScope<'d> {
     }
 
     fn empty(
-        storage: &'d Storage,
+        storage: &Storage,
         txid: u32,
         arena: &'d Arena,
         from: &FromClause<'d>,
@@ -1576,7 +1581,7 @@ impl<'d> QueryScope<'d> {
     }
 
     pub(super) fn singleton(
-        storage: &'d Storage,
+        storage: &Storage,
         txid: u32,
         arena: &'d Arena,
     ) -> Result<Self, SqlError> {
@@ -1584,7 +1589,7 @@ impl<'d> QueryScope<'d> {
     }
 
     fn empty_sources(
-        storage: &'d Storage,
+        storage: &Storage,
         txid: u32,
         arena: &'d Arena,
         table_count: usize,
@@ -1632,6 +1637,12 @@ impl<'d> QueryScope<'d> {
         let row_types = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
+        let view_row_types = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
+        let table_identities = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
         let merged = arena
             .alloc_slice_with(0, |_| MergedColumn {
                 name: "",
@@ -1652,7 +1663,6 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(join_count.max(1), |_| None)
             .map_err(|_| arena_full())?;
         Ok(QueryScope {
-            storage,
             txid,
             type_sources: None,
             names,
@@ -1677,6 +1687,8 @@ impl<'d> QueryScope<'d> {
             lateral,
             func_scalar,
             row_types,
+            view_row_types,
+            table_identities,
             n: 0,
             merged,
             n_merged: 0,
@@ -1876,7 +1888,7 @@ impl<'d> QueryScope<'d> {
     /// when it has no alias, otherwise hidden behind it.
     fn register_join_members<'a>(
         &mut self,
-        storage: &'a Storage,
+        storage: &Storage,
         tref: &'a TableRef<'a>,
         txid: u32,
         arena: &'a Arena,
@@ -1944,7 +1956,7 @@ impl<'d> QueryScope<'d> {
     /// columns to the join's own output.
     fn add_join_members<'a>(
         &mut self,
-        storage: &'a Storage,
+        storage: &Storage,
         tref: &'a TableRef<'a>,
         members: &'a [crate::sql::ast::JoinMember<'a>],
         txid: u32,
@@ -2133,7 +2145,7 @@ impl<'d> QueryScope<'d> {
     /// Resolves execution sources, materializing derived rows once and keeping
     /// only their actual output-column metadata.
     pub fn resolve_exec<'a>(
-        storage: &'a Storage,
+        storage: &Storage,
         from: &'a FromClause<'a>,
         predicate: Option<&'a Expr<'a>>,
         txid: u32,
@@ -2154,7 +2166,7 @@ impl<'d> QueryScope<'d> {
         reason = "scope construction carries explicit query restrictions and execution context"
     )]
     pub fn resolve_exec_outer<'a>(
-        storage: &'a Storage,
+        storage: &Storage,
         from: &'a FromClause<'a>,
         predicate: Option<&'a Expr<'a>>,
         txid: u32,
@@ -2178,7 +2190,7 @@ impl<'d> QueryScope<'d> {
         reason = "scope construction carries explicit query restrictions and execution context"
     )]
     pub(crate) fn resolve_exec_pushed<'a>(
-        storage: &'a Storage,
+        storage: &Storage,
         from: &'a FromClause<'a>,
         predicate: Option<&'a Expr<'a>>,
         txid: u32,
@@ -2487,7 +2499,7 @@ impl<'d> QueryScope<'d> {
     )]
     fn add_exec<'a>(
         &mut self,
-        storage: &'a Storage,
+        storage: &Storage,
         tref: &'a TableRef<'a>,
         txid: u32,
         arena: &'a Arena,
@@ -2609,8 +2621,16 @@ impl<'d> QueryScope<'d> {
                         "a foreign query with parameters is read only as a stream"
                     ));
                 }
+                // SAFETY: `Storage` outlives the statement; the fetch keeps
+                // no reference to it and returns its rows as arena bytes.
+                let run_storage: &'d Storage = unsafe { &*core::ptr::from_ref(storage) };
                 let rows = crate::sql::foreign::materialize(
-                    storage, slot, txid, arena, sequences, pushed,
+                    run_storage,
+                    slot,
+                    txid,
+                    arena,
+                    sequences,
+                    pushed,
                 )?;
                 self.derived[source] = Some(rows);
                 return Ok(());
@@ -2653,7 +2673,7 @@ impl<'d> QueryScope<'d> {
             self.derived[self.n] = Some(&[]);
             self.lateral[self.n] = true;
             self.slots[self.n] = usize::MAX;
-            self.view_accesses[self.n] = tref.view_access;
+            self.set_view_access(storage, tref.view_access);
             self.n += 1;
             self.register_join_members(storage, tref, txid, arena)?;
             return Ok(());
@@ -2665,7 +2685,7 @@ impl<'d> QueryScope<'d> {
             self.derived[self.n] = Some(&[]);
             self.deferred_joins[self.n] = Some(sub);
             self.slots[self.n] = usize::MAX;
-            self.view_accesses[self.n] = tref.view_access;
+            self.set_view_access(storage, tref.view_access);
             self.n += 1;
             self.register_join_members(storage, tref, txid, arena)?;
             return Ok(());
@@ -2687,7 +2707,7 @@ impl<'d> QueryScope<'d> {
         self.derived[self.n] = Some(rows);
         self.external_runs[self.n] = external_run;
         self.slots[self.n] = usize::MAX;
-        self.view_accesses[self.n] = tref.view_access;
+        self.set_view_access(storage, tref.view_access);
         self.n += 1;
         self.register_join_members(storage, tref, txid, arena)?;
         Ok(())
@@ -2698,7 +2718,7 @@ impl<'d> QueryScope<'d> {
     /// tell the order its rows come in.
     #[allow(clippy::too_many_arguments)]
     fn run_derived<'a>(
-        storage: &'a Storage,
+        storage: &Storage,
         sub: &'a crate::sql::ast::Select<'a>,
         position: usize,
         order: super::group::RowOrder,
@@ -2721,12 +2741,32 @@ impl<'d> QueryScope<'d> {
         let _block = super::instrument::enter(super::instrument::Segment::Derived(
             u16::try_from(position).unwrap_or(u16::MAX),
         ));
+        // SAFETY: `Storage` outlives the statement; the derived table's run
+        // keeps no reference to it, and its rows are encoded into the arena
+        // below.
+        let run_storage: &'a Storage = unsafe { &*core::ptr::from_ref(storage) };
         let select_rows = |emit: &mut crate::sql::query::RowSink<'_>| match order {
-            super::group::RowOrder::Observed => {
-                select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
-            }
+            super::group::RowOrder::Observed => select_into_rows(
+                run_storage,
+                txid,
+                sub,
+                arena,
+                params,
+                outer,
+                sequences,
+                emit,
+            ),
             super::group::RowOrder::Unobserved => super::group::with_unobserved_order(sub, || {
-                select_into_rows(storage, txid, sub, arena, params, outer, sequences, emit)
+                select_into_rows(
+                    run_storage,
+                    txid,
+                    sub,
+                    arena,
+                    params,
+                    outer,
+                    sequences,
+                    emit,
+                )
             }),
         };
         if storage.spill_attached() {
@@ -2796,7 +2836,7 @@ impl<'d> QueryScope<'d> {
     /// that scans their rows rather than their members.
     pub(crate) fn run_deferred_joins(
         &mut self,
-        storage: &'d Storage,
+        storage: &Storage,
         txid: u32,
         arena: &'d Arena,
         params: &[Datum<'d>],
@@ -2827,7 +2867,7 @@ impl<'d> QueryScope<'d> {
     /// the output schema is needed. An enclosing row supplies declared types
     /// for correlated table-function arguments without executing the functions.
     pub fn resolve_schema<'a>(
-        storage: &'a Storage,
+        storage: &Storage,
         from: &'a FromClause<'a>,
         txid: u32,
         arena: &'a Arena,
@@ -2839,7 +2879,7 @@ impl<'d> QueryScope<'d> {
     /// Schema of a data-modifying statement's target (`from.base`) joined
     /// with its `FROM`/`USING` items, which cannot read the target.
     pub(crate) fn resolve_dml_schema<'a>(
-        storage: &'a Storage,
+        storage: &Storage,
         from: &'a FromClause<'a>,
         txid: u32,
         arena: &'a Arena,
@@ -2851,7 +2891,7 @@ impl<'d> QueryScope<'d> {
     /// [`Self::resolve_schema`] that also synthesizes the `USING` and
     /// `NATURAL` join conditions, for rewrites that spell those joins out.
     pub(crate) fn resolve_schema_with_join_conditions<'a>(
-        storage: &'a Storage,
+        storage: &Storage,
         from: &'a FromClause<'a>,
         txid: u32,
         arena: &'a Arena,
@@ -2861,7 +2901,7 @@ impl<'d> QueryScope<'d> {
     }
 
     fn resolve_schema_from<'a>(
-        storage: &'a Storage,
+        storage: &Storage,
         from: &'a FromClause<'a>,
         txid: u32,
         arena: &'a Arena,
@@ -2886,7 +2926,7 @@ impl<'d> QueryScope<'d> {
 
     fn add_schema<'a>(
         &mut self,
-        storage: &'a Storage,
+        storage: &Storage,
         tref: &'a TableRef<'a>,
         txid: u32,
         arena: &'a Arena,
@@ -2976,7 +3016,7 @@ impl<'d> QueryScope<'d> {
         self.names[self.n] = exposed;
         self.defs.set_arena(self.n, definition);
         self.authorization_roles[self.n] = tref.authorization_role;
-        self.view_accesses[self.n] = tref.view_access;
+        self.set_view_access(storage, tref.view_access);
         // No rows: this scope is never scanned, only described. An empty row
         // set keeps a stray scan safe rather than reading a physical slot.
         self.derived[self.n] = Some(&[]);
@@ -2993,7 +3033,7 @@ impl<'d> QueryScope<'d> {
     /// (Describe path).
     fn add_catalog<'a>(
         &mut self,
-        storage: &'a Storage,
+        storage: &Storage,
         tref: &'a TableRef<'a>,
         txid: u32,
         arena: &'a Arena,
@@ -3254,7 +3294,7 @@ impl<'d> QueryScope<'d> {
     #[allow(clippy::too_many_arguments)]
     fn add_table_func<'a>(
         &mut self,
-        storage: &'a Storage,
+        storage: &Storage,
         tref: &'a TableRef<'a>,
         txid: u32,
         arena: &'a Arena,
@@ -3319,12 +3359,15 @@ impl<'d> QueryScope<'d> {
             sequences,
             ..crate::sql::eval::NO_HOOKS
         };
+        // SAFETY: `Storage` outlives the statement; the function's run keeps
+        // no reference to it and returns its rows as arena bytes.
+        let run_storage: &'a Storage = unsafe { &*core::ptr::from_ref(storage) };
         let rows: &'a [&'a [u8]] = if !materialize {
             &[]
         } else if outer.is_some() {
             table_func_rows_outer(
                 tref,
-                storage,
+                run_storage,
                 txid,
                 arena,
                 params,
@@ -3336,7 +3379,7 @@ impl<'d> QueryScope<'d> {
         } else {
             table_func_rows_outer(
                 tref,
-                storage,
+                run_storage,
                 txid,
                 arena,
                 params,
@@ -3357,7 +3400,7 @@ impl<'d> QueryScope<'d> {
 
     fn add(
         &mut self,
-        storage: &'d Storage,
+        storage: &Storage,
         tref: &'d TableRef<'d>,
         txid: u32,
         arena: &'d Arena,
@@ -3520,6 +3563,10 @@ impl<'d> QueryScope<'d> {
         self.slots[self.n] = slot;
         self.row_types[self.n] =
             Some(storage.relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)));
+        self.table_identities[self.n] = Some(TableIdentity {
+            oid: crate::sql::catalog::user_table_oid(storage, slot) as u32,
+            has_descendants: storage.relation_has_descendants(slot, txid),
+        });
         self.authorization_roles[self.n] = tref.authorization_role;
         self.n += 1;
         Ok(())
@@ -4271,35 +4318,10 @@ impl<'d> QueryScope<'d> {
             .is_none()
             .then(|| self.entry_index(name).ok())
             .flatten()
-            .and_then(|table| {
-                self.row_types[table].or_else(|| {
-                    self.view_accesses[table].map(|view| {
-                        self.storage.relation_row_type_creation(
-                            crate::storage::RowTypeRelation::View(usize::from(view)),
-                        )
-                    })
-                })
-            });
+            .and_then(|table| self.row_types[table].or(self.view_row_types[table]));
         Some(composite.map_or(ColType::Record, |creation| {
             ColType::Composite(Some(creation))
         }))
-    }
-
-    /// The OID a type name denotes under this scope's transaction.
-    pub(crate) fn named_type_oid(&self, type_name: &str) -> Option<i32> {
-        crate::sql::catalog::user_type_oid(self.storage, self.txid, type_name)
-            .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
-    }
-
-    pub(crate) fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
-        self.storage.domain_base_type_for_oid(type_oid, self.txid)
-    }
-
-    pub(crate) fn select_common_type(
-        &self,
-        inputs: &[i32],
-    ) -> Result<i32, crate::storage::CommonTypeFailure> {
-        self.storage.select_common_type(inputs, self.txid)
     }
 
     pub fn func_scalar_type(&self, name: &str) -> Option<ColType> {
@@ -4561,18 +4583,19 @@ impl<'d> QueryScope<'d> {
                 "tableoid of a FROM item that stores no rows"
             ));
         }
-        Ok(Datum::Oid(
-            crate::sql::catalog::user_table_oid(self.storage, self.slots[table]) as u32,
-        ))
+        let identity = self.table_identities[table].ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a stored FROM item without its table's identity"
+            )
+        })?;
+        Ok(Datum::Oid(identity.oid))
     }
 
     /// [`Self::relation_oid`] for a row whose values were flattened without
     /// the leaf it came from: exact only for a table without descendants.
     pub(crate) fn flat_relation_oid<'v>(&self, table: usize) -> Result<Datum<'v>, SqlError> {
-        if self
-            .storage
-            .relation_has_descendants(self.slots[table], self.txid)
-        {
+        if self.table_identities[table].is_some_and(|identity| identity.has_descendants) {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "tableoid of an inheritance tree or partitioned table is not supported in this query"

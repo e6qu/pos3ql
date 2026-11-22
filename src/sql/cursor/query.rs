@@ -601,8 +601,9 @@ impl CursorQuery {
         match source {
             Some(source) => {
                 // Scope names and arrays borrow this allocation; definitions,
-                // heap bytes and saved files have owned readers. No Storage or
-                // Arena object reference remains in the retained source.
+                // heap bytes and saved files have owned readers. The source's
+                // type does not borrow `Storage`, and it keeps no `Arena`
+                // object reference, so only this allocation outlives it.
                 self.retained = Some(unsafe {
                     core::mem::transmute::<
                         crate::sql::query::RetainedSelect<'_>,

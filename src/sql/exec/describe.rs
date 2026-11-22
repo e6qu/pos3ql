@@ -1365,29 +1365,7 @@ fn describe_record_star<'q>(
                 },
                 None => &NoCols,
             };
-            let slot = match base {
-                Expr::Column { qualifier, name } => match resolver.resolve(*qualifier, name)? {
-                    ColType::Composite(slot) => slot,
-                    _ => None,
-                },
-                Expr::Field { base, field } => match record_field_type(base, field, resolver)? {
-                    ColType::Composite(slot) => slot,
-                    _ => None,
-                },
-                Expr::Cast { type_name, .. } => storage
-                    .expect("checked")
-                    .resolve_composite_slot(type_name, txid)
-                    .map(|slot| {
-                        storage
-                            .expect("checked")
-                            .composite_for(slot, txid)
-                            .creation()
-                    }),
-                _ => infer_type_res(base, resolver)
-                    .ok()
-                    .and_then(|(oid, _)| crate::sql::query::named_composite_creation(oid)),
-            };
-            if let Some(slot) = slot {
+            if let Some(slot) = expanded_row_type(base, columns, storage.expect("checked"), txid)? {
                 let storage = storage.expect("checked");
 
                 let composite = storage.row_type_definition(slot, txid)?.ok_or_else(|| {
@@ -3957,7 +3935,13 @@ fn record_shape_metadata_dyn(
             Ok((count != 0).then_some(count))
         }
         Expr::WholeRow(table) => Ok(shape_from_columns_metadata(table, columns, visit)),
-        Expr::Cast { type_name, .. } => columns.visit_named_composite_fields(type_name, visit),
+        Expr::Cast { type_name, .. } => {
+            match columns.visit_named_composite_fields(type_name, visit)? {
+                Some(count) => Ok(Some(count)),
+                // A domain over a row type.
+                None => static_row_type_fields(base, columns, visit),
+            }
+        }
         Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name) {
             Ok(ColType::Composite(slot)) => Ok(columns.visit_composite_fields(slot, visit)),
             Ok(ColType::Record) => match expr_record_handle(base, columns) {
@@ -4016,6 +4000,61 @@ fn record_shape_metadata_dyn(
                 visit,
             ))
         }
+        _ => static_row_type_fields(base, columns, visit),
+    }
+}
+
+/// The named row type `(base).*` expands to: a row-typed column or field,
+/// a cast to a row type, or any value whose type is a named row type or a
+/// domain over one.
+pub(crate) fn expanded_row_type(
+    base: &Expr,
+    columns: &dyn ColTypeResolver,
+    storage: &crate::storage::Storage,
+    txid: u32,
+) -> Result<Option<crate::storage::TypeCreation>, SqlError> {
+    Ok(match base {
+        Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name)? {
+            ColType::Composite(slot) => slot,
+            _ => None,
+        },
+        Expr::Field { base, field } => match record_field_type(base, field, columns)? {
+            ColType::Composite(slot) => slot,
+            _ => None,
+        },
+        Expr::Cast { type_name, .. }
+            if let Some(slot) = storage.resolve_composite_slot(type_name, txid) =>
+        {
+            Some(storage.composite_for(slot, txid).creation())
+        }
+        _ => infer_type_res(base, columns)
+            .ok()
+            .and_then(|(type_oid, _)| {
+                match crate::sql::eval::constructor_type_from_oid(type_oid, &|oid| {
+                    columns.domain_base_type(oid)
+                }) {
+                    Some(ColType::Composite(slot)) => slot,
+                    _ => None,
+                }
+            }),
+    })
+}
+
+/// The fields of a value whose type is a named row type, or a domain over
+/// one, however it is computed (`(CASE ... END).f`, `(v::row_domain).f`).
+/// `None` when its type is none of those or cannot be inferred here.
+fn static_row_type_fields(
+    base: &Expr,
+    columns: &dyn ColTypeResolver,
+    visit: &mut dyn FnMut(&str, StaticTypeMeta),
+) -> Result<Option<usize>, SqlError> {
+    let Ok((type_oid, _)) = infer_type_res(base, columns) else {
+        return Ok(None);
+    };
+    match crate::sql::eval::constructor_type_from_oid(type_oid, &|oid| {
+        columns.domain_base_type(oid)
+    }) {
+        Some(ColType::Composite(slot @ Some(_))) => Ok(columns.visit_composite_fields(slot, visit)),
         _ => Ok(None),
     }
 }
@@ -4335,8 +4374,13 @@ pub fn record_field_metadata(
     if found.is_none()
         && !matches!(base, Expr::WholeRow(_))
         && !matches!(base, Expr::Column { qualifier: None, name } if columns.is_whole_row(name))
-        && let Some(oid) =
-            base_oid.filter(|oid| crate::sql::query::named_composite_creation(*oid).is_some())
+        && let Some(oid) = base_oid.filter(|&oid| {
+            matches!(
+                crate::sql::eval::constructor_type_from_oid(oid, &|oid| columns
+                    .domain_base_type(oid)),
+                Some(ColType::Composite(Some(_)))
+            )
+        })
         && let Some(name) = columns.type_name_fixed(oid)?
     {
         return Err(sql_err!(
@@ -4598,11 +4642,6 @@ impl<'a> ColumnLookup<'a> for DefCols<'_> {
             .map(|index| self.0.columns()[index].collation)
             .unwrap_or(crate::sql::ast::Collation::None)
     }
-
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
-        record_field_metadata(base, field, self)
-            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
-    }
 }
 
 /// A single DML target's columns, with its optional PostgreSQL correlation name.
@@ -4752,11 +4791,6 @@ impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
             .and_then(|_| self.definition.column_index(name))
             .map(|index| self.definition.columns()[index].collation)
             .unwrap_or(crate::sql::ast::Collation::None)
-    }
-
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
-        record_field_metadata(base, field, self)
-            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
     }
 }
 

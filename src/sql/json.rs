@@ -22,13 +22,15 @@ use lexer::{Expecting, Lexer, Token};
 
 /// The nesting depths PostgreSQL 18.6's `json` and `jsonb` input functions
 /// reach under its default `max_stack_depth` (2048kB) before
-/// `check_stack_depth` fails, measured against the reference server: its
-/// recursive descent spends a fixed stack frame per level. The parser and
+/// `check_stack_depth` fails: its recursive descent spends a fixed stack
+/// frame per level, so the depth is a property of the build. Measured on the
+/// reference build CI compares against (`postgres:18` image, digest
+/// `sha256:885953109528…`, linux/amd64). The parser and
 /// serializers here recurse per level within the query thread's fixed stack
 /// (`QUERY_STACK_BYTES`), so these bound that stack too; container width is
 /// bounded only by the statement arena.
-pub(crate) const JSON_MAX_DEPTH: u32 = 21_790;
-pub(crate) const JSONB_MAX_DEPTH: u32 = 18_675;
+pub(crate) const JSON_MAX_DEPTH: u32 = 14_521;
+pub(crate) const JSONB_MAX_DEPTH: u32 = 14_520;
 
 pub(crate) use crate::sql::stack_depth::stack_depth_exceeded;
 

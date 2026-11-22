@@ -1356,7 +1356,9 @@ fn leaf_col_unknown<'a>(
                     let raw = match &s.from {
                         None => exec::infer_type_pub(expression, None).map(|t| t.0),
                         Some(f) => QueryScope::resolve_schema(storage, f, txid, arena, None)
-                            .and_then(|sc| infer_scope_type(expression, &sc).map(|t| t.0)),
+                            .and_then(|sc| {
+                                infer_scope_type(expression, &sc, storage, txid, arena).map(|t| t.0)
+                            }),
                     };
                     // Inference retains only an owned OID/error, not its
                     // temporary FROM scope or catalog rows.

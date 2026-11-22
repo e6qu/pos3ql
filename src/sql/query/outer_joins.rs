@@ -19,7 +19,7 @@ use super::{QueryScope, ResolvedColumn, arena_full};
 /// item `i + 1`.
 pub(crate) fn reduce_outer_joins<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,

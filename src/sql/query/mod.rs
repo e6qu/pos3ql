@@ -702,7 +702,13 @@ fn collect_stored_query_composite_field_rename_select<'a>(
             count,
         )?;
         let columns: &dyn super::exec::ColTypeResolver = match outer_scope {
-            Some(scope) => &ScopeCols(scope.current),
+            Some(scope) => &CatalogScopeCols {
+                scope: scope.current,
+                outer: None,
+                storage: rename.storage,
+                txid: rename.txid,
+                arena: rename.arena,
+            },
             None => &super::exec::NoCols,
         };
         for expression in select
@@ -737,9 +743,15 @@ fn collect_stored_query_composite_field_rename_select<'a>(
         txid: rename.txid,
         arena: rename.arena,
     });
-    let columns: &dyn super::exec::ColTypeResolver = match (&catalog_columns, outer_scope) {
-        (Some(columns), _) => columns,
-        (None, Some(scope)) => &ScopeCols(scope.current),
+    let outer_columns = outer_scope.map(|scope| CatalogScopeCols {
+        scope: scope.current,
+        outer: None,
+        storage: rename.storage,
+        txid: rename.txid,
+        arena: rename.arena,
+    });
+    let columns: &dyn super::exec::ColTypeResolver = match (&catalog_columns, &outer_columns) {
+        (Some(columns), _) | (None, Some(columns)) => columns,
         (None, None) => &super::exec::NoCols,
     };
     let scope_chain = scope.as_ref().map(|current| StoredQueryRenameScope {
@@ -1293,7 +1305,7 @@ pub(crate) enum ProducedRead<'q> {
 /// What a scan needs to run a deferred ordinary `WITH` query.
 #[derive(Clone, Copy)]
 pub(crate) struct DeferredCteRead<'r, 'a> {
-    pub storage: &'a Storage,
+    pub storage: &'r Storage,
     pub txid: u32,
     pub params: &'r [Datum<'a>],
     pub sequences: Option<&'r dyn super::eval::SequenceAccess>,
@@ -1466,8 +1478,11 @@ fn run_deferred_cte<'a>(
     // than this one, whose reader then reads on from the store.
     let mut stopped = false;
     let mut overtaken = false;
+    // SAFETY: `Storage` outlives the statement; the run keeps no reference
+    // to it and returns its rows as arena bytes.
+    let run_storage: &'a Storage = unsafe { &*core::ptr::from_ref(read.storage) };
     let result = setops::stream_set_body(
-        read.storage,
+        run_storage,
         read.txid,
         deferred.tree,
         arena,
@@ -1601,8 +1616,11 @@ pub(crate) fn read_deferred_cte<'a>(
     if deferred_cte_dry_run(query) {
         let _cte = instrument::enter_block(deferred.block);
         let variables = query.outer.map(super::eval::RoutineVariables);
+        // SAFETY: `Storage` outlives the statement; the run keeps no
+        // reference to it and returns its rows as arena bytes.
+        let run_storage: &'a Storage = unsafe { &*core::ptr::from_ref(query.storage) };
         let (rows, _, _) = setops::materialize_set_body_tied(
-            query.storage,
+            run_storage,
             query.txid,
             deferred.tree,
             arena,
@@ -9691,7 +9709,7 @@ fn patch_param_column_types<'a>(
     items: &'a [SelectItem<'a>],
     scope: Option<&QueryScope<'a>>,
     params: &[Datum],
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     columns: &mut [ColDesc],
@@ -10297,7 +10315,7 @@ fn check_literal_operands<'a>(
     check_literal_operands_typed(
         expression,
         &|other| {
-            infer_scope_type(other, scope)
+            infer_scope_type(other, scope, storage, txid, arena)
                 .ok()
                 .and_then(|(oid, _)| ColType::from_oid(oid))
         },
@@ -10649,13 +10667,13 @@ fn check_key_types<'a>(
         for_each_inline_window(expression, &mut window_literals)?;
     }
     let noncomparable = |e: &Expr<'a>| {
-        infer_scope_type(e, scope)
+        infer_scope_type(e, scope, storage, txid, arena)
             .ok()
             .and_then(|(oid, _)| ColType::from_oid(oid))
             .filter(|ctype| !ctype.has_default_equality())
     };
     let unordered_cid = |e: &Expr<'a>| {
-        infer_scope_type(e, scope)
+        infer_scope_type(e, scope, storage, txid, arena)
             .ok()
             .and_then(|(oid, _)| ColType::from_oid(oid))
             .is_some_and(|ctype| ctype.has_default_equality() && !ctype.has_builtin_ordering())
@@ -10670,7 +10688,7 @@ fn check_key_types<'a>(
         });
     require_select_routine_execute(statement, scope, arena, storage, txid)?;
     let scope_type = |e: &Expr<'a>| {
-        infer_scope_type(e, scope)
+        infer_scope_type(e, scope, storage, txid, arena)
             .ok()
             .and_then(|(oid, _)| ColType::from_oid(oid))
     };
@@ -10699,7 +10717,7 @@ fn check_key_types<'a>(
         // which PostgreSQL's executor checks for EXECUTE.
         // A key whose type is not known yet reports that when evaluated.
         if super::eval::CatalogAccess::builtin_routine_privileges_present(&catalog)
-            && let Ok((oid, _)) = infer_scope_type(key, scope)
+            && let Ok((oid, _)) = infer_scope_type(key, scope, storage, txid, arena)
         {
             let oid = super::eval::CatalogAccess::domain_base_type(&catalog, oid)
                 .map_or(oid, ColType::oid);
@@ -10724,7 +10742,7 @@ fn check_key_types<'a>(
         }
         if unordered_cid(target) {
             let type_name = if matches!(
-                infer_scope_type(target, scope)
+                infer_scope_type(target, scope, storage, txid, arena)
                     .ok()
                     .and_then(|(oid, _)| ColType::from_oid(oid)),
                 Some(ColType::Array(_))
@@ -11697,7 +11715,7 @@ pub(crate) fn validate_static_grouping<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
     outer: Option<&dyn ColumnLookup<'_>>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
@@ -19158,26 +19176,7 @@ fn describe_scope_record_star<'q>(
             }
         }
         _ => {
-            let slot = match base {
-                Expr::Column { qualifier, name } => {
-                    match super::exec::ColTypeResolver::resolve(&resolver, *qualifier, name)? {
-                        ColType::Composite(slot) => slot,
-                        _ => None,
-                    }
-                }
-                Expr::Field { base, field } => {
-                    match super::exec::record_field_type(base, field, &resolver)? {
-                        ColType::Composite(slot) => slot,
-                        _ => None,
-                    }
-                }
-                Expr::Cast { type_name, .. } => storage
-                    .resolve_composite_slot(type_name, txid)
-                    .map(|slot| storage.composite_for(slot, txid).creation()),
-                _ => super::exec::infer_type_res(base, &resolver)
-                    .ok()
-                    .and_then(|(oid, _)| named_composite_creation(oid)),
-            };
+            let slot = super::exec::expanded_row_type(base, &resolver, storage, txid)?;
             if let Some(slot) = slot {
                 let definition = storage.row_type_definition(slot, txid)?.ok_or_else(|| {
                     sql_err!(
@@ -19259,18 +19258,6 @@ pub(super) struct ScopeCols<'s, 'd>(pub(super) &'s QueryScope<'d>);
 impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     fn is_empty_scope(&self) -> bool {
         self.0.n == 0
-    }
-
-    fn named_type_oid(&self, type_name: &str) -> Option<i32> {
-        self.0.named_type_oid(type_name)
-    }
-
-    fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
-        self.0.domain_base_type(type_oid)
-    }
-
-    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
-        self.0.select_common_type(inputs)
     }
 
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
@@ -19998,8 +19985,21 @@ pub(super) fn record_star_width(
         .ok_or_else(|| super::exec::row_expansion_error(base, columns))
 }
 
-fn infer_scope_type(expression: &Expr, scope: &QueryScope) -> Result<(i32, i16), SqlError> {
-    let (oid, typlen) = super::exec::infer_type_res(expression, &ScopeCols(scope))?;
+fn infer_scope_type(
+    expression: &Expr,
+    scope: &QueryScope,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(i32, i16), SqlError> {
+    let columns = CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    let (oid, typlen) = super::exec::infer_type_res(expression, &columns)?;
     if oid == super::types::oid::UNKNOWN {
         Ok((super::types::oid::TEXT, -1))
     } else {
@@ -20420,14 +20420,6 @@ fn arena_full() -> SqlError {
 #[track_caller]
 pub fn arena_full_pub() -> SqlError {
     arena_full()
-}
-
-/// The creation identity of a named composite or relation row type OID.
-pub(crate) fn named_composite_creation(oid: i32) -> Option<crate::storage::TypeCreation> {
-    match crate::storage::NamedTypeKind::from_oid(oid) {
-        Some((crate::storage::NamedTypeKind::Composite, creation, false)) => Some(creation),
-        _ => None,
-    }
 }
 
 /// Visits `expression` and every expression below it, subqueries excepted.

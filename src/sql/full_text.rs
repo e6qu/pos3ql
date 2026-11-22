@@ -72,13 +72,15 @@ pub(crate) const fn restore_query(source: &str) -> TsQuery<'_> {
 
 /// The parenthesis nesting PostgreSQL 18.6's `tsquery` input (`makepol`)
 /// reaches under its default `max_stack_depth` (2048kB) before
-/// `check_stack_depth` fails, measured against the reference server.
-const QUERY_MAX_PAREN_DEPTH: usize = 9_329;
+/// `check_stack_depth` fails. Stack use per level is a property of the build;
+/// measured on the reference build CI compares against (`postgres:18` image,
+/// digest `sha256:885953109528…`, linux/amd64).
+const QUERY_MAX_PAREN_DEPTH: usize = 7_685;
 /// The operator nesting PostgreSQL 18.6's `tsquery` output (`infix`)
 /// reaches under the same limit, measured the same way: every `tsquery`
 /// value here is kept as its output text, so no deeper tree exists and
 /// every traversal of one stays within the query thread's stack.
-const QUERY_MAX_OUTPUT_DEPTH: usize = 14_520;
+const QUERY_MAX_OUTPUT_DEPTH: usize = 16_340;
 /// `STACKDEPTH`: the operators `makepol` holds pending at one nesting level.
 const QUERY_OPERATOR_STACK: usize = 32;
 // Text input reserves one byte for PostgreSQL's internal terminator. Binary

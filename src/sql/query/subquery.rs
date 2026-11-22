@@ -1371,20 +1371,6 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
             .or_else(|| self.outer.map(|outer| outer.collation(qualifier, name)))
             .unwrap_or(Collation::None)
     }
-
-    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
-        if let Some(scope) = self.scope {
-            let collation =
-                crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(scope))
-                    .map_or(Collation::None, |meta| meta.collation);
-            if collation != Collation::None {
-                return collation;
-            }
-        }
-        self.outer.map_or(Collation::None, |outer| {
-            outer.record_field_collation(base, field)
-        })
-    }
 }
 
 fn subquery_collations<'a>(
@@ -2379,7 +2365,7 @@ impl ScopeChain<'_, '_> {
 /// query — i.e. is correlated and must be re-evaluated per outer row.
 pub(crate) fn subquery_node_correlated<'a>(
     node: &'a Expr<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
@@ -2398,7 +2384,7 @@ pub(crate) fn subquery_node_correlated<'a>(
 /// Whether `select` references a column of a query level around it.
 pub(crate) fn select_correlated<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
@@ -2426,7 +2412,7 @@ pub(crate) fn select_correlated<'a>(
 /// which the general executor expands as it runs the query, does not.
 pub(crate) fn select_from_resolves<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
@@ -2456,7 +2442,7 @@ pub(crate) fn expression_has_correlated_subquery<'a>(
 /// schema. Preserve that state explicitly so correlation analysis can inspect
 /// its outer references in the statement's catalog snapshot.
 fn correlation_schema<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     from: &'a crate::sql::ast::FromClause<'a>,
     arena: &'a Arena,
@@ -2534,7 +2520,7 @@ fn correlation_schema<'a>(
 fn select_has_outer_ref<'a>(
     select: &'a Select<'a>,
     chain: &ScopeChain<'_, 'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
@@ -2614,7 +2600,7 @@ fn select_has_outer_ref<'a>(
 fn table_ref_has_outer_ref<'a>(
     table: &'a crate::sql::ast::TableRef<'a>,
     chain: &ScopeChain<'_, 'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
@@ -2664,7 +2650,7 @@ fn table_ref_has_outer_ref<'a>(
 fn expr_has_outer_ref<'a>(
     expression: &'a Expr<'a>,
     chain: &ScopeChain<'_, 'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
@@ -2871,7 +2857,7 @@ pub(super) fn prepare_outer_subqueries<'a>(
 /// general executor expands as it runs the subquery) is not stable here.
 pub(super) fn stable_uncorrelated<'a>(
     node: &'a Expr<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> bool {

@@ -1702,7 +1702,7 @@ fn output_expression<'a>(
 /// `WHERE` equality with a constant fixes every key, so at most one group
 /// forms.
 fn grouping_order_irrelevant<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     keys: &[&'a Expr<'a>],
@@ -2023,7 +2023,7 @@ pub(super) fn hash_row_keys(
 /// `statement` groups by its keys; `source` is the statement as written,
 /// a `DISTINCT` (`distinct`) the planner models as such.
 pub(super) fn groups_in_key_order<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
     statement: &'a Select<'a>,
@@ -2078,7 +2078,7 @@ pub(super) fn groups_in_key_order<'a>(
 
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn hashed_table_group_order<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -2880,7 +2880,7 @@ fn expand_grouped_stars<'a>(
 pub(super) fn planner_statement<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
@@ -3059,7 +3059,7 @@ pub(super) fn validate_grouped_columns<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
     agg_nodes: &[(*const Expr<'a>, &'a Expr<'a>)],
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {

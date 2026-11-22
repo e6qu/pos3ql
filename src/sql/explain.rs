@@ -4043,7 +4043,7 @@ fn projected_shape<'a>(
     statement: &Select<'a>,
     scope: Option<&QueryScope<'a>>,
     outer: Option<&dyn ColumnLookup<'_>>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(u32, StackStr<256>), SqlError> {
@@ -4633,7 +4633,7 @@ pub(crate) enum GroupingStrategy {
 /// of one table.
 #[expect(clippy::too_many_arguments, reason = "planner inputs are explicit")]
 pub(crate) fn grouping_strategy<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     statement: &'a Select<'a>,
     distinct: bool,

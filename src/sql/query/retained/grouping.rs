@@ -99,7 +99,19 @@ fn aggregate_folds_here<'a>(
     let mark = arena.mark();
     let mut state = AggState::default();
     let admitted = state
-        .init(node, storage, txid, &super::ScopeCols(scope), arena)
+        .init(
+            node,
+            storage,
+            txid,
+            &super::CatalogScopeCols {
+                scope,
+                outer: None,
+                storage,
+                txid,
+                arena,
+            },
+            arena,
+        )
         .is_ok()
         && state
             .custom_support_oids()
@@ -115,7 +127,7 @@ fn aggregate_folds_here<'a>(
 /// which also reports any error in it.
 pub(super) fn admit_grouping<'a>(
     statement: &'a Select<'a>,
-    columns: &CatalogScopeCols<'_, 'a, '_, 'a>,
+    columns: &CatalogScopeCols<'_, 'a, '_, '_>,
     catalog: &dyn crate::sql::eval::CatalogAccess,
     arena: &'a Arena,
 ) -> Result<Option<Grouping<'a>>, SqlError> {
@@ -654,8 +666,15 @@ impl<'a> GroupState<'a> {
         for ((template, layout), (_, node)) in
             templates.iter_mut().zip(layouts.iter_mut()).zip(aggregates)
         {
-            template.init(node, storage, txid, &super::ScopeCols(scope), arena)?;
-            match template.fixed_state(node, &super::ScopeCols(scope)) {
+            let columns = super::CatalogScopeCols {
+                scope,
+                outer: None,
+                storage,
+                txid,
+                arena,
+            };
+            template.init(node, storage, txid, &columns, arena)?;
+            match template.fixed_state(node, &columns) {
                 Some(state) => {
                     *layout = state;
                     stride += state_bytes(state);

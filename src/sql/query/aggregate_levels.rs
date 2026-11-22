@@ -284,8 +284,8 @@ impl From<SqlError> for Failure {
 
 type Step<T> = Result<T, Failure>;
 
-struct Analysis<'a> {
-    storage: &'a Storage,
+struct Analysis<'s, 'a> {
+    storage: &'s Storage,
     txid: u32,
     arena: &'a Arena,
 }
@@ -296,7 +296,7 @@ struct Analysis<'a> {
 /// changes, without keeping any analysis allocation.
 pub(super) fn assign_aggregate_levels<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
@@ -495,7 +495,7 @@ fn owned_in_select<'a>(
     Ok(())
 }
 
-impl<'a> Analysis<'a> {
+impl<'a> Analysis<'_, 'a> {
     fn candidate(&self, expression: &Expr<'_>) -> bool {
         matches!(expression, Expr::Call { over: None, .. })
             && call_may_be_aggregate(expression, self.storage, self.txid)
@@ -548,7 +548,11 @@ impl<'a> Analysis<'a> {
     /// Whether a query holds an aggregate this pass must place; `nested`
     /// counts every aggregate of a query inside another one.
     fn select_needs_analysis(&self, select: &'a Select<'a>, nested: bool) -> bool {
-        fn tree_needs<'a>(analysis: &Analysis<'a>, tree: &'a SetTree<'a>, nested: bool) -> bool {
+        fn tree_needs<'a>(
+            analysis: &Analysis<'_, 'a>,
+            tree: &'a SetTree<'a>,
+            nested: bool,
+        ) -> bool {
             match tree {
                 SetTree::Select(select) => analysis.select_needs_analysis(select, nested),
                 SetTree::Op { left, right, .. } => {

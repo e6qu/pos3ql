@@ -190,6 +190,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         locking: &[],
         written: crate::sql::ast::WrittenQuery::PLAIN,
         minmax_subquery: None,
+        cursor_fraction: crate::sql::ast::CursorFraction::ALL,
     };
     let inner = arena.alloc(inner).map_err(|_| arena_full())?;
 
@@ -283,6 +284,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         locking: &[],
         written: crate::sql::ast::WrittenQuery::PLAIN,
         minmax_subquery: None,
+        cursor_fraction: statement.cursor_fraction,
     };
     Ok(&*arena.alloc(outer).map_err(|_| arena_full())?)
 }

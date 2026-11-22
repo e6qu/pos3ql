@@ -24137,8 +24137,24 @@ impl Engine {
                             Err(error) => return Ok(Err(error)),
                         }
                     }
+                    // `EXPLAIN DECLARE` plans the cursor's query as the
+                    // cursor would (`CURSOR_OPT_FAST_PLAN`); `ANALYZE` runs
+                    // it without opening a cursor.
+                    Stmt::DeclareCursor { sql, .. } => match explain::declared_query(sql, arena) {
+                        Ok(declared) => (declared, None),
+                        Err(error) => return Ok(Err(error)),
+                    },
                     _ => (&**statement, None),
                 };
+                // A scrollable cursor's plan runs backward, under a
+                // `Materialize` when its nodes cannot.
+                let scrollable = matches!(
+                    **statement,
+                    Stmt::DeclareCursor {
+                        scroll: cursor::CursorScroll::Scroll,
+                        ..
+                    }
+                );
                 // `ExplainExecuteQuery` evaluates the arguments, then takes
                 // the statement's cached plan (`GetCachedPlan`): a custom plan
                 // folds the argument values in, a generic one prints `$n`.
@@ -24208,6 +24224,19 @@ impl Engine {
                         let plan = plan.and_then(|plan| {
                             explain::refuse_parallel_candidates(&plan, &self.storage, txn.txid)
                                 .map(|()| plan)
+                        });
+                        let plan = plan.and_then(|plan| {
+                            if scrollable {
+                                explain::scrollable_plan(
+                                    plan,
+                                    &self.storage,
+                                    txn.txid,
+                                    options.analyze,
+                                    arena,
+                                )
+                            } else {
+                                Ok(plan)
+                            }
                         });
                         match plan {
                             Ok(plan) => Some(plan),

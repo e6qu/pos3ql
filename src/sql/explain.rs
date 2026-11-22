@@ -4467,6 +4467,7 @@ fn grouped_scan_path<'a>(
             distinct,
         }),
         limit,
+        cursor: statement.cursor_fraction,
         order_len: count,
         ..QueryShape::default()
     };
@@ -4928,6 +4929,7 @@ fn grouping_sets_scan_path<'a>(
                 target_per_group: 0.0,
                 distinct: false,
             }),
+            cursor: statement.cursor_fraction,
             ..QueryShape::default()
         };
         let planned = query::index_paths::scan_path(
@@ -6430,14 +6432,16 @@ fn plan_sublinks<'a>(
         {
             arena
                 .alloc_slice_with(count + 1, |index| match index {
-                    // `cost_material`: two operator costs per row stored.
                     0 => PlanNode {
                         name: StackStr::from_str("Materialize"),
                         startup_cost: nodes[0].startup_cost,
-                        total_cost: nodes[0].total_cost
-                            + 2.0
-                                * crate::sql::guc::planner_value("cpu_operator_cost")
-                                * nodes[0].rows,
+                        total_cost: material_costs(
+                            nodes[0].startup_cost,
+                            nodes[0].total_cost,
+                            nodes[0].rows,
+                            nodes[0].width,
+                        )
+                        .1,
                         rows: nodes[0].rows,
                         width: nodes[0].width,
                         output: nodes[0].output,
@@ -7502,8 +7506,8 @@ fn plan_pulled_select<'a>(
                     scope,
                     statement.items,
                     statement.order_by,
-                    statement.limit,
-                    statement.offset,
+                    (statement.limit, statement.offset),
+                    statement.cursor_fraction,
                     &[],
                     arena,
                 )?
@@ -9031,8 +9035,8 @@ fn plan_pulled_select<'a>(
                 scope,
                 statement.items,
                 statement.order_by,
-                None,
-                None,
+                (None, None),
+                statement.cursor_fraction,
                 &[],
                 arena,
             )?
@@ -11514,6 +11518,154 @@ pub(super) fn refuse_parallel_candidates(
         }
     }
     Ok(())
+}
+
+/// The query of a `DECLARE` that `EXPLAIN` plans, parsed as the cursor
+/// parses it when it opens, and planned as the cursor plans it
+/// (`CURSOR_OPT_FAST_PLAN`).
+pub(super) fn declared_query<'a>(sql: &str, arena: &'a Arena) -> Result<&'a Stmt<'a>, SqlError> {
+    let source = arena.alloc_str(sql).map_err(|_| arena_full())?;
+    let statement = crate::sql::parser::parse_cursor_command(source, arena, &[], &[], |_| Ok(()))?;
+    let Stmt::Select(select) = statement else {
+        return Ok(statement);
+    };
+    let fraction = crate::sql::ast::CursorFraction::fast_plan(crate::sql::guc::planner_value(
+        "cursor_tuple_fraction",
+    ));
+    arena
+        .alloc(Stmt::Select(crate::sql::ast::Select {
+            cursor_fraction: fraction,
+            ..*select
+        }))
+        .map(|statement| &*statement)
+        .map_err(|_| arena_full())
+}
+
+/// A scrollable cursor's plan (`standard_planner` under
+/// `CURSOR_OPT_SCROLL`): its nodes, under a `Materialize`
+/// (`materialize_finished_plan`) unless they run backward.
+pub(super) fn scrollable_plan<'a>(
+    plan: Plan<'a>,
+    storage: &Storage,
+    txid: u32,
+    analyze: bool,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    let nodes = &plan.nodes[..plan.count];
+    if runs_backward(nodes, 0, storage, txid) {
+        return Ok(plan);
+    }
+    if analyze {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN ANALYZE of a scrollable cursor whose plan cannot run backward is not supported"
+        ));
+    }
+    // The `Materialize` would take over the top node's InitPlans.
+    if nodes[1..]
+        .iter()
+        .any(|node| node.depth == 1 && node.subplan.is_some())
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a scrollable cursor whose plan has InitPlans and cannot run backward is not supported"
+        ));
+    }
+    let top = &nodes[0];
+    let (startup_cost, total_cost) =
+        material_costs(top.startup_cost, top.total_cost, top.rows, top.width);
+    let wrapped = arena
+        .alloc_slice_with(plan.count + 1, |index| match index {
+            0 => PlanNode {
+                name: StackStr::from_str("Materialize"),
+                startup_cost,
+                total_cost,
+                rows: top.rows,
+                width: top.width,
+                output: top.output,
+                output_unprintable: top.output_unprintable,
+                unmodeled_costs: top.unmodeled_costs,
+                ..PlanNode::EMPTY
+            },
+            _ => PlanNode {
+                depth: nodes[index - 1].depth + 1,
+                ..nodes[index - 1]
+            },
+        })
+        .map_err(|_| arena_full())?;
+    Ok(Plan {
+        nodes: wrapped,
+        count: plan.count + 1,
+        ..plan
+    })
+}
+
+/// `cost_material` of an input of `startup` and `total` cost: two operator
+/// costs per row stored, and a page read per page it spills past
+/// `work_mem`.
+fn material_costs(startup: f64, total: f64, rows: f64, width: u32) -> (f64, f64) {
+    let value = crate::sql::guc::planner_value;
+    let mut run = total - startup + 2.0 * value("cpu_operator_cost") * rows;
+    let bytes = query::index_paths::joins::relation_byte_size(rows, f64::from(width));
+    if bytes > f64::from(crate::sql::guc::work_mem_kilobytes()) * 1024.0 {
+        run += value("seq_page_cost") * (bytes / 8192.0).ceil();
+    }
+    (startup, startup + run)
+}
+
+/// `ExecSupportsBackwardScan` of the node at `at`: scans of a table, a
+/// function, a `VALUES` list or a CTE, a `Materialize` and a `Sort` run
+/// backward; an index scan when its access method does (btree); a
+/// `Result`, `Subquery Scan`, `Limit` or `LockRows` when its input does,
+/// and an `Append` when every member does.
+fn runs_backward(nodes: &[PlanNode], at: usize, storage: &Storage, txid: u32) -> bool {
+    let node = &nodes[at];
+    let depth = node.depth;
+    let mut children = nodes[at + 1..]
+        .iter()
+        .enumerate()
+        .take_while(|(_, child)| child.depth > depth)
+        .filter(|(_, child)| child.depth == depth + 1 && child.subplan.is_none())
+        .map(|(offset, _)| at + 1 + offset);
+    let name = node.name.as_str();
+    match name {
+        "Seq Scan" | "Tid Scan" | "Tid Range Scan" | "Function Scan" | "Values Scan"
+        | "CTE Scan" | "Materialize" | "Sort" => true,
+        "Result" | "Subquery Scan" | "Limit" | "LockRows" => children
+            .next()
+            .is_some_and(|child| runs_backward(nodes, child, storage, txid)),
+        "Append" => children.all(|child| runs_backward(nodes, child, storage, txid)),
+        _ if name.starts_with("Index Scan ") || name.starts_with("Index Only Scan ") => {
+            let Some((_, index)) = name.split_once(" using ") else {
+                return false;
+            };
+            let schema = (!node.schema.is_empty()).then_some(node.schema.as_str());
+            let btree = crate::sql::ast::IndexAccessMethod::Btree;
+            relation_slot(storage, txid, schema, node.relation.as_str()).is_some_and(|table| {
+                if let Some(definition) = storage
+                    .indexes_for_slot(table, txid)
+                    .find(|definition| definition.name_for(txid).as_str() == index)
+                {
+                    return definition.method == btree;
+                }
+                // A constraint's index: a primary key's or a unique
+                // constraint's is a btree, an exclusion constraint's uses
+                // the constraint's method.
+                let definition = storage.table_def(table, txid);
+                if let Some(exclusion) = definition
+                    .exclusions()
+                    .iter()
+                    .find(|exclusion| exclusion.name.as_str() == index)
+                {
+                    return exclusion.method == btree;
+                }
+                definition
+                    .backing_index_names()
+                    .any(|(name, _)| name.as_str() == index)
+            })
+        }
+        _ => false,
+    }
 }
 
 fn relation_slot(storage: &Storage, txid: u32, schema: Option<&str>, name: &str) -> Option<usize> {

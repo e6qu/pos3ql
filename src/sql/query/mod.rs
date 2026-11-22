@@ -14857,8 +14857,8 @@ fn enter_scan_context<'a>(
                     scope,
                     statement.items,
                     statement.order_by,
-                    statement.limit,
-                    statement.offset,
+                    (statement.limit, statement.offset),
+                    statement.cursor_fraction,
                     params,
                     arena,
                 )?;

@@ -5340,6 +5340,7 @@ fn modeled_join_over<'p, 'a: 'p>(
                 sort_keys
             },
             limit,
+            cursor: statement.cursor_fraction,
             width: if grouped || aggregated {
                 grouped_width
             } else {

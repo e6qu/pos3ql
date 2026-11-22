@@ -1995,6 +1995,7 @@ fn appended_select<'a>(
             windows: &[],
             written: crate::sql::ast::WrittenQuery::PLAIN,
             minmax_subquery: None,
+            cursor_fraction: crate::sql::ast::CursorFraction::ALL,
         })
         .map_err(|_| arena_full())?;
     Ok(Some(&*wrapper))
@@ -2082,6 +2083,7 @@ pub(crate) fn set_query_select<'a>(
             windows: &[],
             written: crate::sql::ast::WrittenQuery::PLAIN,
             minmax_subquery: None,
+            cursor_fraction: crate::sql::ast::CursorFraction::ALL,
         })
         .map(|select| &*select)
         .map_err(|_| arena_full())

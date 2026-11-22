@@ -3271,6 +3271,44 @@ pub struct Select<'a> {
     /// the address of the aggregate call it replaces, which identifies the
     /// subquery to `EXPLAIN ANALYZE` wherever the rewrite is built.
     pub minmax_subquery: Option<usize>,
+    /// The share of the rows the planner expects a cursor over this query
+    /// level to read.
+    pub cursor_fraction: CursorFraction,
+}
+
+/// The tuple fraction `standard_planner` takes from a cursor's options:
+/// a declared cursor (`CURSOR_OPT_FAST_PLAN`) plans for
+/// `cursor_tuple_fraction` of its rows, any other query for all of them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CursorFraction(f64);
+
+impl Default for CursorFraction {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl CursorFraction {
+    /// Every row (`tuple_fraction` 0).
+    pub const ALL: Self = Self(0.0);
+
+    /// A declared cursor's fraction of `cursor_tuple_fraction`: 1 means
+    /// every row, and 0 a vanishing share (`1e-10`) that still favors the
+    /// fastest start.
+    pub fn fast_plan(setting: f64) -> Self {
+        if setting >= 1.0 {
+            Self::ALL
+        } else if setting <= 0.0 {
+            Self(1e-10)
+        } else {
+            Self(setting)
+        }
+    }
+
+    /// The fraction, 0 for every row.
+    pub fn value(self) -> f64 {
+        self.0
+    }
 }
 
 impl Select<'_> {
@@ -3337,6 +3375,7 @@ impl Select<'_> {
         locking: &[],
         written: WrittenQuery::PLAIN,
         minmax_subquery: None,
+        cursor_fraction: crate::sql::ast::CursorFraction::ALL,
     };
 }
 

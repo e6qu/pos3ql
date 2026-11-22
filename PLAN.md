@@ -128,6 +128,27 @@ today.
 - [ ] Object-store sorts stream through a run reader per stream (today a
   large ordered `SELECT` there spools, and a paged portal over one buffers in
   `portal_result_bytes`).
+- [x] A declared cursor (`DECLARE`, a PL/pgSQL `OPEN`) plans for
+  `cursor_tuple_fraction` of its rows, as PostgreSQL's `CURSOR_OPT_FAST_PLAN`
+  does: relations keep their fastest-starting paths and the final path is the
+  one cheapest for that share of the rows (`get_cheapest_fractional_path`), so
+  an ordered cursor may read an index where a query sorts, and a join may hash
+  its other side. A setting of 1 plans for every row and 0 for the fastest
+  start. `EXPLAIN DECLARE` shows that plan, under a `Materialize` when a
+  scrollable cursor's nodes cannot run backward (`ExecSupportsBackwardScan`);
+  `EXPLAIN ANALYZE DECLARE` runs the query without opening a cursor (`995`).
+- [ ] A cursor over a set operation plans its `UNION ALL` members for the
+  cursor's fraction of the rows, as `plan_set_operations` passes it down
+  (today they plan for every row); `EXPLAIN` of a scrollable cursor whose plan
+  has InitPlans or cannot run backward under `ANALYZE` fails with `0A000`.
+- [ ] A grouped relation keeps its fastest-starting paths under a tuple
+  fraction (`fetch_upper_rel`'s `consider_startup`), so `GROUP BY ... LIMIT`
+  and a grouped cursor choose PostgreSQL's `GroupAggregate` over an index
+  scan. Today the grouping keeps only its cheapest paths: the sorted grouping
+  over an index-ordered scan copies each whole row into the statement arena
+  without releasing it, so wide cold rows exhaust `work_arena_bytes` (a
+  `GROUP BY id ORDER BY id LIMIT 1` over 300 rows of 41 KB fails), and that
+  read must release each row or decode only the columns it reads first.
 - [ ] Declared cursors use the retained sort; cursors over the retained
   shapes read as they fetch instead of running the query at the first read
   (a scrollable cursor ordered by a non-column expression re-evaluates

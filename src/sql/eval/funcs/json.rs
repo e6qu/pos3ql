@@ -74,6 +74,9 @@ impl<'a> SqlJsonWriter<'_, 'a> {
                         .call_routine_oid(
                             cast.function_oid,
                             &[value],
+                            // A value JSON conversion reached inside a
+                            // composite or array is not held as passed.
+                            &[crate::sql::toast::DatumForm::Unknown],
                             &[cast.source_type_oid],
                             crate::sql::ast::Collation::None,
                             crate::sql::eval::RoutineCallAccess::Caller,

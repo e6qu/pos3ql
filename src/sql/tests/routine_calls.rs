@@ -3015,6 +3015,7 @@ fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
                 .call_routine_oid(
                     177,
                     &[Datum::Int2(1), Datum::Int4(2)],
+                    &[crate::sql::toast::DatumForm::Formed; 2],
                     &[crate::sql::types::oid::INT2, crate::sql::types::oid::INT4],
                     ast::Collation::None,
                     eval::RoutineCallAccess::Caller,
@@ -3028,6 +3029,7 @@ fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
                 .call_routine_oid(
                     141,
                     &[Datum::Int2(3), Datum::Int4(2)],
+                    &[crate::sql::toast::DatumForm::Formed; 2],
                     &[crate::sql::types::oid::INT2, crate::sql::types::oid::INT4],
                     ast::Collation::None,
                     eval::RoutineCallAccess::Caller,
@@ -3041,6 +3043,7 @@ fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
                 .call_routine_oid(
                     177,
                     &[Datum::Null, Datum::Int4(2)],
+                    &[crate::sql::toast::DatumForm::Formed; 2],
                     &[crate::sql::types::oid::INT4, crate::sql::types::oid::INT4],
                     ast::Collation::None,
                     eval::RoutineCallAccess::Caller,

@@ -3187,7 +3187,7 @@ impl RoutineInvocationState {
         source_position: Option<InvocationSite>,
         input_collation: super::ast::Collation,
         access: super::eval::RoutineCallAccess,
-    ) -> Result<Option<Datum<'query>>, SqlError> {
+    ) -> Result<Option<(Datum<'query>, crate::sql::toast::DatumForm)>, SqlError> {
         self.require_arena(statement_arena)?;
         let pending = || -> Result<PendingRoutineInvocation, SqlError> {
             Ok(PendingRoutineInvocation {
@@ -3216,10 +3216,16 @@ impl RoutineInvocationState {
         };
         match self.key_call(statement_arena, pending)? {
             index_key_calls::KeyCall::Unkeyed => {}
+            // An index key's call result is kept without its form.
             index_key_calls::KeyCall::Kept(value) => {
-                return Ok(Some(value.scalar(statement_arena, query_arena)?));
+                return Ok(Some((
+                    value.scalar(statement_arena, query_arena)?,
+                    crate::sql::toast::DatumForm::Unknown,
+                )));
             }
-            index_key_calls::KeyCall::Placeholder => return Ok(Some(Datum::Null)),
+            index_key_calls::KeyCall::Placeholder => {
+                return Ok(Some((Datum::Null, crate::sql::toast::DatumForm::Formed)));
+            }
         }
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
@@ -3236,7 +3242,7 @@ impl RoutineInvocationState {
                 saved.replay,
                 super::sequence::ReplayInputPosition::KeepConsumed,
             )?;
-            return Ok(Some(value.scalar(statement_arena, query_arena)?));
+            return value.held_scalar(statement_arena, query_arena).map(Some);
         }
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
@@ -4379,6 +4385,7 @@ pub(crate) fn execute_operator_function<'a>(
             input_progress::invocation_site(),
             arena,
         )?
+        .map(|(value, _)| value)
         .ok_or_else(|| {
             sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
@@ -4415,6 +4422,7 @@ pub(crate) fn execute_index_comparison<'a>(
             input_progress::invocation_site(),
             arena,
         )?
+        .map(|(value, _)| value)
         .ok_or_else(|| {
             sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
@@ -4782,21 +4790,28 @@ impl StorageCatalog<'_, '_, '_, '_> {
                             argument: crate::storage::RoutineArgumentDef,
                             expected,
                             input_collation| {
-            let form = coerced_input_form(form, source, expected);
             if source != expected
-                && let Some(value) = self.execute_defined_cast(
+                && let Some(cast) = self.execute_defined_cast(
                     source,
                     expected,
                     -1,
                     value,
+                    form,
                     super::eval::DefinedCastContext::Implicit,
                     input_collation,
                     arena,
                     None,
                 )?
             {
-                return Ok((value, form));
+                return Ok(cast);
             }
+            // A domain holds its base type's datum as it was given.
+            let base = |oid| {
+                self.storage
+                    .domain_base_type_for_oid(oid, self.txid)
+                    .map_or(oid, |base| base.oid())
+            };
+            let form = coerced_input_form(form, base(source), base(expected));
             super::exec::coerce_routine_argument(
                 value,
                 argument,
@@ -5157,24 +5172,30 @@ impl StorageCatalog<'_, '_, '_, '_> {
         clippy::too_many_arguments,
         reason = "cast execution preserves target type modifier and input collation"
     )]
+    /// Runs the user-defined cast from `source_oid` to `target_oid` on
+    /// `value`, held as `form`: the converted value and how it is held.
     fn execute_defined_cast<'a>(
         &self,
         source_oid: i32,
         target_oid: i32,
         target_type_mod: i32,
         value: Datum<'a>,
+        form: crate::sql::toast::DatumForm,
         context: super::eval::DefinedCastContext,
         input_collation: super::ast::Collation,
         arena: &'a Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
+    ) -> Result<Option<(Datum<'a>, crate::sql::toast::DatumForm)>, SqlError> {
         let Some(cast) = self.bind_defined_cast(source_oid, target_oid, context)? else {
             return Ok(None);
         };
-        self.execute_bound_cast(
+        self.execute_cast_path(
             &cast,
-            value,
+            cast.source_oid,
+            cast.target_oid,
             target_type_mod,
+            value,
+            form,
             input_collation,
             arena,
             sequences,
@@ -5193,10 +5214,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
         target_oid: i32,
         target_type_mod: i32,
         value: Datum<'a>,
+        form: crate::sql::toast::DatumForm,
         input_collation: super::ast::Collation,
         arena: &'a Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-    ) -> Result<Datum<'a>, SqlError> {
+    ) -> Result<(Datum<'a>, crate::sql::toast::DatumForm), SqlError> {
+        use crate::sql::toast::DatumForm;
         let source_base = self
             .storage
             .domain_base_type_for_oid(source_oid, self.txid)
@@ -5222,12 +5245,13 @@ impl StorageCatalog<'_, '_, '_, '_> {
             _ => None,
         };
         if source_base.is_some() || target_base.is_some() {
-            let value = self.execute_cast_path(
+            let (value, form) = self.execute_cast_path(
                 selected,
                 source_base.unwrap_or(source_oid),
                 target_base.map_or(target_oid, |(oid, _)| oid),
                 target_base.map_or(target_type_mod, |(_, type_mod)| type_mod),
                 value,
+                form,
                 input_collation,
                 arena,
                 sequences,
@@ -5242,9 +5266,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
                             "cast target type is unavailable"
                         )
                     })?;
-                self.coerce_result(value, target, arena, sequences)
+                let converted = self.coerce_result(value, target, arena, sequences)?;
+                Ok((converted, form.converted(&value, &converted)))
             } else {
-                Ok(value)
+                Ok((value, form))
             };
         }
         if source_oid != selected.leaf_source_oid || target_oid != selected.leaf_target_oid {
@@ -5262,7 +5287,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             ) = (source, target)
             {
                 let (raw, stored_element) = match value {
-                    Datum::Null => return Ok(Datum::Null),
+                    Datum::Null => return Ok((Datum::Null, DatumForm::Formed)),
                     Datum::Array { element, raw } => (raw, element),
                     _ => {
                         return Err(sql_err!(
@@ -5277,21 +5302,28 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     .iter_mut()
                     .zip(crate::sql::array::elements(raw, stored_element))
                 {
-                    *out = self.execute_cast_path(
-                        selected,
-                        source.element_oid(),
-                        target.element_oid(),
-                        target_type_mod,
-                        input,
-                        input_collation,
-                        arena,
-                        sequences,
-                    )?;
+                    // An array element is passed on as the array holds it.
+                    *out = self
+                        .execute_cast_path(
+                            selected,
+                            source.element_oid(),
+                            target.element_oid(),
+                            target_type_mod,
+                            input,
+                            DatumForm::Stored(StoredForm::Inline),
+                            input_collation,
+                            arena,
+                            sequences,
+                        )?
+                        .0;
                 }
-                return Ok(Datum::Array {
-                    element: target,
-                    raw: crate::sql::array::build_shaped(items, shape, arena)?,
-                });
+                return Ok((
+                    Datum::Array {
+                        element: target,
+                        raw: crate::sql::array::build_shaped(items, shape, arena)?,
+                    },
+                    DatumForm::Formed,
+                ));
             }
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -5300,12 +5332,17 @@ impl StorageCatalog<'_, '_, '_, '_> {
         }
         let cast = selected.definition;
         let context = selected.context;
-        let result = match cast.method {
-            crate::storage::CastMethod::Binary => value,
-            crate::storage::CastMethod::InOut if value.is_null() => Datum::Null,
+        let (result, result_form) = match cast.method {
+            crate::storage::CastMethod::Binary => (value, form),
+            crate::storage::CastMethod::InOut if value.is_null() => {
+                (Datum::Null, DatumForm::Formed)
+            }
             crate::storage::CastMethod::InOut => {
                 let text = super::eval::datum_to_text(value, arena)?;
-                self.coerce_result(Datum::Text(text), cast.target, arena, sequences)?
+                (
+                    self.coerce_result(Datum::Text(text), cast.target, arena, sequences)?,
+                    DatumForm::Formed,
+                )
             }
             crate::storage::CastMethod::Function(slot) => {
                 let slot = self
@@ -5318,7 +5355,9 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 let mut routine = self.storage.routine_for(slot, self.txid);
                 routine.attributes.strict = selected.strict;
                 let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                let mut forms = [DatumForm::Formed; crate::storage::MAX_ROUTINE_ARGUMENTS];
                 arguments[0] = value;
+                forms[0] = form;
                 if routine.argument_count >= 2 {
                     arguments[1] = Datum::Int4(target_type_mod);
                 }
@@ -5330,17 +5369,17 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     slot,
                     &routine,
                     &arguments[..routine.argument_count],
-                    // A cast's value reaches its function without its form.
-                    &crate::sql::toast::UNRECORDED_ARGUMENTS,
+                    &forms[..routine.argument_count],
                     input_collation,
                     super::eval::RoutineCallAccess::Caller,
                     input_progress::invocation_site(),
                     arena,
                 )?
-                .unwrap_or(Datum::Null)
+                .unwrap_or((Datum::Null, DatumForm::Formed))
             }
         };
-        self.coerce_result(result, cast.target, arena, sequences)
+        let converted = self.coerce_result(result, cast.target, arena, sequences)?;
+        Ok((converted, result_form.converted(&result, &converted)))
     }
 
     #[expect(
@@ -5352,6 +5391,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         schema: Option<&str>,
         name: &str,
         arguments: &[Datum<'a>],
+        argument_forms: &[crate::sql::toast::DatumForm],
         argument_type_oids: &[i32],
         input_collation: super::ast::Collation,
         argument_collations: &[super::ast::Collation],
@@ -5360,6 +5400,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
     ) -> Result<Option<super::eval::OperatorEvaluation<'a>>, SqlError> {
         if arguments.len() != argument_type_oids.len()
             || arguments.len() != argument_collations.len()
+            || arguments.len() != argument_forms.len()
             || !(1..=2).contains(&arguments.len())
         {
             return Err(sql_err!(
@@ -5418,6 +5459,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 Some(super::eval::OperatorEvaluation {
                     value,
                     first_argument: builtin_arguments[0],
+                    form: crate::sql::toast::DatumForm::Formed,
                 })
             });
         }
@@ -5449,6 +5491,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             ));
         }
         let mut coerced = [Datum::Null; 2];
+        let mut coerced_forms = [crate::sql::toast::DatumForm::Unknown; 2];
         for index in 0..expected_count {
             let expected_oid = self
                 .storage
@@ -5459,21 +5502,28 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         "operator argument type identity is unavailable"
                     )
                 })?;
-            coerced[index] = if argument_type_oids[index] == expected_oid {
-                self.coerce_result(arguments[index], expected[index], arena, None)?
-            } else if let Some(value) = self.execute_defined_cast(
+            let form = argument_forms[index];
+            (coerced[index], coerced_forms[index]) = if argument_type_oids[index] == expected_oid {
+                let value = self.coerce_result(arguments[index], expected[index], arena, None)?;
+                (value, form.converted(&arguments[index], &value))
+            } else if let Some(cast) = self.execute_defined_cast(
                 argument_type_oids[index],
                 expected_oid,
                 -1,
                 arguments[index],
+                form,
                 super::eval::DefinedCastContext::Implicit,
                 argument_collations[index],
                 arena,
                 None,
             )? {
-                value
+                cast
             } else {
-                self.coerce_result(arguments[index], expected[index], arena, None)?
+                let value = self.coerce_result(arguments[index], expected[index], arena, None)?;
+                (
+                    value,
+                    coerced_input_form(form, argument_type_oids[index], expected_oid),
+                )
             };
         }
         let function_oid = operator
@@ -5496,13 +5546,14 @@ impl StorageCatalog<'_, '_, '_, '_> {
             return Ok(Some(super::eval::OperatorEvaluation {
                 value: Datum::Null,
                 first_argument: coerced[0],
+                form: crate::sql::toast::DatumForm::Formed,
             }));
         }
         self.execute_routine(
             function,
             &self.storage.routine_for(function, self.txid),
             &coerced[..expected_count],
-            &crate::sql::toast::UNRECORDED_ARGUMENTS,
+            &coerced_forms[..expected_count],
             input_collation,
             super::eval::RoutineCallAccess::Caller,
             input_progress::invocation_site(),
@@ -5514,10 +5565,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 "operator function produced no scalar result"
             )
         })
-        .map(|value| {
+        .map(|(value, form)| {
             Some(super::eval::OperatorEvaluation {
                 value,
                 first_argument: coerced[0],
+                form,
             })
         })
     }
@@ -5536,15 +5588,23 @@ impl StorageCatalog<'_, '_, '_, '_> {
         access: super::eval::RoutineCallAccess,
         source_position: Option<InvocationSite>,
         arena: &'a Arena,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
+    ) -> Result<Option<(Datum<'a>, crate::sql::toast::DatumForm)>, SqlError> {
+        use crate::sql::toast::DatumForm;
         super::exec::reject_native_routine_call(routine, self.txid)?;
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
-            return Ok(Some(Datum::Null));
+            return Ok(Some((Datum::Null, DatumForm::Formed)));
         }
         if let crate::storage::RoutineLanguage::Native(native) = routine.language {
             return super::foreign::call_native(self.storage, self.txid, native, arguments)
-                .map(Some);
+                .map(|value| Some((value, DatumForm::Formed)));
         }
+        // An immutable call of constants is folded while planning, and
+        // `makeConst` detoasts the datum it keeps into a new one.
+        let folded = routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable
+            && call_arguments_constant();
+        let held = |result: Option<(Datum<'a>, DatumForm)>| {
+            result.map(|(value, form)| (value, if folded { DatumForm::Formed } else { form }))
+        };
         let _input_body = input_progress::enter_body();
         let owner = crate::storage::SessionIdentity::bound(
             self.storage
@@ -5587,17 +5647,19 @@ impl StorageCatalog<'_, '_, '_, '_> {
             .invocations
             .filter(|invocations| invocations.resolves(routine))
         {
-            return invocations.resolve(
-                routine,
-                arguments,
-                forms,
-                self.statement_arena
-                    .expect("routine invocation state has statement arena"),
-                arena,
-                source_position,
-                input_collation,
-                access,
-            );
+            return invocations
+                .resolve(
+                    routine,
+                    arguments,
+                    forms,
+                    self.statement_arena
+                        .expect("routine invocation state has statement arena"),
+                    arena,
+                    source_position,
+                    input_collation,
+                    access,
+                )
+                .map(held);
         }
         if let Some(result) = with_active_routine_invocations(|context| {
             context
@@ -5615,7 +5677,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     )
                 })
         }) {
-            return result;
+            return result.map(held);
         }
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
             return Err(sql_err!(
@@ -5804,12 +5866,14 @@ impl StorageCatalog<'_, '_, '_, '_> {
                             sequences,
                             &mut |_, _| Ok(()),
                         )?;
-                        return Ok(Some(Datum::Text("")));
+                        return Ok(Some((Datum::Text(""), DatumForm::Formed)));
                     }
                     RoutineFunctionResult::Forbidden(statement) => {
                         return Err(routine_forbidden_statement_error(statement));
                     }
-                    RoutineFunctionResult::Empty => return Ok(Some(Datum::Text(""))),
+                    RoutineFunctionResult::Empty => {
+                        return Ok(Some((Datum::Text(""), DatumForm::Formed)));
+                    }
                 };
                 execute_bound_routine_query(
                     result_query,
@@ -5821,39 +5885,41 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     &parameters[..arguments.len()],
                     true,
                     sequences,
-                    &mut |values, _| {
+                    &mut |values, row_forms| {
                         if result.is_none() {
-                            result = Some(result_shape.capture(
-                                values,
-                                || {
-                                    RoutineResultContract::stored(
-                                        self.storage,
-                                        self.txid,
-                                        routine,
-                                        arena,
-                                    )
-                                    .map(RoutineResultContract::name)
-                                },
-                                arena,
-                            )?);
+                            result = Some((
+                                result_shape.capture(
+                                    values,
+                                    || {
+                                        RoutineResultContract::stored(
+                                            self.storage,
+                                            self.txid,
+                                            routine,
+                                            arena,
+                                        )
+                                        .map(RoutineResultContract::name)
+                                    },
+                                    arena,
+                                )?,
+                                row_forms.first().copied(),
+                            ));
                         }
                         Ok(())
                     },
                 )?;
-                let result = result.unwrap_or(Datum::Null);
+                let (result, row_form) = result.unwrap_or((Datum::Null, None));
+                let form = sql_function_result_form(frame.inlining, result_query, row_form, forms);
                 let Some(result_contract) = result_contract else {
-                    return Ok(Some(result));
+                    return Ok(Some((result, form)));
                 };
-                if result_contract.polymorphic_type().is_some() {
-                    Ok(Some(result))
+                let converted = if result_contract.polymorphic_type().is_some() {
+                    result
+                } else if matches!(result_type, ColType::Composite(_)) {
+                    self.coerce_result(result, result_contract, arena, sequences)?
                 } else {
-                    if matches!(result_type, ColType::Composite(_)) {
-                        self.coerce_result(result, result_contract, arena, sequences)
-                            .map(Some)
-                    } else {
-                        super::eval::cast_to(result, result_type, arena).map(Some)
-                    }
-                }
+                    super::eval::cast_to(result, result_type, arena)?
+                };
+                Ok(Some((converted, form.converted(&result, &converted))))
             })
         });
         if let Some((total, own)) = timed.finish()
@@ -5867,7 +5933,42 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 self.routine_workspace,
             )?;
         }
-        output
+        output.map(held)
+    }
+}
+
+/// How a SQL function holds the datum it returns. An inlined body is its
+/// expression in the caller: a parameter it gives is the caller's datum,
+/// any other value is formed. An executed body returns its last query's
+/// first row as SQL function results keep it, a tuple that packs a short
+/// value and keeps a stored datum's TOAST form. A body passing a
+/// parameter on is planned with that parameter as a constant (detoasted)
+/// or as a parameter (unchanged) depending on the plan cache's choice, so
+/// its form is not known.
+pub(crate) fn sql_function_result_form(
+    inlining: crate::sql::error_context::SqlFunctionInlining,
+    result: &RoutineQuery<'_>,
+    row_form: Option<StoredForm>,
+    argument_forms: &[crate::sql::toast::DatumForm],
+) -> crate::sql::toast::DatumForm {
+    use crate::sql::toast::DatumForm;
+    let item = match result {
+        RoutineQuery::Select(select) => match select.items {
+            [super::ast::SelectItem::Expr { expression, .. }] => Some(*expression),
+            _ => None,
+        },
+        RoutineQuery::Set(_) => None,
+    };
+    let inlined = inlining == crate::sql::error_context::SqlFunctionInlining::Inlined;
+    match item {
+        Some(Expr::Param(number)) if inlined => argument_forms
+            .get(*number as usize - 1)
+            .copied()
+            .unwrap_or(DatumForm::Unknown),
+        Some(expression) if crate::sql::toast::passes_parameter(expression) => DatumForm::Unknown,
+        Some(_) if inlined => DatumForm::Formed,
+        None if inlined => DatumForm::Unknown,
+        _ => row_form.map_or(DatumForm::Stored(StoredForm::Inline), DatumForm::Stored),
     }
 }
 
@@ -7168,7 +7269,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )
             -> Result<(Datum<'a>, crate::sql::toast::DatumForm), SqlError>,
         arena: &'a Arena,
-    ) -> Result<Datum<'a>, SqlError> {
+    ) -> Result<(Datum<'a>, crate::sql::toast::DatumForm), SqlError> {
         with_call_arguments(
             arguments
                 .iter()
@@ -7211,21 +7312,25 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         let values = arena
                             .alloc_slice_with(arguments.len(), |_| Datum::Null)
                             .map_err(|_| arena_full())?;
-                        for (value, expression) in values.iter_mut().zip(arguments) {
-                            *value = evaluate(expression)?.0;
+                        let mut forms = [crate::sql::toast::DatumForm::Unknown; 2];
+                        for ((value, form), expression) in
+                            values.iter_mut().zip(forms.iter_mut()).zip(arguments)
+                        {
+                            (*value, *form) = evaluate(expression)?;
                         }
                         return self
                             .execute_catalog_operator(
                                 schema,
                                 name,
                                 values,
+                                &forms[..arguments.len().min(forms.len())],
                                 argument_type_oids,
                                 input_collation,
                                 collations,
                                 super::eval::OperatorNulls::RoutineStrictness,
                                 arena,
                             )?
-                            .map(|evaluation| evaluation.value)
+                            .map(|evaluation| (evaluation.value, evaluation.form))
                             .ok_or_else(|| {
                                 sql_err!(
                                     sqlstate::UNDEFINED_FUNCTION,
@@ -7264,7 +7369,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     arena,
                 )?
                 else {
-                    return Ok(Datum::Null);
+                    return Ok((Datum::Null, crate::sql::toast::DatumForm::Formed));
                 };
                 let routine = &declared;
                 self.execute_routine(
@@ -7291,6 +7396,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         &self,
         oid: i32,
         arguments: &[Datum<'a>],
+        argument_forms: &[crate::sql::toast::DatumForm],
         argument_type_oids: &[i32],
         input_collation: super::ast::Collation,
         access: super::eval::RoutineCallAccess,
@@ -7308,6 +7414,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             if declaration.kind != b'f'
                 || declaration.returns_set
                 || arguments.len() != argument_type_oids.len()
+                || arguments.len() != argument_forms.len()
             {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -7339,11 +7446,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         )
                     })?;
                 *output = if source != target
-                    && let Some(value) = self.execute_defined_cast(
+                    && let Some((value, _)) = self.execute_defined_cast(
                         source,
                         target,
                         -1,
                         arguments[index],
+                        argument_forms[index],
                         super::eval::DefinedCastContext::Implicit,
                         input_collation,
                         arena,
@@ -7371,7 +7479,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .map(Some);
         };
         let routine = self.storage.routine_for(slot, self.txid);
-        if arguments.len() != routine.argument_count || argument_type_oids.len() != arguments.len()
+        if arguments.len() != routine.argument_count
+            || argument_type_oids.len() != arguments.len()
+            || argument_forms.len() != arguments.len()
         {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -7387,18 +7497,18 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     "bound support function polymorphic contract does not match its arguments"
                 )
             })?;
-        // A support function's arguments are evaluated values whose forms
-        // its caller does not keep.
-        self.execute_routine(
-            slot,
-            &routine,
-            arguments,
-            &crate::sql::toast::UNRECORDED_ARGUMENTS,
-            input_collation,
-            access,
-            input_progress::invocation_site(),
-            arena,
-        )
+        Ok(self
+            .execute_routine(
+                slot,
+                &routine,
+                arguments,
+                argument_forms,
+                input_collation,
+                access,
+                input_progress::invocation_site(),
+                arena,
+            )?
+            .map(|(value, _)| value))
     }
 
     fn cast_evaluation(
@@ -7505,16 +7615,20 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arena: &'a Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Datum<'a>, SqlError> {
+        // An array constructor's element reaches its cast without how it
+        // was held.
         self.execute_cast_path(
             cast,
             cast.source_oid,
             cast.target_oid,
             target_type_mod,
             value,
+            crate::sql::toast::DatumForm::Unknown,
             input_collation,
             arena,
             sequences,
         )
+        .map(|(value, _)| value)
     }
 
     fn cast_defined<'a>(
@@ -7523,16 +7637,18 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         target_oid: i32,
         target_type_mod: i32,
         value: Datum<'a>,
+        form: crate::sql::toast::DatumForm,
         context: super::eval::DefinedCastContext,
         input_collation: super::ast::Collation,
         arena: &'a Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
+    ) -> Result<Option<(Datum<'a>, crate::sql::toast::DatumForm)>, SqlError> {
         self.execute_defined_cast(
             source_oid,
             target_oid,
             target_type_mod,
             value,
+            form,
             context,
             input_collation,
             arena,
@@ -7560,6 +7676,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         &self,
         name: &str,
         arguments: [Datum<'a>; 2],
+        argument_forms: [crate::sql::toast::DatumForm; 2],
         argument_type_oids: [i32; 2],
         input_collation: super::ast::Collation,
         argument_collations: [super::ast::Collation; 2],
@@ -7570,6 +7687,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             None,
             name,
             &arguments,
+            &argument_forms,
             &argument_type_oids,
             input_collation,
             &argument_collations,

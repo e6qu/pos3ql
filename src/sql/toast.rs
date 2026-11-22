@@ -173,6 +173,157 @@ impl DatumForm {
 pub(crate) const UNRECORDED_ARGUMENTS: [DatumForm; crate::storage::MAX_ROUTINE_ARGUMENTS] =
     [DatumForm::Unknown; crate::storage::MAX_ROUTINE_ARGUMENTS];
 
+/// How the results of routine calls are held, by the call expression that
+/// gave them. PostgreSQL passes a datum a function returns on unchanged
+/// (`SPI_datumTransfer` copies it with its header and TOAST form), so a
+/// call's result keeps the form its routine gave it; an expression reading
+/// the result finds it here by the calling expression and the datum's
+/// identity. Entries live in a fixed thread-local table: the newest result
+/// of each call expression replaces the oldest entry when the table is full.
+mod call_results {
+    use super::DatumForm;
+    use core::cell::{Cell, RefCell};
+
+    const CAPACITY: usize = 64;
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        call: usize,
+        identity: (usize, usize),
+        form: DatumForm,
+        age: u64,
+    }
+
+    const EMPTY: Entry = Entry {
+        call: 0,
+        identity: (0, 0),
+        form: DatumForm::Unknown,
+        age: 0,
+    };
+
+    thread_local! {
+        static ENTRIES: RefCell<[Entry; CAPACITY]> = const { RefCell::new([EMPTY; CAPACITY]) };
+        static AGE: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record(call: usize, identity: (usize, usize), form: DatumForm) {
+        let age = AGE.with(|age| {
+            let next = age.get().wrapping_add(1);
+            age.set(next);
+            next
+        });
+        ENTRIES.with_borrow_mut(|table| {
+            let at = table
+                .iter()
+                .position(|entry| entry.call == call)
+                .unwrap_or_else(|| {
+                    (0..CAPACITY)
+                        .min_by_key(|&at| table[at].age)
+                        .expect("the table has entries")
+                });
+            table[at] = Entry {
+                call,
+                identity,
+                form,
+                age,
+            };
+        });
+    }
+
+    pub(super) fn form(call: usize, identity: (usize, usize)) -> Option<DatumForm> {
+        ENTRIES.with_borrow(|table| {
+            table
+                .iter()
+                .find(|entry| entry.call == call && entry.age != 0)
+                .filter(|entry| entry.identity == identity)
+                .map(|entry| entry.form)
+        })
+    }
+}
+
+/// Notes that the routine call `call` gave `value` held as `form`.
+pub(crate) fn record_call_result(
+    call: &crate::sql::ast::Expr<'_>,
+    value: &crate::sql::types::Datum<'_>,
+    form: DatumForm,
+) {
+    if let Some(identity) = datum_identity(value) {
+        call_results::record(core::ptr::from_ref(call) as usize, identity, form);
+    }
+}
+
+/// Moves the record of `value`, which the call `from` gave, to `to`.
+pub(crate) fn moved_call_result(
+    from: &crate::sql::ast::Expr<'_>,
+    to: &crate::sql::ast::Expr<'_>,
+    value: &crate::sql::types::Datum<'_>,
+) {
+    if let Some(identity) = datum_identity(value)
+        && let Some(form) = call_results::form(core::ptr::from_ref(from) as usize, identity)
+    {
+        call_results::record(core::ptr::from_ref(to) as usize, identity, form);
+    }
+}
+
+/// How `value`, which the routine call `call` gave, is held: `Some(None)`
+/// when the call is a routine's whose result was not recorded with this
+/// datum, `None` when `call` is no routine call or `value` no datum TOAST
+/// can hold in another form.
+fn call_result_form(
+    call: &crate::sql::ast::Expr<'_>,
+    value: &crate::sql::types::Datum<'_>,
+) -> Option<Option<DatumForm>> {
+    let identity = datum_identity(value)?;
+    let found = call_results::form(core::ptr::from_ref(call) as usize, identity);
+    if found.is_some() || routine_call(call) {
+        Some(found)
+    } else {
+        None
+    }
+}
+
+/// Whether `expression` calls a function with no built-in signature, whose
+/// result is the datum its routine returns.
+fn routine_call(expression: &crate::sql::ast::Expr<'_>) -> bool {
+    match expression {
+        crate::sql::ast::Expr::Call { name, kind, .. } => {
+            *kind == crate::sql::ast::CallKind::Routine
+                && crate::sql::catalog::builtin_callable_signatures(
+                    name.rsplit('.').next().unwrap_or(name),
+                )
+                .next()
+                .is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Whether `expression`, the body of a SQL function inlined into its
+/// caller, may give one of its parameters' datums unchanged: a parameter, a
+/// conversion leaving it as it was, or a branch choosing it.
+pub(crate) fn passes_parameter(expression: &crate::sql::ast::Expr<'_>) -> bool {
+    use crate::sql::ast::Expr;
+    match expression {
+        Expr::Param(_) => true,
+        Expr::Collate { operand, .. } | Expr::Cast { operand, .. } => passes_parameter(operand),
+        Expr::Case {
+            whens, otherwise, ..
+        } => whens
+            .iter()
+            .map(|(_, then)| *then)
+            .chain(otherwise.iter().copied())
+            .any(passes_parameter),
+        Expr::Call { name, args, .. } => {
+            let base = name.rsplit('.').next().unwrap_or(name);
+            ["coalesce", "greatest", "least", "nullif"]
+                .iter()
+                .any(|passing| base.eq_ignore_ascii_case(passing))
+                && args.iter().any(|arg| passes_parameter(arg))
+        }
+        _ => false,
+    }
+}
+
 /// The varlena header of a datum a row holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatumHeader {
@@ -704,6 +855,14 @@ fn source_of<'a>(
         }
         Ok(found)
     };
+    // A routine's result: a function, operator or cast function call.
+    if let Some(form) = call_result_form(expression, value) {
+        return Ok(Some(match form {
+            Some(DatumForm::Stored(_)) => Source::Stored,
+            Some(DatumForm::Formed) => Source::Fresh,
+            Some(DatumForm::Unknown) | None => Source::Unknown,
+        }));
+    }
     match expression {
         Expr::Column { qualifier, name } => column(*qualifier, name),
         Expr::SchemaColumn { table, name, .. } => column(Some(table), name),
@@ -932,23 +1091,6 @@ const PASSING_CALLS: &[&str] = &[
     "lead",
 ];
 
-/// Whether `expression` calls a function with no built-in signature. Such a
-/// function may return a datum it was given unchanged, so its result does
-/// not carry the datum's form.
-pub(crate) fn user_defined_call(expression: &crate::sql::ast::Expr<'_>) -> bool {
-    match expression {
-        crate::sql::ast::Expr::Call { name, kind, .. } => {
-            *kind == crate::sql::ast::CallKind::Routine
-                && crate::sql::catalog::builtin_callable_signatures(
-                    name.rsplit('.').next().unwrap_or(name),
-                )
-                .next()
-                .is_none()
-        }
-        _ => false,
-    }
-}
-
 /// Whether `expression` may give a datum read from a stored row: a column,
 /// a conversion leaving it as it was, a branch choosing it, an aggregate or
 /// window function passing an input datum on, or a subquery giving one.
@@ -964,6 +1106,8 @@ fn may_pass_stored(expression: &crate::sql::ast::Expr<'_>) -> bool {
             .map(|(_, then)| *then)
             .chain(otherwise.iter().copied())
             .any(may_pass_stored),
+        // A routine may return a datum it was given or read.
+        Expr::Call { .. } if routine_call(expression) => true,
         Expr::Call { name, args, .. } => {
             let base = name.rsplit('.').next().unwrap_or(name);
             ["coalesce", "greatest", "least", "nullif"]
@@ -1121,6 +1265,23 @@ fn given_form<'a>(
         }
         Ok(found)
     };
+    // A routine's result is the very datum it returned.
+    if let Some(form) = call_result_form(expression, value) {
+        return Ok(Some(match form {
+            Some(DatumForm::Stored(form)) => Given {
+                form,
+                identical: true,
+            },
+            Some(DatumForm::Formed) => Given {
+                form: StoredForm::Inline,
+                identical: false,
+            },
+            Some(DatumForm::Unknown) | None => Given {
+                form: StoredForm::Unmodelled,
+                identical: false,
+            },
+        }));
+    }
     match expression {
         Expr::Column { qualifier, name } => column(*qualifier, name),
         Expr::SchemaColumn { table, name, .. } => column(Some(table), name),

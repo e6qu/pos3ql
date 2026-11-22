@@ -233,6 +233,7 @@ impl SqlResult {
         txid: u32,
         sequences: &dyn crate::sql::eval::SequenceAccess,
         write: bool,
+        row_form: crate::sql::toast::DatumForm,
         arena: &Arena,
     ) -> Result<(), SqlError> {
         match self {
@@ -247,12 +248,20 @@ impl SqlResult {
                         || source.declared_result(storage, txid, arena),
                         arena,
                     )?;
-                    let captured = if write {
-                        coerce_sql_result(captured, source, storage, txid, arena, Some(sequences))?
+                    let (captured, form) = if write {
+                        let coerced = coerce_sql_result(
+                            captured,
+                            source,
+                            storage,
+                            txid,
+                            arena,
+                            Some(sequences),
+                        )?;
+                        (coerced, row_form.converted(&captured, &coerced))
                     } else {
-                        captured
+                        (captured, row_form)
                     };
-                    value.replace(&[captured])?;
+                    value.replace_held(&[captured], &[form])?;
                     *present = true;
                     *checked = write;
                 }
@@ -740,11 +749,37 @@ impl SqlExecution {
             } => {
                 let arena = context.arena;
                 if !*present {
-                    return Ok(FunctionOutput::Scalar(Datum::Null));
+                    return Ok(FunctionOutput::Scalar(
+                        Datum::Null,
+                        crate::sql::toast::DatumForm::Formed,
+                    ));
                 }
+                let mut row_form = [crate::sql::toast::DatumForm::Unknown];
+                value.held_forms(&mut row_form)?;
+                let form = match (row_form[0], parsed.program.result) {
+                    (
+                        crate::sql::toast::DatumForm::Stored(stored),
+                        query::RoutineFunctionResult::Query(result),
+                    ) => {
+                        // The caller's argument forms do not reach a body
+                        // run here.
+                        let form = query::sql_function_result_form(
+                            self.source.inlining(&parsed.program),
+                            result,
+                            Some(stored),
+                            &crate::sql::toast::UNRECORDED_ARGUMENTS,
+                        );
+                        if self.source.planned_with_constants {
+                            crate::sql::toast::DatumForm::Formed
+                        } else {
+                            form
+                        }
+                    }
+                    (form, _) => form,
+                };
                 let value = value.read(0, arena)?;
                 if *checked {
-                    return Ok(FunctionOutput::Scalar(value));
+                    return Ok(FunctionOutput::Scalar(value, form));
                 }
                 let txid = context.txn.txid;
                 execute_procedural_query(
@@ -763,7 +798,9 @@ impl SqlExecution {
                         )
                     },
                 )
-                .map(FunctionOutput::Scalar)
+                .map(|converted| {
+                    FunctionOutput::Scalar(converted, form.converted(&value, &converted))
+                })
             }
         };
         if output.is_ok() {
@@ -844,7 +881,7 @@ impl SqlExecution {
                         .as_ref()
                         .map(|saved| (saved.path, saved.view()));
                     let scalar = capture && !self.source.kind.is_set_returning();
-                    let mut emit = |values: &[Datum], _: &[StoredForm]| {
+                    let mut emit = |values: &[Datum], forms: &[StoredForm]| {
                         if capture {
                             self.result.capture(
                                 &self.source,
@@ -854,6 +891,9 @@ impl SqlExecution {
                                 txid,
                                 sequences,
                                 false,
+                                crate::sql::toast::DatumForm::Stored(
+                                    forms.first().copied().unwrap_or(StoredForm::Inline),
+                                ),
                                 arena,
                             )
                         } else {
@@ -1005,6 +1045,8 @@ impl SqlExecution {
                          sequences: &dyn crate::sql::eval::SequenceAccess,
                          values: &[Datum]| {
                             if capture {
+                                // A `RETURNING` row does not carry its
+                                // values' forms.
                                 self.result.capture(
                                     &self.source,
                                     shape,
@@ -1013,6 +1055,7 @@ impl SqlExecution {
                                     txid,
                                     sequences,
                                     true,
+                                    crate::sql::toast::DatumForm::Unknown,
                                     arena,
                                 )
                             } else {

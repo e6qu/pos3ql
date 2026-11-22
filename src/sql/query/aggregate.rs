@@ -13,6 +13,7 @@ use crate::sql::eval::{
     resolved_expression_collation, sqlstate,
 };
 use crate::sql::exec::MAX_PROJ;
+use crate::sql::toast::DatumForm;
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::storage::Storage;
@@ -1050,6 +1051,7 @@ impl<'a> AggState<'a> {
                 .call_routine_oid(
                     serde.serialize_oid,
                     &[incoming],
+                    &[DatumForm::Unknown],
                     &[self.custom_state_oid],
                     self.custom_input_collation,
                     crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
@@ -1065,6 +1067,7 @@ impl<'a> AggState<'a> {
                 .call_routine_oid(
                     serde.deserialize_oid,
                     &[serialized, Datum::Null],
+                    &[DatumForm::Unknown, DatumForm::Formed],
                     &[
                         crate::sql::types::oid::BYTEA,
                         crate::sql::types::oid::INTERNAL,
@@ -1102,6 +1105,7 @@ impl<'a> AggState<'a> {
                 .call_routine_oid(
                     partial.combine_oid,
                     &[current, incoming],
+                    &[DatumForm::Unknown; 2],
                     &[self.custom_state_oid, self.custom_state_oid],
                     self.custom_input_collation,
                     crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
@@ -1977,8 +1981,11 @@ impl<'a> AggState<'a> {
             .moving
             .expect("moving aggregate contract selected");
         let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut forms = [DatumForm::Unknown; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (index, expression) in args.iter().enumerate() {
             values[index] = eval_full(expression, arena, params, row, hooks)?;
+            forms[index + 1] =
+                crate::sql::toast::held_form(expression, row, hooks.catalog, &values[index])?;
         }
         if self.custom_inverse_strict && values[..args.len()].iter().any(Datum::is_null) {
             return Ok(true);
@@ -2000,6 +2007,8 @@ impl<'a> AggState<'a> {
             .call_routine_oid(
                 moving.inverse_oid,
                 &arguments[..1 + args.len()],
+                // The state is kept without how it is held.
+                &forms[..1 + args.len()],
                 &argument_type_oids[..1 + args.len()],
                 self.custom_input_collation,
                 crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
@@ -2274,8 +2283,11 @@ impl<'a> AggState<'a> {
                 (&ordered_expressions[..order_by.len()], order_by)
             };
         let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut forms = [DatumForm::Unknown; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (index, expression) in transition_expressions.iter().enumerate() {
             values[index] = eval_full(expression, arena, params, row, hooks)?;
+            forms[index] =
+                crate::sql::toast::held_form(expression, row, hooks.catalog, &values[index])?;
             let collation = resolved_expression_collation(expression, row, hooks.catalog)?;
             self.order_collations_mut()[index] = collation;
         }
@@ -2315,6 +2327,7 @@ impl<'a> AggState<'a> {
                 aggregate.transition_oid
             },
             &values[..transition_expressions.len()],
+            &forms[..transition_expressions.len()],
             arena,
             hooks.catalog,
         )?;
@@ -2322,10 +2335,13 @@ impl<'a> AggState<'a> {
         Ok(())
     }
 
+    /// Calls the transition function with the state and `values`, each
+    /// held as `forms` says.
     fn apply_custom_transition(
         &mut self,
         transition_oid: i32,
         values: &[Datum<'a>],
+        forms: &[DatumForm],
         arena: &'a Arena,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Result<(), SqlError> {
@@ -2348,8 +2364,11 @@ impl<'a> AggState<'a> {
         })?;
         let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut argument_type_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        // The state is kept without how it is held.
+        let mut argument_forms = [DatumForm::Unknown; crate::storage::MAX_ROUTINE_ARGUMENTS];
         arguments[0] = self.best.unwrap_or(Datum::Null);
         arguments[1..1 + values.len()].copy_from_slice(values);
+        argument_forms[1..1 + values.len()].copy_from_slice(forms);
         argument_type_oids[0] = if self.custom_moving {
             self.custom_moving_state_oid
         } else {
@@ -2361,6 +2380,7 @@ impl<'a> AggState<'a> {
             .call_routine_oid(
                 transition_oid,
                 &arguments[..1 + values.len()],
+                &argument_forms[..1 + values.len()],
                 &argument_type_oids[..1 + values.len()],
                 self.custom_input_collation,
                 crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
@@ -3531,9 +3551,11 @@ impl<'a> AggState<'a> {
                 for (index, value) in values.iter_mut().enumerate().take(argument_count) {
                     *value = crate::sql::exec::decode_projected_col_record(row, index, arena)?;
                 }
+                // A sorted input is passed on without how it was held.
                 self.apply_custom_transition(
                     aggregate.transition_oid,
                     &values[..argument_count],
+                    &crate::sql::toast::UNRECORDED_ARGUMENTS[..argument_count],
                     arena,
                     catalog,
                 )?;
@@ -3589,6 +3611,7 @@ impl<'a> AggState<'a> {
             .call_routine_oid(
                 final_function.function_oid,
                 &arguments[..count],
+                &crate::sql::toast::UNRECORDED_ARGUMENTS[..count],
                 &argument_type_oids[..count],
                 self.custom_input_collation,
                 crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),

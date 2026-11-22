@@ -2167,6 +2167,53 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
         .any(|known| known.eq_ignore_ascii_case(tag))
 }
 
+/// Whether a statement runs at the top level or inside a routine:
+/// PostgreSQL's `isTopLevel`, which decides how its transaction-block checks
+/// (`RequireTransactionBlock`, `WarnNoTransactionBlock`,
+/// `PreventInTransactionBlock`) treat a statement outside a block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatementLevel {
+    TopLevel,
+    Nested,
+}
+
+impl StatementLevel {
+    /// Whether `CheckTransactionBlock` reports this statement as outside a
+    /// transaction block: only a top-level one in no block, implicit or
+    /// explicit, and no subtransaction.
+    fn outside_transaction_block(self, txn: &TxnState) -> bool {
+        self == Self::TopLevel && !txn.is_transaction_block() && !txn.has_savepoints()
+    }
+}
+
+/// `PreventInTransactionBlock`'s error for `command` run inside a routine:
+/// a block or subtransaction reports itself before the routine does.
+fn nested_top_level_only_error(command: TopLevelCommand, txn: &TxnState) -> SqlError {
+    if txn.is_transaction_block() || txn.has_savepoints() {
+        sql_err!(
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            "{} cannot run inside a transaction block",
+            command.label()
+        )
+    } else {
+        sql_err!(
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            "{} cannot be executed from a function",
+            command.label()
+        )
+    }
+}
+
+/// The level of a statement the executor runs: a nested routine statement
+/// keeps the enclosing query's workspace.
+const fn statement_level(reset_workspace: bool) -> StatementLevel {
+    if reset_workspace {
+        StatementLevel::TopLevel
+    } else {
+        StatementLevel::Nested
+    }
+}
+
 #[derive(Clone, Copy)]
 enum TopLevelCommand {
     // These preserve PostgreSQL's immediate-commit flag. Commands that
@@ -10960,6 +11007,7 @@ impl Engine {
         value: &str,
         local: bool,
         syntax: ast::SettingSyntax,
+        level: StatementLevel,
         txn: &mut TxnState,
         guc: &GucState,
         arena: &Arena,
@@ -10970,7 +11018,7 @@ impl Engine {
         {
             return Ok(Err(error));
         }
-        if local && !txn.is_explicit() {
+        if local && level.outside_transaction_block(txn) {
             responder.warning(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                 "SET LOCAL can only be used in transaction blocks",
@@ -11185,10 +11233,11 @@ impl Engine {
         tables: &[ast::QualName<'_>],
         mode: ast::TableLockMode,
         nowait: bool,
+        level: StatementLevel,
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if !txn.is_explicit() {
+        if level.outside_transaction_block(txn) {
             return Ok(Err(sql_err!(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                 "LOCK TABLE can only be used in transaction blocks"
@@ -11221,6 +11270,7 @@ impl Engine {
         &mut self,
         targets: ast::ConstraintTargets<'_>,
         mode: ast::ConstraintMode,
+        level: StatementLevel,
         txn: &mut TxnState,
         guc: &GucState,
         cursors: &mut cursor::CursorPool,
@@ -11228,7 +11278,9 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let _atomic_reads = self.atomic_block_read_scope();
-        if !txn.is_explicit() {
+        // Outside any block the mode would end with the statement's own
+        // transaction, so only the warning remains.
+        if level.outside_transaction_block(txn) {
             responder.warning(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                 "SET CONSTRAINTS can only be used in transaction blocks",
@@ -19932,8 +19984,8 @@ impl Engine {
                     .map_err(BodyError::Wire)?
                     .map_err(BodyError::Sql)?;
                 match output {
-                    exec::FunctionOutput::Scalar(value) => {
-                        exec::encode_projected_pub(&[value], scratch)
+                    exec::FunctionOutput::Scalar(value, form) => {
+                        exec::encode_projected_held(&[value], &[form], scratch)
                     }
                     exec::FunctionOutput::Rows(rows) => exec::pack_projected_rows(rows, scratch),
                 }
@@ -20047,8 +20099,8 @@ impl Engine {
                     scratch,
                     responder,
                 )? {
-                    exec::FunctionOutput::Scalar(value) => {
-                        exec::encode_projected_pub(&[value], scratch)
+                    exec::FunctionOutput::Scalar(value, form) => {
+                        exec::encode_projected_held(&[value], &[form], scratch)
                     }
                     exec::FunctionOutput::Rows(rows) => exec::pack_projected_rows(rows, scratch),
                 }
@@ -22328,7 +22380,7 @@ impl Engine {
                 if routine.language == crate::storage::RoutineLanguage::PlPgSql {
                     let txid = txn.txid;
                     guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
-                    let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                    let mut output_values = exec::ProcedureOutputValues::new();
                     let (instance, conflict) = match self.plpgsql_instance_owner(
                         routine,
                         input_collation,
@@ -22378,7 +22430,8 @@ impl Engine {
                     if let Some(capture) = capture.as_deref_mut() {
                         if let Err(error) = capture.record(
                             routine,
-                            &output_values[..output_count],
+                            &output_values.values[..output_count],
+                            &output_values.forms[..output_count],
                             &self.storage,
                             txn.txid,
                             arena,
@@ -22418,8 +22471,8 @@ impl Engine {
                                 type_oid,
                                 parameter.ctype.typlen(),
                             );
-                            output_values[output_index] = match eval::cast_to(
-                                output_values[output_index],
+                            output_values.values[output_index] = match eval::cast_to(
+                                output_values.values[output_index],
                                 parameter.ctype,
                                 arena,
                             ) {
@@ -22429,7 +22482,7 @@ impl Engine {
                             output_index += 1;
                         }
                         responder.row_description(&description[..output_count])?;
-                        responder.data_row(&output_values[..output_count])?;
+                        responder.data_row(&output_values.values[..output_count])?;
                     }
                     return responder.command_complete("CALL").map(|_| Ok(()));
                 }
@@ -22685,9 +22738,12 @@ impl Engine {
                             )));
                         }
                         if let Some(capture) = capture.as_deref_mut() {
+                            // A SQL procedure's output row does not carry
+                            // its values' forms.
                             if let Err(error) = capture.record(
                                 routine,
                                 &output_values[..output_count],
+                                &crate::sql::toast::UNRECORDED_ARGUMENTS[..output_count],
                                 &self.storage,
                                 txn.txid,
                                 arena,
@@ -23353,7 +23409,6 @@ impl Engine {
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
-        transaction_context: exec::PlpgsqlTransactionContext,
         arena: &Arena,
         responder: &mut Responder,
         execute: F,
@@ -23379,14 +23434,8 @@ impl Engine {
                 ),
             )));
         }
-        if transaction_context == exec::PlpgsqlTransactionContext::Atomic
-            && let Some(command) = top_level_only_command(statement)
-        {
-            return Ok(Err(sql_err!(
-                sqlstate::ACTIVE_SQL_TRANSACTION,
-                "{} cannot run inside a transaction block",
-                command.label()
-            )));
+        if let Some(command) = top_level_only_command(statement) {
+            return Ok(Err(nested_top_level_only_error(command, txn)));
         }
         if txn.read_only && statement_writes(statement) {
             return Ok(Err(sql_err!(
@@ -23676,14 +23725,17 @@ impl Engine {
                 ),
             )));
         }
-        if routine_transaction_context == exec::PlpgsqlTransactionContext::Atomic
-            && let Some(command) = top_level_only_command(statement)
-        {
-            return Ok(Err(sql_err!(
-                sqlstate::ACTIVE_SQL_TRANSACTION,
-                "{} cannot run inside a transaction block",
-                command.label()
-            )));
+        if let Some(command) = top_level_only_command(statement) {
+            if !reset_workspace {
+                return Ok(Err(nested_top_level_only_error(command, txn)));
+            }
+            if routine_transaction_context == exec::PlpgsqlTransactionContext::Atomic {
+                return Ok(Err(sql_err!(
+                    sqlstate::ACTIVE_SQL_TRANSACTION,
+                    "{} cannot run inside a transaction block",
+                    command.label()
+                )));
+            }
         }
         if txn.read_only && statement_writes(statement) {
             return Ok(Err(sql_err!(
@@ -26485,7 +26537,14 @@ impl Engine {
                 tables,
                 mode,
                 nowait,
-            } => self.execute_lock_table_statement(tables, *mode, *nowait, txn, responder),
+            } => self.execute_lock_table_statement(
+                tables,
+                *mode,
+                *nowait,
+                statement_level(reset_workspace),
+                txn,
+                responder,
+            ),
             Stmt::Savepoint(name) => {
                 if !txn.is_explicit() {
                     return Ok(Err(sql_err!(
@@ -26553,16 +26612,31 @@ impl Engine {
                 Ok(Ok(()))
             }
             Stmt::SetConstraints { targets, mode } => self.execute_set_constraints_statement(
-                *targets, *mode, txn, guc, cursors, arena, responder,
+                *targets,
+                *mode,
+                statement_level(reset_workspace),
+                txn,
+                guc,
+                cursors,
+                arena,
+                responder,
             ),
             Stmt::Set {
                 name,
                 value,
                 local,
                 syntax,
-            } => {
-                self.execute_set_statement(name, value, *local, *syntax, txn, guc, arena, responder)
-            }
+            } => self.execute_set_statement(
+                name,
+                value,
+                *local,
+                *syntax,
+                statement_level(reset_workspace),
+                txn,
+                guc,
+                arena,
+                responder,
+            ),
             Stmt::SetCatalog(_) => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "current database cannot be changed"

@@ -291,20 +291,23 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 #### 1. Finish work in progress
 
 - [ ] **TOAST stored forms in routines.** PostgreSQL passes a stored
-  (compressed or out-of-line) datum on unchanged; pos3ql does not yet carry
-  that form in these places, and each is `0A000` where the form decides a
-  size (`pg_column_size`):
+  (compressed or out-of-line) datum on unchanged. A function's result
+  (PL/pgSQL `RETURN`, a SQL function's inlined body or result tuple, a folded
+  IMMUTABLE call, a user-defined operator or cast), the arguments a
+  user-defined cast, operator or aggregate transition function is passed,
+  and a procedure's output parameters keep their forms (`998`). Still `0A000` where the form decides a size
+  (`pg_column_size`):
   - `NEW` and `OLD` columns: PostgreSQL reads a `BEFORE` trigger's `NEW` as
     formed (3004 bytes) and an `AFTER` trigger's as stored (44); the firing
     path, the movable engine firings and queued `AFTER` events carry row
     values without forms;
-  - the datum a user-defined function returns (PostgreSQL passes a returned
-    parameter on unchanged); pos3ql takes it as formed anew where its size
-    feeds a plan;
-  - an argument passed on by a user-defined cast, operator or support
-    function, or a domain conversion (PostgreSQL keeps the caller's datum,
-    44, as `EXECUTE 'CALL p($1)' USING` does in pos3ql: `992`);
-  - a procedure's output parameters returned to `CALL`.
+  - a domain `CHECK`'s `VALUE`: the coercion does not carry its datum's form
+    into the check;
+  - an aggregate's transition state, its sorted or `DISTINCT` inputs, and
+    its final function's arguments; an array constructor element's cast;
+  - a SQL function body that returns a parameter without being inlined
+    (PostgreSQL's plan cache folds it into a new datum or passes it on),
+    and a SQL procedure's or data-modifying SQL function's result row.
 - [ ] **TOAST stored forms in the executor:** the input datum `min`, `max`,
   `any_value`, `mode`, `percentile_disc` and window value functions return,
   grouping keys, scalar subqueries, window rows, index-only scans, `RETURNING`

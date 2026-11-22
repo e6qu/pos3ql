@@ -399,6 +399,8 @@ pub(super) unsafe fn for_each_validation_row(
 /// candidate input, for evaluating that domain's CHECK predicates.
 struct ValueLookup<'v> {
     value: Datum<'v>,
+    /// The domain's base type, which `VALUE` has.
+    ctype: crate::sql::types::ColType,
 }
 
 impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
@@ -411,6 +413,20 @@ impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
         Ok(crate::sql::toast::unknown_form(
             &self.lookup(qualifier, name)?,
         ))
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
+        (qualifier.is_none() && name.eq_ignore_ascii_case("value")).then_some(self.ctype)
+    }
+
+    // `VALUE` is the datum the coercion was given, held in a form this
+    // lookup does not record.
+    fn datum_header(
+        &self,
+        _qualifier: Option<&str>,
+        _name: &str,
+    ) -> crate::sql::toast::DatumHeader {
+        crate::sql::toast::DatumHeader::Unknown
     }
 
     fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
@@ -653,7 +669,10 @@ pub(crate) fn validate_domain_check<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
-    let context = ValueLookup { value };
+    let context = ValueLookup {
+        value,
+        ctype: domain.base,
+    };
     let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         catalog: Some(&catalog),

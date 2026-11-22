@@ -126,6 +126,63 @@ WHERE relname LIKE 'iv%' ORDER BY relname;
 COMMIT;
 SELECT relname, relpages, reltuples FROM pg_class
 WHERE relname LIKE 'iv%' ORDER BY relname;
+-- Only a table created or truncated in the current subtransaction is: a
+-- savepoint, or a PL/pgSQL exception block, starts a new one, and releasing
+-- it hands its tables to the enclosing one.
+BEGIN;
+CREATE TABLE ia(a int PRIMARY KEY);
+INSERT INTO ia SELECT generate_series(1, 1000);
+SAVEPOINT s;
+TRUNCATE ia;
+COMMIT;
+SELECT relname, relpages, reltuples FROM pg_class
+WHERE relname LIKE 'ia%' ORDER BY relname;
+BEGIN;
+SAVEPOINT s;
+CREATE TABLE ib(a int PRIMARY KEY);
+INSERT INTO ib SELECT generate_series(1, 1000);
+RELEASE s;
+TRUNCATE ib;
+COMMIT;
+SELECT relname, relpages, reltuples FROM pg_class
+WHERE relname LIKE 'ib%' ORDER BY relname;
+BEGIN;
+CREATE TABLE ic(a int PRIMARY KEY);
+INSERT INTO ic SELECT generate_series(1, 1000);
+SAVEPOINT s;
+SELECT 1/0;
+ROLLBACK TO s;
+TRUNCATE ic;
+COMMIT;
+SELECT relname, relpages, reltuples FROM pg_class
+WHERE relname LIKE 'ic%' ORDER BY relname;
+INSERT INTO iv SELECT generate_series(21, 30);
+BEGIN;
+TRUNCATE iv;
+SAVEPOINT s;
+TRUNCATE iv;
+COMMIT;
+SELECT relname, relpages, reltuples FROM pg_class
+WHERE relname LIKE 'iv%' ORDER BY relname;
+CREATE FUNCTION truncate_blocks() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  CREATE TABLE id(a int PRIMARY KEY);
+  INSERT INTO id SELECT generate_series(1, 1000);
+  BEGIN
+    TRUNCATE id;
+  EXCEPTION WHEN division_by_zero THEN NULL;
+  END;
+  BEGIN
+    CREATE TABLE ie(a int PRIMARY KEY);
+    INSERT INTO ie SELECT generate_series(1, 1000);
+    TRUNCATE ie;
+  EXCEPTION WHEN division_by_zero THEN NULL;
+  END;
+END $$;
+SELECT truncate_blocks();
+SELECT relname, relpages, reltuples FROM pg_class
+WHERE relname ~ '^i[de]' ORDER BY relname;
+DROP FUNCTION truncate_blocks();
 -- A rolled-back CREATE INDEX leaves the table's counts it made.
 CREATE TABLE ir(a int);
 INSERT INTO ir SELECT generate_series(1, 1000);
@@ -151,4 +208,4 @@ CREATE INDEX ix_spgist ON ix USING spgist(p);
 CREATE INDEX ix_brin ON ix USING brin(a);
 SELECT relname, relpages, reltuples FROM pg_class
 WHERE relname LIKE 'ix%' ORDER BY relname;
-DROP TABLE ip, iu, iv, ir, iq, ix;
+DROP TABLE ip, iu, iv, ir, iq, ix, ia, ib, ic, id, ie;

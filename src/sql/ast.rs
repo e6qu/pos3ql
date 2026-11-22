@@ -7522,8 +7522,11 @@ pub enum BinaryOp {
     And,
     Or,
     Concat,
-    /// `@@` and its PostgreSQL-compatible `@@@` alias.
+    /// `@@`.
     TextSearchMatch,
+    /// `@@@`, PostgreSQL's deprecated `tsvector`/`tsquery` match operator: a
+    /// separate operator, which a user may also define for other types.
+    TextSearchMatchAlias,
     /// `<->` between two tsquery values.
     TextSearchPhrase,
     /// `json -> key/index` — returns json/jsonb.
@@ -7610,7 +7613,8 @@ impl BinaryOp {
             b"~>~" => Self::PatternGt,
             b"~>=~" => Self::PatternGtEq,
             b"||" => Self::Concat,
-            b"@@" | b"@@@" => Self::TextSearchMatch,
+            b"@@" => Self::TextSearchMatch,
+            b"@@@" => Self::TextSearchMatchAlias,
             b"<->" => Self::TextSearchPhrase,
             b"->" => Self::JsonGet,
             b"->>" => Self::JsonGetText,
@@ -7666,6 +7670,7 @@ impl BinaryOp {
             Self::PatternGtEq => "~>=~",
             Self::Concat => "||",
             Self::TextSearchMatch => "@@",
+            Self::TextSearchMatchAlias => "@@@",
             Self::TextSearchPhrase => "<->",
             Self::JsonGet => "->",
             Self::JsonGetText => "->>",
@@ -7728,7 +7733,7 @@ impl BinaryOp {
             | Self::PatternGtEq => 4,
             // Containment/overlap/adjacency operators bind like comparisons.
             Self::Contains | Self::ContainedBy | Self::Overlaps => 4,
-            Self::TextSearchMatch => 4,
+            Self::TextSearchMatch | Self::TextSearchMatchAlias => 4,
             Self::NotRightOf | Self::NotLeftOf | Self::Adjacent => 4,
             Self::Same
             | Self::Below

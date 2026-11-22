@@ -296,6 +296,8 @@ pub(crate) fn dispatch<'a>(
                         right: args[1],
                         search_catalog: true,
                         nulls: super::super::OperatorNulls::ReturnNull,
+                        // NULLIF gives its first argument, not the result.
+                        site: None,
                     },
                     left,
                     right,

@@ -350,7 +350,7 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
                     }
                     TriggerReturnValue::Old => binding.rows.old.value(),
                     TriggerReturnValue::New => binding.rows.new.value(),
-                    TriggerReturnValue::Value(value) => TriggerRecordValue::Foreign(value),
+                    TriggerReturnValue::Value(value, _) => TriggerRecordValue::Foreign(value),
                 };
                 let returned = match record {
                     TriggerRecordValue::Row(row) => Some(row),

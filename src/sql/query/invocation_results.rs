@@ -60,6 +60,20 @@ impl ResultBytes {
         super::super::exec::decode_projected_col_record(bytes, 0, output)
     }
 
+    /// The scalar result with how its routine held it, which the image
+    /// records (a value without a record is held as a tuple holds it).
+    pub(super) fn held_scalar<'out>(
+        self,
+        source: &Arena,
+        output: &'out Arena,
+    ) -> Result<(Datum<'out>, crate::sql::toast::DatumForm), SqlError> {
+        let bytes = self.copy(source, output)?;
+        Ok((
+            super::super::exec::decode_projected_col_record(bytes, 0, output)?,
+            super::super::exec::projected_datum_form(bytes, 0),
+        ))
+    }
+
     pub(super) fn rows<'out>(
         self,
         source: &'out Arena,

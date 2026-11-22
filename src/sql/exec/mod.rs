@@ -1896,11 +1896,11 @@ pub(crate) use projected::{
     PROJECTED_TEXT_TAG, ProjectedValue, compare_projected_key, compare_projected_prefix,
     compare_projected_rows, compare_projected_values, decode_projected_row_into,
     encode_projected_by_into, encode_projected_formed, encode_projected_formed_into,
-    encode_projected_held_into, encode_projected_into, encode_projected_persistent_pub,
-    pack_projected_rows, projected_datum_form, projected_row_len, projected_row_len_by,
-    projected_row_len_formed, projected_row_len_held, projected_row_width, projected_stored_form,
-    projected_stored_form_at, projected_stored_forms, projected_value_size, try_each_record_field,
-    unpack_projected_rows,
+    encode_projected_held, encode_projected_held_into, encode_projected_into,
+    encode_projected_persistent_pub, pack_projected_rows, projected_datum_form, projected_row_len,
+    projected_row_len_by, projected_row_len_formed, projected_row_len_held, projected_row_width,
+    projected_stored_form, projected_stored_form_at, projected_stored_forms, projected_value_size,
+    try_each_record_field, unpack_projected_rows,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,
@@ -22588,7 +22588,8 @@ enum TriggerReturnValue<'a> {
     Old,
     Null,
     Void,
-    Value(Datum<'a>),
+    /// A returned value and how the function holds it.
+    Value(Datum<'a>, DatumForm),
 }
 
 /// The PL/pgSQL execution boundary determines which runtime-only names and
@@ -24925,8 +24926,7 @@ fn execute_plpgsql_dynamic_call<'a>(
 /// written argument.
 struct PlpgsqlCallOutputs<'a> {
     arguments: [Option<SqlName>; crate::storage::MAX_ROUTINE_ARGUMENTS],
-    assigned: [Option<u8>; crate::storage::MAX_ROUTINE_ARGUMENTS],
-    values: [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    outputs: ProcedureOutputs<'a>,
 }
 
 /// Runs a static `CALL` as PL/pgSQL's `exec_stmt_call` does: arguments are
@@ -25043,8 +25043,7 @@ fn execute_plpgsql_call<'a>(
         )?;
         return Ok(PlpgsqlCallOutputs {
             arguments: targets,
-            assigned: outputs.assigned,
-            values: outputs.values,
+            outputs,
         });
     };
     let retained = context.txn.retains_write_frame();
@@ -25071,8 +25070,7 @@ fn execute_plpgsql_call<'a>(
     routine_utility_outcome(outcome)?;
     Ok(PlpgsqlCallOutputs {
         arguments: targets,
-        assigned: outputs.assigned,
-        values: outputs.values,
+        outputs,
     })
 }
 
@@ -25225,7 +25223,7 @@ fn execute_atomic_procedure_call<'a>(
             .storage()
             .ensure_function_statistics(procedure_oid)?;
     }
-    let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let mut output_values = ProcedureOutputValues::new();
     let host = context.host.reborrow();
     let mut procedure_context = TriggerExecContext {
         host,
@@ -25240,7 +25238,7 @@ fn execute_atomic_procedure_call<'a>(
             slot,
             routine,
             completed.input_collation,
-            &mut output_values,
+            &mut output_values.values,
         )?
     } else {
         run_plpgsql_procedure(
@@ -25263,7 +25261,8 @@ fn execute_atomic_procedure_call<'a>(
     }
     outputs.record(
         routine,
-        &output_values[..output_count],
+        &output_values.values[..output_count],
+        &output_values.forms[..output_count],
         context.storage(),
         txid,
         arena,
@@ -25696,6 +25695,12 @@ pub(crate) struct ProcedureOutputs<'a> {
     /// The output ordinal each written argument receives, if any.
     pub assigned: [Option<u8>; crate::storage::MAX_ROUTINE_ARGUMENTS],
     pub values: [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    /// How the procedure held each output value.
+    pub forms: [DatumForm; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    /// Each output parameter's name and type, the columns of the row the
+    /// call returns.
+    pub names: [SqlName; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    pub type_oids: [i32; crate::storage::MAX_ROUTINE_ARGUMENTS],
     pub count: usize,
 }
 
@@ -25705,6 +25710,9 @@ impl<'a> ProcedureOutputs<'a> {
             writable,
             assigned: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
             values: [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS],
+            forms: [DatumForm::Unknown; crate::storage::MAX_ROUTINE_ARGUMENTS],
+            names: [SqlName::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS],
+            type_oids: [0; crate::storage::MAX_ROUTINE_ARGUMENTS],
             count: 0,
         }
     }
@@ -25751,22 +25759,47 @@ impl<'a> ProcedureOutputs<'a> {
         Ok(())
     }
 
-    /// Records the finished call's outputs, converted to their declared types.
+    /// Records the finished call's outputs, held as `forms` says,
+    /// converted to their declared types.
     pub(crate) fn record(
         &mut self,
         routine: &crate::storage::RoutineDef,
         values: &[Datum<'_>],
+        forms: &[DatumForm],
         storage: &Storage,
         txid: u32,
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
+        if forms.len() != values.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "procedure output forms do not match its outputs"
+            ));
+        }
         let outputs = routine
             .parameters()
             .iter()
             .filter(|parameter| parameter.mode.is_output());
-        for ((slot, value), parameter) in self.values.iter_mut().zip(values).zip(outputs) {
+        for (index, (((slot, held), (value, form)), parameter)) in self
+            .values
+            .iter_mut()
+            .zip(self.forms.iter_mut())
+            .zip(values.iter().zip(forms))
+            .zip(outputs)
+            .enumerate()
+        {
+            self.names[index] = parameter.name;
+            self.type_oids[index] = storage
+                .routine_type_oid(parameter.ctype, parameter.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "procedure output parameter type no longer exists"
+                    )
+                })?;
+            let detached = detach_routine_datum(*value, arena)?;
             *slot = coerce_routine_argument(
-                detach_routine_datum(*value, arena)?,
+                detached,
                 crate::storage::RoutineArgumentDef {
                     name: parameter.name,
                     ctype: parameter.ctype,
@@ -25777,9 +25810,21 @@ impl<'a> ProcedureOutputs<'a> {
                 arena,
                 None,
             )?;
+            *held = form.converted(&detached, slot);
         }
         self.count = values.len();
         Ok(())
+    }
+
+    /// The form output `index` has in the row a procedure returns its
+    /// outputs in: tuple forming packs a value formed anew and keeps a
+    /// stored datum's TOAST form.
+    pub(crate) fn tuple_form(&self, index: usize) -> crate::storage::StoredForm {
+        match self.forms[index] {
+            DatumForm::Stored(form) => form,
+            DatumForm::Formed => crate::storage::StoredForm::Inline,
+            DatumForm::Unknown => crate::sql::toast::uncarried_form(&self.values[index]),
+        }
     }
 }
 
@@ -29140,11 +29185,35 @@ fn parse_trigger_statement<'a>(
             into,
         });
     }
-    if [
-        "create", "alter", "drop", "comment", "grant", "revoke", "set", "reset", "discard",
+    // Maintenance and session commands PostgreSQL hands to its SQL parser
+    // like any other utility; several stand alone or open with an option
+    // list (`ANALYZE`, `VACUUM (VERBOSE) t`) or a string (`LOAD 'lib'`).
+    let maintenance = [
+        "truncate",
+        "lock",
+        "notify",
+        "listen",
+        "unlisten",
+        "analyze",
+        "analyse",
+        "vacuum",
+        "cluster",
+        "reindex",
+        "refresh",
+        "security",
+        "import",
+        "load",
+        "checkpoint",
+        "reassign",
     ]
     .iter()
-    .any(|keyword| strip_trigger_keyword(segment, keyword).is_some())
+    .any(|keyword| strip_trigger_keyword(segment, keyword).is_some());
+    if maintenance
+        || [
+            "create", "alter", "drop", "comment", "grant", "revoke", "set", "reset", "discard",
+        ]
+        .iter()
+        .any(|keyword| strip_trigger_keyword(segment, keyword).is_some())
     {
         use crate::sql::lexer::{Lexer, Tok};
         let mut lexer = Lexer::new(segment, arena);
@@ -29156,10 +29225,12 @@ fn parse_trigger_statement<'a>(
         })?;
         // A utility starts with two words; assignment punctuation belongs to
         // the local-variable parser even when the variable is named alter.
-        if matches!(
-            (first, second),
-            (Tok::Ident(_), Tok::Ident(_) | Tok::QuotedIdent(_))
-        ) {
+        let utility = match (first, second) {
+            (Tok::Ident(_), Tok::Ident(_) | Tok::QuotedIdent(_)) => true,
+            (Tok::Ident(_), Tok::Str(_) | Tok::Eof | Tok::Op("(")) => maintenance,
+            _ => false,
+        };
+        if utility {
             super::plpgsql_inputs::record(
                 super::plpgsql_inputs::Kind::Statement,
                 segment.as_ptr() as usize,
@@ -31548,7 +31619,7 @@ pub(in crate::sql) fn execute_plpgsql_procedure<'a>(
     forms: &'a [DatumForm],
     arena: &'a Arena,
     responder: &mut Responder<'_>,
-    outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    outputs: &mut ProcedureOutputValues<'a>,
     environment: &CallEnvironment,
     timing: Option<super::statistics::FunctionTiming>,
     retention: Option<&mut Option<SuspendedProcedure>>,
@@ -31800,22 +31871,41 @@ fn procedure_seeded_values<'a>(
     Ok(seeded)
 }
 
-/// Copies each OUT and INOUT parameter's final value, by name.
+/// Copies each OUT and INOUT parameter's final value, by name, with how
+/// its variable holds it.
 fn procedure_output_values<'a>(
     routine: &crate::storage::RoutineDef,
     execution: &execution_frame::ExecutionFrame<'_, 'a>,
-    outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    outputs: &mut ProcedureOutputValues<'a>,
 ) -> usize {
     let mut output_count = 0usize;
     for (index, parameter) in routine.parameters().iter().enumerate() {
         if !parameter.mode.is_output() {
             continue;
         }
-        outputs[output_count] = parameter_slot(&execution.locals, index, parameter)
-            .map_or(Datum::Null, |slot| execution.values[slot].value);
+        let slot = parameter_slot(&execution.locals, index, parameter)
+            .map_or(LocalSlot::NULL, |slot| execution.values[slot]);
+        outputs.values[output_count] = slot.value;
+        outputs.forms[output_count] = slot.form;
         output_count += 1;
     }
     output_count
+}
+
+/// The output values a procedure body finishes with and how it holds each.
+pub(crate) struct ProcedureOutputValues<'a> {
+    pub(crate) values: [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    pub(crate) forms: [DatumForm; crate::storage::MAX_ROUTINE_ARGUMENTS],
+}
+
+impl ProcedureOutputValues<'_> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            values: [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS],
+            // A SQL procedure's output row does not carry its forms.
+            forms: [DatumForm::Unknown; crate::storage::MAX_ROUTINE_ARGUMENTS],
+        }
+    }
 }
 
 /// Runs a PL/pgSQL procedure body on `context`'s host with `context.params`
@@ -31826,7 +31916,7 @@ fn run_plpgsql_procedure<'a>(
     routine: &crate::storage::RoutineDef,
     forms: &[DatumForm],
     input_collation: crate::sql::ast::Collation,
-    outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    outputs: &mut ProcedureOutputValues<'a>,
     compiled_conflict: super::guc::PlpgsqlSettings,
 ) -> Result<usize, SqlError> {
     let arena = context.arena;
@@ -35532,7 +35622,7 @@ fn execute_bound_plpgsql_utility<'a>(
                         guc,
                         sqlprep,
                         cursors,
-                        transaction_context,
+                        ..
                     } = &mut context.host
                     else {
                         return Err(engine_triggers::engine_required(sql_err!(
@@ -35547,7 +35637,6 @@ fn execute_bound_plpgsql_utility<'a>(
                             sqlprep,
                             cursors,
                             guc,
-                            *transaction_context,
                             context.arena,
                             responder,
                             |engine, txn, _, _, _, responder| {
@@ -35613,7 +35702,7 @@ fn execute_bound_plpgsql_utility<'a>(
                                     guc,
                                     sqlprep,
                                     cursors,
-                                    transaction_context,
+                                    ..
                                 } = &mut context.host
                                 else {
                                     unreachable!(
@@ -35636,7 +35725,6 @@ fn execute_bound_plpgsql_utility<'a>(
                                         sqlprep,
                                         cursors,
                                         guc,
-                                        *transaction_context,
                                         context.arena,
                                         responder,
                                         |engine, txn, _, _, _, responder| {
@@ -35700,7 +35788,7 @@ fn execute_bound_plpgsql_utility<'a>(
                 guc,
                 sqlprep,
                 cursors,
-                transaction_context,
+                ..
             } = &mut context.host
             else {
                 return Err(engine_triggers::engine_required(sql_err!(
@@ -35715,7 +35803,6 @@ fn execute_bound_plpgsql_utility<'a>(
             sqlprep,
             cursors,
             guc,
-            *transaction_context,
             context.arena,
             responder,
             |engine, txn, sqlprep, cursors, guc, responder| match query.statement {
@@ -37254,6 +37341,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     value,
                     *local,
                     *syntax,
+                    super::StatementLevel::Nested,
                     txn,
                     guc,
                     context.arena,
@@ -37323,10 +37411,18 @@ fn execute_bound_plpgsql_utility<'a>(
                     tables,
                     mode,
                     nowait,
-                } => engine.execute_lock_table_statement(tables, *mode, *nowait, txn, responder),
+                } => engine.execute_lock_table_statement(
+                    tables,
+                    *mode,
+                    *nowait,
+                    super::StatementLevel::Nested,
+                    txn,
+                    responder,
+                ),
                 Stmt::SetConstraints { targets, mode } => engine.execute_set_constraints_statement(
                     *targets,
                     *mode,
+                    super::StatementLevel::Nested,
                     txn,
                     guc,
                     cursors,
@@ -41343,7 +41439,10 @@ fn execute_trigger_step_in<'a>(
                                 "cannot return non-composite value from function returning composite type"
                             ));
                         }
-                        TriggerReturnValue::Value(value)
+                        // The function returns the datum as PL/pgSQL holds
+                        // the expression's result (`exec_stmt_return`).
+                        let form = assigned_local_form(expression, &scope, &value)?;
+                        TriggerReturnValue::Value(value, form)
                     }
                 };
                 Ok(Some(TriggerFlow::Return(result)))
@@ -42933,7 +43032,25 @@ fn execute_trigger_step_in<'a>(
                                     "INTO used with a command that cannot return data"
                                 ));
                             }
-                            capture(&outputs.values[..outputs.count], &[])?;
+                            let mut forms = [crate::storage::StoredForm::Inline;
+                                crate::storage::MAX_ROUTINE_ARGUMENTS];
+                            for (index, form) in forms[..outputs.count].iter_mut().enumerate() {
+                                *form = outputs.tuple_form(index);
+                            }
+                            capture(&outputs.values[..outputs.count], &forms[..outputs.count])?;
+                            // The row's columns are the output parameters.
+                            if record_target && let Datum::Record(fields) = selected[0] {
+                                let named = arena
+                                    .alloc_slice_copy(fields)
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                for (index, field) in named.iter_mut().enumerate() {
+                                    field.name = arena
+                                        .alloc_str(outputs.names[index].as_str())
+                                        .map_err(|_| super::query::arena_full_pub())?;
+                                    field.type_oid = outputs.type_oids[index];
+                                }
+                                selected[0] = Datum::Record(&*named);
+                            }
                         }
                         _ => {
                             return Err(sql_err!(
@@ -43076,8 +43193,9 @@ fn execute_trigger_step_in<'a>(
                     &mut expressions,
                     &mut status.pending_call,
                 )?;
-                for (argument, output) in outputs.arguments.iter().zip(outputs.assigned) {
+                for (argument, output) in outputs.arguments.iter().zip(outputs.outputs.assigned) {
                     if let (Some(name), Some(output)) = (argument, output) {
+                        let output = usize::from(output);
                         assign_trigger_local(
                             context,
                             locals,
@@ -43085,10 +43203,8 @@ fn execute_trigger_step_in<'a>(
                             PlpgsqlVariableName::plain(*name),
                             // A procedure's outputs come back as a tuple.
                             result_tuple_slot(
-                                outputs.values[usize::from(output)],
-                                crate::sql::toast::uncarried_form(
-                                    &outputs.values[usize::from(output)],
-                                ),
+                                outputs.outputs.values[output],
+                                outputs.outputs.tuple_form(output),
                             ),
                         )?;
                     }
@@ -111219,12 +111335,14 @@ pub(crate) fn coerce<'a>(
                 target_oid,
                 col.type_mod,
                 v,
+                // The value assigned reaches here without how it is held.
+                crate::sql::toast::DatumForm::Unknown,
                 crate::sql::eval::DefinedCastContext::Assignment,
                 crate::sql::ast::Collation::None,
                 arena,
                 sequences,
             )? {
-                v = cast;
+                v = cast.0;
             }
         }
     }

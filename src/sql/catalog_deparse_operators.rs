@@ -212,6 +212,13 @@ impl Context<'_> {
             | BinaryOp::JsonExistsAny
             | BinaryOp::JsonExistsAll => (l, r.or(Some(oid::TEXT_ARRAY))),
             BinaryOp::JsonPathExists => (l, r.or(Some(oid::JSONPATH))),
+            BinaryOp::TextSearchMatchAlias => match (l, r) {
+                (Some(oid::TSVECTOR), None) => (l, Some(oid::TSQUERY)),
+                (Some(oid::TSQUERY), None) => (l, Some(oid::TSVECTOR)),
+                (None, Some(oid::TSQUERY)) => (Some(oid::TSVECTOR), r),
+                (None, Some(oid::TSVECTOR)) => (Some(oid::TSQUERY), r),
+                (l, r) => (l, r),
+            },
             BinaryOp::TextSearchMatch => match (l, r) {
                 (Some(oid::JSONB), None) => (l, Some(oid::JSONPATH)),
                 (Some(oid::TSVECTOR), None) => (l, Some(oid::TSQUERY)),

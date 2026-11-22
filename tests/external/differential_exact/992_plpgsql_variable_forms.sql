@@ -69,3 +69,57 @@ END $$;
 SELECT e, for_forms(e)
 FROM unnest(ARRAY['scalar', 'short', 'record', 'targets', 'execute',
                   'execute record']) e;
+-- A parameter holds the datum its caller's argument gives: a stored value
+-- in its stored form (a short one packed), a value an expression formed
+-- with a four-byte header. A binary-coercible conversion (varchar to text)
+-- passes the datum on; a cast function forms a new one.
+CREATE TABLE pv (id int, s text, big text, vc varchar(4000), c char(3));
+INSERT INTO pv VALUES (1, 'short', repeat('a', 3000), repeat('b', 3000), 'ab');
+CREATE FUNCTION psize(p text) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN RETURN pg_column_size(p); END $$;
+CREATE FUNCTION vsize(p varchar) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN RETURN pg_column_size(p); END $$;
+SELECT psize(s) AS s, psize(big) AS big, psize(s || '') AS formed,
+       psize(big || '') AS formed_big, psize('lit') AS literal, psize(vc) AS vc,
+       vsize(vc) AS vc_varchar, psize(c) AS bpchar, psize(id::text) AS cast
+FROM pv;
+CREATE FUNCTION pass_on(k int) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE v text; w text; x text;
+BEGIN
+  SELECT s, big INTO v, w FROM pv WHERE id = k;
+  x := upper('abc');
+  RETURN psize(v) || ' ' || psize(w) || ' ' || psize(x) || ' ' || psize(v || '');
+END $$;
+SELECT pass_on(1);
+CREATE PROCEDURE psize_proc(p text) LANGUAGE plpgsql AS $$
+BEGIN RAISE NOTICE 'parameter %', pg_column_size(p); END $$;
+CALL psize_proc('abc');
+DO $$
+DECLARE b text;
+BEGIN
+  SELECT big INTO b FROM pv WHERE id = 1;
+  CALL psize_proc(b);
+  CALL psize_proc(b || '');
+END $$;
+-- A value a query forms is held as its result tuple formed it, and a
+-- FETCH reads a cursor's row as its query gave it.
+CREATE FUNCTION formed_rows() RETURNS SETOF int LANGUAGE plpgsql AS $$
+DECLARE
+  c CURSOR FOR SELECT s, big, big || '' AS f, s || '' AS sf FROM pv;
+  a text; b text; f text; sf text; r record; v text; w text;
+BEGIN
+  OPEN c;
+  FETCH c INTO a, b, f, sf;
+  RETURN NEXT pg_column_size(a); RETURN NEXT pg_column_size(b);
+  RETURN NEXT pg_column_size(f); RETURN NEXT pg_column_size(sf);
+  CLOSE c;
+  OPEN c; FETCH c INTO r; CLOSE c;
+  RETURN NEXT pg_column_size(r.big); RETURN NEXT pg_column_size(r.f);
+  FOR v IN SELECT big || '' FROM pv LOOP RETURN NEXT pg_column_size(v); END LOOP;
+  SELECT big || '' INTO w FROM pv; RETURN NEXT pg_column_size(w);
+  SELECT repeat('z', 200) INTO w; RETURN NEXT pg_column_size(w);
+  FOR r IN SELECT big || '' AS b FROM pv LOOP RETURN NEXT pg_column_size(r.b); END LOOP;
+  EXECUTE 'SELECT big FROM pv' INTO r; RETURN NEXT pg_column_size(r.big);
+  EXECUTE 'SELECT big || '''' FROM pv' INTO w; RETURN NEXT pg_column_size(w);
+END $$;
+SELECT formed_rows();

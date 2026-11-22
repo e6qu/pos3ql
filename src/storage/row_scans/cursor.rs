@@ -382,8 +382,9 @@ mod tests {
                 }
                 let skipped = query.skip_row();
                 let mut projected = crate::mem::arena::ArenaList::new(work);
+                let mut projected_forms = crate::mem::arena::ArenaList::new(work);
                 for index in 0..query.items_len() {
-                    for value in query.evaluate_item(
+                    let (values, forms) = query.evaluate_item(
                         index,
                         storage,
                         txid,
@@ -391,9 +392,13 @@ mod tests {
                         None,
                         Some(&invocations),
                         work,
-                    )? {
+                    )?;
+                    for (value, form) in values.iter().zip(forms) {
                         projected
                             .push(*value)
+                            .map_err(|_| crate::sql::eval::arena_full())?;
+                        projected_forms
+                            .push(*form)
                             .map_err(|_| crate::sql::eval::arena_full())?;
                     }
                 }
@@ -404,6 +409,7 @@ mod tests {
                         work,
                         responder,
                         projected.as_slice(),
+                        projected_forms.as_slice(),
                     )
                     .map_err(|_| {
                         crate::sql_err!(

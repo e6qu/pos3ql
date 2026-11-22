@@ -3934,8 +3934,9 @@ pub(crate) fn window_select<'a>(
                 None,
                 limit,
                 offset,
-                &mut |values, _| match super::emit_data_row(storage, txid, arena, responder, values)
-                {
+                &mut |values, forms| match super::emit_data_row(
+                    storage, txid, arena, responder, values, forms,
+                ) {
                     Ok(Ok(())) => Ok(true),
                     Ok(Err(error)) => Err(error),
                     Err(_) => {
@@ -3970,6 +3971,7 @@ pub(crate) fn window_select<'a>(
         rows
     };
     let proj_rows = rows.rows;
+    let form_rows = rows.forms;
     let order = match rows.ordered(
         storage,
         txid,
@@ -4003,7 +4005,7 @@ pub(crate) fn window_select<'a>(
             continue;
         }
         stages.limit.row();
-        match super::emit_data_row(storage, txid, arena, responder, proj_rows[i]) {
+        match super::emit_data_row(storage, txid, arena, responder, proj_rows[i], form_rows[i]) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return sql_fail(error),
             Err(wire) => return Err(wire),

@@ -276,6 +276,8 @@ enum InputState<'a> {
     Pending,
     Value {
         value: InputValue<'a>,
+        /// How a routine input holds its value.
+        form: crate::sql::toast::DatumForm,
         next_input: usize,
         next_invocation: usize,
         next_call: usize,
@@ -574,12 +576,13 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
         &self,
         site: InputSite<'_>,
         output: &'value Arena,
-        evaluate: impl FnOnce() -> Result<Datum<'value>, SqlError>,
-    ) -> Result<Datum<'value>, SqlError> {
+        evaluate: impl FnOnce() -> Result<(Datum<'value>, crate::sql::toast::DatumForm), SqlError>,
+    ) -> Result<(Datum<'value>, crate::sql::toast::DatumForm), SqlError> {
         let (ordinal, mut frame) = self.frame(site)?;
         match frame.state {
             InputState::Value {
                 value,
+                form,
                 next_input,
                 next_invocation,
                 next_call,
@@ -594,26 +597,27 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 self.next.set(next_input);
                 self.invocation.set(next_invocation);
                 self.registry.next.set(next_call);
-                return match value {
+                let value = match value {
                     InputValue::Retained(handle) => {
                         let bytes = self
                             .owner
                             .retained_slice_mut(handle)
                             .map_err(|_| changed())?;
                         let encoded = output.alloc_slice_copy(&bytes).map_err(|_| full())?;
-                        super::super::exec::decode_projected_col_record(encoded, 0, output)
+                        super::super::exec::decode_projected_col_record(encoded, 0, output)?
                     }
                     InputValue::Evaluated(value) => {
-                        super::super::exec::detach_routine_datum(*value, output)
+                        super::super::exec::detach_routine_datum(*value, output)?
                     }
                 };
+                return Ok((value, form));
             }
             InputState::Pending => {}
             InputState::Definition(_) | InputState::CastDefinition(_) => return Err(changed()),
         }
         // A nested expression may append frames; never hold a borrow across it.
         let before = super::super::sequence::begin_replay_cursor()?;
-        let result = evaluate()?;
+        let (result, form) = evaluate()?;
         let replay = super::super::sequence::finish_replay_cursor(before, self.arena)?;
         // Ordinary arguments without a replay context need no cursor payload.
         // Keep large live cursors outside the geometrically grown frame list.
@@ -624,13 +628,14 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
         };
         frame.state = InputState::Value {
             value: InputValue::Evaluated(self.arena.alloc(result).map_err(|_| full())?),
+            form,
             next_input: self.next.get(),
             next_invocation: self.invocation.get(),
             next_call: self.registry.next.get(),
             replay,
         };
         self.update_frame(ordinal, frame)?;
-        Ok(result)
+        Ok((result, form))
     }
 
     fn definition(
@@ -1077,6 +1082,20 @@ pub(crate) fn value<'a>(
     arena: &'a Arena,
     evaluate: impl FnOnce() -> Result<Datum<'a>, SqlError>,
 ) -> Result<Datum<'a>, SqlError> {
+    // An expression's saved value is read back as a value, whose form
+    // nothing reads.
+    held_value(site, arena, || {
+        evaluate().map(|value| (value, crate::sql::toast::DatumForm::Unknown))
+    })
+    .map(|(value, _)| value)
+}
+
+/// [`value`] of a routine input, which keeps how it holds its value.
+pub(crate) fn held_value<'a>(
+    site: InputSite<'a>,
+    arena: &'a Arena,
+    evaluate: impl FnOnce() -> Result<(Datum<'a>, crate::sql::toast::DatumForm), SqlError>,
+) -> Result<(Datum<'a>, crate::sql::toast::DatumForm), SqlError> {
     let Some(active) = ACTIVE_INPUT.with(Cell::get) else {
         return evaluate();
     };
@@ -1474,6 +1493,7 @@ mod tests {
                             },
                             state: InputState::Value {
                                 value: InputValue::Evaluated(datum),
+                                form: crate::sql::toast::DatumForm::Formed,
                                 next_input: 8,
                                 next_invocation: 9,
                                 next_call: 10,
@@ -1557,6 +1577,7 @@ mod tests {
                 ));
                 let InputState::Value {
                     value: InputValue::Retained(handle),
+                    form: crate::sql::toast::DatumForm::Formed,
                     next_input: 8,
                     next_invocation: 9,
                     next_call: 10,
@@ -1671,6 +1692,7 @@ mod tests {
                         site: InputSite::Expression(InputNode::Value),
                         state: InputState::Value {
                             value: InputValue::Evaluated(&datum),
+                            form: crate::sql::toast::DatumForm::Formed,
                             next_input: 1,
                             next_invocation: 0,
                             next_call: 0,

@@ -810,7 +810,13 @@ impl CursorQuery {
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
         invocations: Option<&crate::sql::query::RoutineInvocationState>,
         frame: &'frame Arena,
-    ) -> Result<&'frame [Datum<'frame>], SqlError> {
+    ) -> Result<
+        (
+            &'frame [Datum<'frame>],
+            &'frame [crate::storage::rowenc::StoredForm],
+        ),
+        SqlError,
+    > {
         let bound = self.bound.as_ref().expect("bound cursor query");
         crate::sql::type_input_plans::with_owner(self.owner, || {
             crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
@@ -827,8 +833,6 @@ impl CursorQuery {
                         invocations,
                         frame,
                     )
-                    // A cursor's rows leave the statement without their forms.
-                    .map(|(values, _)| values)
             })
         })
     }

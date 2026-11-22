@@ -70,6 +70,120 @@ impl From<ToastedForm> for crate::storage::rowenc::StoredForm {
     }
 }
 
+/// How a datum is held, which `pg_column_size` reads. PL/pgSQL keeps the
+/// datum it is given (`datumTransfer`), and a call passes its argument
+/// datums on unchanged: an expression's result as the expression formed it,
+/// and a value read from a tuple as the tuple holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatumForm {
+    /// Formed by an expression: a four-byte varlena header, uncompressed.
+    Formed,
+    /// Read from a tuple: a short value packed, a stored datum in the TOAST
+    /// form it was stored in.
+    Stored(crate::storage::rowenc::StoredForm),
+    /// Passed on from a source that does not record how it held the datum:
+    /// neither its header nor its TOAST form is known.
+    Unknown,
+}
+
+impl DatumForm {
+    /// The header the datum has.
+    pub(crate) const fn header(self) -> DatumHeader {
+        match self {
+            Self::Formed => DatumHeader::Formed,
+            Self::Stored(_) => DatumHeader::Tuple,
+            Self::Unknown => DatumHeader::Unknown,
+        }
+    }
+
+    /// The TOAST form of `value` held this way: `None` for a datum formed
+    /// anew, which tuple forming would form again.
+    pub(crate) fn stored(
+        self,
+        value: &crate::sql::types::Datum<'_>,
+    ) -> Option<crate::storage::rowenc::StoredForm> {
+        match self {
+            Self::Formed => None,
+            Self::Stored(form) => Some(form),
+            Self::Unknown => unknown_form(value),
+        }
+    }
+
+    /// This form as one integer, which [`Self::from_code`] reads back: a
+    /// statement's journal keeps it with the value.
+    pub(crate) const fn code(self) -> i64 {
+        use crate::storage::rowenc::StoredForm;
+        match self {
+            Self::Formed => -1,
+            Self::Unknown => -2,
+            Self::Stored(StoredForm::Inline) => 0,
+            Self::Stored(StoredForm::Compressed(size)) => 1 << 32 | size as i64,
+            Self::Stored(StoredForm::External {
+                saved,
+                compressed: false,
+            }) => 2 << 32 | saved as i64,
+            Self::Stored(StoredForm::External {
+                saved,
+                compressed: true,
+            }) => 3 << 32 | saved as i64,
+            Self::Stored(StoredForm::Unmodelled) => 4 << 32,
+        }
+    }
+
+    /// The form [`Self::code`] gave `code`.
+    pub(crate) const fn from_code(code: i64) -> Option<Self> {
+        use crate::storage::rowenc::StoredForm;
+        let size = (code & 0xffff_ffff) as u32;
+        Some(match (code, code >> 32) {
+            (-1, _) => Self::Formed,
+            (-2, _) => Self::Unknown,
+            (0, _) => Self::Stored(StoredForm::Inline),
+            (_, 1) => Self::Stored(StoredForm::Compressed(size)),
+            (_, 2) => Self::Stored(StoredForm::External {
+                saved: size,
+                compressed: false,
+            }),
+            (_, 3) => Self::Stored(StoredForm::External {
+                saved: size,
+                compressed: true,
+            }),
+            (_, 4) if size == 0 => Self::Stored(StoredForm::Unmodelled),
+            _ => return None,
+        })
+    }
+
+    /// This form after a conversion turned `before` into `after`: a
+    /// conversion that formed a new datum holds it as formed.
+    pub(crate) fn converted(
+        self,
+        before: &crate::sql::types::Datum<'_>,
+        after: &crate::sql::types::Datum<'_>,
+    ) -> Self {
+        if same_datum_identity(before, after) || datum_identity(after).is_none() {
+            self
+        } else {
+            Self::Formed
+        }
+    }
+}
+
+/// The forms of arguments that reach a routine without how they held their
+/// values: an operator's operands, a cast's value, a support function's
+/// inputs, or dynamic SQL's `USING` values.
+pub(crate) const UNRECORDED_ARGUMENTS: [DatumForm; crate::storage::MAX_ROUTINE_ARGUMENTS] =
+    [DatumForm::Unknown; crate::storage::MAX_ROUTINE_ARGUMENTS];
+
+/// The varlena header of a datum a row holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatumHeader {
+    /// Read from a tuple, which packs a short value into a one-byte header.
+    Tuple,
+    /// Formed by an expression, with a four-byte header.
+    Formed,
+    /// Not recorded by the row's source.
+    Unknown,
+}
+
 /// The row's forms depend on bytes or a compression method the model does
 /// not have: a value that must be compressed has no known data bytes, or
 /// its column compresses with lz4.
@@ -490,6 +604,23 @@ pub(crate) fn passed_form<'a>(
     Ok(branch_form(expression, row, catalog, value)?.unwrap_or(StoredForm::Inline))
 }
 
+/// How `value`, the result of `expression` over `row`, is held when the
+/// expression's result is passed on as it is (a call's argument, a
+/// PL/pgSQL simple expression's result): a datum read from a stored row in
+/// its stored form, a value the expression formed with a four-byte header.
+pub(crate) fn held_form<'a>(
+    expression: &crate::sql::ast::Expr<'_>,
+    row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    value: &crate::sql::types::Datum<'_>,
+) -> Result<DatumForm, crate::sql::eval::SqlError> {
+    Ok(match reads_stored_datum(expression, row, value)? {
+        Some(true) => DatumForm::Stored(passed_form(expression, row, catalog, value)?),
+        Some(false) => DatumForm::Formed,
+        None => DatumForm::Unknown,
+    })
+}
+
 /// Whether a datum passed on unchanged as `passed` gives `value`: a
 /// binary-coercible cast from `text` to `character` relabels it.
 fn same_datum(passed: &crate::sql::types::Datum<'_>, value: &crate::sql::types::Datum<'_>) -> bool {
@@ -539,8 +670,12 @@ fn source_of<'a>(
         let Some(read) = column_datum(row, qualifier, name)? else {
             return Ok(Some(Source::Fresh));
         };
-        if row.holds_formed_datum(qualifier, name) {
-            return Ok(same_datum(&read, value).then_some(Source::Fresh));
+        match row.datum_header(qualifier, name) {
+            DatumHeader::Formed => return Ok(same_datum(&read, value).then_some(Source::Fresh)),
+            DatumHeader::Unknown => {
+                return Ok(same_datum(&read, value).then_some(Source::Unknown));
+            }
+            DatumHeader::Tuple => {}
         }
         // A composite read from a stored row is the stored datum; one a
         // query formed (a whole row, `ROW(...)`) it passes on as formed.
@@ -796,6 +931,23 @@ const PASSING_CALLS: &[&str] = &[
     "lag",
     "lead",
 ];
+
+/// Whether `expression` calls a function with no built-in signature. Such a
+/// function may return a datum it was given unchanged, so its result does
+/// not carry the datum's form.
+pub(crate) fn user_defined_call(expression: &crate::sql::ast::Expr<'_>) -> bool {
+    match expression {
+        crate::sql::ast::Expr::Call { name, kind, .. } => {
+            *kind == crate::sql::ast::CallKind::Routine
+                && crate::sql::catalog::builtin_callable_signatures(
+                    name.rsplit('.').next().unwrap_or(name),
+                )
+                .next()
+                .is_none()
+        }
+        _ => false,
+    }
+}
 
 /// Whether `expression` may give a datum read from a stored row: a column,
 /// a conversion leaving it as it was, a branch choosing it, an aggregate or
@@ -1074,6 +1226,15 @@ pub(crate) fn unknown_form(
     value: &crate::sql::types::Datum<'_>,
 ) -> Option<crate::storage::rowenc::StoredForm> {
     may_be_toasted(value).then_some(crate::storage::rowenc::StoredForm::Unmodelled)
+}
+
+/// The form a result row that does not carry its values' forms gives
+/// `value`: one TOAST may have stored otherwise is not modelled, and a
+/// shorter one is held as tuple forming packs it.
+pub(crate) fn uncarried_form(
+    value: &crate::sql::types::Datum<'_>,
+) -> crate::storage::rowenc::StoredForm {
+    unknown_form(value).unwrap_or(crate::storage::rowenc::StoredForm::Inline)
 }
 
 /// The form `value`, a grouped query's output of `expression`, keeps: a

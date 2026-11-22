@@ -1845,7 +1845,8 @@ mod control_flow;
 mod diagnostics;
 mod execution_frame;
 mod local_values;
-pub(crate) use local_values::{LocalForm, LocalSlot};
+use crate::sql::toast::DatumForm;
+pub(crate) use local_values::LocalSlot;
 mod loop_rows;
 mod numeric_loops;
 mod set_rows;
@@ -1895,8 +1896,9 @@ pub(crate) use projected::{
     PROJECTED_TEXT_TAG, ProjectedValue, compare_projected_key, compare_projected_prefix,
     compare_projected_rows, compare_projected_values, decode_projected_row_into,
     encode_projected_by_into, encode_projected_formed, encode_projected_formed_into,
-    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows, projected_row_len,
-    projected_row_len_by, projected_row_len_formed, projected_row_width, projected_stored_form,
+    encode_projected_held_into, encode_projected_into, encode_projected_persistent_pub,
+    pack_projected_rows, projected_datum_form, projected_row_len, projected_row_len_by,
+    projected_row_len_formed, projected_row_len_held, projected_row_width, projected_stored_form,
     projected_stored_form_at, projected_stored_forms, projected_value_size, try_each_record_field,
     unpack_projected_rows,
 };
@@ -24899,6 +24901,8 @@ fn execute_plpgsql_dynamic_call<'a>(
                     *variadic,
                     arena,
                     query.arguments,
+                    // `USING` values reach the statement without their forms.
+                    &crate::sql::toast::UNRECORDED_ARGUMENTS[..query.arguments.len()],
                     context.txn,
                     sqlprep,
                     cursors,
@@ -24974,8 +24978,11 @@ fn execute_plpgsql_call<'a>(
     // function calls evaluate as in any other statement of the block.
     // A resumed call reads its finished arguments back instead of running
     // their routine calls again.
-    for (value, argument) in values.iter_mut().zip(arguments.iter()) {
-        *value = expressions.eval(context, argument, scope)?;
+    let mut forms = [DatumForm::Formed; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    for (index, argument) in arguments.iter().enumerate() {
+        values[index] = expressions.eval(context, argument, scope)?;
+        // The procedure's parameter keeps the datum the argument gives.
+        forms[index] = crate::sql::toast::held_form(argument, scope, None, &values[index])?;
     }
     {
         let catalog = super::query::storage_catalog(context.storage(), arena, context.txn.txid);
@@ -25028,6 +25035,7 @@ fn execute_plpgsql_call<'a>(
             argument_names,
             *variadic,
             &values[..arguments.len()],
+            &forms[..arguments.len()],
             &types[..arguments.len()],
             &mut outputs,
         )?;
@@ -25046,6 +25054,7 @@ fn execute_plpgsql_call<'a>(
             *variadic,
             arena,
             &values[..arguments.len()],
+            &forms[..arguments.len()],
             context.txn,
             sqlprep,
             cursors,
@@ -25079,6 +25088,7 @@ fn execute_atomic_procedure_call<'a>(
     argument_names: &[Option<&str>],
     variadic: bool,
     values: &[Datum<'a>],
+    forms: &[DatumForm],
     types: &[i32],
     outputs: &mut ProcedureOutputs<'a>,
 ) -> Result<(), SqlError> {
@@ -25173,7 +25183,11 @@ fn execute_atomic_procedure_call<'a>(
                     variadic,
                     context: super::query::RoutineInputContext::Procedure,
                 },
-                &mut |argument| eval_full(argument, arena, values, &NoColumns, &hooks),
+                &mut |argument| {
+                    crate::sql::eval::routine_argument(
+                        argument, arena, values, forms, &NoColumns, &hooks,
+                    )
+                },
                 arena,
             )?
             .ok_or_else(|| {
@@ -25230,6 +25244,7 @@ fn execute_atomic_procedure_call<'a>(
         run_plpgsql_procedure(
             &mut procedure_context,
             routine,
+            &completed.forms[..routine.argument_count],
             completed.input_collation,
             &mut output_values,
             super::guc::active_plpgsql_settings()?,
@@ -25533,6 +25548,7 @@ fn run_atomic_sql_procedure_call<'a>(
     }
     let arena = context.arena;
     let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let mut forms = [DatumForm::Formed; crate::storage::MAX_ROUTINE_ARGUMENTS];
     let mut types = [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
     {
         let catalog = super::query::storage_catalog(context.storage(), arena, context.txn.txid);
@@ -25550,7 +25566,15 @@ fn run_atomic_sql_procedure_call<'a>(
             types[index] =
                 crate::sql::eval::expression_type_identity(argument, &NoColumns, &hooks)?
                     .routine_argument_oid();
-            values[index] = eval_full(argument, arena, context.params, &NoColumns, &hooks)?;
+            // The body's parameters reach it without their forms.
+            (values[index], forms[index]) = crate::sql::eval::routine_argument(
+                argument,
+                arena,
+                context.params,
+                &crate::sql::toast::UNRECORDED_ARGUMENTS[..context.params.len()],
+                &NoColumns,
+                &hooks,
+            )?;
         }
     }
     let values = arena
@@ -25572,6 +25596,7 @@ fn run_atomic_sql_procedure_call<'a>(
         argument_names,
         variadic,
         values,
+        &forms[..arguments.len()],
         &types[..arguments.len()],
         &mut outputs,
     )
@@ -30009,25 +30034,31 @@ fn declare_routine_parameters(
 }
 
 /// The initial values of [`declare_routine_parameters`]'s variables: each
-/// input in order, NULL for an output-only parameter and for every alias.
+/// input in order, held as its caller passed it (`forms`), NULL for an
+/// output-only parameter and for every alias.
 fn seed_routine_parameters<'a>(
     parameters: &[RoutineParameterDef],
     inputs: &[Datum<'a>],
+    forms: &[DatumForm],
     values: &mut [LocalSlot<'a>],
 ) -> Result<usize, SqlError> {
+    let mismatch = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "routine inputs do not match its parameters"
+        )
+    };
+    if inputs.len() != forms.len() {
+        return Err(mismatch());
+    }
     let count = parameter_variable_count(parameters);
     values[..count].fill(LocalSlot::NULL);
     let mut input_index = 0usize;
     for (value, parameter) in values.iter_mut().zip(parameters) {
         if parameter.mode.is_input() {
             *value = LocalSlot {
-                value: inputs.get(input_index).copied().ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "routine inputs do not match its parameters"
-                    )
-                })?,
-                form: LocalForm::Passed,
+                value: inputs.get(input_index).copied().ok_or_else(mismatch)?,
+                form: forms[input_index],
             };
             input_index += 1;
         }
@@ -31512,6 +31543,7 @@ pub(in crate::sql) fn execute_plpgsql_procedure<'a>(
     routine: &crate::storage::RoutineDef,
     input_collation: crate::sql::ast::Collation,
     inputs: &'a [Datum<'a>],
+    forms: &'a [DatumForm],
     arena: &'a Arena,
     responder: &mut Responder<'_>,
     outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
@@ -31543,6 +31575,7 @@ pub(in crate::sql) fn execute_plpgsql_procedure<'a>(
         let count = run_plpgsql_procedure(
             &mut context,
             routine,
+            forms,
             input_collation,
             outputs,
             compiled_conflict,
@@ -31575,14 +31608,14 @@ pub(in crate::sql) fn execute_plpgsql_procedure<'a>(
                         .with_input_sites(sites),
                 )
             },
-            &|inputs| procedure_seeded_values(routine, inputs, arena),
+            &|inputs, forms| procedure_seeded_values(routine, inputs, forms, arena),
             retention,
             &mut finish,
         )?,
         (None, Some(timing)) => {
             let (program, code) = compile_plpgsql_procedure(&context, routine, arena)?;
             let locals = procedure_declarations(routine, program.locals, arena)?;
-            let seeded = procedure_seeded_values(routine, inputs, arena)?;
+            let seeded = procedure_seeded_values(routine, inputs, forms, arena)?;
             let invocation = TriggerInvocation::procedure(
                 routine,
                 input_collation,
@@ -31608,6 +31641,7 @@ pub(in crate::sql) fn execute_plpgsql_procedure<'a>(
                     seeded,
                 },
                 inputs,
+                forms,
                 environment,
                 timing,
                 retention,
@@ -31670,7 +31704,7 @@ pub(in crate::sql) fn execute_retained_anonymous_plpgsql<'a>(
             &mut context,
             identity,
             &|sites, settings| Ok(TriggerInvocation::anonymous(settings)?.with_input_sites(sites)),
-            &|_| Ok(&[]),
+            &|_, _| Ok(&[]),
             retention,
             &mut finish,
         );
@@ -31704,6 +31738,7 @@ pub(in crate::sql) fn execute_retained_anonymous_plpgsql<'a>(
             invocation,
             seeded: &[],
         },
+        &[],
         &[],
         &environment,
         super::statistics::begin_function_timing(false)?,
@@ -31747,10 +31782,11 @@ fn procedure_declarations<'a>(
     Ok(declarations)
 }
 
-/// Initial values of the parameters' variables.
+/// Initial values of the parameters' variables, held as `forms` says.
 fn procedure_seeded_values<'a>(
     routine: &crate::storage::RoutineDef,
     inputs: &'a [Datum<'a>],
+    forms: &[DatumForm],
     arena: &'a Arena,
 ) -> Result<&'a [LocalSlot<'a>], SqlError> {
     let seeded = arena
@@ -31758,7 +31794,7 @@ fn procedure_seeded_values<'a>(
             LocalSlot::NULL
         })
         .map_err(|_| super::query::arena_full_pub())?;
-    seed_routine_parameters(routine.parameters(), inputs, seeded)?;
+    seed_routine_parameters(routine.parameters(), inputs, forms, seeded)?;
     Ok(seeded)
 }
 
@@ -31781,10 +31817,12 @@ fn procedure_output_values<'a>(
 }
 
 /// Runs a PL/pgSQL procedure body on `context`'s host with `context.params`
-/// as its inputs, returning the number of output values written.
+/// as its inputs, held as `forms` says, returning the number of output
+/// values written.
 fn run_plpgsql_procedure<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     routine: &crate::storage::RoutineDef,
+    forms: &[DatumForm],
     input_collation: crate::sql::ast::Collation,
     outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
     compiled_conflict: super::guc::PlpgsqlSettings,
@@ -31821,7 +31859,7 @@ fn run_plpgsql_procedure<'a>(
         parameter_variable_count(routine.parameters()),
     )?;
     let mut declaration_count = declare_routine_parameters(routine, declarations)?;
-    seed_routine_parameters(routine.parameters(), inputs, &mut seeded)?;
+    seed_routine_parameters(routine.parameters(), inputs, forms, &mut seeded)?;
     let seeded_count = declaration_count;
     for local in program.locals {
         declarations[declaration_count] = *local;
@@ -32367,7 +32405,7 @@ struct PlpgsqlVariable<'a> {
     user_type: Option<crate::storage::UserTypeName>,
     /// How the variable holds its datum; a special variable PL/pgSQL forms
     /// (`FOUND`, `TG_*`, `SQLSTATE`, `SQLERRM`) holds it as formed.
-    form: LocalForm,
+    form: DatumForm,
 }
 
 impl<'a> PlpgsqlVariable<'a> {
@@ -32426,7 +32464,7 @@ fn plpgsql_variable<'a>(
             }),
             ctype: ColType::Text,
             user_type: None,
-            form: LocalForm::Formed,
+            form: DatumForm::Formed,
         });
     }
     if let Some(index) = local {
@@ -32442,14 +32480,14 @@ fn plpgsql_variable<'a>(
             value: invocation.value(field),
             ctype: field.ctype(),
             user_type: None,
-            form: LocalForm::Formed,
+            form: DatumForm::Formed,
         });
     }
     TriggerStatusVariable::parse(name).map(|_| PlpgsqlVariable {
         value: found.map(Datum::Bool).unwrap_or(Datum::Null),
         ctype: ColType::Bool,
         user_type: None,
-        form: LocalForm::Formed,
+        form: DatumForm::Formed,
     })
 }
 
@@ -32696,10 +32734,8 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
-        match self.named(qualifier, name).map(|variable| variable.form) {
-            Some(LocalForm::Formed) => return Ok(None),
-            Some(LocalForm::Stored(form)) => return Ok(Some(form)),
-            Some(LocalForm::Passed) | None => {}
+        if let Some(variable) = self.named(qualifier, name) {
+            return Ok(variable.form.stored(&variable.value));
         }
         // A record variable holds its fields as the row it was given did.
         let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
@@ -32710,15 +32746,17 @@ where
         {
             return Ok(Some(field.form));
         }
-        // A parameter or a trigger row's column.
+        // A trigger row's column.
         Ok(crate::sql::toast::unknown_form(
             &self.lookup(qualifier, name)?,
         ))
     }
 
-    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+    fn datum_header(&self, qualifier: Option<&str>, name: &str) -> crate::sql::toast::DatumHeader {
         self.named(qualifier, name)
-            .is_some_and(|variable| variable.form == LocalForm::Formed)
+            .map_or(crate::sql::toast::DatumHeader::Tuple, |variable| {
+                variable.form.header()
+            })
     }
 
     fn procedural_variable(
@@ -33217,19 +33255,20 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, crate::sql::eval::SqlError> {
-        match self.named(qualifier, name).map(|variable| variable.form) {
-            Some(LocalForm::Formed) => Ok(None),
-            Some(LocalForm::Stored(form)) => Ok(Some(form)),
-            // A parameter, a record field or a trigger row's column.
-            Some(LocalForm::Passed) | None => Ok(crate::sql::toast::unknown_form(
+        match self.named(qualifier, name) {
+            Some(variable) => Ok(variable.form.stored(&variable.value)),
+            // A record field or a trigger row's column.
+            None => Ok(crate::sql::toast::unknown_form(
                 &self.lookup(qualifier, name)?,
             )),
         }
     }
 
-    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
+    fn datum_header(&self, qualifier: Option<&str>, name: &str) -> crate::sql::toast::DatumHeader {
         self.named(qualifier, name)
-            .is_some_and(|variable| variable.form == LocalForm::Formed)
+            .map_or(crate::sql::toast::DatumHeader::Tuple, |variable| {
+                variable.form.header()
+            })
     }
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -38721,47 +38760,32 @@ fn assigned_local_form(
     expression: &Expr<'_>,
     scope: &dyn ColumnLookup<'_>,
     value: &Datum<'_>,
-) -> Result<LocalForm, SqlError> {
-    use crate::sql::toast::{passed_form, reads_stored_datum};
+) -> Result<DatumForm, SqlError> {
     if expression.contains_subquery() {
-        return Ok(LocalForm::Stored(passed_form(
+        return Ok(DatumForm::Stored(crate::sql::toast::passed_form(
             expression, scope, None, value,
         )?));
     }
-    Ok(match reads_stored_datum(expression, scope, value)? {
-        Some(true) => LocalForm::Stored(passed_form(expression, scope, None, value)?),
-        Some(false) => LocalForm::Formed,
-        None => LocalForm::Stored(crate::storage::StoredForm::Unmodelled),
-    })
+    crate::sql::toast::held_form(expression, scope, None, value)
 }
 
-/// A variable assigned `value`, a column of a query's result row holding it
-/// in `form`: SPI's result tuple packs a short value, and a value TOAST may
-/// store otherwise keeps a form only the row carries.
+/// A variable assigned `value`, a column of a query's result row holding
+/// it in `form`: SPI's result tuple packs a short value and keeps the TOAST
+/// form of a longer one, which is `Unmodelled` where the row does not carry
+/// it ([`crate::sql::toast::uncarried_form`]).
 fn result_tuple_slot(value: Datum<'_>, form: crate::storage::StoredForm) -> LocalSlot<'_> {
-    let form = match form {
-        crate::storage::StoredForm::Inline => {
-            crate::sql::toast::unknown_form(&value).unwrap_or(crate::storage::StoredForm::Inline)
-        }
-        form => form,
-    };
     LocalSlot {
         value,
-        form: LocalForm::Stored(form),
+        form: DatumForm::Stored(form),
     }
 }
 
 impl<'a> LocalSlot<'a> {
-    /// This slot after converting its value to `converted`: a conversion
-    /// that formed a new datum holds it as formed.
+    /// This slot after converting its value to `converted`.
     fn converted(self, converted: Datum<'a>) -> Self {
         Self {
             value: converted,
-            form: if crate::sql::toast::same_datum_identity(&self.value, &converted) {
-                self.form
-            } else {
-                LocalForm::Formed
-            },
+            form: self.form.converted(&self.value, &converted),
         }
     }
 }
@@ -39872,13 +39896,17 @@ struct TriggerForRows<'a> {
     width: usize,
 }
 
-/// The form a query's result row carries for column `index`: a result row
-/// that carries none holds each value as tuple forming gave it.
-fn form_at(carried: &[crate::storage::StoredForm], index: usize) -> crate::storage::StoredForm {
+/// The form a query's result row carries for its column `index`, holding
+/// `value`: a row that carries no forms leaves it uncarried.
+fn form_at(
+    carried: &[crate::storage::StoredForm],
+    index: usize,
+    value: &Datum<'_>,
+) -> crate::storage::StoredForm {
     carried
         .get(index)
         .copied()
-        .unwrap_or(crate::storage::StoredForm::Inline)
+        .unwrap_or_else(|| crate::sql::toast::uncarried_form(value))
 }
 
 /// The TOAST forms of a `FOR` loop's scalar values.
@@ -39892,10 +39920,12 @@ enum ForRowForms<'a> {
 }
 
 impl ForRowForms<'_> {
-    fn get(self, index: usize) -> crate::storage::StoredForm {
+    /// The form row `index`'s `value` holds; a value whose source does not
+    /// carry it, which TOAST may have stored otherwise, is unmodelled.
+    fn get(self, index: usize, value: &Datum<'_>) -> crate::storage::StoredForm {
         match self {
             Self::Carried(forms) => forms[index],
-            Self::NotCarried => crate::storage::StoredForm::Inline,
+            Self::NotCarried => crate::sql::toast::uncarried_form(value),
         }
     }
 }
@@ -39938,7 +39968,7 @@ where
             rows.push(value)
                 .map_err(|_| super::query::arena_full_pub())?;
             forms
-                .push(form_at(carried, 0))
+                .push(form_at(carried, 0, &value))
                 .map_err(|_| super::query::arena_full_pub())
         },
     )?;
@@ -40020,7 +40050,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 }; MAX_PROJ];
                 for index in 0..width {
                     row_fields[index] = RecordField {
-                        form: form_at(carried, index),
+                        form: form_at(carried, index, &values[index]),
                         name: fields[index].0,
                         type_oid: fields[index].1,
                         type_mod: fields[index].2,
@@ -40035,7 +40065,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 detached_trigger_datum(values[0], arena)?
             };
             row_forms
-                .push(form_at(carried, 0))
+                .push(form_at(carried, 0, values.first().unwrap_or(&Datum::Null)))
                 .map_err(|_| super::query::arena_full_pub())?;
             rows.push(value).map_err(|_| super::query::arena_full_pub())
         })?;
@@ -40337,7 +40367,7 @@ where
             }; MAX_PROJ];
             for index in 0..width {
                 fields[index] = RecordField {
-                    form: form_at(carried, index),
+                    form: form_at(carried, index, &values[index]),
                     name: result_arena
                         .alloc_str(columns[index].name)
                         .map_err(|_| super::query::arena_full_pub())?,
@@ -40974,6 +41004,8 @@ fn execute_trigger_step_in<'a>(
                     statement,
                     arguments,
                     selected,
+                    // RETURNING rows do not carry their values' forms.
+                    &[],
                     source_width,
                     rows,
                     status,
@@ -42082,9 +42114,11 @@ fn execute_trigger_step_in<'a>(
                             };
                             let mut values = [Datum::Null; MAX_COLUMNS];
                             let mut decoded = [Datum::Null; MAX_COLUMNS];
+                            let mut forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
                             if let Some(row) = rows.first().copied() {
                                 let width = {
                                     let cursors = context.host.cursors();
+                                    cursors.row_forms(name, row, &mut forms)?;
                                     cursors.copy_row(name, row, arena, &mut decoded)?
                                 };
                                 if width != column_count {
@@ -42117,17 +42151,21 @@ fn execute_trigger_step_in<'a>(
                                     value: Datum::Null,
                                 }; MAX_COLUMNS];
                                 for index in 0..column_count {
-                                    let value = decoded[index];
+                                    let decoded = decoded[index];
                                     let value = match catalog_column_type(
                                         context.storage(),
                                         context.txn.txid,
                                         column_type_oids[index],
                                     ) {
-                                        Some((ctype, _)) => cast_to(value, ctype, arena)?,
-                                        None => value,
+                                        Some((ctype, _)) => cast_to(decoded, ctype, arena)?,
+                                        None => decoded,
                                     };
                                     fields[index] = RecordField {
-                                        form: crate::storage::StoredForm::Inline,
+                                        form: crate::sql::toast::converted_form(
+                                            &decoded,
+                                            &value,
+                                            forms[index],
+                                        ),
                                         name: column_names[index]
                                             .expect("cursor description name initialized"),
                                         type_oid: column_type_oids[index],
@@ -42149,10 +42187,7 @@ fn execute_trigger_step_in<'a>(
                                     local_values,
                                     target,
                                     targets[index],
-                                    result_tuple_slot(
-                                        values[index],
-                                        crate::storage::StoredForm::Inline,
-                                    ),
+                                    result_tuple_slot(values[index], forms[index]),
                                 )?;
                             }
                         }
@@ -42361,10 +42396,7 @@ fn execute_trigger_step_in<'a>(
                                             MAX_PROJ];
                                         for (index, value) in values.iter().copied().enumerate() {
                                             row_fields[index] = RecordField {
-                                                form: forms
-                                                    .get(index)
-                                                    .copied()
-                                                    .unwrap_or(crate::storage::StoredForm::Inline),
+                                                form: form_at(forms, index, &value),
                                                 name: fields[index].0,
                                                 type_oid: fields[index].1,
                                                 type_mod: fields[index].2,
@@ -42385,9 +42417,7 @@ fn execute_trigger_step_in<'a>(
                                             .enumerate()
                                         {
                                             *slot = detached_trigger_datum(value, arena)?;
-                                            if let Some(form) = forms.get(index) {
-                                                selected_forms[index] = *form;
-                                            }
+                                            selected_forms[index] = form_at(forms, index, &value);
                                         }
                                     }
                                     found = true;
@@ -42481,6 +42511,7 @@ fn execute_trigger_step_in<'a>(
                     transition: &transition,
                 };
                 let mut selected = [Datum::Null; MAX_COLUMNS];
+                let mut selected_forms = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
                 let mut found = false;
                 let mut row_count = 0usize;
                 let mut source_width = 0usize;
@@ -42624,7 +42655,7 @@ fn execute_trigger_step_in<'a>(
                             }
                             Ok(())
                         };
-                    let mut capture = |values: &[Datum], _: &[StoredForm]| {
+                    let mut capture = |values: &[Datum], forms: &[StoredForm]| {
                         if record_target && record_width != 0 && values.len() != record_width {
                             return Err(sql_err!(
                                 sqlstate::INTERNAL_ERROR,
@@ -42643,7 +42674,7 @@ fn execute_trigger_step_in<'a>(
                                 }; MAX_PROJ];
                                 for (index, value) in values.iter().copied().enumerate() {
                                     fields[index] = RecordField {
-                                        form: crate::storage::StoredForm::Inline,
+                                        form: form_at(forms, index, &value),
                                         name: arena
                                             .alloc_str(record_names[index].as_str())
                                             .map_err(|_| super::query::arena_full_pub())?,
@@ -42659,11 +42690,13 @@ fn execute_trigger_step_in<'a>(
                             } else {
                                 // Extra columns are ignored and missing ones
                                 // leave their targets NULL.
-                                for (slot, value) in selected[..statement.targets.len()]
+                                for (index, (slot, value)) in selected[..statement.targets.len()]
                                     .iter_mut()
                                     .zip(values.iter().copied())
+                                    .enumerate()
                                 {
                                     *slot = detached_trigger_datum(value, arena)?;
+                                    selected_forms[index] = form_at(forms, index, &value);
                                 }
                             }
                             found = true;
@@ -42688,7 +42721,7 @@ fn execute_trigger_step_in<'a>(
                                     let line = arena
                                         .alloc_str(line)
                                         .map_err(|_| super::query::arena_full_pub())?;
-                                    capture(&[Datum::Text(line)], &[])
+                                    capture(&[Datum::Text(line)], &[StoredForm::Inline])
                                 },
                             )?;
                         }
@@ -42707,7 +42740,7 @@ fn execute_trigger_step_in<'a>(
                                 .arena
                                 .alloc_str(value.as_str())
                                 .map_err(|_| super::query::arena_full_pub())?;
-                            capture(&[Datum::Text(value)], &[])?;
+                            capture(&[Datum::Text(value)], &[StoredForm::Inline])?;
                         }
                         Stmt::ShowAll => {
                             let PlpgsqlExecHost::Routine { engine, guc, .. } = &context.host else {
@@ -42789,11 +42822,13 @@ fn execute_trigger_step_in<'a>(
                             };
                             for row in rows.iter().copied() {
                                 let mut values = [Datum::Null; MAX_COLUMNS];
+                                let mut forms = [StoredForm::Inline; MAX_COLUMNS];
                                 let width = {
                                     let cursors = context.host.cursors();
+                                    cursors.row_forms(name, row, &mut forms)?;
                                     cursors.copy_row(name, row, arena, &mut values)?
                                 };
-                                capture(&values[..width], &[])?;
+                                capture(&values[..width], &forms[..width])?;
                             }
                         }
                         Stmt::Select(_) | Stmt::SetQuery(_) => {
@@ -42900,6 +42935,7 @@ fn execute_trigger_step_in<'a>(
                         statement,
                         query.arguments,
                         &selected[..statement.targets.len()],
+                        &selected_forms[..statement.targets.len()],
                         source_width,
                         row_count as u64,
                         status,
@@ -43031,7 +43067,9 @@ fn execute_trigger_step_in<'a>(
                             // A procedure's outputs come back as a tuple.
                             result_tuple_slot(
                                 outputs.values[usize::from(output)],
-                                crate::storage::StoredForm::Inline,
+                                crate::sql::toast::uncarried_form(
+                                    &outputs.values[usize::from(output)],
+                                ),
                             ),
                         )?;
                     }
@@ -45056,7 +45094,7 @@ fn cursor_statement_effect<'s, 'a, 'b>(
                 }
                 let count = changed
                     .len()
-                    .checked_mul(2)
+                    .checked_mul(3)
                     .and_then(|count| count.checked_add(6))
                     .ok_or_else(super::query::arena_full_pub)?;
                 let output = arena
@@ -45068,8 +45106,10 @@ fn cursor_statement_effect<'s, 'a, 'b>(
                 output[4] = status.found.map_or(Datum::Null, Datum::Bool);
                 output[5] = Datum::Int8(status.row_count);
                 for (at, slot) in changed.iter().copied().enumerate() {
-                    output[6 + at * 2] = Datum::Int4(slot.code()?);
-                    output[7 + at * 2] = slot.read(local_values, records)?;
+                    let (value, form) = slot.read(local_values, records)?;
+                    output[6 + at * 3] = Datum::Int4(slot.code()?);
+                    output[7 + at * 3] = value;
+                    output[8 + at * 3] = Datum::Int8(form.code());
                 }
                 Ok(&*output)
             })();
@@ -45079,7 +45119,7 @@ fn cursor_statement_effect<'s, 'a, 'b>(
             }
         },
     )?;
-    if result.len() != changed.len() * 2 + 6 {
+    if result.len() != changed.len() * 3 + 6 {
         return Err(sql_err!(
             sqlstate::SERIALIZATION_FAILURE,
             "cursor output changed while waiting"
@@ -45103,13 +45143,23 @@ fn cursor_statement_effect<'s, 'a, 'b>(
     };
     status.row_count = row_count;
     for (at, slot) in changed.iter().copied().enumerate() {
-        if !matches!(result[6 + at * 2], Datum::Int4(code) if code == slot.code()?) {
+        if !matches!(result[6 + at * 3], Datum::Int4(code) if code == slot.code()?) {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "cursor output target changed while waiting"
             ));
         }
-        slot.write(local_values, records, result[7 + at * 2])?;
+        let form = match result[8 + at * 3] {
+            Datum::Int8(code) => DatumForm::from_code(code),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor replay has an invalid value form"
+            )
+        })?;
+        slot.write(local_values, records, result[7 + at * 3], form)?;
     }
     cursor_effect_result(result)?;
     Ok(None)
@@ -45147,22 +45197,29 @@ impl CursorOutputSlot {
         self,
         local_values: &[LocalSlot<'a>],
         records: &mut TriggerRows<'_, 'a>,
-    ) -> Result<Datum<'a>, SqlError> {
+    ) -> Result<(Datum<'a>, DatumForm), SqlError> {
         match self {
             Self::Local(index) => local_values
                 .get(index)
-                .map(|slot| slot.value)
+                .map(|slot| (slot.value, slot.form))
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "cursor output local is unavailable"
                     )
                 }),
-            Self::Assigned(name) => Ok(Datum::Bool(records.record_mut(name).row().is_some())),
-            Self::Field(name, column) => Ok(records
-                .record_mut(name)
-                .row()
-                .map_or(Datum::Null, |row| row[column])),
+            // A trigger record keeps no forms.
+            Self::Assigned(name) => Ok((
+                Datum::Bool(records.record_mut(name).row().is_some()),
+                DatumForm::Unknown,
+            )),
+            Self::Field(name, column) => Ok((
+                records
+                    .record_mut(name)
+                    .row()
+                    .map_or(Datum::Null, |row| row[column]),
+                DatumForm::Unknown,
+            )),
         }
     }
 
@@ -45171,12 +45228,11 @@ impl CursorOutputSlot {
         local_values: &mut [LocalSlot<'a>],
         records: &mut TriggerRows<'_, 'a>,
         value: Datum<'a>,
+        form: DatumForm,
     ) -> Result<(), SqlError> {
         match (self, value) {
-            // A fetched row's column, read from the cursor's result tuple.
-            (Self::Local(index), value) => {
-                local_values[index] = result_tuple_slot(value, crate::storage::StoredForm::Inline);
-            }
+            // A local keeps the form the cursor statement gave it.
+            (Self::Local(index), value) => local_values[index] = LocalSlot { value, form },
             (Self::Assigned(_), Datum::Bool(true)) => {}
             (Self::Assigned(name), Datum::Bool(false)) => records.record_mut(name).set_row(None),
             (Self::Field(name, column), value) => records.record_mut(name).set_field(column, value),
@@ -45283,6 +45339,7 @@ fn finish_dynamic_into<'a>(
     statement: PlpgsqlDynamicSelectInto<'a>,
     arguments: &[Datum<'a>],
     selected: &[Datum<'a>],
+    forms: &[crate::storage::StoredForm],
     source_width: usize,
     rows: u64,
     status: &mut TriggerExecutionStatus<'a>,
@@ -45325,11 +45382,12 @@ fn finish_dynamic_into<'a>(
         {
             check_multi_assignment(context.responder, target_width, source_width)?;
         }
-        for (target, value) in statement
+        for (index, (target, value)) in statement
             .targets
             .iter()
             .copied()
             .zip(selected.iter().copied())
+            .enumerate()
         {
             let resolved = plpgsql_into_target(locals, new_row.definition, target)?;
             assign_plpgsql_into_target(
@@ -45340,7 +45398,7 @@ fn finish_dynamic_into<'a>(
                 local_values,
                 target,
                 resolved,
-                result_tuple_slot(value, crate::storage::StoredForm::Inline),
+                result_tuple_slot(value, form_at(forms, index, &value)),
             )?;
         }
         Ok(())
@@ -45635,7 +45693,8 @@ fn store_static_returning<'a>(
             local_values,
             target,
             resolved,
-            result_tuple_slot(value, crate::storage::StoredForm::Inline),
+            // RETURNING rows do not carry their values' forms.
+            result_tuple_slot(value, crate::sql::toast::uncarried_form(&value)),
         )?;
     }
     Ok(())
@@ -94491,7 +94550,15 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
             return Ok(Err(e));
         }
     } else {
-        match crate::sql::query::emit_data_row(storage, txid, arena, responder, &projected[..n]) {
+        // RETURNING rows do not carry their values' forms.
+        match crate::sql::query::emit_data_row(
+            storage,
+            txid,
+            arena,
+            responder,
+            &projected[..n],
+            &[],
+        ) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Ok(Err(error)),
             Err(wire) => return Err(wire),
@@ -94689,7 +94756,15 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
             Err(error) => Ok(Err(error)),
         }
     } else {
-        match crate::sql::query::emit_data_row(storage, txid, arena, responder, &projected[..n]) {
+        // RETURNING rows do not carry their values' forms.
+        match crate::sql::query::emit_data_row(
+            storage,
+            txid,
+            arena,
+            responder,
+            &projected[..n],
+            &[],
+        ) {
             Ok(Ok(())) => Ok(Ok(())),
             Ok(Err(error)) => Ok(Err(error)),
             Err(wire) => Err(wire),

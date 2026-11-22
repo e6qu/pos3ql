@@ -1000,8 +1000,8 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for EnclosingRow<'_, 'a> {
         self.0.stored_form(qualifier, name)
     }
 
-    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
-        self.0.holds_formed_datum(qualifier, name)
+    fn datum_header(&self, qualifier: Option<&str>, name: &str) -> crate::sql::toast::DatumHeader {
+        self.0.datum_header(qualifier, name)
     }
 
     fn resolve_column_type_unsuggested(
@@ -1120,8 +1120,12 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for RoutineVariables<'_, 'a> {
         self.0.stored_form(qualifier, name)
     }
 
-    fn holds_formed_datum(&self, qualifier: Option<&str>, name: &str) -> bool {
-        self.names(qualifier, name) && self.0.holds_formed_datum(qualifier, name)
+    fn datum_header(&self, qualifier: Option<&str>, name: &str) -> crate::sql::toast::DatumHeader {
+        if self.names(qualifier, name) {
+            self.0.datum_header(qualifier, name)
+        } else {
+            crate::sql::toast::DatumHeader::Tuple
+        }
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'b>, SqlError> {
@@ -1213,11 +1217,15 @@ pub trait ColumnLookup<'a> {
         name: &str,
     ) -> Result<Option<crate::storage::StoredForm>, SqlError>;
 
-    /// Whether the column holds a datum an expression formed, with the
-    /// four-byte varlena header it gave it, rather than one read from a
-    /// tuple: a PL/pgSQL variable a simple expression assigned.
-    fn holds_formed_datum(&self, _qualifier: Option<&str>, _name: &str) -> bool {
-        false
+    /// The varlena header of the datum the column holds: one read from a
+    /// tuple unless, like a PL/pgSQL variable a simple expression assigned
+    /// or a parameter passed an unrecorded datum, the column holds another.
+    fn datum_header(
+        &self,
+        _qualifier: Option<&str>,
+        _name: &str,
+    ) -> crate::sql::toast::DatumHeader {
+        crate::sql::toast::DatumHeader::Tuple
     }
 
     /// [`Self::lookup`] for a caller that may still find the column in an
@@ -3258,7 +3266,10 @@ pub trait CatalogAccess {
         _arguments: &[&'a Expr<'a>],
         _argument_type_oids: &[i32],
         _argument_collation: &dyn Fn(&'a Expr<'a>) -> Result<Option<DerivedCollation>, SqlError>,
-        _evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
+        _evaluate: &mut dyn FnMut(
+            &'a Expr<'a>,
+        )
+            -> Result<(Datum<'a>, crate::sql::toast::DatumForm), SqlError>,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         Err(sql_err!(
@@ -8166,6 +8177,26 @@ fn eval_full_unpositioned<'a>(
     )
 }
 
+/// A routine call's argument `expression` over `row` and how it holds its
+/// value: PostgreSQL passes the datum the expression gives on unchanged. A
+/// parameter `$n` holds its value as `param_forms` records, or as a
+/// client's bound value formed by its type's input when it records none.
+pub(crate) fn routine_argument<'a>(
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    param_forms: &[crate::sql::toast::DatumForm],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(Datum<'a>, crate::sql::toast::DatumForm), SqlError> {
+    let value = eval_full(expression, arena, params, row, hooks)?;
+    let form = match expression {
+        Expr::Param(number) if let Some(form) = param_forms.get(*number as usize - 1) => *form,
+        _ => crate::sql::toast::held_form(expression, row, hooks.catalog, &value)?,
+    };
+    Ok((value, form))
+}
+
 pub(crate) fn bound_literal_value<'a>(
     value: crate::sql::ast::BoundLiteralValue<'a>,
     arena: &'a Arena,
@@ -9250,7 +9281,9 @@ fn eval_full_inner<'a>(
                             args,
                             types,
                             &|argument| routine_argument_collation(argument, row, hooks.catalog),
-                            &mut |argument| eval_full(argument, arena, params, row, hooks),
+                            &mut |argument| {
+                                routine_argument(argument, arena, params, &[], row, hooks)
+                            },
                             arena,
                         );
                     }
@@ -12366,7 +12399,7 @@ fn call<'a>(
                 args,
                 argument_type_oids,
                 &|argument| routine_argument_collation(argument, row, hooks.catalog),
-                &mut |argument| eval_full(argument, arena, params, row, hooks),
+                &mut |argument| routine_argument(argument, arena, params, &[], row, hooks),
                 arena,
             );
         }

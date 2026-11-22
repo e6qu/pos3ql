@@ -158,13 +158,11 @@ While a request waits on the network, the SQL worker serves other connections:
 reading a cached invoice continues while another connection's commit uploads or
 cleanup lists and deletes old files. Exceptions and details:
 
-- A large `SELECT` from one table, a retained join or a grouping (no sorting,
-  subqueries or set operations in object-store mode) resumes row by row: a cold
-  block after delivered rows yields like any other download. Other large
-  results, once their first bytes have reached the client, finish their
-  remaining reads synchronously, because a sent prefix cannot be withdrawn.
-  Rows the client has not yet read never hold the worker. Resuming more result
-  shapes is [planned](../PLAN.md#pause-and-resume-every-query-path).
+- Statements yield while they wait for a download, with the exceptions the
+  [execution model](architecture.md#execution-model) lists: for example, a
+  large result whose first bytes reached the client and that cannot stream
+  finishes its remaining reads synchronously, because a sent prefix cannot
+  be withdrawn. Rows the client has not yet read never hold the worker.
 - Deleting old files never delays a statement that waits for memory. When
   the row heap, `row_overlay_slots` or `row_history_slots` fill, a writer
   waits for the next checkpoint to save resident rows and release their

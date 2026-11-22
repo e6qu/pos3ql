@@ -45,6 +45,7 @@ definitions keep technical text consistent.
 - **compare-and-swap (CAS)**: updating a saved reference only if it still has the generation previously read, so an old writer cannot replace newer state.
 - **declared type**: the schema-qualified type shown in catalog, parameter and replication metadata, as distinct from the executor's value type.
 - **durable mode**: `object_store = on`; a commit is acknowledged only after its commit batch is published.
+- **effect**: work a restarted statement could not undo or repeat (a volatile call, a routine body, `nextval`, output reaching the client); reads after it no longer restart the statement.
 - **ETag**: the object store's opaque, quoted generation token used for compare-and-swap.
 - **execution control pool**: fixed startup memory shared by running procedural calls for their positions, local variables, source images and error state.
 - **LSN**: log sequence number, a position in the journal used for replay and replication progress.
@@ -57,12 +58,17 @@ definitions keep technical text consistent.
 - **promotion**: moving durable write ownership to a fresh process by compare-and-swap.
 - **pruning**: skipping data that summaries prove cannot match; candidates are still checked exactly.
 - **publication**: making prepared state visible through its authoritative reference. Uploading an object alone does not commit it.
+- **pull node**: a plan node that returns one row per call and keeps its position in its own record, so a storage wait below it resumes where it stopped.
 - **reclamation**: reusing memory or deleting objects once nothing needs them.
+- **result stream**: a large result that delivers rows as the client reads them, from a retained read position, instead of queuing them in the spool.
+- **retained reader**: the plan tree a result stream, cursor or in-place `SELECT` keeps between rows; it holds no storage borrow between calls.
 - **retention**: keeping bytes or objects while a reader, recovery or backup still needs them.
 - **S3-compatible API**: the HTTP data-plane subset qualified against MinIO and compatible stores; no vendor SDK or control plane.
 - **snapshot**: the read position and transaction context that decide which row versions a read sees.
 - **SST**: sorted string table: an immutable object of versioned rows with index, filter and roster blocks. Writes create replacement objects instead of editing published ones.
+- **stored form**: how PostgreSQL's TOAST stored a value (compressed, out of line, or as formed); a value passed on keeps it, and `pg_column_size` reports it.
 - **value slot**: one typed SQL value entry; large values refer to bytes stored elsewhere, which the slot does not own.
 - **VOPR**: deterministic simulation that injects faults from a reproducible seed.
 - **WAL**: the checksummed journal encoding used for recovery and logical replication; not PostgreSQL's physical WAL format.
 - **writer fence**: a durable ownership record that stops an older process from publishing after promotion.
+- **yield** (pause): a statement waiting for storage or a lock gives up the SQL worker and later resumes; a path that cannot yield **blocks** the worker.

@@ -2446,7 +2446,17 @@ pub(crate) fn scan_path<'a>(
     let mut layouts = [(1.0, 0u32, 1.0, false); MAX_INDEXES];
     for (position, index) in planner.indexes.iter().enumerate() {
         if index.catalog.method == IndexAccessMethod::Btree {
-            layouts[position] = super::btree_layout(&planner, index, entries);
+            let (pages, height, leaves, deduplicated) =
+                super::btree_layout(&planner, index, entries);
+            layouts[position] = match super::measured_layout(storage, slot, txid, &index.catalog) {
+                Some(layout) => (
+                    layout.pages as f64,
+                    layout.height,
+                    layout.leaves as f64,
+                    deduplicated,
+                ),
+                None => (pages, height, leaves, deduplicated),
+            };
         }
     }
     let indexes = arena
@@ -2687,13 +2697,16 @@ pub(crate) fn scan_path<'a>(
         };
         let (pages, height, leaves, deduplicated) =
             super::btree_layout(&planner, &planner.indexes[position], entries);
-        partial_layouts[position] = Some((
-            pages,
-            height,
-            leaves,
-            deduplicated,
-            entries.min(size.tuples),
-        ));
+        let catalog = &planner.indexes[position].catalog;
+        let (pages, height, leaves) = match super::measured_layout(storage, slot, txid, catalog) {
+            Some(layout) => (layout.pages as f64, layout.height, layout.leaves as f64),
+            None => (pages, height, leaves),
+        };
+        // `estimate_rel_size` of the index: its counted tuple density over
+        // its pages, the metapage left out.
+        let tuples = super::partial_index_tuples(&planner, catalog, pages);
+        partial_layouts[position] =
+            Some((pages, height, leaves, deduplicated, tuples.min(size.tuples)));
     }
     // The restrictions each usable predicate implies (`indrestrictinfo`); a
     // write's target keeps them all.

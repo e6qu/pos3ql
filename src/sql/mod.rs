@@ -7183,6 +7183,22 @@ impl Engine {
                 return Err(error);
             }
         }
+        // A committed TRUNCATE's new files have 0 pages and are uncounted.
+        for event_index in 0..txn.truncates().len() {
+            for target_index in 0..txn.truncates()[event_index].target_count() {
+                let slot = txn.truncates()[event_index].target_slot(target_index);
+                let stamp = self.storage.transaction_truncate_stamp(txn.txid, slot);
+                if stamp == 0 || !self.storage.table_slot_visible_to(slot, txn.txid) {
+                    continue;
+                }
+                if let Err(error) =
+                    exec::reset_truncated_counts(&self.storage, slot, txn.txid, stamp, &self.work)
+                {
+                    self.rollback_txn(txn, guc);
+                    return Err(error);
+                }
+            }
+        }
         for i in 0..txn.touched().len() {
             let (table, rowid, _) = txn.touched()[i];
             // A row may be written several times in one transaction; journal
@@ -7341,6 +7357,40 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
+        }
+        // Index relation counts change in place, like a table's: a commit
+        // journals every visible index's unjournaled counts.
+        let mut from = 0;
+        while let Some((slot, revision, image)) = self.storage.next_unjournaled_index_counts(from) {
+            from = slot + 1;
+            let Some((owner, database, _)) =
+                crate::sql::catalog::index_statistics_source(&self.storage, txn.txid, image.oid)
+            else {
+                continue;
+            };
+            if database != image.database || database != self.storage.current_database_oid() {
+                continue;
+            }
+            let (crate::storage::IndexStatisticsOwner::Implicit(table)
+            | crate::storage::IndexStatisticsOwner::Explicit(table)) = owner;
+            if self
+                .storage
+                .table_def(usize::from(table), txn.txid)
+                .persistence
+                != crate::storage::RelationPersistence::Temporary
+                && let Err(error) = self.wal.stage_reserved(
+                    txn.txid,
+                    self.storage.bump_lsn(),
+                    &WalOp::IndexRelationCounts {
+                        oid: image.oid,
+                        counts: image.counts,
+                    },
+                )
+            {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.stage_index_counts(slot, revision, txn.txid);
         }
         // pg_statistic column rows are transactional, but PostgreSQL updates
         // pg_class reltuples/relpages in place. A later commit therefore also
@@ -8202,6 +8252,7 @@ impl Engine {
                 self.storage.clear_brin_maintenance_dirty(slot);
             }
         }
+        self.storage.acknowledge_index_counts(txn.txid);
         statistics_receipts.acknowledge();
         self.wal.commit();
         if let txn::CommitTarget::CommitPrepared { slot, .. }
@@ -10449,10 +10500,13 @@ impl Engine {
         })
     }
 
+    /// ANALYZE of `targets`; without VACUUM (`measure_indexes`) it also
+    /// counts each table's indexes, as `do_analyze_rel` does.
     fn analyze_targets(
         &mut self,
         targets: &[ast::MaintenanceTarget<'_>],
         txn: &mut TxnState,
+        measure_indexes: bool,
     ) -> Result<u64, SqlError> {
         self.validate_maintenance_targets(targets, txn.txid)?;
         let _snapshot = self.storage.analyze_snapshot();
@@ -10488,6 +10542,18 @@ impl Engine {
                         &self.work,
                     )?;
                     drop(indexes);
+                    if measure_indexes {
+                        exec::measure_index_counts(
+                            &self.storage,
+                            slot,
+                            txn.txid,
+                            exec::IndexSelection::All,
+                            exec::IndexMeasurement::Analyze {
+                                rows: statistics.rows,
+                            },
+                            &self.work,
+                        )?;
+                    }
                     if statistics.relation_estimates_changed(&previous) {
                         txn.record_statistics_plan_change(&self.storage, slot as u32);
                     }
@@ -10558,6 +10624,18 @@ impl Engine {
                 );
                 drop(indexes);
                 let statistics = statistics?;
+                if measure_indexes {
+                    exec::measure_index_counts(
+                        &self.storage,
+                        slot,
+                        txn.txid,
+                        exec::IndexSelection::All,
+                        exec::IndexMeasurement::Analyze {
+                            rows: statistics.rows,
+                        },
+                        &self.work,
+                    )?;
+                }
                 if statistics.relation_estimates_changed(&previous) {
                     txn.record_statistics_plan_change(&self.storage, slot as u32);
                 }
@@ -10589,6 +10667,38 @@ impl Engine {
             .is_partitioned()
     }
 
+    /// VACUUM's in-place counts of the table in slot `slot` and of its
+    /// indexes. Indexes are vacuumed, and recounted, only when dead rows
+    /// left entries to remove on at least 2% of the table's pages
+    /// (`BYPASS_THRESHOLD_PAGES`); VACUUM FULL rebuilt them already.
+    fn vacuum_relation_counts(
+        &mut self,
+        slot: usize,
+        txid: u32,
+        full: bool,
+    ) -> Result<(), SqlError> {
+        let dead = self.storage.relation_cumulative_statistics(slot).n_dead_tup;
+        let previous_pages = self.storage.table_statistics(slot, txid).pages;
+        self.storage
+            .refresh_relation_counts(slot, txid, &self.work)?;
+        let pages = self
+            .storage
+            .table_statistics(slot, txid)
+            .pages
+            .max(previous_pages);
+        if !full && dead != 0 && dead as f64 >= 0.02 * pages as f64 {
+            exec::measure_index_counts(
+                &self.storage,
+                slot,
+                txid,
+                exec::IndexSelection::All,
+                exec::IndexMeasurement::Vacuum,
+                &self.work,
+            )?;
+        }
+        Ok(())
+    }
+
     fn record_vacuum_targets(
         &mut self,
         targets: &[ast::MaintenanceTarget<'_>],
@@ -10609,8 +10719,7 @@ impl Engine {
                         exec::rebuild_table_index_keys(&self.storage, txid, slot, &self.work)?;
                         self.work.reset();
                     }
-                    self.storage
-                        .refresh_relation_counts(slot, txid, &self.work)?;
+                    self.vacuum_relation_counts(slot, txid, full)?;
                     self.storage.vacuum_relation_index_hint(slot)?;
                     self.storage.record_relation_vacuum(slot, elapsed_micros);
                 }
@@ -10634,8 +10743,7 @@ impl Engine {
                         exec::rebuild_table_index_keys(&self.storage, txid, slot, &self.work)?;
                         self.work.reset();
                     }
-                    self.storage
-                        .refresh_relation_counts(slot, txid, &self.work)?;
+                    self.vacuum_relation_counts(slot, txid, full)?;
                     self.storage.vacuum_relation_index_hint(slot)?;
                     self.storage.record_relation_vacuum(slot, elapsed_micros);
                 }
@@ -10732,7 +10840,7 @@ impl Engine {
             return Ok(Err(error));
         }
         let validation = if options.analyze {
-            self.analyze_targets(targets, txn).map(|_| ())
+            self.analyze_targets(targets, txn, false).map(|_| ())
         } else {
             self.validate_maintenance_targets(targets, txn.txid)
         };
@@ -10774,7 +10882,7 @@ impl Engine {
         ) {
             return Ok(Err(error));
         }
-        if let Err(error) = self.analyze_targets(targets, txn) {
+        if let Err(error) = self.analyze_targets(targets, txn, true) {
             return Ok(Err(error));
         }
         responder.command_complete("ANALYZE")?;
@@ -23381,6 +23489,13 @@ impl Engine {
         {
             return Ok(Err(error));
         }
+        // A statement that created indexes leaves them measured as built.
+        if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = exec::measure_unmeasured_indexes(&self.storage, txn.txid, arena)
+        {
+            return Ok(Err(error));
+        }
         if matches!(outcome, Ok(Ok(())))
             && event_tag.is_some()
             && let Err(error) = exec::reconcile_foreign_key_clones(
@@ -26761,6 +26876,13 @@ impl Engine {
             && let Err(error) = self
                 .storage
                 .reconcile_partition_triggers(txn, event_ddl_mark)
+        {
+            return Ok(Err(error));
+        }
+        // A statement that created indexes leaves them measured as built.
+        if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = exec::measure_unmeasured_indexes(&self.storage, txn.txid, arena)
         {
             return Ok(Err(error));
         }
@@ -33882,6 +34004,9 @@ fn apply_wal_op(
             index.restore_expression_dependencies(expression_dependencies.entries())?;
             let slot = storage.create_index(index, 0)?;
             storage.commit_index_create(slot)?;
+        }
+        WalOp::IndexRelationCounts { oid, counts } => {
+            storage.restore_index_relation_counts(storage.current_database_oid(), oid, counts)?;
         }
         WalOp::BrinMaintenance {
             index_created_at,

@@ -514,8 +514,8 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   the forms its query gave them (`992`).
 - [ ] PL/pgSQL forms not carried yet (each `0A000` where the form
   decides a size): an argument a user-defined cast, operator or support
-  function, a domain conversion or `EXECUTE 'CALL p($1)' USING` passes on
-  (PostgreSQL keeps the caller's datum, 44), a procedure's output
+  function or a domain conversion passes on (PostgreSQL keeps the caller's
+  datum, 44; `EXECUTE 'CALL p($1)' USING` keeps it, `992`), a procedure's output
   parameters returned to `CALL`, the datum a user-defined function returns
   (PostgreSQL passes a returned parameter on unchanged), and `NEW` and
   `OLD` columns TOAST may store otherwise (PostgreSQL reads a `BEFORE`
@@ -572,11 +572,16 @@ Fixture numbers refer to `tests/external/differential_exact/`.
 
 - [ ] Index layouts and counters: a btree grown by inserts has the pages
   PostgreSQL's page splits and deduplication leave (an index created before
-  6,000 inserts is costed as built, 8.00 below PostgreSQL's full scan);
-  an index's `pg_class.relpages` and `reltuples` (0 today); cumulative
-  counters for `CREATE INDEX`'s heap scan, the heap fetches of bitmap and
-  index-only scans (`idx_tup_fetch`), and partition index scans read only
-  for their order.
+  6,000 inserts is costed, and its `relpages` counted, as built: 8.00 below
+  PostgreSQL's full scan); a hash, GIN, GiST, SP-GiST or BRIN index over rows
+  keeps the `relpages` and `reltuples` last counted (0 when never), since
+  only their empty layouts are modelled; `VACUUM` recounts an index's
+  entries when dead rows reach 2% of the table's pages, approximating
+  PostgreSQL's index-vacuum bypass; `ANALYZE` of a table past its sample
+  counts a partial index's entries exactly where PostgreSQL scales the
+  sample's share (`996`); cumulative counters for `CREATE INDEX`'s
+  heap scan, the heap fetches of bitmap and index-only scans
+  (`idx_tup_fetch`), and partition index scans read only for their order.
 - [ ] Range and multirange histograms; `compute_distinct_stats` for types
   without an ordering; the binary form of a
   composite value inside a statistics array (sent as text today).

@@ -64,6 +64,9 @@ const TABLE_STATISTICS_V6: u8 = 250;
 /// is (0 for a table column) and its value distribution's bytes, after the
 /// relation's heap and all-visible page counts.
 const TABLE_STATISTICS_V7: u8 = 249;
+/// An index's OID, relation pages and tuples, then its layout's pages,
+/// height, leaves and table row changes.
+const INDEX_RELATION_COUNTS_BYTES: usize = 4 + 4 + 4 + 8 + 4 + 8 + 8;
 /// Format, validity, rows, width, generation, pages, all-visible pages and
 /// the column count.
 const STATISTICS_HEADER: usize = 1 + 1 + 8 + 4 + 8 + 8 + 8 + 2;
@@ -177,6 +180,9 @@ wal_record_kinds! {
     KIND_CREATE_ENUM_V3 = 149;
     KIND_ANALYZE_EXTENDED_STATISTICS_V2 = 150;
     KIND_ANALYZE_EXTENDED_STATISTICS_V3 = 180;
+/// One index's `pg_class.relpages` and `reltuples` and page layout, written
+/// in place like PostgreSQL's `vac_update_relstats`.
+    KIND_INDEX_RELATION_COUNTS = 181;
     KIND_CREATE_DOMAIN_TYPED = 151;
     KIND_CREATE_VIEW_BOUND = 152;
     KIND_UPSERT_V2 = 153;
@@ -2230,6 +2236,12 @@ pub(crate) enum WalOp<'a> {
         unsummarized_ranges: [u64; crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES],
         range_count: u8,
     },
+    /// Absolute relation counts of the index `oid` of the record's database,
+    /// which a later commit can publish for a rolled-back transaction.
+    IndexRelationCounts {
+        oid: i32,
+        counts: crate::storage::IndexRelationCounts,
+    },
     AlterIndexDefinition {
         schema: &'a str,
         name: &'a str,
@@ -3651,6 +3663,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::AdvanceReplicationSlot { .. } => KIND_ADVANCE_REPLICATION_SLOT,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
         WalOp::BrinMaintenance { .. } => KIND_BRIN_MAINTENANCE,
+        WalOp::IndexRelationCounts { .. } => KIND_INDEX_RELATION_COUNTS,
         WalOp::AlterIndexDefinition { .. } => KIND_ALTER_INDEX_DEFINITION_V2,
         WalOp::CreateTablespace { .. } => KIND_CREATE_TABLESPACE,
         WalOp::AlterTablespace { .. } => KIND_ALTER_TABLESPACE,
@@ -4333,6 +4346,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + expression_dependencies.encoded_len()
         }
         WalOp::BrinMaintenance { range_count, .. } => 8 + 4 + 8 + 1 + usize::from(*range_count) * 8,
+        WalOp::IndexRelationCounts { .. } => INDEX_RELATION_COUNTS_BYTES,
         WalOp::AlterIndexDefinition {
             schema,
             name,
@@ -6165,6 +6179,15 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok && append_index_definition(buffer, *definition, *parent)
                 && buffer.append(&[0xa7])
                 && expression_dependencies.append(buffer)
+        }
+        WalOp::IndexRelationCounts { oid, counts } => {
+            buffer.append(&oid.to_le_bytes())
+                && buffer.append(&counts.pages.to_le_bytes())
+                && buffer.append(&counts.tuples.to_bits().to_le_bytes())
+                && buffer.append(&counts.layout.pages.to_le_bytes())
+                && buffer.append(&counts.layout.height.to_le_bytes())
+                && buffer.append(&counts.layout.leaves.to_le_bytes())
+                && buffer.append(&counts.layout.changes.to_le_bytes())
         }
         WalOp::BrinMaintenance {
             index_created_at,
@@ -10610,6 +10633,26 @@ fn decode_op_inner<'a>(
                 range_count: count as u8,
             })
         }),
+        KIND_INDEX_RELATION_COUNTS => {
+            let bytes: &[u8; INDEX_RELATION_COUNTS_BYTES] = payload.try_into().ok()?;
+            let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let long = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            let tuples = f32::from_bits(word(8));
+            let layout = crate::storage::IndexLayout {
+                pages: long(12),
+                height: word(20),
+                leaves: long(24),
+                changes: long(32),
+            };
+            (tuples >= -1.0 && layout.pages != 0).then_some(WalOp::IndexRelationCounts {
+                oid: word(0) as i32,
+                counts: crate::storage::IndexRelationCounts {
+                    pages: word(4),
+                    tuples,
+                    layout,
+                },
+            })
+        }
         KIND_ALTER_INDEX_DEFINITION => None,
         KIND_ALTER_INDEX_DEFINITION_V2 => decode_large_op(|| {
             let schema = take_name(&mut at)?;
@@ -18321,6 +18364,45 @@ mod tests {
         corrupt[..payload.len()].copy_from_slice(payload);
         corrupt[20] = (crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES + 1) as u8;
         assert!(decode_op(KIND_BRIN_MAINTENANCE, &corrupt[..payload.len()]).is_none());
+    }
+
+    #[test]
+    fn index_relation_counts_round_trip_and_reject_invalid_counts() {
+        let counts = crate::storage::IndexRelationCounts {
+            pages: 74,
+            tuples: 10_000.0,
+            layout: crate::storage::IndexLayout {
+                pages: 74,
+                height: 1,
+                leaves: 72,
+                changes: 10_003,
+            },
+        };
+        let operation = WalOp::IndexRelationCounts {
+            oid: 16_400,
+            counts,
+        };
+        let mut bytes = [0; 256];
+        let payload = encode_catalog_operation(&operation, &mut bytes);
+        assert_eq!(payload.len(), INDEX_RELATION_COUNTS_BYTES);
+        let Some(WalOp::IndexRelationCounts {
+            oid,
+            counts: decoded,
+        }) = decode_op(KIND_INDEX_RELATION_COUNTS, payload)
+        else {
+            panic!("index relation counts WAL payload must decode");
+        };
+        assert_eq!((oid, decoded), (16_400, counts));
+        // A NaN or below -1 tuple count, a layout without pages, or a short
+        // payload is corrupt.
+        let mut corrupt = [0; INDEX_RELATION_COUNTS_BYTES];
+        corrupt.copy_from_slice(payload);
+        corrupt[8..12].copy_from_slice(&f32::NAN.to_bits().to_le_bytes());
+        assert!(decode_op(KIND_INDEX_RELATION_COUNTS, &corrupt).is_none());
+        corrupt.copy_from_slice(payload);
+        corrupt[12..20].copy_from_slice(&0u64.to_le_bytes());
+        assert!(decode_op(KIND_INDEX_RELATION_COUNTS, &corrupt).is_none());
+        assert!(decode_op(KIND_INDEX_RELATION_COUNTS, &payload[..20]).is_none());
     }
 
     #[test]

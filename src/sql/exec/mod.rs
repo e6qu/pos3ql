@@ -23533,6 +23533,9 @@ struct BoundPlpgsqlCommand<'a> {
     source: &'a str,
     statement: &'a Stmt<'a>,
     arguments: &'a [Datum<'a>],
+    /// How each argument holds its datum: `USING` passes on the datum its
+    /// expression gives.
+    argument_forms: &'a [DatumForm],
     parameter_types: &'a [i32],
     inputs: &'a [super::type_inputs::Binding<'a>],
 }
@@ -24901,8 +24904,7 @@ fn execute_plpgsql_dynamic_call<'a>(
                     *variadic,
                     arena,
                     query.arguments,
-                    // `USING` values reach the statement without their forms.
-                    &crate::sql::toast::UNRECORDED_ARGUMENTS[..query.arguments.len()],
+                    query.argument_forms,
                     context.txn,
                     sqlprep,
                     cursors,
@@ -34686,9 +34688,15 @@ fn bind_plpgsql_dynamic_query<'a>(
                 };
         }
     }
+    let argument_forms = context
+        .arena
+        .alloc_slice_with(query.arguments.len(), |_| DatumForm::Unknown)
+        .map_err(|_| super::query::arena_full_pub())?;
     for (index, expression) in query.arguments.iter().copied().enumerate() {
-        arguments[index] =
-            detached_trigger_datum(expressions.eval(context, expression, scope)?, context.arena)?;
+        let value = expressions.eval(context, expression, scope)?;
+        // `exec_eval_using_params` copies the datum as it is held.
+        argument_forms[index] = crate::sql::toast::held_form(expression, scope, None, &value)?;
+        arguments[index] = detached_trigger_datum(value, context.arena)?;
     }
     crate::sql::error_context::begin_dynamic_query(command);
     if matches!(kind, DynamicCommandKind::Cursor) {
@@ -34784,6 +34792,7 @@ fn bind_plpgsql_dynamic_query<'a>(
         source: command,
         statement,
         arguments: &*arguments,
+        argument_forms: &*argument_forms,
         parameter_types,
         inputs,
     })
@@ -34877,6 +34886,11 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
             context.txn.txid,
         )?,
         arguments: &*values,
+        // `EXECUTE name(...)` passes values its arguments formed or read.
+        argument_forms: context
+            .arena
+            .alloc_slice_with(values.len(), |_| DatumForm::Unknown)
+            .map_err(|_| super::query::arena_full_pub())?,
         parameter_types,
         inputs,
     })
@@ -35663,6 +35677,7 @@ fn execute_bound_plpgsql_utility<'a>(
                                     source: "",
                                     statement: requalified,
                                     arguments: &[],
+                                    argument_forms: &[],
                                     parameter_types: &[],
                                     inputs: &[],
                                 },
@@ -37824,6 +37839,10 @@ fn execute_plpgsql_dynamic_explain(
             statement,
             inputs: &[],
             arguments,
+            argument_forms: context
+                .arena
+                .alloc_slice_with(arguments.len(), |_| DatumForm::Unknown)
+                .map_err(|_| super::query::arena_full_pub())?,
             parameter_types: context
                 .arena
                 .alloc_slice_with(arguments.len(), |index| {
@@ -43097,6 +43116,7 @@ fn execute_trigger_step_in<'a>(
                         )?
                         .unwrap_or(&[]),
                         arguments: &[],
+                        argument_forms: &[],
                         parameter_types: &[],
                     },
                 )?;
@@ -75418,7 +75438,18 @@ fn prepare_index_creation(
         arena,
     )?;
     storage.prepare_index_definition_enforcers(slot, txn.txid, operation)?;
-    storage.write_relation_counts(table, statistics, true)
+    measure_index_counts(
+        storage,
+        table,
+        txn.txid,
+        IndexSelection::Oid(crate::sql::catalog::explicit_index_oid(&index)),
+        IndexMeasurement::Build,
+        arena,
+    )?;
+    if index_build_counts_table(storage, table, txn.txid) {
+        storage.write_relation_counts(table, statistics, true)?;
+    }
+    Ok(())
 }
 
 pub(super) fn build_concurrent_index(
@@ -75615,6 +75646,7 @@ fn validate_index_rows(
             txid,
             &definition,
             ordered,
+            None,
             arena,
             visit,
         )
@@ -75627,6 +75659,7 @@ fn validate_index_rows(
                 txid,
                 &definition,
                 ordered,
+                None,
                 arena,
                 visit,
             )
@@ -75661,6 +75694,319 @@ fn validate_index_rows(
     Ok(statistics)
 }
 
+/// How an index's `pg_class` counts are measured.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IndexMeasurement {
+    /// CREATE INDEX, REINDEX or a rebuild lays the index out anew.
+    Build,
+    /// VACUUM removed dead entries: it counts the entries left, in a file
+    /// that keeps its pages.
+    Vacuum,
+    /// ANALYZE (`do_analyze_rel`): the file's pages, and the share of the
+    /// table's `rows` the index holds.
+    Analyze { rows: u64 },
+    /// The commit of a TRUNCATE leaves a new index nothing has counted, for
+    /// each index whose counts nothing wrote since the TRUNCATE's `since`.
+    Truncate { since: u64 },
+}
+
+/// Which of a table's indexes a measurement covers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IndexSelection {
+    All,
+    Oid(i32),
+}
+
+/// The pages and tuples PostgreSQL 18.6's build of an index with no entries
+/// reports (measured 2026-11-22): a btree's metapage alone; a GIN index's
+/// metapage and root; a GiST root; a hash index's metapage, two buckets and
+/// bitmap page; an SP-GiST metapage, root and first leaf; and a BRIN
+/// metapage, range map and first regular page with one placeholder range.
+fn empty_index_counts(method: crate::sql::ast::IndexAccessMethod) -> (u32, f32) {
+    use crate::sql::ast::IndexAccessMethod;
+    match method {
+        IndexAccessMethod::Btree => (1, 0.0),
+        IndexAccessMethod::Gin => (2, 0.0),
+        IndexAccessMethod::Gist => (1, 0.0),
+        IndexAccessMethod::Hash => (4, 0.0),
+        IndexAccessMethod::SpGist => (3, 0.0),
+        IndexAccessMethod::Brin => (3, 1.0),
+    }
+}
+
+/// Measures the `pg_class.relpages` and `reltuples` of the selected
+/// indexes of the table in slot `table`, and the btree layout the planner
+/// reads, as `measurement` sets them. A btree is laid out as its build
+/// would lay it out over the current rows; another access method's pages
+/// are known only while the table is empty, and its counts stay as they
+/// were otherwise.
+pub(crate) fn measure_index_counts(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    selection: IndexSelection,
+    measurement: IndexMeasurement,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    use crate::sql::ast::IndexAccessMethod;
+    let definition = (*storage.table_def(table, txid)).clone();
+    // A partitioned table's indexes have no storage, and a foreign table
+    // none at all.
+    if definition.partition.is_partitioned()
+        || definition.kind == crate::storage::TableKind::Foreign
+    {
+        return Ok(true);
+    }
+    let mut found = false;
+    let database = storage.current_database_oid();
+    let changes = storage.relation_row_changes(table, txid);
+    let live_rows = core::cell::Cell::new(None::<u64>);
+    // Counts written before this transaction's TRUNCATE describe old files.
+    let truncated = storage.transaction_truncate_stamp(txid, table);
+    let mut each = |oid: i32,
+                    key: Option<constraints::LayoutKey<'_>>,
+                    method: IndexAccessMethod,
+                    partial: bool|
+     -> Result<(), SqlError> {
+        let stale = truncated != 0 && storage.index_counts_written(oid) < truncated;
+        let previous = if stale {
+            None
+        } else {
+            storage.index_relation_counts(database, oid)
+        };
+        match selection {
+            IndexSelection::Oid(selected) if selected != oid => return Ok(()),
+            _ => {}
+        }
+        if let IndexMeasurement::Truncate { since } = measurement
+            && storage.index_counts_written(oid) >= since
+        {
+            found = true;
+            return Ok(());
+        }
+        found = true;
+        // The table's rows, counted without decoding a column, only where a
+        // measurement needs them.
+        let count_rows = || -> Result<u64, SqlError> {
+            if let Some(rows) = live_rows.get() {
+                return Ok(rows);
+            }
+            let mut rows = 0u64;
+            for_each_index_build_row(
+                storage,
+                table,
+                txid,
+                &definition,
+                false,
+                Some(0),
+                arena,
+                &mut |_, _, _| {
+                    rows += 1;
+                    Ok(())
+                },
+            )?;
+            live_rows.set(Some(rows));
+            Ok(rows)
+        };
+        let mark = arena.mark();
+        let measured = (|| {
+            let (layout, entries) = match (key, measurement) {
+                (_, IndexMeasurement::Truncate { .. }) => {
+                    (crate::storage::btree_layout::BtreeLayout::EMPTY, 0)
+                }
+                // ANALYZE reads the pages of an index no row has changed
+                // since its layout was measured.
+                (Some(_), IndexMeasurement::Analyze { rows: total })
+                    if !partial
+                        && previous.is_some_and(|previous| previous.layout.changes == changes) =>
+                {
+                    let layout = previous.expect("checked above").layout;
+                    (
+                        crate::storage::btree_layout::BtreeLayout {
+                            pages: layout.pages,
+                            height: layout.height,
+                            leaves: layout.leaves,
+                        },
+                        total,
+                    )
+                }
+                (Some(key), _) => constraints::btree_build_layout(
+                    storage,
+                    txid,
+                    &definition,
+                    key,
+                    &mut |decoded, visit| {
+                        for_each_index_build_row(
+                            storage,
+                            table,
+                            txid,
+                            &definition,
+                            false,
+                            decoded,
+                            arena,
+                            visit,
+                        )
+                    },
+                    arena,
+                )?,
+                (None, _) if count_rows()? == 0 => {
+                    let (pages, _) = empty_index_counts(method);
+                    (
+                        crate::storage::btree_layout::BtreeLayout {
+                            pages: u64::from(pages),
+                            height: 0,
+                            leaves: 0,
+                        },
+                        0,
+                    )
+                }
+                // Another access method's layout over rows is not modelled.
+                (None, _) => return Ok(None),
+            };
+            let previous_pages = previous.map_or(0, |previous| previous.layout.pages);
+            let previous_height = previous.map_or(0, |previous| previous.layout.height);
+            let (pages, height) = match measurement {
+                IndexMeasurement::Build | IndexMeasurement::Truncate { .. } => {
+                    (layout.pages, layout.height)
+                }
+                // The file keeps every page it had; deleted pages stay.
+                IndexMeasurement::Vacuum | IndexMeasurement::Analyze { .. } => (
+                    layout.pages.max(previous_pages),
+                    layout.height.max(previous_height),
+                ),
+            };
+            // A build of no entries leaves an uncounted index's counts as they
+            // were (`index_update_stats` updates only counted relations).
+            let uncounted = measurement == IndexMeasurement::Build
+                && entries == 0
+                && (stale || previous.is_some_and(|previous| previous.tuples < 0.0));
+            let tuples = match measurement {
+                IndexMeasurement::Truncate { .. } => -1.0,
+                _ if uncounted => -1.0,
+                IndexMeasurement::Build | IndexMeasurement::Vacuum if key.is_some() => {
+                    entries as f32
+                }
+                IndexMeasurement::Build | IndexMeasurement::Vacuum => empty_index_counts(method).1,
+                // `totalindexrows`: `ceil(tupleFract * totalrows)`.
+                IndexMeasurement::Analyze { rows: total } => {
+                    let rows = if partial { count_rows()? } else { 0 };
+                    let fraction = if partial && rows != 0 {
+                        entries as f64 / rows as f64
+                    } else {
+                        1.0
+                    };
+                    (fraction * total as f64).ceil() as f32
+                }
+            };
+            Ok(Some(crate::storage::IndexRelationCounts {
+                pages: if matches!(measurement, IndexMeasurement::Truncate { .. }) {
+                    0
+                } else if uncounted {
+                    previous.map_or(0, |previous| previous.pages)
+                } else {
+                    u32::try_from(pages).unwrap_or(u32::MAX)
+                },
+                tuples,
+                layout: crate::storage::IndexLayout {
+                    pages,
+                    height,
+                    leaves: layout.leaves,
+                    changes,
+                },
+            }))
+        })();
+        // SAFETY: the layout pass's entries and keys are consumed; only the
+        // counts or an owned error escape.
+        unsafe { arena.rewind_to(mark) };
+        match measured? {
+            Some(counts) => storage.set_index_relation_counts(oid, counts),
+            None => Ok(()),
+        }
+    };
+    for (column, metadata) in definition.columns().iter().enumerate() {
+        if metadata.unique
+            && let Some(identity) = definition.column_index_identity(column)
+        {
+            each(
+                identity.oid(),
+                Some(constraints::LayoutKey::Column(column)),
+                IndexAccessMethod::Btree,
+                false,
+            )?;
+        }
+    }
+    for key in definition.uniques() {
+        if let Some(identity) = key.index_identity {
+            each(
+                identity.oid(),
+                Some(constraints::LayoutKey::Table(key)),
+                IndexAccessMethod::Btree,
+                false,
+            )?;
+        }
+    }
+    for exclusion in definition.exclusions() {
+        if let Some(identity) = exclusion.index_identity {
+            each(identity.oid(), None, exclusion.method, false)?;
+        }
+    }
+    for index in storage.indexes_for_slot(table, txid) {
+        if index.relation_kind() == crate::storage::IndexRelationKind::Toast
+            || !index.mutable_for(txid).kind.live()
+            || index.mutable_for(txid).kind.is_partitioned()
+        {
+            continue;
+        }
+        let oid = crate::sql::catalog::explicit_index_oid(&index);
+        let key = (index.method == IndexAccessMethod::Btree)
+            .then_some(constraints::LayoutKey::Index(&index));
+        each(oid, key, index.method, index.predicate.is_some())?;
+    }
+    Ok(found)
+}
+
+/// Measures, as built over the current rows, every index of the current
+/// database nothing has measured: a statement that creates tables, adds
+/// constraints or rebuilds indexes leaves its new indexes measured.
+pub(crate) fn measure_unmeasured_indexes(
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mut from = 0;
+    while let Some((position, table, oid)) = storage.next_unmeasured_index(from) {
+        from = position + 1;
+        if !storage.table_slot_visible_to(table, txid) {
+            continue;
+        }
+        if measure_index_counts(
+            storage,
+            table,
+            txid,
+            IndexSelection::Oid(oid),
+            IndexMeasurement::Build,
+            arena,
+        )? && storage
+            .index_relation_counts(storage.current_database_oid(), oid)
+            .is_none()
+        {
+            storage.mark_index_counts_unmodelled(oid);
+        }
+    }
+    Ok(())
+}
+
+/// Whether CREATE INDEX and REINDEX update the table's own `pg_class`
+/// counts (`index_update_stats`): PostgreSQL 18 leaves them while autovacuum
+/// is off for the table, so restored statistics survive.
+pub(crate) fn index_build_counts_table(storage: &Storage, table: usize, txid: u32) -> bool {
+    storage
+        .table_def(table, txid)
+        .storage_options
+        .autovacuum_enabled
+        .is_none_or(|(enabled, _)| enabled)
+}
+
 /// Visits each row an index build reads: its row identifier, values and
 /// stored size. `ordered` visits them in a sequential scan's physical order,
 /// which takes a sorted copy of the resident rows; otherwise resident rows
@@ -75671,6 +76017,7 @@ fn for_each_index_build_row(
     txid: u32,
     definition: &TableDef,
     ordered: bool,
+    decoded: Option<u64>,
     arena: &Arena,
     visit: &mut constraints::BuildRowVisit<'_>,
 ) -> Result<(), SqlError> {
@@ -75689,7 +76036,7 @@ fn for_each_index_build_row(
     let scanned = if ordered {
         scan.for_each_home_physically(arena, &mut |rowid, home| each(visit, rowid, home))?
     } else {
-        scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
+        scan.for_each_spilled_row_batch(arena, true, decoded, &mut |batch| {
             for spilled in batch {
                 match spilled.representation {
                     crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
@@ -78750,6 +79097,14 @@ pub(crate) fn rebuild_table_index_keys(
         txid,
         IndexRowValidation::Reindex { selected: None },
         arena,
+    )?;
+    measure_index_counts(
+        storage,
+        table,
+        txid,
+        IndexSelection::All,
+        IndexMeasurement::Build,
+        arena,
     )
     .map(|_| ())
 }
@@ -78762,13 +79117,24 @@ fn rebuild_reindex_table_cache(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let _maintenance = MaintenancePath::enter(storage, txn.txid)?;
-    validate_index_rows(
+    let statistics = validate_index_rows(
         storage,
         table,
         txn.txid,
         IndexRowValidation::Reindex { selected },
         arena,
     )?;
+    measure_index_counts(
+        storage,
+        table,
+        txn.txid,
+        selected.map_or(IndexSelection::All, IndexSelection::Oid),
+        IndexMeasurement::Build,
+        arena,
+    )?;
+    if index_build_counts_table(storage, table, txn.txid) {
+        storage.write_relation_counts(table, statistics, true)?;
+    }
     storage.mark_value_bindings_dirty(table);
     storage.rebuild_value_caches(
         table,
@@ -82807,7 +83173,11 @@ pub fn apply_replication_truncate(
     }
     txn.record_truncate(storage, tables, cascade, restart_identity, txn.command_id())?;
     for &table in tables {
-        storage.record_relation_transaction_truncate(txn.txid, table)?;
+        storage.record_relation_transaction_truncate(
+            txn.txid,
+            table,
+            Some(storage.next_relation_counts_stamp()?),
+        )?;
     }
     Ok(())
 }
@@ -98804,6 +99174,17 @@ pub(crate) fn truncate(
             return sql_fail(error);
         }
     }
+    // PostgreSQL truncates a table created or already truncated in the
+    // current subtransaction in place: its indexes are rebuilt empty, and
+    // their builds update the table's counts. Any other table gets new files
+    // whose counts its commit resets.
+    let in_place = match arena.alloc_slice_with(n, |_| false) {
+        Ok(flags) => flags,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    for (flag, &table_index) in in_place.iter_mut().zip(list[..n].iter()) {
+        *flag = txn.truncate_in_place(table_index);
+    }
     if let Err(error) = txn.record_truncate(
         storage,
         &list[..n],
@@ -98838,13 +99219,99 @@ pub(crate) fn truncate(
             return sql_fail(error);
         }
     }
-    for &table_index in &list[..n] {
-        if let Err(error) = storage.record_relation_transaction_truncate(txn.txid, table_index) {
+    for (&table_index, &in_place) in list[..n].iter().zip(in_place.iter()) {
+        let stamp = if in_place {
+            if let Err(error) = rebuild_truncated_indexes(storage, table_index, txn.txid, arena) {
+                return sql_fail(error);
+            }
+            None
+        } else {
+            match storage.next_relation_counts_stamp() {
+                Ok(stamp) => Some(stamp),
+                Err(error) => return sql_fail(error),
+            }
+        };
+        if let Err(error) =
+            storage.record_relation_transaction_truncate(txn.txid, table_index, stamp)
+        {
             return sql_fail(error);
         }
     }
     responder.command_complete("TRUNCATE TABLE")?;
     sql_ok()
+}
+
+/// A TRUNCATE in place rebuilds the table's indexes empty; each build's
+/// `index_update_stats` sets a counted table's counts to its empty file
+/// unless autovacuum is off for it.
+fn rebuild_truncated_indexes(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let has_index = measure_index_counts(
+        storage,
+        table,
+        txid,
+        IndexSelection::All,
+        IndexMeasurement::Build,
+        arena,
+    )?;
+    let definition = storage.table_def(table, txid);
+    if !has_index
+        || definition.partition.is_partitioned()
+        || definition.kind == crate::storage::TableKind::Foreign
+        || !index_build_counts_table(storage, table, txid)
+    {
+        return Ok(());
+    }
+    drop(definition);
+    let mut statistics = storage.table_statistics(table, 0);
+    let truncated = storage.transaction_truncate_stamp(txid, table);
+    if !statistics.valid || (truncated != 0 && storage.relation_counts_written(table) < truncated) {
+        return Ok(());
+    }
+    statistics.rows = 0;
+    statistics.pages = 0;
+    statistics.all_visible_pages = 0;
+    storage.write_relation_counts(table, statistics, true)
+}
+
+/// Resets, as the commit of a TRUNCATE that gave table `table` new files,
+/// the table's and its indexes' counts nothing has written since `stamp`:
+/// PostgreSQL's new files have 0 pages and are uncounted.
+pub(crate) fn reset_truncated_counts(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    stamp: u64,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let definition = storage.table_def(table, txid);
+    if definition.partition.is_partitioned()
+        || definition.kind == crate::storage::TableKind::Foreign
+    {
+        return Ok(());
+    }
+    drop(definition);
+    if storage.relation_counts_written(table) < stamp {
+        let mut statistics = storage.table_statistics(table, 0);
+        statistics.valid = false;
+        statistics.rows = 0;
+        statistics.pages = 0;
+        statistics.all_visible_pages = 0;
+        storage.write_relation_counts(table, statistics, true)?;
+    }
+    measure_index_counts(
+        storage,
+        table,
+        txid,
+        IndexSelection::All,
+        IndexMeasurement::Truncate { since: stamp },
+        arena,
+    )
+    .map(|_| ())
 }
 
 /// Whether `ALTER COLUMN ... TYPE` may cast `from` to `to` without a `USING`
@@ -99088,6 +99555,7 @@ fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
             txid,
             &physical,
             ordered,
+            None,
             arena,
             &mut |rowid, physical_values, stored| {
                 let mut values = [Datum::Null; MAX_COLUMNS];

@@ -94,6 +94,7 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 149 | Enum create | Current. Kinds 23 and 147 are rejected. |
 | 150 | Extended statistics ANALYZE | Rejected, as kind 77 is: their summaries were approximations. |
 | 180 | Extended statistics ANALYZE | Current. Schema and name, then `XST4`, the valid and inherited bytes, the analyzed generation and the sampled rows (eight bytes each), the ndistinct flag, the 16-bit count of combinations (247) and, when built, each combination's estimate (eight bytes) in `statext_ndistinct_build` order; the dependencies flag, the 16-bit count of dependencies (1016) and, when built, each degree's IEEE-754 bits in `statext_dependencies_build` order; each key's expression statistics (valid byte, null fraction, distinct values, distinct fraction, width, then the 16-bit length and bytes of its distribution: most common values, histogram and correlation as a table column's); the 16-bit MCV item count and each item's sampled count, base-frequency bits and text-array values. |
+| 181 | Index relation counts | One index's `pg_class.relpages` and `reltuples`, written in place by its build, VACUUM or ANALYZE: four-byte OID (in the record's database), four-byte pages, `reltuples` as IEEE-754 single bits (at least -1), then its layout's eight-byte pages (nonzero), four-byte root level, eight-byte leaf pages and eight-byte table row-change count. A later commit republishes counts a rolled-back transaction changed. |
 | 151 | Domain with bound checks, defaults or named array base | Kind 21 remains readable. |
 | 152 | Bound view | Kind 144's layout for a query with bound enum literals. |
 | 153 | Row upsert | Allows tagged enum member cells and legacy cells. Kind 3 remains readable. |
@@ -237,6 +238,7 @@ inserts a missing writer.
 | `pacl` | Parameter permissions; an empty row differs from removal. |
 | `brtn` | Built-in routine attributes in the preceding `dbctx` database: OID, five attribute codes, cost and rows bits, then the journal record's settings bytes in hex (at most 6,180 characters). `own` and `acl` records for class 20 name the routine OID. |
 | `idx` | Index definition; a trailing `xd <count> <hex>...` lists its [expression dependencies](#expression-dependencies) (1–16), omitted when it has none. Table owners are rejected. |
+| `ixc` | Index relation counts, after every `idx` line: database OID, index OID, then kind 181's fields in decimal (`reltuples` as its single-precision bits). An index whose counter slot is missing is rejected. |
 | `ptx` | Prepared transaction; owner as decimal role identifier. |
 | `rol` | Role identifier, catalog slot, encoded name and attributes. Never written for the predefined roles, which are bootstrap facts. |
 | `rmem` | Position, stamp, role/member/grantor identifiers, option flags. Every live membership is listed, so restoring a manifest first removes the initdb memberships a fresh catalog starts with. |

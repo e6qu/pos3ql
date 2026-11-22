@@ -673,6 +673,67 @@ fn btree_layout(
     (size.pages, size.height, size.leaves, deduplicate)
 }
 
+/// The layout of btree `index` of the table in slot `slot` as last measured
+/// (by its build, VACUUM or ANALYZE), while no row of the table has changed
+/// since: the pages, height and leaves PostgreSQL's file holds.
+fn measured_layout(
+    storage: &Storage,
+    slot: usize,
+    txid: u32,
+    index: &PlannerIndex,
+) -> Option<crate::storage::IndexLayout> {
+    storage
+        .index_relation_counts(storage.current_database_oid(), index.oid)
+        .map(|counts| counts.layout)
+        .filter(|layout| layout.changes == storage.relation_row_changes(slot, txid))
+}
+
+/// `estimate_rel_size` of a partial btree `index` of `pages` pages: the
+/// tuple density of its counted `relpages` and `reltuples`, the metapage
+/// left out of both, or without counts the density of its key columns'
+/// widths in heap tuples.
+fn partial_index_tuples(planner: &Planner<'_, '_>, index: &PlannerIndex, pages: f64) -> f64 {
+    let counts = planner
+        .storage
+        .index_relation_counts(planner.storage.current_database_oid(), index.oid);
+    let (relpages, reltuples) = counts.map_or((0u32, -1.0f64), |counts| {
+        (counts.pages, f64::from(counts.tuples))
+    });
+    let (current, relpages) = if relpages > 0 {
+        (pages - 1.0, relpages - 1)
+    } else {
+        (pages, relpages)
+    };
+    let density = if reltuples >= 0.0 && relpages > 0 {
+        reltuples / f64::from(relpages)
+    } else {
+        // `get_rel_data_width` of the index's columns, a heap tuple header
+        // and a line pointer: integer division.
+        let mut width = 0i32;
+        for &column in index.columns[..index.n_cols]
+            .iter()
+            .chain(&index.include_columns[..index.n_include_cols])
+        {
+            let column = usize::from(column);
+            width += match planner.variables.get(column) {
+                Some(variable) => variable
+                    .statistics
+                    .and_then(|(stamp, key)| planner.statistics.index_column(stamp, key))
+                    .map_or_else(
+                        || type_average_width(variable.ctype, -1) as i32,
+                        |column| column.average_width as i32,
+                    ),
+                None => {
+                    let meta = &planner.definition.columns()[column];
+                    type_average_width(meta.ctype, meta.type_mod) as i32
+                }
+            };
+        }
+        f64::from((8192 - 24) / (width + 24 + 4))
+    };
+    (density * current).round_ties_even()
+}
+
 /// Whether `collation` orders strings byte by byte: the database default
 /// (`C`) and the built-in collations do.
 fn c_collation(collation: Collation) -> bool {

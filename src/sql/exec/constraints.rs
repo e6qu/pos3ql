@@ -21,7 +21,9 @@ use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, ValidationRead, 
 use super::{RowCtx, check_not_null};
 
 mod build_sort;
-pub(crate) use build_sort::{BuildKeys, BuildRowVisit, RebuildPhase, check_sorted_builds};
+pub(crate) use build_sort::{
+    BuildKeys, BuildRowVisit, LayoutKey, RebuildPhase, btree_build_layout, check_sorted_builds,
+};
 mod exclusion_build;
 pub(crate) use exclusion_build::check_exclusion_build;
 
@@ -2437,7 +2439,7 @@ pub(crate) enum HeapTuple {
 /// compressed when pglz shortens it enough, a short one takes a one-byte
 /// header. `None` when a value has no PostgreSQL size here, or the tuple
 /// could only fit after compressing bytes the model does not have.
-fn btree_tuple_size(
+pub(super) fn btree_tuple_size(
     key: &[Datum],
     hints: &[Option<i32>],
     storage: &Storage,

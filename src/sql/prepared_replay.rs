@@ -77,6 +77,10 @@ pub(super) fn stage_catalog_record(
             )?;
             transaction.record_routine_change(storage, change)?;
         }
+        WalOp::IndexRelationCounts { oid, counts } => {
+            // Relation counts are an absolute, nontransactional image.
+            storage.restore_index_relation_counts(storage.current_database_oid(), oid, counts)?;
+        }
         WalOp::BrinMaintenance {
             index_created_at,
             pages_per_range,

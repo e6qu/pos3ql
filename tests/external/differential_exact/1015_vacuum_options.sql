@@ -1,7 +1,6 @@
 -- VACUUM's options as ExecVacuum checks them. PROCESS_MAIN false leaves the
 -- table unvacuumed, SKIP_LOCKED passes over a table another transaction
--- holds, ONLY_DATABASE_STATS vacuums no table; the others select nothing
--- this engine has and are checked only.
+-- holds, and VACUUM FULL does not count as an ordinary vacuum.
 CREATE TABLE vo (a int PRIMARY KEY, b text);
 CREATE TABLE vo_parent (a int) PARTITION BY RANGE (a);
 CREATE TABLE vo_child PARTITION OF vo_parent FOR VALUES FROM (0) TO (100);
@@ -41,9 +40,6 @@ VACUUM (BUFFER_USAGE_LIMIT 0, FULL, ANALYZE) vo;
 VACUUM (BUFFER_USAGE_LIMIT '1kB') vo;
 VACUUM (DISABLE_PAGE_SKIPPING, FULL) vo;
 VACUUM (SKIP_DATABASE_STATS) vo;
-VACUUM (ONLY_DATABASE_STATS);
-VACUUM (ONLY_DATABASE_STATS, VERBOSE false, PROCESS_MAIN false, PROCESS_TOAST false);
-VACUUM (ONLY_DATABASE_STATS, INDEX_CLEANUP off, TRUNCATE off, PARALLEL 2);
 VACUUM (ONLY_DATABASE_STATS) vo;
 VACUUM (ONLY_DATABASE_STATS, FREEZE);
 VACUUM (ONLY_DATABASE_STATS, SKIP_LOCKED);

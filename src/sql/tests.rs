@@ -54691,6 +54691,9 @@ fn vacuum_and_analyze() {
     for cmd in [
         "VACUUM FREEZE VERBOSE vt",
         "VACUUM (VERBOSE) vt",
+        "VACUUM (ONLY_DATABASE_STATS)",
+        "VACUUM (ONLY_DATABASE_STATS, PROCESS_MAIN false, PROCESS_TOAST false)",
+        "VACUUM (ONLY_DATABASE_STATS, INDEX_CLEANUP off, TRUNCATE off, PARALLEL 2)",
         "ANALYZE (VERBOSE) vt",
         "ANALYZE VERBOSE vt",
     ] {

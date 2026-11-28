@@ -10851,7 +10851,9 @@ impl Engine {
         }
         self.vacuum_relation_counts(slot, txid, options)?;
         self.storage.vacuum_relation_index_hint(slot)?;
-        self.storage.record_relation_vacuum(slot, elapsed_micros);
+        if !options.full {
+            self.storage.record_relation_vacuum(slot, elapsed_micros);
+        }
         Ok(())
     }
 
@@ -10930,11 +10932,11 @@ impl Engine {
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        // ONLY_DATABASE_STATS updates `pg_database.datfrozenxid` alone,
-        // which this engine does not track: no table is vacuumed.
         if options.only_database_stats {
-            responder.command_complete("VACUUM")?;
-            return Ok(Ok(()));
+            return Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "VACUUM option ONLY_DATABASE_STATS is not supported"
+            )));
         }
         let started = datetime::now_micros();
         let mode = if options.full {

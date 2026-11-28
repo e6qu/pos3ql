@@ -820,6 +820,12 @@ those workflows, not every library feature.
   nothing more. `VACUUM` and `ANALYZE` skip a table the role may not
   maintain with PostgreSQL's `permission denied to analyze "t", skipping it`
   warning. The predefined roles are not counted in `max_roles`.
+- `VACUUM (SKIP_LOCKED)` skips a table it cannot lock immediately.
+  `PROCESS_MAIN false` skips vacuuming the main table. Ordinary vacuum
+  counters record lazy vacuums. `VACUUM (ONLY_DATABASE_STATS)` returns
+  `0A000` because it requires PostgreSQL's database-level frozen
+  transaction IDs. `VACUUM VERBOSE` and `ANALYZE VERBOSE` return `0A000`
+  for PostgreSQL's physical-page reports.
 - `DROP ROLE` of a role that still owns objects or holds privileges fails
   with `2BP01` and PostgreSQL's `DETAIL` list (`owner of table t`,
   `privileges for function upper(text)`, `privileges for column b of table

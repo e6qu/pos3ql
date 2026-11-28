@@ -593,7 +593,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                         Err(error) => return sql_fail(error),
                     };
                     let instead_of_forms =
-                        match instead_of_forms.rebased(&row[..def.n_columns], new) {
+                        match instead_of_forms.rebased(&row[..def.n_columns], new, None) {
                             Ok(forms) => forms,
                             Err(error) => return sql_fail(error),
                         };
@@ -784,7 +784,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                         // Detach the NEW image before the trigger body
                         // changes storage the source rows may read.
                         match detached_values(&new[..def.n_columns], arena).and_then(|detached| {
-                            assigned = assigned.rebased(&new[..def.n_columns], detached)?;
+                            assigned = assigned.rebased(&new[..def.n_columns], detached, None)?;
                             Ok(detached)
                         }) {
                             Ok(new) => (TriggerEvents::UPDATE, Some(new), "UPDATE"),

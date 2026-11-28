@@ -659,45 +659,37 @@ impl CarriedForms {
         Ok(())
     }
 
-    /// These datums and `other`'s; a datum both carry keeps the form this
-    /// one gives it.
-    pub(crate) fn joined(mut self, other: &Self) -> Result<Self, crate::sql::eval::SqlError> {
-        for carried in &other.entries[..other.count] {
-            if self.entries[..self.count]
-                .iter()
-                .any(|kept| kept.identity == carried.identity)
-            {
-                continue;
-            }
-            let entry = self.entries.get_mut(self.count).ok_or_else(|| {
-                crate::sql_err!(
-                    crate::sql::eval::sqlstate::TOO_MANY_COLUMNS,
-                    "a written row passes on more stored values than a row has columns"
-                )
-            })?;
-            *entry = *carried;
-            self.count += 1;
-        }
-        Ok(self)
-    }
-
-    /// These datums after a copy turned the values `before` into `after`
-    /// (a trigger's detached row): each copy of a carried datum carries it.
+    /// Keeps the forms of values in the finished row. A value can come from
+    /// the old row or an assignment. Each output column contributes at most
+    /// one entry, even if several columns hold copies of the same datum.
     pub(crate) fn rebased(
         &self,
         before: &[crate::sql::types::Datum<'_>],
         after: &[crate::sql::types::Datum<'_>],
+        assigned: Option<&Self>,
     ) -> Result<Self, crate::sql::eval::SqlError> {
         let mut rebased = Self::NONE;
-        for (before, after) in before.iter().zip(after) {
+        let assignments = assigned.map_or(&[][..], |forms| &forms.entries[..forms.count]);
+        for (column, (before, after)) in before.iter().zip(after).enumerate() {
             let Some(identity) = datum_identity(before) else {
                 continue;
             };
-            for carried in &self.entries[..self.count] {
-                if carried.identity == identity {
-                    rebased.carry(after, carried.form, carried.column)?;
-                }
-            }
+            let mut matching = self.entries[..self.count]
+                .iter()
+                .chain(assignments)
+                .filter(|carried| carried.identity == identity);
+            let Some(first) = matching.next() else {
+                continue;
+            };
+            let column = u16::try_from(column).ok();
+            let carried = if first.column == column {
+                first
+            } else {
+                matching
+                    .find(|entry| entry.column == column)
+                    .unwrap_or(first)
+            };
+            rebased.carry(after, carried.form, carried.column)?;
         }
         Ok(rebased)
     }
@@ -1822,6 +1814,38 @@ mod tests {
             value: Some((bytes.len(), Some(bytes))),
             stored: None,
         }
+    }
+
+    #[test]
+    fn rebasing_keeps_one_form_per_written_column_at_capacity() {
+        use crate::sql::types::Datum;
+        use crate::storage::{MAX_COLUMNS, StoredForm};
+
+        let old_text = "old stored datum";
+        let new_text = "new stored datum";
+        let old = Datum::Text(old_text);
+        let new = Datum::Text(new_text);
+        let mut previous = CarriedForms::NONE;
+        let mut assignments = CarriedForms::NONE;
+        for column in 0..MAX_COLUMNS {
+            previous
+                .carry(&old, StoredForm::Compressed(13), Some(column as u16))
+                .unwrap();
+            assignments
+                .carry(&new, StoredForm::Compressed(17), None)
+                .unwrap();
+        }
+
+        let written = [new; MAX_COLUMNS];
+        let carried = previous
+            .rebased(&written, &written, Some(&assignments))
+            .unwrap();
+        assert_eq!(carried.count, MAX_COLUMNS);
+        assert!(carried.entries.iter().all(|entry| {
+            entry.identity == datum_identity(&new).unwrap()
+                && entry.form == StoredForm::Compressed(17)
+                && entry.column.is_none()
+        }));
     }
 
     #[test]

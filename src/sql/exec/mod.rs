@@ -88981,7 +88981,10 @@ fn merge_target<'a>(
                                         pair_physical,
                                         true,
                                     )
-                                    .and_then(|carried| carried.joined(&assigned))
+                                    .and_then(|carried| {
+                                        let values = &physical_new[..row_definition.n_columns];
+                                        carried.rebased(values, values, Some(&assigned))
+                                    })
                                     .map(|carried| (forms, carried))
                                 }) {
                                     Ok(forms) => forms,
@@ -89232,8 +89235,10 @@ fn merge_target<'a>(
                                     pair_physical,
                                     in_place,
                                 )
-                                .and_then(|carried| carried.joined(&assigned))
-                                {
+                                .and_then(|carried| {
+                                    let values = &persisted[..new_definition.n_columns];
+                                    carried.rebased(values, values, Some(&assigned))
+                                }) {
                                     Ok(carried) => carried,
                                     Err(error) => return sql_fail(error),
                                 };
@@ -92726,7 +92731,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         Ok(values) => values,
                         Err(error) => return sql_fail(error),
                     };
-                    let assigned = match assigned.rebased(&new[..def.n_columns], detached) {
+                    let assigned = match assigned.rebased(&new[..def.n_columns], detached, None) {
                         Ok(assigned) => assigned,
                         Err(error) => return sql_fail(error),
                     };
@@ -97455,9 +97460,12 @@ pub(crate) fn update<'a>(
                     &physical_old[..row_definition.n_columns],
                     true,
                 )
-                .and_then(|carried| carried.joined(&assigned))
                 .and_then(|carried| {
-                    carried.rebased(&physical_new[..row_definition.n_columns], new_physical)
+                    carried.rebased(
+                        &physical_new[..row_definition.n_columns],
+                        new_physical,
+                        Some(&assigned),
+                    )
                 }) {
                     Ok(carried) => carried,
                     Err(error) => return sql_fail(error),

@@ -415,17 +415,22 @@ pub(super) fn merge_through_instead_triggers<'a>(
                 break;
             }
             let mut sv = [Datum::Null; MAX_COLUMNS];
+            let mut sf = [crate::storage::StoredForm::Inline; MAX_COLUMNS];
             let width = if by_source {
                 source_def.n_columns
             } else {
                 let bytes = source_rows[source_index];
                 let width = projected_row_width(bytes);
-                for (column, slot) in sv.iter_mut().enumerate().take(width) {
+                for (column, (slot, form)) in
+                    sv.iter_mut().zip(sf.iter_mut()).enumerate().take(width)
+                {
                     *slot = decode_projected_pub(bytes, column);
+                    *form = projected_stored_form(bytes, column);
                 }
                 width
             };
             let sv = &sv[..source_def.n_columns.min(width)];
+            let sf = &sf[..sv.len()];
             let source_values = (!by_source).then_some(sv);
             matched = by_source || core::mem::take(&mut resumed_match).matched;
             for j in core::mem::take(&mut first_pair)..=n_view {
@@ -516,7 +521,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                     let scope = ProceduralMergeScope {
                         row: &source_row,
                         outer,
-                        source_forms: None,
+                        source_forms: Some((sv, sf)),
                     };
                     let mut chosen = None;
                     for when in statement
@@ -550,7 +555,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                     else {
                         continue;
                     };
-                    // An INSTEAD OF trigger receives the row; it stores none.
+                    // An INSTEAD OF trigger receives the row as formed.
                     let mut instead_of_forms = crate::sql::toast::CarriedForms::NONE;
                     let (mut row, explicit) = match merge_insert_values(
                         &def,
@@ -587,6 +592,11 @@ pub(super) fn merge_through_instead_triggers<'a>(
                         Ok(values) => values,
                         Err(error) => return sql_fail(error),
                     };
+                    let instead_of_forms =
+                        match instead_of_forms.rebased(&row[..def.n_columns], new, None) {
+                            Ok(forms) => forms,
+                            Err(error) => return sql_fail(error),
+                        };
                     match fire_trigger_merge_row(
                         storage,
                         txn,
@@ -600,6 +610,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                         Some(&mut *new),
                         checks,
                         params,
+                        &instead_of_forms,
                     ) {
                         Ok(true) => {}
                         Ok(false) => continue,
@@ -656,7 +667,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                     source_members: source.members,
                     source: source_values,
                     source_namespace_when_absent: false,
-                    source_forms: None,
+                    source_forms: (!by_source).then_some(sf),
                     old_name: None,
                     old: None,
                     new_name: None,
@@ -713,6 +724,8 @@ pub(super) fn merge_through_instead_triggers<'a>(
                         Err(error) => return sql_fail(error),
                     }
                 }
+                // The stored datums the assignments pass on.
+                let mut assigned = crate::sql::toast::CarriedForms::NONE;
                 let (event, new, action) = match chosen {
                     None | Some(MergeAction::DoNothing) => continue,
                     Some(MergeAction::Delete) => (TriggerEvents::DELETE, None, "DELETE"),
@@ -749,6 +762,19 @@ pub(super) fn merge_through_instead_triggers<'a>(
                                             Some((&def.columns()[column], cast)),
                                         )
                                     })
+                                    .and_then(|value| {
+                                        // A source datum keeps its stored form.
+                                        let catalog =
+                                            super::query::storage_catalog(storage, arena, txn.txid);
+                                        let form = crate::sql::toast::passed_form(
+                                            expression,
+                                            &scope,
+                                            Some(&catalog),
+                                            &value,
+                                        )?;
+                                        assigned.carry(&value, form, None)?;
+                                        Ok(value)
+                                    })
                             };
                             new[column] = match value {
                                 Ok(value) => value,
@@ -757,7 +783,10 @@ pub(super) fn merge_through_instead_triggers<'a>(
                         }
                         // Detach the NEW image before the trigger body
                         // changes storage the source rows may read.
-                        match detached_values(&new[..def.n_columns], arena) {
+                        match detached_values(&new[..def.n_columns], arena).and_then(|detached| {
+                            assigned = assigned.rebased(&new[..def.n_columns], detached, None)?;
+                            Ok(detached)
+                        }) {
                             Ok(new) => (TriggerEvents::UPDATE, Some(new), "UPDATE"),
                             Err(error) => return sql_fail(error),
                         }
@@ -783,6 +812,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                     new.as_deref_mut(),
                     checks,
                     params,
+                    &assigned,
                 );
                 match fired {
                     Ok(true) => {}
@@ -921,6 +951,7 @@ fn fire_trigger_merge_row<'a>(
     new: Option<&mut [Datum<'a>]>,
     checks: Option<ViewCheck<'a>>,
     params: &[Datum<'a>],
+    carried: &crate::sql::toast::CarriedForms,
 ) -> Result<bool, SqlError> {
     let seq_session = services.seq_session;
     let mut new = new;
@@ -935,6 +966,11 @@ fn fire_trigger_merge_row<'a>(
         event,
         old,
         new.as_deref_mut(),
+        if old.is_some() {
+            trigger_firing::ImageForms::instead_of(carried)
+        } else {
+            trigger_firing::ImageForms::insert(carried)
+        },
     )? {
         return Ok(false);
     }

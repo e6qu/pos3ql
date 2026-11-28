@@ -52,7 +52,11 @@ pub(super) fn stage_truncate(
         }
         transaction.record_truncate(storage, selected, *cascade, *restart_identity, *command_id)?;
         for &table in selected.iter() {
-            storage.record_relation_transaction_truncate(transaction.txid, table)?;
+            storage.record_relation_transaction_truncate(
+                transaction.txid,
+                table,
+                Some(storage.next_relation_counts_stamp()?),
+            )?;
         }
         Ok(())
     })();

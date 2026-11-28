@@ -9663,14 +9663,28 @@ fn plpgsql_dynamic_administration_uses_static_catalog_boundaries() {
             "dynamic_catalog_heap|dynamic_catalog_owner",
         ]
     );
+    // CREATE TABLESPACE runs only at top level, outside any transaction block,
+    // as PostgreSQL's PreventInTransactionBlock requires.
+    for location in ["source", "target"] {
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "CREATE TABLESPACE dynamic_catalog_{location} LOCATION '/object/dynamic-catalog-{location}'"
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+    }
     let tablespaces = run_with(
         &mut engine,
         &mut budget,
         "CREATE PROCEDURE dynamic_catalog_tablespaces() LANGUAGE plpgsql AS '
            BEGIN
              COMMIT;
-             EXECUTE ''CREATE TABLESPACE dynamic_catalog_source LOCATION ''''/object/dynamic-catalog-source'''''';
-             EXECUTE ''CREATE TABLESPACE dynamic_catalog_target LOCATION ''''/object/dynamic-catalog-target'''''';
              EXECUTE ''ALTER TABLE dynamic_catalog_rows OWNER TO postgres'';
              EXECUTE ''ALTER TABLE dynamic_catalog_rows SET TABLESPACE dynamic_catalog_source'';
              EXECUTE ''CREATE INDEX dynamic_catalog_rows_idx ON dynamic_catalog_rows (id) TABLESPACE dynamic_catalog_source'';
@@ -10016,7 +10030,7 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
     let rejected = String::from_utf8_lossy(&rejected);
     assert!(
         rejected.contains("25001")
-            && rejected.contains("VACUUM cannot run inside a transaction block"),
+            && rejected.contains("VACUUM cannot be executed from a function"),
         "{rejected}"
     );
     let discarded = run_with(
@@ -10027,7 +10041,7 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
     let discarded = String::from_utf8_lossy(&discarded);
     assert!(
         discarded.contains("25001")
-            && discarded.contains("DISCARD ALL cannot run inside a transaction block"),
+            && discarded.contains("DISCARD ALL cannot be executed from a function"),
         "{discarded}"
     );
     let reset = run_with(
@@ -54657,22 +54671,42 @@ fn vacuum_and_analyze() {
         "VACUUM FULL vt",
         "VACUUM (FULL, ANALYZE) vt",
         "VACUUM ANALYZE vt, vt",
-    ] {
-        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
-        assert!(text.contains("VACUUM"), "{cmd}: {text}");
-    }
-    for cmd in [
         "VACUUM FREEZE vt",
         "VACUUM (SKIP_LOCKED) vt",
-        "VACUUM PROCESS_MAIN vt",
-        "VACUUM SKIP_DATABASE_STATS",
-        "VACUUM ONLY_DATABASE_STATS",
+    ] {
+        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
+        assert!(
+            text.contains("VACUUM") && !text.contains("ERROR"),
+            "{cmd}: {text}"
+        );
+    }
+    for (command, sqlstate) in [
+        ("VACUUM PROCESS_MAIN vt", "42601"),
+        ("VACUUM SKIP_DATABASE_STATS", "42P01"),
+        ("VACUUM ONLY_DATABASE_STATS", "42P01"),
+    ] {
+        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, command)).to_string();
+        assert!(text.contains(sqlstate), "{command}: {text}");
+    }
+    for cmd in [
+        "VACUUM FREEZE VERBOSE vt",
+        "VACUUM (VERBOSE) vt",
+        "VACUUM (ONLY_DATABASE_STATS)",
+        "VACUUM (ONLY_DATABASE_STATS, PROCESS_MAIN false, PROCESS_TOAST false)",
+        "VACUUM (ONLY_DATABASE_STATS, INDEX_CLEANUP off, TRUNCATE off, PARALLEL 2)",
         "ANALYZE (VERBOSE) vt",
+        "ANALYZE VERBOSE vt",
     ] {
         let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
         assert!(text.contains("0A000"), "{cmd}: {text}");
     }
-    for cmd in ["ANALYZE", "ANALYZE vt", "ANALYZE vt (a, b)"] {
+    for cmd in [
+        "ANALYZE",
+        "ANALYZE vt",
+        "ANALYZE vt (a, b)",
+        "ANALYZE (SKIP_LOCKED) vt",
+        "ANALYZE (VERBOSE false, BUFFER_USAGE_LIMIT '1MB') vt",
+    ] {
         let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
         assert!(text.contains("ANALYZE"), "{cmd}: {text}");
     }

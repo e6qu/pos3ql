@@ -21586,7 +21586,13 @@ fn pg_class<'a>(
             || referenced[slot];
         let has_rules = storage.table_has_rules(slot, txid);
         let n_checks = table_def.n_checks as i32;
-        let statistics = storage.table_statistics(slot, txid);
+        let mut statistics = storage.table_statistics(slot, txid);
+        // This transaction's TRUNCATE gave the table new files nothing has
+        // counted since.
+        let truncated = storage.transaction_truncate_stamp(txid, slot);
+        if truncated != 0 && storage.relation_counts_written(slot) < truncated {
+            statistics.valid = false;
+        }
         let reltuples = statistics.relation_tuples();
         let relpages = statistics.relation_pages();
         let materialized = storage
@@ -21782,8 +21788,9 @@ fn pg_class<'a>(
                 Datum::Int4(PG_TOAST_NS_OID),
                 text("i", arena)?,
                 Datum::Int4(2),
-                Datum::Float8(-1.0),
-                Datum::Int4(0),
+                // An empty TOAST table's index: its btree metapage.
+                Datum::Float8(0.0),
+                Datum::Int4(1),
                 Datum::Int4(403),
                 Datum::Int4(owner),
                 Datum::Int4(0),
@@ -21878,6 +21885,20 @@ fn pg_class<'a>(
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_class"));
         }
+        // A partitioned index has no storage: 0 pages and 0 tuples. Another
+        // holds the counts its build, VACUUM or ANALYZE measured.
+        let truncated = storage.transaction_truncate_stamp(txid, info.table_slot);
+        let (relpages, reltuples) = if info.kind.is_partitioned() {
+            (0, 0.0)
+        } else if truncated != 0 && storage.index_counts_written(info.oid) < truncated {
+            (0, -1.0)
+        } else {
+            storage
+                .index_relation_counts(info.table_database, info.oid)
+                .map_or((0, 0.0), |counts| {
+                    (counts.pages.min(i32::MAX as u32) as i32, counts.tuples)
+                })
+        };
         out[n] = row(
             &[
                 Datum::Int4(info.oid),
@@ -21889,8 +21910,8 @@ fn pg_class<'a>(
                 )),
                 text(if info.kind.is_partitioned() { "I" } else { "i" }, arena)?,
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
-                Datum::Float8(0.0),
-                Datum::Int4(0), // relpages
+                Datum::Float8(f64::from(reltuples)),
+                Datum::Int4(relpages),
                 Datum::Int4(match info.method {
                     crate::sql::ast::IndexAccessMethod::Gist => 783,
                     crate::sql::ast::IndexAccessMethod::Hash => 405,

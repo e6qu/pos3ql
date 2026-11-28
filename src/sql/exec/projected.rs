@@ -151,6 +151,24 @@ pub(crate) fn projected_row_len_held(
     Ok(len)
 }
 
+/// [`encode_projected_held_into`] into `arena`: a routine's result with
+/// how the routine holds it.
+pub(crate) fn encode_projected_held<'a>(
+    values: &[Datum],
+    forms: &[DatumForm],
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let len = projected_row_len_held(values, forms)?;
+    let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "projected row exceeds the statement arena"
+        )
+    })?;
+    encode_projected_held_into(values, forms, out)?;
+    Ok(&*out)
+}
+
 /// Encodes values a call passes on with how each is held, which
 /// [`projected_datum_form`] reads back, into `out` of
 /// [`projected_row_len_held`] bytes.

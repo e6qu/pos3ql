@@ -1,20 +1,22 @@
 //! Runs the join plan PostgreSQL's join search chose
-//! ([`super::index_paths::join_query`]), so its rows come back in
-//! PostgreSQL's order: a nested loop reads its inner input again (or its
-//! `Materialize` copy) for each outer row; a hash join builds its table on
-//! the first outer row, stops at an empty one, and returns each outer row's
-//! matches newest first, as `ExecHashJoin` walks a bucket's chain; a merge
-//! join reads its sorted outer input first (its inner one only when the
-//! outer has rows) and returns each outer row's run of inner matches in
-//! inner order. An outer join returns each unmatched row of a side it keeps
-//! with NULLs for the other, as each executor node does. Sorts order as
-//! PostgreSQL's `pg_qsort` does.
+//! ([`super::index_paths::join_query`]) through its pull nodes ([`pull`]),
+//! so its rows come back in PostgreSQL's order: a nested loop reads its
+//! inner input again (or its `Materialize` copy) for each outer row; a hash
+//! join builds its table on the first outer row, stops at an empty one, and
+//! returns each outer row's matches newest first, as `ExecHashJoin` walks a
+//! bucket's chain; a merge join reads its sorted outer input first (its
+//! inner one only when the outer has rows) and returns each outer row's run
+//! of inner matches in inner order. An outer join returns each unmatched
+//! row of a side it keeps with NULLs for the other, as each executor node
+//! does. Sorts order as PostgreSQL's `pg_qsort` does. This module holds
+//! what every node reads: the plan's row layout, its comparisons, hashes
+//! and orders.
 //! <https://github.com/postgres/postgres/blob/REL_18_6/src/backend/executor/nodeHashjoin.c>
 //! <https://github.com/postgres/postgres/blob/REL_18_6/src/backend/executor/nodeMergejoin.c>
 
 use core::cmp::Ordering;
 
-use crate::mem::arena::{Arena, ArenaList};
+use crate::mem::arena::Arena;
 use crate::sql::ast::Collation;
 use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError};
 use crate::sql::types::Datum;
@@ -53,29 +55,6 @@ fn node(role: impl FnOnce(u16) -> super::instrument::Role, path: u32) -> super::
     })
 }
 
-/// Moves `files`' entries of `batch` to `out`, replacing its contents, and
-/// keeps the others in place in their order (`BufFile` reads of one batch).
-fn take_batch<'a, T: Copy + 'a>(
-    files: &mut ArenaList<'a, (u32, T)>,
-    batch: u32,
-    out: &mut ArenaList<'a, T>,
-) -> Result<(), SqlError> {
-    out.truncate(0);
-    let entries = files.as_mut_slice().map_err(|_| arena_full())?;
-    let mut kept = 0;
-    for at in 0..entries.len() {
-        let (at_batch, entry) = entries[at];
-        if at_batch == batch {
-            out.push(entry).map_err(|_| arena_full())?;
-        } else {
-            entries[kept] = (at_batch, entry);
-            kept += 1;
-        }
-    }
-    files.truncate(kept);
-    Ok(())
-}
-
 /// One base row: its values and row identity.
 #[derive(Clone, Copy)]
 struct BaseRow<'a> {
@@ -86,505 +65,12 @@ struct BaseRow<'a> {
     rowid: Option<u64>,
 }
 
-/// A hash table or `Materialize` store a node keeps across rescans.
-#[derive(Clone, Copy)]
-struct Built<'a> {
-    rows: &'a [Row<'a>],
-    index: &'a [u32],
-}
-
-/// A row a batched hash table holds: its hash value and its size as
-/// `spaceUsed` counts it (`HJTUPLE_OVERHEAD` and the minimal tuple).
-#[derive(Clone, Copy)]
-struct HashedRow<'a> {
-    row: Row<'a>,
-    hash: u32,
-    size: usize,
-}
-
 /// A skew bucket (`HashSkewBucket`): its slot in the skew array.
 #[derive(Clone, Copy)]
 struct SkewSlot {
     position: u32,
     hash: u32,
     removed: bool,
-}
-
-/// A memory chunk (`HashMemoryChunk`): its space and used bytes.
-#[derive(Clone, Copy)]
-struct Chunk {
-    id: u32,
-    maxlen: usize,
-    used: usize,
-}
-
-/// A row in memory: its chunk, its place in the chunk, and when it was
-/// last prepended to its chain.
-#[derive(Clone, Copy)]
-struct MemoryRow<'a> {
-    chunk: u32,
-    place: u32,
-    prepended: u64,
-    hashed: HashedRow<'a>,
-}
-
-/// PostgreSQL's hash table of a join of several batches, as
-/// `nodeHash.c` keeps it.
-struct BatchTable<'a> {
-    buckets: u32,
-    original_buckets: u32,
-    /// `nbuckets_optimal`, which a one-batch build grows.
-    optimal_buckets: u32,
-    batches: u32,
-    original_batches: u32,
-    current: u32,
-    space_allowed: usize,
-    space_used: usize,
-    peak: usize,
-    grow: bool,
-    total: usize,
-    skew_total: usize,
-    skew_enabled: bool,
-    skew_length: u32,
-    skew_used: usize,
-    skew_allowed: usize,
-    skew: ArenaList<'a, SkewSlot>,
-    /// Skew rows by their bucket's index in `skew`, in insertion order.
-    skew_rows: ArenaList<'a, (u32, HashedRow<'a>, u64)>,
-    /// The chunk list, head first.
-    chunks: ArenaList<'a, Chunk>,
-    next_chunk: u32,
-    memory: ArenaList<'a, MemoryRow<'a>>,
-    prepends: u64,
-    inner_files: ArenaList<'a, (u32, HashedRow<'a>)>,
-    /// Saved outer rows by batch: each the query's relations, kept as
-    /// [`Runner::keep`] keeps them.
-    outer_files: ArenaList<'a, (u32, Row<'a>)>,
-    /// `memory` ordered by hash, newest prepend first, once loaded.
-    index: &'a [u32],
-    /// Each row's match flag (`HeapTupleHeaderSetMatch`), in memory and in
-    /// the skew buckets, once loaded.
-    matched: &'a [core::cell::Cell<bool>],
-    skew_matched: &'a [core::cell::Cell<bool>],
-    arena: &'a Arena,
-}
-
-impl<'a> BatchTable<'a> {
-    fn new(
-        arena: &'a Arena,
-        sizing: super::index_paths::joins::HashSizing,
-    ) -> Result<Self, SqlError> {
-        let space_allowed = sizing.space_allowed as usize;
-        Ok(Self {
-            buckets: sizing.buckets,
-            original_buckets: sizing.buckets,
-            optimal_buckets: sizing.buckets,
-            batches: sizing.batches,
-            original_batches: sizing.batches,
-            current: 0,
-            space_allowed,
-            space_used: 0,
-            peak: 0,
-            grow: true,
-            total: 0,
-            skew_total: 0,
-            skew_enabled: false,
-            skew_length: 0,
-            skew_used: 0,
-            skew_allowed: space_allowed * 2 / 100,
-            skew: ArenaList::new(arena),
-            skew_rows: ArenaList::new(arena),
-            chunks: ArenaList::new(arena),
-            next_chunk: 0,
-            memory: ArenaList::new(arena),
-            prepends: 0,
-            inner_files: ArenaList::new(arena),
-            outer_files: ArenaList::new(arena),
-            index: &[],
-            matched: &[],
-            skew_matched: &[],
-            arena,
-        })
-    }
-
-    /// `ExecHashGetBucketAndBatch`'s batch.
-    fn batch_of(&self, hash: u32) -> u32 {
-        hash.rotate_right(self.buckets.trailing_zeros()) & (self.batches - 1)
-    }
-
-    /// `ExecHashGetSkewBucket`: probing stops at an empty slot.
-    fn skew_bucket(&self, hash: u32) -> Option<usize> {
-        if !self.skew_enabled {
-            return None;
-        }
-        let slots = self.skew.borrowed_slice();
-        let mut position = hash & (self.skew_length - 1);
-        loop {
-            let held = slots
-                .iter()
-                .position(|slot| slot.position == position && !slot.removed)?;
-            if slots[held].hash == hash {
-                return Some(held);
-            }
-            position = (position + 1) & (self.skew_length - 1);
-        }
-    }
-
-    /// `dense_alloc`: the chunk the row's bytes go to.
-    fn dense_alloc(&mut self, size: usize) -> Result<(u32, u32), SqlError> {
-        const CHUNK: usize = 32 * 1024;
-        let size = size.next_multiple_of(8);
-        let chunks = self.chunks.borrowed_slice();
-        let mut list: [Chunk; 0] = [];
-        let _ = &mut list;
-        let head = chunks.first().copied();
-        let place = |chunk: u32, memory: &[MemoryRow<'_>]| {
-            memory.iter().filter(|row| row.chunk == chunk).count() as u32
-        };
-        if size > CHUNK / 4 {
-            let chunk = Chunk {
-                id: self.next_chunk,
-                maxlen: size,
-                used: size,
-            };
-            self.next_chunk += 1;
-            self.relink(chunk, usize::from(head.is_some()))?;
-            return Ok((chunk.id, 0));
-        }
-        match head {
-            Some(head) if head.maxlen - head.used >= size => {
-                let mut rebuilt = ArenaList::new(self.arena);
-                for (at, chunk) in self.chunks.borrowed_slice().iter().enumerate() {
-                    let mut chunk = *chunk;
-                    if at == 0 {
-                        chunk.used += size;
-                    }
-                    rebuilt.push(chunk).map_err(|_| arena_full())?;
-                }
-                self.chunks = rebuilt;
-                Ok((head.id, place(head.id, self.memory.borrowed_slice())))
-            }
-            _ => {
-                let chunk = Chunk {
-                    id: self.next_chunk,
-                    maxlen: CHUNK,
-                    used: size,
-                };
-                self.next_chunk += 1;
-                self.relink(chunk, 0)?;
-                Ok((chunk.id, 0))
-            }
-        }
-    }
-
-    /// Links `chunk` into the list at `position`.
-    fn relink(&mut self, chunk: Chunk, position: usize) -> Result<(), SqlError> {
-        let mut rebuilt = ArenaList::new(self.arena);
-        let held = self.chunks.borrowed_slice();
-        for (at, old) in held.iter().enumerate() {
-            if at == position {
-                rebuilt.push(chunk).map_err(|_| arena_full())?;
-            }
-            rebuilt.push(*old).map_err(|_| arena_full())?;
-        }
-        if position >= held.len() {
-            rebuilt.push(chunk).map_err(|_| arena_full())?;
-        }
-        self.chunks = rebuilt;
-        Ok(())
-    }
-
-    fn note_space(&mut self, size: usize) {
-        self.space_used += size;
-        self.peak = self.peak.max(self.space_used);
-    }
-
-    /// Puts a row into the main table in memory, at its chain's head.
-    fn keep(&mut self, hashed: HashedRow<'a>) -> Result<(), SqlError> {
-        let (chunk, place) = self.dense_alloc(hashed.size)?;
-        self.prepends += 1;
-        self.memory
-            .push(MemoryRow {
-                chunk,
-                place,
-                prepended: self.prepends,
-                hashed,
-            })
-            .map_err(|_| arena_full())
-    }
-
-    /// `MultiExecPrivateHash`'s insert: into a skew bucket, else
-    /// `ExecHashTableInsert`.
-    fn insert(&mut self, hashed: HashedRow<'a>, _arena: &'a Arena) -> Result<(), SqlError> {
-        if let Some(bucket) = self.skew_bucket(hashed.hash) {
-            self.prepends += 1;
-            self.skew_rows
-                .push((bucket as u32, hashed, self.prepends))
-                .map_err(|_| arena_full())?;
-            self.note_space(hashed.size);
-            self.skew_used += hashed.size;
-            self.skew_total += 1;
-            while self.skew_used > self.skew_allowed {
-                self.remove_next_skew_bucket()?;
-            }
-            if self.space_used > self.space_allowed {
-                self.increase_batches()?;
-            }
-            return Ok(());
-        }
-        if self.batch_of(hashed.hash) == self.current {
-            // The rows before this one, skew rows aside, outnumbering the
-            // buckets double them while the table has one batch.
-            let before = self.total - self.skew_total;
-            self.keep(hashed)?;
-            if self.batches == 1 && before > self.optimal_buckets as usize {
-                self.optimal_buckets *= 2;
-            }
-            self.note_space(hashed.size);
-            if self.space_used + self.optimal_buckets as usize * 8 > self.space_allowed {
-                self.increase_batches()?;
-            }
-        } else {
-            let batch = self.batch_of(hashed.hash);
-            self.inner_files
-                .push((batch, hashed))
-                .map_err(|_| arena_full())?;
-        }
-        Ok(())
-    }
-
-    /// `ExecHashRemoveNextSkewBucket`: the last skew bucket's rows, head of
-    /// its chain first, move to the main table or their batch.
-    fn remove_next_skew_bucket(&mut self) -> Result<(), SqlError> {
-        let Some(bucket) = self
-            .skew
-            .borrowed_slice()
-            .iter()
-            .rposition(|slot| !slot.removed)
-        else {
-            self.skew_used = 0;
-            return Ok(());
-        };
-        let hash = self.skew.borrowed_slice()[bucket].hash;
-        let batch = self.batch_of(hash);
-        let rows = self.skew_rows.as_slice();
-        let mut chain = ArenaList::new(self.arena);
-        for &(at, hashed, prepended) in rows {
-            if at as usize == bucket {
-                chain.push((prepended, hashed)).map_err(|_| arena_full())?;
-            }
-        }
-        let chain = chain.as_slice();
-        for &(_, hashed) in chain.iter().rev() {
-            if batch == self.current {
-                self.keep(hashed)?;
-                self.skew_used -= hashed.size;
-            } else {
-                self.inner_files
-                    .push((batch, hashed))
-                    .map_err(|_| arena_full())?;
-                self.space_used -= hashed.size;
-                self.skew_used -= hashed.size;
-            }
-        }
-        let mut slots = ArenaList::new(self.arena);
-        for (at, slot) in self.skew.borrowed_slice().iter().enumerate() {
-            slots
-                .push(SkewSlot {
-                    removed: slot.removed || at == bucket,
-                    ..*slot
-                })
-                .map_err(|_| arena_full())?;
-        }
-        self.skew = slots;
-        Ok(())
-    }
-
-    /// `ExecHashIncreaseNumBatches`.
-    fn increase_batches(&mut self) -> Result<(), SqlError> {
-        if !self.grow {
-            return Ok(());
-        }
-        // `ExecHashIncreaseBatchSize`.
-        if self.space_allowed <= self.batches as usize * 2 * 8192 {
-            self.space_allowed *= 2;
-            return Ok(());
-        }
-        self.batches *= 2;
-        self.buckets = self.optimal_buckets;
-        let walk = self.walk()?;
-        self.chunks = ArenaList::new(self.arena);
-        self.memory = ArenaList::new(self.arena);
-        let (mut in_memory, mut freed) = (0usize, 0usize);
-        for &row in walk {
-            in_memory += 1;
-            let batch = self.batch_of(row.hashed.hash);
-            if batch == self.current {
-                self.keep(row.hashed)?;
-            } else {
-                self.inner_files
-                    .push((batch, row.hashed))
-                    .map_err(|_| arena_full())?;
-                self.space_used -= row.hashed.size;
-                freed += 1;
-            }
-        }
-        if freed == 0 || freed == in_memory {
-            self.grow = false;
-        }
-        Ok(())
-    }
-
-    /// `ExecHashIncreaseNumBuckets`: every row in memory prepended again,
-    /// walking the chunks.
-    fn increase_buckets(&mut self) -> Result<(), SqlError> {
-        self.buckets = self.optimal_buckets;
-        let walk = self.walk()?;
-        let mut memory = ArenaList::new(self.arena);
-        for &row in walk {
-            self.prepends += 1;
-            memory
-                .push(MemoryRow {
-                    prepended: self.prepends,
-                    ..row
-                })
-                .map_err(|_| arena_full())?;
-        }
-        self.memory = memory;
-        Ok(())
-    }
-
-    /// The table's main rows as a probe reads them.
-    fn frozen(&self) -> Frozen<'a> {
-        Frozen {
-            memory: self.memory.as_slice(),
-            index: self.index,
-            matched: self.matched,
-            buckets: self.buckets,
-        }
-    }
-
-    /// The rows in memory in chunk-list order, each chunk's in place order.
-    fn walk(&self) -> Result<&'a [MemoryRow<'a>], SqlError> {
-        let chunks = self.chunks.borrowed_slice();
-        let rows = self.memory.borrowed_slice();
-        let ordered = self
-            .arena
-            .alloc_slice_with(rows.len(), |at| rows[at])
-            .map_err(|_| arena_full())?;
-        let position = |chunk: u32| {
-            chunks
-                .iter()
-                .position(|held| held.id == chunk)
-                .unwrap_or(usize::MAX)
-        };
-        ordered.sort_unstable_by_key(|row| (position(row.chunk), row.place));
-        Ok(ordered)
-    }
-
-    /// `ExecHashTableReset` for the next batch.
-    fn reset(&mut self) {
-        self.chunks = ArenaList::new(self.arena);
-        self.memory = ArenaList::new(self.arena);
-        self.space_used = 0;
-        self.index = &[];
-        self.matched = &[];
-    }
-
-    /// Orders the rows in memory for probing: by hash, newest prepend
-    /// first.
-    fn ready(&mut self, _runner: &Runner<'_, 'a>, _keys: &KeySides) -> Result<(), SqlError> {
-        let rows = self.memory.borrowed_slice();
-        let index = self
-            .arena
-            .alloc_slice_with(rows.len(), |at| at as u32)
-            .map_err(|_| arena_full())?;
-        index.sort_unstable_by_key(|&at| {
-            let row = rows[at as usize];
-            (row.hashed.hash, core::cmp::Reverse(row.prepended))
-        });
-        self.index = index;
-        self.matched = core::cell::Cell::from_mut(
-            self.arena
-                .alloc_slice_with(rows.len(), |_| false)
-                .map_err(|_| arena_full())?,
-        )
-        .as_slice_of_cells();
-        if self.skew_matched.len() != self.skew_rows.len() {
-            self.skew_matched = core::cell::Cell::from_mut(
-                self.arena
-                    .alloc_slice_with(self.skew_rows.len(), |_| false)
-                    .map_err(|_| arena_full())?,
-            )
-            .as_slice_of_cells();
-        }
-        Ok(())
-    }
-
-    /// Skew bucket `bucket`'s rows, chain head (newest) first, by their
-    /// place among the skew rows.
-    fn skew_chain(&self, bucket: usize, out: &mut ArenaList<'a, u32>) -> Result<(), SqlError> {
-        let rows = self.skew_rows.borrowed_slice();
-        for (place, &(at, _, _)) in rows.iter().enumerate().rev() {
-            if at as usize == bucket {
-                out.push(place as u32).map_err(|_| arena_full())?;
-            }
-        }
-        Ok(())
-    }
-
-    /// The rows no outer row matched, as `ExecScanHashTableForUnmatched`
-    /// walks them: each bucket's chain in bucket order, then each skew
-    /// bucket's.
-    fn unmatched(&self, out: &mut ArenaList<'a, Row<'a>>) -> Result<(), SqlError> {
-        let rows = self.memory.borrowed_slice();
-        let order = self
-            .arena
-            .alloc_slice_with(rows.len(), |at| at as u32)
-            .map_err(|_| arena_full())?;
-        let mask = self.buckets - 1;
-        order.sort_unstable_by_key(|&at| {
-            let row = rows[at as usize];
-            (row.hashed.hash & mask, core::cmp::Reverse(row.prepended))
-        });
-        for &at in order.iter() {
-            if !self.matched[at as usize].get() {
-                out.push(rows[at as usize].hashed.row)
-                    .map_err(|_| arena_full())?;
-            }
-        }
-        // Only batch 0 has skew buckets.
-        if self.current != 0 {
-            return Ok(());
-        }
-        let skew_rows = self.skew_rows.borrowed_slice();
-        for (bucket, slot) in self.skew.borrowed_slice().iter().enumerate() {
-            if slot.removed {
-                continue;
-            }
-            for (place, &(at, hashed, _)) in skew_rows.iter().enumerate().rev() {
-                if at as usize == bucket && !self.skew_matched[place].get() {
-                    out.push(hashed.row).map_err(|_| arena_full())?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn figures(&self, _id: u32) -> super::instrument::HashTable {
-        super::instrument::HashTable {
-            tuples: self.total as u64,
-            tuple_bytes: None,
-            own_bytes: 0,
-            batches: Some(super::instrument::HashBatches {
-                buckets: self.buckets,
-                original_buckets: self.original_buckets,
-                batches: self.batches,
-                original_batches: self.original_batches,
-                peak: self.peak,
-            }),
-        }
-    }
 }
 
 /// The skew buckets `ExecHashBuildSkewHash` fills.
@@ -595,88 +81,6 @@ trait SkewBuckets {
     fn skew_slot(&self, position: u32) -> Option<u32>;
     /// Takes a skew slot (`HashSkewBucket`), charging its space.
     fn take_skew_slot(&mut self, slot: SkewSlot) -> Result<(), SqlError>;
-}
-
-impl SkewBuckets for BatchTable<'_> {
-    fn enable_skew(&mut self, length: u32, space: usize) {
-        self.skew_enabled = true;
-        self.skew_length = length;
-        self.note_space(space);
-        self.skew_used += space;
-    }
-
-    fn skew_slot(&self, position: u32) -> Option<u32> {
-        self.skew
-            .borrowed_slice()
-            .iter()
-            .find(|held| held.position == position)
-            .map(|held| held.hash)
-    }
-
-    fn take_skew_slot(&mut self, slot: SkewSlot) -> Result<(), SqlError> {
-        self.skew.push(slot).map_err(|_| arena_full())?;
-        self.note_space(16);
-        self.skew_used += 16;
-        Ok(())
-    }
-}
-
-/// A built table's main rows, ordered for probing.
-#[derive(Clone, Copy)]
-struct Frozen<'a> {
-    memory: &'a [MemoryRow<'a>],
-    /// `memory` ordered by hash, newest prepend first.
-    index: &'a [u32],
-    matched: &'a [core::cell::Cell<bool>],
-    buckets: u32,
-}
-
-impl<'a> Frozen<'a> {
-    /// The main table's rows of `hash`, chain head first, by their place in
-    /// memory.
-    fn chain_of(&self, hash: u32, out: &mut ArenaList<'a, u32>) -> Result<(), SqlError> {
-        let rows = self.memory;
-        let start = self
-            .index
-            .partition_point(|&at| rows[at as usize].hashed.hash < hash);
-        for &at in &self.index[start..] {
-            if rows[at as usize].hashed.hash != hash {
-                break;
-            }
-            out.push(at).map_err(|_| arena_full())?;
-        }
-        Ok(())
-    }
-
-    /// `ExecHashTableResetMatchFlags`.
-    fn reset_matches(&self) {
-        for flag in self.matched {
-            flag.set(false);
-        }
-    }
-
-    /// The rows no outer row matched, in bucket order.
-    fn unmatched(
-        &self,
-        arena: &'a Arena,
-        out: &mut ArenaList<'a, Row<'a>>,
-    ) -> Result<(), SqlError> {
-        let order = arena
-            .alloc_slice_with(self.memory.len(), |at| at as u32)
-            .map_err(|_| arena_full())?;
-        let mask = self.buckets - 1;
-        order.sort_unstable_by_key(|&at| {
-            let row = self.memory[at as usize];
-            (row.hashed.hash & mask, core::cmp::Reverse(row.prepended))
-        });
-        for &at in order.iter() {
-            if !self.matched[at as usize].get() {
-                out.push(self.memory[at as usize].hashed.row)
-                    .map_err(|_| arena_full())?;
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Whether [`datum_hash`] hashes values of `ctype`: the types whose default
@@ -935,37 +339,10 @@ enum MergeEval {
     EndOfJoin,
 }
 
-/// `ExecMergeJoin`'s states of an inner join.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MergeState {
-    InitializeOuter,
-    InitializeInner,
-    JoinTuples,
-    NextInner,
-    NextOuter,
-    TestOuter,
-    SkipTest,
-    SkipOuterAdvance,
-    SkipInnerAdvance,
-    EndOuter,
-    EndInner,
-}
-
-/// A merge join's input rows in merge order, and the nodes counting what
-/// the join fetched: its `Sort`, or the scan it read in part.
-struct MergeInput<'a> {
-    rows: &'a [Row<'a>],
-    sort: super::instrument::Node,
-    lazy: Option<super::instrument::Node>,
-    /// The pages the scan read in part reads, when `BUFFERS` counts them.
-    pages: Option<LazyPages<'a>>,
-}
-
 /// What an index scan a merge join reads in part reads per row: an index
-/// entry, and the heap page of relation `rel`'s row.
+/// entry, and its row's heap page.
 #[derive(Clone, Copy)]
 struct LazyPages<'a> {
-    rel: usize,
     model: super::instrument::PageModel,
     /// `(row identity, heap page)` sorted by identity.
     heap: &'a [(u64, u64)],
@@ -976,110 +353,50 @@ struct LazyPages<'a> {
     buffers: bool,
 }
 
-impl MergeInput<'_> {
-    /// Counts the `fetched` rows its sort, or its scan read in part,
-    /// returned.
-    fn counted(&self, fetched: usize) {
-        self.sort.rows(fetched as u64);
-        if let Some(lazy) = self.lazy {
-            let _scan = lazy.start();
-            lazy.rows(fetched as u64);
-            if let Some(pages) = self.pages {
+/// Counts an execution of the index scan `lazy` a join read in part:
+/// `fetched` rows and those its filter `removed`, and by `pages` the index entry and heap page of each
+/// fetched row of identity `rowids`.
+fn count_read_in_part(
+    lazy: super::instrument::Node,
+    pages: Option<LazyPages<'_>>,
+    (fetched, removed): (usize, u64),
+    rowids: impl Iterator<Item = Option<u64>>,
+) {
+    let _scan = lazy.start();
+    lazy.add_counted(fetched as u64, removed);
+    let Some(pages) = pages else {
+        return;
+    };
+    if pages.buffers {
+        lazy.page_model(pages.model);
+    }
+    for rowid in rowids {
+        if pages.buffers {
+            lazy.index_entry();
+        }
+        let Some(rowid) = rowid else {
+            continue;
+        };
+        let Ok(at) = pages.heap.binary_search_by_key(&rowid, |&(id, _)| id) else {
+            continue;
+        };
+        let page = pages.heap[at].1;
+        match pages.visible {
+            Some(visible) if page < visible => {}
+            Some(_) => {
+                lazy.heap_fetch();
                 if pages.buffers {
-                    lazy.page_model(pages.model);
-                }
-                for row in &self.rows[..fetched.min(self.rows.len())] {
-                    if pages.buffers {
-                        lazy.index_entry();
-                    }
-                    let Some(rowid) = row[pages.rel].and_then(|row| row.rowid) else {
-                        continue;
-                    };
-                    let Ok(at) = pages.heap.binary_search_by_key(&rowid, |&(id, _)| id) else {
-                        continue;
-                    };
-                    let page = pages.heap[at].1;
-                    match pages.visible {
-                        Some(visible) if page < visible => {}
-                        Some(_) => {
-                            lazy.heap_fetch();
-                            if pages.buffers {
-                                lazy.heap_page(page);
-                            }
-                        }
-                        None if pages.buffers => lazy.heap_page(page),
-                        None => {}
-                    }
+                    lazy.heap_page(page);
                 }
             }
+            None if pages.buffers => lazy.heap_page(page),
+            None => {}
         }
     }
 }
 
-/// A `Memoize` entry: its key, its rows' place in the cache's row list and
-/// whether its input was read to the end.
-#[derive(Clone, Copy)]
-struct MemoEntry<'a> {
-    key: [Datum<'a>; super::index_paths::joins::MAX_KEYS],
-    start: usize,
-    len: usize,
-    complete: bool,
-}
-
-/// A `Memoize` node's cache, kept across the nested loop's rescans.
-struct MemoCache<'a> {
-    entries: ArenaList<'a, MemoEntry<'a>>,
-    rows: ArenaList<'a, Row<'a>>,
-    stats: super::instrument::MemoizeStats,
-    /// `mem_used`.
-    used: usize,
-}
-
-/// What a hash join's probe reads: its keys, its join conditions and
-/// filters, its join type and inner relations, and its node.
-struct Probe<'k> {
-    keys: &'k KeySides,
-    quals: (&'k ClauseList, &'k ClauseList),
-    jointype: JoinType,
-    inner_relids: Relids,
-    join: super::instrument::Node,
-}
-
 /// Each key clause's (outer, inner) column; unused entries hold `usize::MAX`.
 type KeySides = [((usize, usize), (usize, usize)); super::index_paths::joins::MAX_JOIN_CLAUSES];
-
-/// The rows bound so far, by FROM position.
-type Bound<'a> = [Option<BaseRow<'a>>; RELATION_NUMBERS];
-
-/// A kept row: the query's relations of a [`Bound`], so a store of rows
-/// grows with the relations the query joins, not the most it may.
-type Row<'a> = &'a [Option<BaseRow<'a>>];
-
-struct Runner<'r, 'a> {
-    cx: JoinContext<'r, 'a>,
-    /// The statement's storage, which the scan nodes it makes borrow.
-    storage: &'r Storage,
-    /// Each path's kept hash table or store, which a rescan reads again
-    /// (`ExecReScanHashJoin`, `ExecReScanMaterial`).
-    built: &'a [core::cell::Cell<Option<Built<'a>>>],
-    /// Each hash join's one-batch table, which a rescan probes again.
-    frozen: &'a [core::cell::Cell<Option<Frozen<'a>>>],
-    /// Each base scan's node, made at its first execution and rescanned
-    /// for each later one.
-    scan_nodes: &'r [core::cell::RefCell<Option<ScanRecord<'a>>>],
-    /// Each `Memoize` node's cache.
-    memos: &'r [core::cell::Cell<Option<MemoCache<'a>>>],
-    /// The block the join's nodes count in.
-    block: super::instrument::BlockId,
-}
-
-impl<'r, 'a> core::ops::Deref for Runner<'r, 'a> {
-    type Target = JoinContext<'r, 'a>;
-
-    fn deref(&self) -> &JoinContext<'r, 'a> {
-        &self.cx
-    }
-}
 
 /// The flat row layout of a join's relations, which every node of its plan
 /// evaluates conditions over, made once per plan.
@@ -1146,18 +463,6 @@ impl<'a> JoinLayout<'a> {
     }
 }
 
-/// The type of a relation's column, or of an expression member, in `scope`.
-fn member_type(
-    model: &ModeledJoin<'_>,
-    scope: &QueryScope<'_>,
-    (table, column): (usize, usize),
-) -> crate::sql::types::ColType {
-    if let Some(id) = Member::plain(0, column as u16).expression_id() {
-        return model.expressions[id].ctype;
-    }
-    scope.defs.stored(table).expect("a plain table").columns()[column].ctype
-}
-
 /// What every node of a join's plan reads to compare and bind rows: the
 /// plan, its relations' layout and the statement's evaluation context.
 #[derive(Clone, Copy)]
@@ -1206,20 +511,21 @@ impl<'r, 'a> JoinContext<'r, 'a> {
         }
     }
 
-    /// `bound`'s relations of the query, kept in the arena.
-    fn keep(&self, bound: &Bound<'a>) -> Result<Row<'a>, SqlError> {
-        let row = self
-            .arena
-            .alloc_slice_with(self.scope.n, |table| bound[table])
-            .map_err(|_| arena_full())?;
-        Ok(row)
-    }
-
     fn bind(&self, bound: &mut [Option<BaseRow<'a>>], row: &[Option<BaseRow<'a>>], relids: Relids) {
         for table in 0..self.scope.n {
             if relids.contains(table as u32) {
                 bound[table] = row[table];
             }
+        }
+    }
+
+    /// Records `error` unless an earlier one was: the read fails with the
+    /// first at its next check.
+    fn fail(&self, error: SqlError) {
+        if let Some(first) = self.failed.take() {
+            self.failed.set(Some(first));
+        } else {
+            self.failed.set(Some(error));
         }
     }
 
@@ -1279,10 +585,6 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             .expect("a plain table")
             .columns()[column]
             .collation
-    }
-
-    fn column_type(&self, member: (usize, usize)) -> crate::sql::types::ColType {
-        member_type(self.model, self.scope, member)
     }
 
     /// Each clause's (outer, inner) columns.
@@ -1496,15 +798,6 @@ impl<'r, 'a> JoinContext<'r, 'a> {
                 .is_none()
     }
 
-    /// Whether every key's type has a hash function here.
-    fn hashable(&self, keys: &KeySides) -> bool {
-        JoinContext::keys(keys).all(|&(outer, inner)| {
-            [outer, inner]
-                .into_iter()
-                .all(|member| datum_type_hashable(self.column_type(member)))
-        })
-    }
-
     /// The combined hash of a row's join keys (`ExecHashGetHashValue`):
     /// `None` when a key is NULL.
     fn key_hash(
@@ -1531,7 +824,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             let one = datum_hash(&value).ok_or_else(|| {
                 crate::sql_err!(
                     crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                    "a hash join of several batches over keys of this type is not supported"
+                    "a hash join over keys of this type is not supported"
                 )
             })?;
             hash = if at == 0 {
@@ -1582,7 +875,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             let Some(hash) = datum_hash(&value) else {
                 return Err(crate::sql_err!(
                     crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                    "a hash join of several batches over keys of this type is not supported"
+                    "a hash join over keys of this type is not supported"
                 ));
             };
             // Open addressing in the skew array; a repeated hash is skipped.
@@ -1608,32 +901,58 @@ impl<'r, 'a> JoinContext<'r, 'a> {
     /// The `t_len` of the minimal tuple of path `id`'s target list for
     /// the bound row.
     fn tuple_len(&self, bound: &[Option<BaseRow<'a>>], id: u32) -> Result<usize, SqlError> {
-        self.tuple_sizes(bound, id, false).map(|(length, _)| length)
+        self.tuple_sizes(bound, id, &[]).map(|(length, _)| length)
     }
 
-    /// The `t_len` of a row's tuple under the `id` path and what a sort
-    /// writes of it to a tape (`writetup_heap`, or `writetup_datum` when
-    /// `datum` names a sort of one column).
+    /// The columns of path `id`'s target list, then each of `extra` it
+    /// lacks: a sort's key expressions, which `make_sort_from_pathkeys`
+    /// adds to its input's target list as resjunk columns.
+    fn sort_columns(
+        &self,
+        id: u32,
+        extra: &[(usize, usize)],
+        each: &mut dyn FnMut((usize, usize)),
+    ) {
+        let mut listed = [(usize::MAX, 0usize); super::index_paths::joins::MAX_KEYS];
+        self.model
+            .plan
+            .target_list(self.model.plan.path(id).relids, &mut |column| {
+                let member = (usize::from(column.rel), usize::from(column.column));
+                for (slot, &key) in listed.iter_mut().zip(extra) {
+                    if key == member {
+                        *slot = key;
+                    }
+                }
+                each(member);
+            });
+        for (at, &key) in extra.iter().enumerate() {
+            if listed.get(at) != Some(&key) {
+                each(key);
+            }
+        }
+    }
+
+    /// The `t_len` of a row's tuple under the `id` path, with the sort key
+    /// columns `extra` it lacks, and what a sort writes of it to a tape
+    /// (`writetup_heap`, or `writetup_datum` for a sort of one column).
     fn tuple_sizes(
         &self,
         bound: &[Option<BaseRow<'a>>],
         id: u32,
-        datum: bool,
+        extra: &[(usize, usize)],
     ) -> Result<(usize, usize), SqlError> {
         let mut values = [Datum::Null; 128];
         let mut width = 0;
         let mut fits = true;
-        self.model
-            .plan
-            .target_list(self.model.plan.path(id).relids, &mut |column| {
-                if width < values.len() {
-                    values[width] =
-                        self.value(bound, (usize::from(column.rel), usize::from(column.column)));
-                    width += 1;
-                } else {
-                    fits = false;
-                }
-            });
+        self.sort_columns(id, extra, &mut |member| {
+            if width < values.len() {
+                values[width] = self.value(bound, member);
+                width += 1;
+            } else {
+                fits = false;
+            }
+        });
+        let datum = !extra.is_empty() && width == 1;
         let sizes = fits
             .then(|| {
                 super::postgres_memory::SizeSource {
@@ -1911,52 +1230,19 @@ pub(super) fn run_modeled<'a>(
     visit: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     let written = scope;
-    let scope = model.scope(written);
-    let mut output = OutputRow::new(model, written, arena)?;
     let block = super::instrument::current_block();
-    let built = core::cell::Cell::from_mut(
-        arena
-            .alloc_slice_with(model.plan.paths.len(), |_| None::<Built<'a>>)
-            .map_err(|_| arena_full())?,
-    )
-    .as_slice_of_cells();
-    let frozen = core::cell::Cell::from_mut(
-        arena
-            .alloc_slice_with(model.plan.paths.len(), |_| None::<Frozen<'a>>)
-            .map_err(|_| arena_full())?,
-    )
-    .as_slice_of_cells();
-    // The plan's node records, in one `plan_build_bytes` lease.
-    let mut scan_nodes = storage
-        .plan_build()
-        .lease::<core::cell::RefCell<Option<ScanRecord<'a>>>>(model.plan.paths.len())
-        .map_err(node_pool_full)?;
-    for _ in 0..model.plan.paths.len() {
-        scan_nodes
-            .push_reserved(core::cell::RefCell::new(None))
-            .map_err(node_pool_full)?;
+    let mut pull = ModeledPull::general(storage, txid, model, written, params, arena, hooks)?;
+    while pull.next_row(storage, written, arena, hooks)? {
+        let keep = {
+            let _block = super::instrument::enter_block(block);
+            visit(&pull.row(written))?
+        };
+        pull.finish_row();
+        if !keep {
+            break;
+        }
     }
-    let memos = arena
-        .alloc_owned_slice_with(model.plan.paths.len(), |_| core::cell::Cell::new(None))
-        .map_err(|_| arena_full())?;
-    let layout = JoinLayout::new(model, scope, arena)?;
-    let runner = Runner {
-        cx: JoinContext::new(storage, scope, txid, model, arena, params, hooks, &layout),
-        storage,
-        built,
-        frozen,
-        scan_nodes: &scan_nodes,
-        memos: &memos,
-        block,
-    };
-    let mut bound: Bound<'a> = [None; RELATION_NUMBERS];
-    runner.exec(model.plan.top, &mut bound, &mut |bound| {
-        runner.check()?;
-        output.fill(model, written, layout.nulls, bound);
-        let _block = super::instrument::enter_block(block);
-        visit(&output.row(model, written))
-    })?;
-    runner.check()
+    pull.finish()
 }
 
 /// The joined row a plan returns, as the query reads it: each relation's
@@ -2169,896 +1455,44 @@ fn node_pool_full(error: crate::mem::lease_pool::LeaseError) -> SqlError {
     .plan_build_exhausted()
 }
 
-/// The rows a materialized input holds: each one's base rows, by FROM
-/// position.
-struct Held<'a> {
-    rows: ArenaList<'a, Row<'a>>,
-}
-
-impl<'r, 'a> Runner<'r, 'a> {
-    /// Runs path `id`, binding its relations' rows into `bound` for each of
-    /// its rows. Returns false once `sink` stopped.
-    fn exec(
+/// The orders the nodes read stored rows in, each over the rows decoded
+/// into the arena.
+impl<'r, 'a> JoinContext<'r, 'a> {
+    /// The bound rows of `relids`, flat by the query's FROM positions: the
+    /// outer row a parameterized scan or a `LATERAL` subquery reads.
+    fn outer_values(
         &self,
-        id: u32,
-        bound: &mut Bound<'a>,
-        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
-        super::check_timeout()?;
-        // A join reached from a scan's row counts in the join's block.
-        let _block = super::instrument::enter_block(self.block);
-        let path = *self.model.plan.path(id);
-        match path.kind {
-            PathKind::Dummy => Ok(true),
-            PathKind::Scan { rel, path } => self.scan(id, usize::from(rel), path, bound, sink),
-            PathKind::Material { input } => self.exec(input, bound, sink),
-            PathKind::Unique {
-                input,
-                keys,
-                key_count,
-                method,
-            } => match method {
-                super::index_paths::joins::UniqueMethod::Noop => self.exec(input, bound, sink),
-                super::index_paths::joins::UniqueMethod::Sort => {
-                    self.unique(input, self.model.plan.keys(keys, key_count), bound, sink)
-                }
-                super::index_paths::joins::UniqueMethod::Hash => self.unique_hashed(
-                    input,
-                    self.model.plan.keys(keys, key_count),
-                    path.rows,
-                    bound,
-                    sink,
-                ),
-            },
-            PathKind::Memoize {
-                input,
-                keys,
-                key_count,
-                single_row,
-                binary,
-            } => self.memoize(
-                id,
-                input,
-                self.model.plan.keys(keys, key_count),
-                (single_row, binary),
-                bound,
-                sink,
-            ),
-            PathKind::NestLoop {
-                jointype,
-                outer,
-                inner,
-                clauses,
-                inner_unique,
-            } => {
-                let join = node(super::instrument::Role::Join, id);
-                let _join = join.start();
-                let material = match self.model.plan.path(inner).kind {
-                    PathKind::Material { input } => Some(input),
-                    _ => None,
-                };
-                let material_node = node(super::instrument::Role::Materialize, inner);
-                let inner_relids = self.model.plan.path(inner).relids;
-                let (join_quals, other_quals) =
-                    self.split(&clauses, path.relids, jointype, &ClauseList::EMPTY);
-                // `ExecNestLoop`: a semi join, or a unique inner relation,
-                // ends each outer row's scan at its first match, an anti
-                // join at its first match without returning it; a left or
-                // anti join returns an unmatched outer row with NULLs.
-                let single_match = inner_unique || jointype == JoinType::Semi;
-                // A loop that stops at its first match reads its inner
-                // `Materialize` only as far as some loop needed
-                // (`ExecMaterial` fetching on demand): under `EXPLAIN
-                // ANALYZE` the inner scan counts those rows, as one read.
-                let lazy = match material {
-                    Some(input)
-                        if super::instrument::active()
-                            && (single_match || jointype == JoinType::Anti) =>
-                    {
-                        let PathKind::Scan {
-                            rel,
-                            path: scan_path,
-                        } = self.model.plan.path(input).kind
-                        else {
-                            return Err(crate::sql_err!(
-                                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                                "EXPLAIN ANALYZE of a materialized join read in part is not supported"
-                            ));
-                        };
-                        let rel = usize::from(rel);
-                        let modeled = self.model.rels[rel];
-                        let scan = modeled.scan(
-                            self.storage,
-                            self.txid,
-                            scan_path,
-                            self.params,
-                            self.arena,
-                        )?;
-                        if modeled.restriction.is_some()
-                            && !(scan.path.kind == super::index_paths::ScanKind::Index
-                                && self.counts_lazily(rel, scan_path)?)
-                        {
-                            return Err(crate::sql_err!(
-                                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                                "EXPLAIN ANALYZE of a materialized join read in part is not supported"
-                            ));
-                        }
-                        let _block =
-                            super::instrument::enter_block(self.block.child(scan_segment(rel)));
-                        Some(super::instrument::node(super::instrument::Role::Scan(0)))
-                    }
-                    _ => None,
-                };
-                let reached = core::cell::Cell::new(0usize);
-                let kept = self.exec(outer, bound, &mut |bound| {
-                    let mut matched = false;
-                    let mut stopped = false;
-                    let mut pass = |bound: &mut Bound<'a>| -> Result<bool, SqlError> {
-                        if !self.equal(bound, &join_quals)? {
-                            join.join_filtered();
-                            return Ok(true);
-                        }
-                        matched = true;
-                        if jointype == JoinType::Anti {
-                            return Ok(false);
-                        }
-                        if self.equal(bound, &other_quals)? {
-                            join.row();
-                            if !sink(bound)? {
-                                stopped = true;
-                                return Ok(false);
-                            }
-                        } else {
-                            join.filtered();
-                        }
-                        Ok(!single_match)
-                    };
-                    match material {
-                        None => {
-                            self.exec(inner, bound, &mut pass)?;
-                        }
-                        Some(input) => {
-                            let _material = material_node.start();
-                            let store = match self.built[inner as usize].get() {
-                                Some(store) => store,
-                                None => {
-                                    let rows = if lazy.is_some() {
-                                        let _suspended = super::instrument::suspend();
-                                        self.hold(input, bound)?.rows.as_slice()
-                                    } else {
-                                        self.hold(input, bound)?.rows.as_slice()
-                                    };
-                                    let store = Built { rows, index: &[] };
-                                    // The tuplestore `EXPLAIN ANALYZE` reports.
-                                    if lazy.is_none() {
-                                        material_node.store_opened();
-                                        for row in store.rows {
-                                            material_node
-                                                .store_row(self.tuple_len(row, inner).ok());
-                                        }
-                                    }
-                                    self.built[inner as usize].set(Some(store));
-                                    store
-                                }
-                            };
-                            for (at, row) in store.rows.iter().enumerate() {
-                                material_node.row();
-                                reached.set(reached.get().max(at + 1));
-                                self.bind(bound, row, inner_relids);
-                                if !pass(bound)? {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if stopped {
-                        return Ok(false);
-                    }
-                    if !matched && jointype.fills_outer() {
-                        self.null_extend(bound, inner_relids);
-                        if self.equal(bound, &other_quals)? {
-                            join.row();
-                            if !sink(bound)? {
-                                return Ok(false);
-                            }
-                        } else {
-                            join.filtered();
-                        }
-                    }
-                    Ok(true)
-                })?;
-                if let Some(lazy) = lazy {
-                    let rows = self.built[inner as usize]
-                        .get()
-                        .map_or(&[][..], |store| store.rows);
-                    let reached = reached.get().min(rows.len());
-                    {
-                        let _scan = lazy.start();
-                        lazy.rows(reached as u64);
-                    }
-                    material_node.store_opened();
-                    for row in &rows[..reached] {
-                        material_node.store_row(self.tuple_len(row, inner).ok());
-                    }
-                }
-                Ok(kept)
-            }
-            PathKind::HashJoin {
-                jointype,
-                outer,
-                inner,
-                clauses,
-                hash,
-                buckets,
-                batches,
-                ..
-            } => {
-                // An inner input reading the values of an outer row above
-                // changes at each rescan, which builds the table again
-                // (`ExecReScanHashJoin` with the inner plan's `chgParam`).
-                if self.model.plan.path(inner).param != Relids::EMPTY {
-                    self.built[id as usize].set(None);
-                    self.frozen[id as usize].set(None);
-                }
-                let outer_relids = self.model.plan.path(outer).relids;
-                let inner_relids = self.model.plan.path(inner).relids;
-                let keys = self.sides(&hash, outer_relids);
-                let quals = self.split(&clauses, path.relids, jointype, &hash);
-                let join = node(super::instrument::Role::Join, id);
-                let hash_node = node(super::instrument::Role::Hash, id);
-                let _join = join.start();
-                if self.hashable(&keys) {
-                    return self.batched_hash_join(
-                        id, jointype, outer, inner, quals, &keys, join, hash_node, bound, sink,
-                    );
-                }
-                debug_assert_eq!(batches, 1, "planned batches need hashable keys");
-                debug_assert!(!jointype.fills_inner(), "planned without hashable keys");
-                let build = |bound: &mut Bound<'a>| -> Result<Built<'a>, SqlError> {
-                    let _hash = hash_node.start();
-                    let held = self.hold(inner, bound)?;
-                    let (index, bytes) = self.hash_index(&held, &keys, inner, buckets)?;
-                    // A table that outgrows its memory splits into batches,
-                    // which rows of these key types cannot be assigned to.
-                    let inner_path = self.model.plan.path(inner);
-                    let sizing = super::index_paths::joins::choose_hash_table_size(
-                        inner_path.rows,
-                        inner_path.width,
-                        self.skewed(&keys),
-                        self.model.plan.settings,
-                    );
-                    let mut final_buckets = buckets as usize;
-                    while index.len() > final_buckets + 1 {
-                        final_buckets *= 2;
-                    }
-                    if bytes + final_buckets * 8 > sizing.space_allowed as usize {
-                        return Err(crate::sql_err!(
-                            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                            "a hash join whose table outgrows its memory over keys of this type is not supported"
-                        ));
-                    }
-                    hash_node.rows(index.len() as u64);
-                    hash_node.hash_table(super::instrument::HashTable {
-                        tuples: index.len() as u64,
-                        tuple_bytes: Some(bytes),
-                        own_bytes: 0,
-                        batches: None,
-                    });
-                    let built = Built {
-                        rows: held.rows.as_slice(),
-                        index,
-                    };
-                    self.built[id as usize].set(Some(built));
-                    Ok(built)
-                };
-                // `ExecHashJoin` reads the first outer row before building
-                // its table when it returns unmatched outer rows or the
-                // outer plan starts cheaper than the table costs, and ends
-                // at an empty table unless it returns unmatched outer rows;
-                // a rescan reuses the table and reads every outer row.
-                let fill_outer = jointype.fills_outer();
-                let mut table = self.built[id as usize].get();
-                if table.is_none()
-                    && !fill_outer
-                    && self.model.plan.path(outer).startup >= self.model.plan.path(inner).total
-                {
-                    let built = build(bound)?;
-                    if built.index.is_empty() {
-                        return Ok(true);
-                    }
-                    table = Some(built);
-                }
-                let (join_quals, other_quals) = quals;
-                let mut ended = false;
-                let kept = self.exec(outer, bound, &mut |bound| {
-                    if table.is_none() {
-                        let built = build(bound)?;
-                        if built.index.is_empty() && !fill_outer {
-                            ended = true;
-                            return Ok(false);
-                        }
-                        table = Some(built);
-                    }
-                    let Built { rows, index } = table.expect("built");
-                    let mut matched = false;
-                    if let Some(start) = self.first_match(bound, rows, index, &keys)? {
-                        for &at in &index[start..] {
-                            let row = &rows[at as usize];
-                            if self.compare_sides(bound, row, &keys)? != Ordering::Equal {
-                                break;
-                            }
-                            self.bind(bound, row, inner_relids);
-                            if !self.equal(bound, &join_quals)? {
-                                join.join_filtered();
-                                continue;
-                            }
-                            matched = true;
-                            if jointype == JoinType::Anti {
-                                break;
-                            }
-                            if self.equal(bound, &other_quals)? {
-                                join.row();
-                                if !sink(bound)? {
-                                    return Ok(false);
-                                }
-                            } else {
-                                join.filtered();
-                            }
-                            if jointype == JoinType::Semi {
-                                break;
-                            }
-                        }
-                    }
-                    if !matched && fill_outer {
-                        self.null_extend(bound, inner_relids);
-                        if self.equal(bound, &other_quals)? {
-                            join.row();
-                            if !sink(bound)? {
-                                return Ok(false);
-                            }
-                        } else {
-                            join.filtered();
-                        }
-                    }
-                    Ok(true)
-                })?;
-                Ok(kept || ended)
-            }
-            PathKind::MergeJoin {
-                jointype,
-                outer,
-                inner,
-                merge,
-                outer_sort,
-                inner_sort,
-                clauses,
-                materialize_inner,
-                inner_unique,
-                descending,
-                nulls_first,
-            } => self.merge_join(
-                id,
-                jointype,
-                path.relids,
-                (outer, outer_sort),
-                (inner, inner_sort),
-                &merge,
-                &clauses,
-                materialize_inner,
-                inner_unique,
-                (descending, nulls_first),
-                bound,
-                sink,
-            ),
-        }
-    }
-
-    /// A merge join as `ExecMergeJoin` runs it: it reads its outer input,
-    /// then its inner one only for a joinable outer row (or to return
-    /// unmatched inner rows), marks the inner input at each run of equal
-    /// keys and restores it for the next outer row of the same keys, returns
-    /// each unmatched row of a side it fills with NULLs for the other, and
-    /// ends when an input it does not fill ends. A sorted input is read
-    /// whole by its `Sort` when first fetched; an input already in order is
-    /// read only as far as the join fetches it.
-    #[allow(clippy::too_many_arguments)]
-    fn merge_join(
-        &self,
-        id: u32,
-        jointype: JoinType,
+        bound: &[Option<BaseRow<'a>>],
         relids: Relids,
-        (outer, outer_sort): (u32, Keys),
-        (inner, inner_sort): (u32, Keys),
-        merge: &ClauseList,
-        clauses: &ClauseList,
-        materialize_inner: bool,
-        inner_unique: bool,
-        (descending, nulls_first): (u32, u32),
-        bound: &mut Bound<'a>,
-        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
-        let join = node(super::instrument::Role::Join, id);
-        let _join = join.start();
-        let outer_relids = self.model.plan.path(outer).relids;
-        let inner_relids = self.model.plan.path(inner).relids;
-        let keys = self.sides(merge, outer_relids);
-        let (join_quals, other_quals) = self.split(clauses, relids, jointype, merge);
-        let fill_outer = jointype.fills_outer();
-        let fill_inner = jointype.fills_inner();
-        let single_match = inner_unique || jointype == JoinType::Semi;
-        let skip_mark_restore = (inner_unique
-            || matches!(jointype, JoinType::Semi | JoinType::Anti))
-            && clauses.as_slice().len() == merge.as_slice().len();
-        let outer_input = self.merge_input(id, outer, &outer_sort, 0, bound)?;
-        let outer_rows = outer_input.rows;
-        // `MJEvalOuterValues` and `MJEvalInnerValues`: a NULL first key
-        // sorted last ends the join unless the join returns that side's
-        // unmatched rows.
-        let eval = |row: &[Option<BaseRow<'a>>], outer_side: bool| -> MergeEval {
-            let fills = if outer_side { fill_outer } else { fill_inner };
-            let mut result = MergeEval::Matchable;
-            for (at, &(o, i)) in JoinContext::keys(&keys).enumerate() {
-                if self.value(row, if outer_side { o } else { i }).is_null() {
-                    if at == 0 && nulls_first & 1 == 0 && !fills {
-                        return MergeEval::EndOfJoin;
-                    }
-                    result = MergeEval::NonMatchable;
-                }
-            }
-            result
-        };
-        let mut outer_fetches = 0usize;
-        let mut inner_fetches = 0usize;
-        let mut inner_reached = 0usize;
-        let mut inner_input: Option<MergeInput<'a>> = None;
-        let mut outer_at: Option<usize> = None;
-        let mut inner_at: Option<usize> = None;
-        let mut inner_next = 0usize;
-        let mut marked: Option<usize> = None;
-        // The tuplestore of a `Materialize` over the inner input.
-        let mut material_store: Option<super::material_store::MaterialStore<'_>> = None;
-        let mut matched_outer = false;
-        let mut matched_inner = false;
-        let mut state = MergeState::InitializeOuter;
-        let mut stopped = false;
-        macro_rules! next_outer {
-            () => {{
-                if outer_fetches < outer_rows.len() {
-                    outer_fetches += 1;
-                    outer_at = Some(outer_fetches - 1);
-                } else {
-                    outer_at = None;
-                }
-            }};
+    ) -> Result<OuterValues<'a>, SqlError> {
+        let n = self.scope.n;
+        let offsets = self
+            .arena
+            .alloc_slice_with(n, |_| 0usize)
+            .map_err(|_| arena_full())?;
+        let mut width = 0;
+        for (table, offset) in offsets.iter_mut().enumerate() {
+            *offset = width;
+            width += self.scope.stored_width(table);
         }
-        macro_rules! fetch_outer {
-            () => {{
-                next_outer!();
-                match outer_at {
-                    Some(at) => eval(&outer_rows[at], true),
-                    None => MergeEval::EndOfJoin,
-                }
-            }};
-        }
-        macro_rules! next_inner {
-            () => {{
-                if inner_input.is_none() {
-                    inner_input = Some(self.merge_input(id, inner, &inner_sort, 1, bound)?);
-                }
-                let rows = inner_input.as_ref().expect("read").rows;
-                if inner_next < rows.len() {
-                    inner_at = Some(inner_next);
-                    inner_next += 1;
-                    inner_fetches += 1;
-                    inner_reached = inner_reached.max(inner_next);
-                } else {
-                    inner_at = None;
-                }
-                if materialize_inner && super::instrument::active() {
-                    if material_store.is_none() {
-                        let lengths = self
-                            .arena
-                            .alloc_slice_with(rows.len(), |_| 0usize)
-                            .map_err(|_| arena_full())?;
-                        for (length, row) in lengths.iter_mut().zip(rows) {
-                            *length = self.tuple_len(row, inner)?;
-                        }
-                        material_store = Some(super::material_store::MaterialStore::new(lengths));
-                    }
-                    material_store.as_mut().expect("opened").next()?;
-                }
-            }};
-        }
-        macro_rules! fetch_inner {
-            () => {{
-                next_inner!();
-                let rows = inner_input.as_ref().expect("read").rows;
-                match inner_at {
-                    Some(at) => eval(&rows[at], false),
-                    None => MergeEval::EndOfJoin,
-                }
-            }};
-        }
-        // `MJFillOuter` and `MJFillInner`: the current row with NULLs for
-        // the other side, when the join's filters pass it.
-        macro_rules! fill {
-            ($outer_side:expr) => {{
-                let inner_rows = inner_input.as_ref().map_or(&[][..], |input| input.rows);
-                if $outer_side {
-                    self.bind(bound, &outer_rows[outer_at.expect("outer")], outer_relids);
-                    self.null_extend(bound, inner_relids);
-                } else {
-                    self.bind(bound, &inner_rows[inner_at.expect("inner")], inner_relids);
-                    self.null_extend(bound, outer_relids);
-                }
-                if self.equal(bound, &other_quals)? {
-                    join.row();
-                    if !sink(bound)? {
-                        stopped = true;
-                        break;
-                    }
-                } else {
-                    join.filtered();
-                }
-            }};
-        }
-        // `MJCompare`: each key compared as its sort orders it
-        // (`ApplySortComparator`), NULL equal to NULL only to order the
-        // rows, never to join them.
-        let compare = |outer_row: &[Option<BaseRow<'a>>],
-                       inner_row: &[Option<BaseRow<'a>>]|
-         -> Result<Ordering, SqlError> {
-            let mut null_equals_null = false;
-            for (at, &(o, i)) in JoinContext::keys(&keys).enumerate() {
-                let (one, two) = (self.value(outer_row, o), self.value(inner_row, i));
-                let first = nulls_first >> at & 1 != 0;
-                let order = match (one.is_null(), two.is_null()) {
-                    (true, true) => {
-                        null_equals_null = true;
-                        continue;
-                    }
-                    (true, false) if first => Ordering::Less,
-                    (true, false) => Ordering::Greater,
-                    (false, true) if first => Ordering::Greater,
-                    (false, true) => Ordering::Less,
-                    (false, false) => {
-                        let order = crate::sql::eval::compare_datums_collated(
-                            self.storage,
-                            self.txid,
-                            self.collation(o),
-                            &one,
-                            &two,
-                        )?;
-                        if descending >> at & 1 != 0 {
-                            order.reverse()
-                        } else {
-                            order
-                        }
-                    }
-                };
-                if order != Ordering::Equal {
-                    return Ok(order);
-                }
-            }
-            Ok(if null_equals_null {
-                Ordering::Greater
-            } else {
-                Ordering::Equal
-            })
-        };
-        let out_of_order = || {
-            crate::sql_err!(
-                crate::sql::eval::sqlstate::INTERNAL_ERROR,
-                "mergejoin input data is out of order"
-            )
-        };
-        loop {
-            super::check_timeout()?;
-            match state {
-                MergeState::InitializeOuter => match fetch_outer!() {
-                    MergeEval::Matchable => state = MergeState::InitializeInner,
-                    MergeEval::NonMatchable => {
-                        if fill_outer {
-                            fill!(true);
-                        }
-                    }
-                    MergeEval::EndOfJoin => {
-                        if !fill_inner {
-                            break;
-                        }
-                        state = MergeState::EndOuter;
-                        matched_inner = true;
-                    }
-                },
-                MergeState::InitializeInner => match fetch_inner!() {
-                    MergeEval::Matchable => state = MergeState::SkipTest,
-                    MergeEval::NonMatchable => {
-                        if fill_inner {
-                            fill!(false);
-                        }
-                    }
-                    MergeEval::EndOfJoin => {
-                        if !fill_outer {
-                            break;
-                        }
-                        state = MergeState::EndInner;
-                        matched_outer = false;
-                    }
-                },
-                MergeState::JoinTuples => {
-                    state = MergeState::NextInner;
-                    let inner_rows = inner_input.as_ref().expect("read").rows;
-                    let (o, i) = (outer_at.expect("outer"), inner_at.expect("inner"));
-                    self.bind(bound, outer_rows[o], outer_relids);
-                    self.bind(bound, inner_rows[i], inner_relids);
-                    if !self.equal(bound, &join_quals)? {
-                        join.join_filtered();
-                        continue;
-                    }
-                    matched_outer = true;
-                    matched_inner = true;
-                    if jointype == JoinType::Anti {
-                        state = MergeState::NextOuter;
-                        continue;
-                    }
-                    if single_match {
-                        state = MergeState::NextOuter;
-                    }
-                    if jointype == JoinType::RightAnti {
-                        continue;
-                    }
-                    if self.equal(bound, &other_quals)? {
-                        join.row();
-                        if !sink(bound)? {
-                            stopped = true;
-                            break;
-                        }
-                    } else {
-                        join.filtered();
-                    }
-                }
-                MergeState::NextInner => {
-                    if fill_inner && !matched_inner {
-                        fill!(false);
-                    }
-                    let fetched = fetch_inner!();
-                    matched_inner = false;
-                    state = match fetched {
-                        MergeEval::Matchable => {
-                            let inner_rows = inner_input.as_ref().expect("read").rows;
-                            match compare(
-                                outer_rows[outer_at.expect("outer")],
-                                inner_rows[inner_at.expect("inner")],
-                            )? {
-                                Ordering::Equal => MergeState::JoinTuples,
-                                Ordering::Less => MergeState::NextOuter,
-                                Ordering::Greater => return Err(out_of_order()),
-                            }
-                        }
-                        MergeEval::NonMatchable => MergeState::NextOuter,
-                        MergeEval::EndOfJoin => {
-                            inner_at = None;
-                            MergeState::NextOuter
-                        }
-                    };
-                }
-                MergeState::NextOuter => {
-                    if fill_outer && !matched_outer {
-                        fill!(true);
-                    }
-                    let fetched = fetch_outer!();
-                    matched_outer = false;
-                    match fetched {
-                        MergeEval::Matchable => state = MergeState::TestOuter,
-                        MergeEval::NonMatchable => {}
-                        MergeEval::EndOfJoin => {
-                            if fill_inner && inner_at.is_some() {
-                                state = MergeState::EndOuter;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
-                MergeState::TestOuter => {
-                    let inner_rows = inner_input.as_ref().expect("read").rows;
-                    let mark = marked.expect("a marked inner row");
-                    match compare(outer_rows[outer_at.expect("outer")], inner_rows[mark])? {
-                        Ordering::Equal => {
-                            if !skip_mark_restore {
-                                // `ExecRestrPos`: the next fetch follows the mark.
-                                inner_at = Some(mark);
-                                inner_next = mark + 1;
-                                if let Some(store) = material_store.as_mut() {
-                                    store.restore();
-                                }
-                            }
-                            state = MergeState::JoinTuples;
-                        }
-                        Ordering::Greater => {
-                            let current = match inner_at {
-                                None => MergeEval::EndOfJoin,
-                                Some(at) => eval(inner_rows[at], false),
-                            };
-                            match current {
-                                MergeEval::Matchable => state = MergeState::SkipTest,
-                                MergeEval::NonMatchable => state = MergeState::SkipInnerAdvance,
-                                MergeEval::EndOfJoin => {
-                                    if !fill_outer {
-                                        break;
-                                    }
-                                    state = MergeState::EndInner;
-                                }
-                            }
-                        }
-                        Ordering::Less => return Err(out_of_order()),
-                    }
-                }
-                MergeState::SkipTest => {
-                    let inner_rows = inner_input.as_ref().expect("read").rows;
-                    state = match compare(
-                        outer_rows[outer_at.expect("outer")],
-                        inner_rows[inner_at.expect("inner")],
-                    )? {
-                        Ordering::Equal => {
-                            marked = inner_at;
-                            if !skip_mark_restore && let Some(store) = material_store.as_mut() {
-                                store.mark();
-                            }
-                            MergeState::JoinTuples
-                        }
-                        Ordering::Less => MergeState::SkipOuterAdvance,
-                        Ordering::Greater => MergeState::SkipInnerAdvance,
-                    };
-                }
-                MergeState::SkipOuterAdvance => {
-                    if fill_outer && !matched_outer {
-                        fill!(true);
-                    }
-                    let fetched = fetch_outer!();
-                    matched_outer = false;
-                    match fetched {
-                        MergeEval::Matchable => state = MergeState::SkipTest,
-                        MergeEval::NonMatchable => {}
-                        MergeEval::EndOfJoin => {
-                            if fill_inner && inner_at.is_some() {
-                                state = MergeState::EndOuter;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
-                MergeState::SkipInnerAdvance => {
-                    if fill_inner && !matched_inner {
-                        fill!(false);
-                    }
-                    let fetched = fetch_inner!();
-                    matched_inner = false;
-                    match fetched {
-                        MergeEval::Matchable => state = MergeState::SkipTest,
-                        MergeEval::NonMatchable => {}
-                        MergeEval::EndOfJoin => {
-                            if fill_outer && outer_at.is_some() {
-                                state = MergeState::EndInner;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
-                MergeState::EndOuter => {
-                    if !matched_inner {
-                        fill!(false);
-                    }
-                    next_inner!();
-                    matched_inner = false;
-                    if inner_at.is_none() {
-                        break;
-                    }
-                }
-                MergeState::EndInner => {
-                    if !matched_outer {
-                        fill!(true);
-                    }
-                    next_outer!();
-                    matched_outer = false;
-                    if outer_at.is_none() {
-                        break;
-                    }
-                }
+        let values = self
+            .arena
+            .alloc_slice_with(width, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for table in 0..n {
+            if let Some(row) = bound[table]
+                && relids.contains(table as u32)
+            {
+                let columns = self.columns_of(row.values);
+                values[offsets[table]..offsets[table] + columns.len()].copy_from_slice(columns);
             }
         }
-        // The inputs' counts: a sort returns each row the join fetched, a
-        // `Materialize` too while its input returns each row once.
-        outer_input.counted(outer_fetches);
-        if let Some(input) = inner_input {
-            if materialize_inner {
-                let material = node(super::instrument::Role::Materialize, id);
-                let _material = material.start();
-                material.rows(inner_fetches as u64);
-                // Its tuplestore holds the rows it read from its input that
-                // the mark still needs.
-                material.store_opened();
-                if let Some(store) = material_store.take() {
-                    material.stored_space(false, store.finish());
-                }
-                input.counted(inner_reached);
-            } else {
-                input.counted(inner_fetches);
-            }
-        }
-        Ok(!stopped)
-    }
-
-    /// A merge join input: sorted, read whole by its `Sort` when the join
-    /// first fetches from it, or in order already, read as far as fetched.
-    fn merge_input(
-        &self,
-        join: u32,
-        id: u32,
-        keys: &Keys,
-        side: u8,
-        bound: &mut Bound<'a>,
-    ) -> Result<MergeInput<'a>, SqlError> {
-        let relids = self.model.plan.path(id).relids;
-        if !keys.as_slice().is_empty() {
-            let sort = node(
-                |number| super::instrument::Role::MergeSort(number, side),
-                join,
-            );
-            let _sort = sort.start();
-            let held = self.hold(id, bound)?;
-            let (order, space) = self.sorted(&held, keys, relids, id)?;
-            let rows = held.rows.borrowed_slice();
-            // The planner puts a `Materialize` above an inner sort the join
-            // marks, so both sorts are ordinary tuplesorts.
-            if super::instrument::active() {
-                sort.sorted(space);
-            }
-            let sorted = self
-                .arena
-                .alloc_slice_with(order.len(), |at| rows[order[at] as usize])
-                .map_err(|_| arena_full())?;
-            return Ok(MergeInput {
-                rows: sorted,
-                sort,
-                lazy: None,
-                pages: None,
-            });
-        }
-        // An input in index order: read under no count, then counted as far
-        // as the join fetched it.
-        let mut pages = None;
-        let lazy = match self.model.plan.path(id).kind {
-            PathKind::Scan { rel, path } if self.counts_lazily(usize::from(rel), path)? => {
-                let rel = usize::from(rel);
-                let _block = super::instrument::enter_block(self.block.child(scan_segment(rel)));
-                let buffers = super::instrument::buffers_counted();
-                let lazy_pages = self.lazy_pages(rel, path, buffers)?;
-                if buffers || lazy_pages.visible.is_some() {
-                    pages = Some(lazy_pages);
-                }
-                Some(super::instrument::node(super::instrument::Role::Scan(0)))
-            }
-            _ if super::instrument::active() => {
-                return Err(crate::sql_err!(
-                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                    "EXPLAIN ANALYZE of a merge join over an input in order without a sort is not supported"
-                ));
-            }
-            _ => None,
-        };
-        let held = {
-            let _suspended = super::instrument::suspend();
-            self.hold(id, bound)?
-        };
-        Ok(MergeInput {
-            rows: held.rows.as_slice(),
-            sort: super::instrument::Node::NONE,
-            lazy,
-            pages,
-        })
+        let forms = self
+            .arena
+            .alloc_slice_with(width, |_| StoredForm::Inline)
+            .map_err(|_| arena_full())?;
+        self.flat_forms(bound, Some(relids), forms);
+        Ok((values, offsets, forms))
     }
 
     /// How the index scan of `rel` by its path `path`, read in part by a
@@ -3070,7 +1504,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         let index_only = scan.path.kind == super::index_paths::ScanKind::IndexOnly;
         if !buffers && !index_only {
             return Ok(LazyPages {
-                rel,
                 model: super::instrument::PageModel {
                     local: false,
                     relation_pages: 0,
@@ -3089,7 +1522,6 @@ impl<'r, 'a> Runner<'r, 'a> {
         let visible =
             index_only.then(|| super::instrument::all_visible_pages(self.storage, slot, self.txid));
         Ok(LazyPages {
-            rel,
             model: super::instrument::PageModel {
                 local: self.storage.table_def(slot, self.txid).persistence
                     == crate::storage::RelationPersistence::Temporary,
@@ -3105,10 +1537,12 @@ impl<'r, 'a> Runner<'r, 'a> {
         })
     }
 
-    /// Whether the join can count an index scan of `rel` read in part: an
-    /// index or index-only scan without a filter, whose rows are each one
-    /// fetch.
-    fn counts_lazily(&self, rel: usize, path: u16) -> Result<bool, SqlError> {
+    /// Whether the join can count an index scan of `rel` read in part, and
+    /// whether it filters: an index or index-only scan without a filter,
+    /// whose rows are each one fetch, or an index scan with one when its
+    /// pages are not counted, whose fetches count the rows its filter
+    /// removed before them.
+    fn counts_lazily(&self, rel: usize, path: u16) -> Result<Option<bool>, SqlError> {
         let modeled = self.model.rels[rel];
         let scan = modeled.scan(self.storage, self.txid, path, self.params, self.arena)?;
         let conjuncts = modeled.restriction.map_or(0, |restriction| {
@@ -3117,132 +1551,16 @@ impl<'r, 'a> Runner<'r, 'a> {
             super::plan::flatten_and(restriction, &mut parts, &mut count);
             count
         });
-        Ok(matches!(
-            scan.path.kind,
-            super::index_paths::ScanKind::Index | super::index_paths::ScanKind::IndexOnly
-        ) && scan.path.absorbed.len() == conjuncts)
-    }
-
-    /// A `Memoize` node (`ExecMemoize`): the rows of its input for the bound
-    /// outer row's key, from its cache when an earlier call read them all,
-    /// counting hits, misses and its entries' memory as PostgreSQL does.
-    fn memoize(
-        &self,
-        id: u32,
-        input: u32,
-        keys: &[super::index_paths::joins::Member],
-        (single_row, binary): (bool, bool),
-        bound: &mut Bound<'a>,
-        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
-        let memoize = node(super::instrument::Role::Memoize, id);
-        let _memoize = memoize.start();
-        let inner_relids = self.model.plan.path(input).relids;
-        let mut key = [Datum::Null; super::index_paths::joins::MAX_KEYS];
-        for (at, member) in keys.iter().enumerate() {
-            key[at] = self.value(bound, (usize::from(member.rel), usize::from(member.column)));
-        }
-        let key = &key[..keys.len()];
-        let mut cache = self.memos[id as usize].take().unwrap_or_else(|| MemoCache {
-            entries: ArenaList::new(self.arena),
-            rows: ArenaList::new(self.arena),
-            stats: super::instrument::MemoizeStats::default(),
-            used: 0,
-        });
-        let mut found = None;
-        for (at, entry) in cache.entries.borrowed_slice().iter().enumerate() {
-            if self.same_key(&entry.key[..keys.len()], key, keys, binary)? {
-                found = Some(at);
-                break;
+        let filtered = scan.path.absorbed.len() != conjuncts;
+        Ok(match scan.path.kind {
+            super::index_paths::ScanKind::Index
+                if !filtered || !super::instrument::buffers_counted() =>
+            {
+                Some(filtered)
             }
-        }
-        if let Some(at) = found
-            && cache.entries.borrowed_slice()[at].complete
-        {
-            cache.stats.hits += 1;
-            let entry = cache.entries.borrowed_slice()[at];
-            let mut keep = true;
-            for position in entry.start..entry.start + entry.len {
-                let row = cache.rows.borrowed_slice()[position];
-                self.bind(bound, row, inner_relids);
-                memoize.row();
-                if !sink(bound)? {
-                    keep = false;
-                    break;
-                }
-            }
-            memoize.memoize(cache.stats);
-            self.memos[id as usize].set(Some(cache));
-            return Ok(keep);
-        }
-        if found.is_some() {
-            return Err(crate::sql_err!(
-                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                "a Memoize entry its consumer left incomplete is not supported"
-            ));
-        }
-        cache.stats.misses += 1;
-        let mut stored = [Datum::Null; super::index_paths::joins::MAX_KEYS];
-        stored[..key.len()].copy_from_slice(key);
-        let key_len =
-            super::postgres_memory::minimal_tuple_len_with_tids(None, key.iter().copied(), 0)
-                .ok_or_else(|| {
-                    crate::sql_err!(
-                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                        "a Memoize key with no PostgreSQL size here is not supported"
-                    )
-                })?;
-        // `EMPTY_ENTRY_MEMORY_BYTES`: the entry, its key and the key's tuple.
-        cache.used += 24 + 24 + key_len;
-        cache.stats.peak = cache.stats.peak.max(cache.used);
-        let start = cache.rows.len();
-        let entry_at = cache.entries.len();
-        cache
-            .entries
-            .push(MemoEntry {
-                key: stored,
-                start,
-                len: 0,
-                complete: false,
-            })
-            .map_err(|_| arena_full())?;
-        let limit = self.model.plan.settings.hash_mem_bytes as usize;
-        let mut len = 0usize;
-        let mut complete = true;
-        let mut stopped = false;
-        let saved = *bound;
-        let kept = self.exec(input, bound, &mut |bound| {
-            // `CACHE_TUPLE_BYTES`: the cached tuple and its list cell.
-            cache.used += 16 + self.tuple_len(bound, input)?;
-            cache.stats.peak = cache.stats.peak.max(cache.used);
-            if cache.used > limit && super::instrument::active() {
-                return Err(crate::sql_err!(
-                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                    "EXPLAIN ANALYZE of a Memoize node that evicts cache entries is not supported"
-                ));
-            }
-            cache
-                .rows
-                .push(self.keep(bound)?)
-                .map_err(|_| arena_full())?;
-            len += 1;
-            memoize.row();
-            if !sink(bound)? {
-                stopped = true;
-                complete = single_row;
-                return Ok(false);
-            }
-            // A unique inner relation's entry is complete at its first row.
-            Ok(!single_row)
-        })?;
-        let _ = kept;
-        *bound = saved;
-        let entry = &mut cache.entries.as_mut_slice().map_err(|_| arena_full())?[entry_at];
-        entry.len = len;
-        entry.complete = complete;
-        memoize.memoize(cache.stats);
-        self.memos[id as usize].set(Some(cache));
-        Ok(!stopped)
+            super::index_paths::ScanKind::IndexOnly if !filtered => Some(false),
+            _ => None,
+        })
     }
 
     /// Whether two Memoize keys are equal: NULLs equal each other.
@@ -3281,857 +1599,125 @@ impl<'r, 'a> Runner<'r, 'a> {
         Ok(true)
     }
 
-    /// A hash join PostgreSQL plans with several batches
-    /// (`ExecHashJoin` with `ExecHashTableInsert`, `ExecHashIncreaseNumBatches`,
-    /// the skew buckets of `ExecHashBuildSkewHash` and
-    /// `ExecHashJoinNewBatch`): batch 0's outer rows probe as they are read,
-    /// the others are saved to their batch, and each later batch is loaded
-    /// and probed in turn.
-    #[allow(clippy::too_many_arguments)]
-    fn batched_hash_join(
+    /// `ExecInitSort`: a sort by `keys` of path `id`'s rows whose tuple is
+    /// a single column sorts datums.
+    fn sorts_datums(&self, id: u32, keys: &[(usize, usize)]) -> bool {
+        let mut columns = 0;
+        self.sort_columns(id, keys, &mut |_| columns += 1);
+        columns == 1
+    }
+
+    /// The sizes a tuplesort by `keys` of path `id`'s rows charges for the
+    /// bound row: its tuple's `t_len` and what a run writes of it.
+    fn sort_sizes(
         &self,
+        row: &[Option<BaseRow<'a>>],
         id: u32,
-        jointype: JoinType,
-        outer: u32,
-        inner: u32,
-        quals: (ClauseList, ClauseList),
-        keys: &KeySides,
-        join: super::instrument::Node,
-        hash_node: super::instrument::Node,
-        bound: &mut Bound<'a>,
-        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
-        let inner_path = *self.model.plan.path(inner);
-        let inner_relids = inner_path.relids;
-        let outer_relids = self.model.plan.path(outer).relids;
-        let (fill_outer, fill_inner) = (jointype.fills_outer(), jointype.fills_inner());
-        let sizing = super::index_paths::joins::choose_hash_table_size(
-            inner_path.rows,
-            inner_path.width,
-            self.skewed(keys),
-            self.model.plan.settings,
-        );
-        let probe = Probe {
-            keys,
-            quals: (&quals.0, &quals.1),
-            jointype,
-            inner_relids,
-            join,
-        };
-        // A rescan reads a one-batch table again (`ExecReScanHashJoin`),
-        // its match flags cleared.
-        if let Some(frozen) = self.frozen[id as usize].get() {
-            frozen.reset_matches();
-            if frozen.memory.is_empty() && !fill_outer {
-                return Ok(true);
-            }
-            let kept = self.exec(outer, bound, &mut |bound| {
-                let hash = self.key_hash(bound, keys, true, fill_outer)?;
-                self.probe_batch(frozen, None, hash, &probe, bound, sink)
-            })?;
-            if !kept || !fill_inner {
-                return Ok(kept);
-            }
-            let mut rows = ArenaList::new(self.arena);
-            frozen.unmatched(self.arena, &mut rows)?;
-            return self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink);
-        }
-        let mut table: Option<BatchTable<'a>> = None;
-        let built_first =
-            fill_inner || (!fill_outer && self.model.plan.path(outer).startup >= inner_path.total);
-        if built_first {
-            let built = self.build_batches(inner, keys, sizing, hash_node, fill_inner, bound)?;
-            if built.total == 0 && !fill_outer {
-                if built.batches == 1 {
-                    self.frozen[id as usize].set(Some(built.frozen()));
-                }
-                return Ok(true);
-            }
-            table = Some(built);
-        }
-        let mut ended = false;
-        // Batch 0: probe as the outer rows are read; save the rest.
-        let kept = self.exec(outer, bound, &mut |bound| {
-            if table.is_none() {
-                let built =
-                    self.build_batches(inner, keys, sizing, hash_node, fill_inner, bound)?;
-                if built.total == 0 && !fill_outer {
-                    // A rescan probes the empty table with every outer row.
-                    if built.batches == 1 {
-                        self.frozen[id as usize].set(Some(built.frozen()));
-                    }
-                    ended = true;
-                    return Ok(false);
-                }
-                table = Some(built);
-            }
-            let table = table.as_mut().expect("built");
-            let table = &mut *table;
-            let hash = self.key_hash(bound, keys, true, fill_outer)?;
-            let Some(value) = hash else {
-                return Ok(true);
-            };
-            let skew = table.skew_bucket(value);
-            if skew.is_none() && table.batch_of(value) != 0 {
-                let batch = table.batch_of(value);
-                let saved = self.keep(bound)?;
-                table
-                    .outer_files
-                    .push((batch, saved))
-                    .map_err(|_| arena_full())?;
-                return Ok(true);
-            }
-            let skew = skew.map(|at| (&*table, at));
-            self.probe_batch(table.frozen(), skew, hash, &probe, bound, sink)
-        })?;
-        if !kept && !ended {
-            return Ok(false);
-        }
-        let Some(mut table) = table else {
-            return Ok(true);
-        };
-        if table.batches == 1 {
-            self.frozen[id as usize].set(Some(table.frozen()));
-            if fill_inner && !ended {
-                let mut rows = ArenaList::new(self.arena);
-                table.unmatched(&mut rows)?;
-                return self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink);
-            }
-            return Ok(true);
-        }
-        // Each batch returns its unmatched inner rows once its outer rows
-        // are done (`HJ_FILL_INNER_TUPLES`), batch 0's skew buckets too.
-        if fill_inner && !ended {
-            let mut rows = ArenaList::new(self.arena);
-            table.unmatched(&mut rows)?;
-            if !self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink)? {
-                return Ok(false);
-            }
-        }
-        // `ExecHashJoinNewBatch`.
-        table.skew_enabled = false;
-        let outer_start = table.batches;
-        let mut current = 0u32;
-        // The current batch's saved rows, read in the order they were saved.
-        let mut loaded = ArenaList::new(self.arena);
-        let mut probes = ArenaList::new(self.arena);
-        loop {
-            current += 1;
-            let has = |files: &[(u32, HashedRow<'a>)], batch: u32| {
-                files.iter().any(|(at, _)| *at == batch)
-            };
-            let has_outer =
-                |files: &[(u32, Row<'a>)], batch: u32| files.iter().any(|(at, _)| *at == batch);
-            // A batch lacking outer or inner rows is skipped unless the join
-            // returns the unmatched rows it has, or batches grew since.
-            while current < table.batches
-                && (!has_outer(table.outer_files.borrowed_slice(), current)
-                    || !has(table.inner_files.borrowed_slice(), current))
-            {
-                if (has_outer(table.outer_files.borrowed_slice(), current) && fill_outer)
-                    || (has(table.inner_files.borrowed_slice(), current) && fill_inner)
-                {
-                    break;
-                }
-                if has(table.inner_files.borrowed_slice(), current)
-                    && table.batches != table.original_batches
-                {
-                    break;
-                }
-                if has_outer(table.outer_files.borrowed_slice(), current)
-                    && table.batches != outer_start
-                {
-                    break;
-                }
-                current += 1;
-            }
-            if current >= table.batches {
-                return Ok(true);
-            }
-            table.current = current;
-            table.reset();
-            take_batch(&mut table.inner_files, current, &mut loaded)?;
-            for at in 0..loaded.len() {
-                table.insert(loaded.borrowed_slice()[at], self.arena)?;
-            }
-            take_batch(&mut table.outer_files, current, &mut probes)?;
-            table.ready(self, keys)?;
-            for at in 0..probes.len() {
-                let saved = probes.borrowed_slice()[at];
-                let mut row = *bound;
-                row[..saved.len()].copy_from_slice(saved);
-                let hash = self.key_hash(&row, keys, true, fill_outer)?;
-                let value = hash.expect("saved rows have hash values");
-                let batch = table.batch_of(value);
-                if batch != table.current {
-                    table
-                        .outer_files
-                        .push((batch, saved))
-                        .map_err(|_| arena_full())?;
-                    continue;
-                }
-                if !self.probe_batch(table.frozen(), None, hash, &probe, &mut row, sink)? {
-                    return Ok(false);
-                }
-            }
-            if fill_inner {
-                let mut rows = ArenaList::new(self.arena);
-                table.unmatched(&mut rows)?;
-                if !self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink)? {
-                    return Ok(false);
-                }
-            }
-            hash_node.hash_table(table.figures(id));
-        }
+        keys: &[(usize, usize)],
+    ) -> Result<(usize, usize), SqlError> {
+        self.tuple_sizes(row, id, keys)
     }
 
-    /// Returns each unmatched inner row with NULLs for the outer relation
-    /// when the join's filters pass it (`HJ_FILL_INNER_TUPLES`).
-    fn fill_inner_rows(
-        &self,
-        rows: &[Row<'a>],
-        probe: &Probe<'_>,
-        outer_relids: Relids,
-        bound: &mut Bound<'a>,
-        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
-        for row in rows {
-            self.bind(bound, row, probe.inner_relids);
-            self.null_extend(bound, outer_relids);
-            if self.equal(bound, probe.quals.1)? {
-                probe.join.row();
-                if !sink(bound)? {
-                    return Ok(false);
-                }
-            } else {
-                probe.join.filtered();
-            }
+    /// The members a sort by `keys` of a path of `relids` compares, each
+    /// with its key's flags.
+    fn sort_members(&self, keys: &Keys, relids: Relids) -> ([(usize, usize); 8], [u8; 8], usize) {
+        let mut members = [(0usize, 0usize); 8];
+        let mut flags = [0u8; 8];
+        for (at, &key) in keys.as_slice().iter().enumerate() {
+            let class = key & KEY_CLASS;
+            let member = self.model.plan.classes[usize::from(class)]
+                .sort_member(relids)
+                .expect("a sort key reads its input");
+            members[at] = self.model.member(class, member as u8);
+            flags[at] = key;
         }
-        Ok(true)
+        (members, flags, keys.as_slice().len())
     }
 
-    /// Builds the table of path `inner`'s rows (`MultiExecPrivateHash`).
-    fn build_batches(
-        &self,
-        inner: u32,
-        keys: &KeySides,
-        sizing: super::index_paths::joins::HashSizing,
-        hash_node: super::instrument::Node,
-        keep_nulls: bool,
-        bound: &mut Bound<'a>,
-    ) -> Result<BatchTable<'a>, SqlError> {
-        let _hash = hash_node.start();
-        let held = self.hold(inner, bound)?;
-        let mut table = BatchTable::new(self.arena, sizing)?;
-        // `ExecHashBuildSkewHash`: the outer key's most common values, when
-        // the join hashes one key of a stored column into several batches.
-        if sizing.batches > 1 && self.skewed(keys) {
-            self.build_skew(&mut table, keys[0].0, sizing)?;
+    /// Each compared member's column, for its collation.
+    fn unique_members(
+        keys: &[super::index_paths::joins::Member],
+    ) -> ([(usize, usize); super::index_paths::joins::MAX_KEYS], usize) {
+        let mut members = [(0usize, 0usize); super::index_paths::joins::MAX_KEYS];
+        for (slot, member) in members.iter_mut().zip(keys) {
+            *slot = (usize::from(member.rel), usize::from(member.column));
         }
-        for row in held.rows.borrowed_slice() {
-            let Some(hash) = self.key_hash(row, keys, false, keep_nulls)? else {
-                continue;
-            };
-            let size = 16 + self.tuple_len(row, inner)?;
-            table.insert(HashedRow { row, hash, size }, self.arena)?;
-            table.total += 1;
-        }
-        if table.buckets != table.optimal_buckets {
-            table.increase_buckets()?;
-        }
-        table.space_used += table.buckets as usize * 8;
-        table.peak = table.peak.max(table.space_used);
-        table.ready(self, keys)?;
-        hash_node.rows(table.total as u64);
-        hash_node.hash_table(table.figures(inner));
-        Ok(table)
+        (members, keys.len())
     }
 
-    /// Probes the current batch (or skew bucket `skew`) for the bound outer
-    /// row of hash `hash`, passing each match (`HJ_SCAN_BUCKET`), then an
-    /// unmatched outer row with NULLs when the join returns those
-    /// (`HJ_FILL_OUTER_TUPLE`). A NULL key (`hash` `None`) matches nothing.
-    fn probe_batch(
-        &self,
-        frozen: Frozen<'a>,
-        skew: Option<(&BatchTable<'a>, usize)>,
-        hash: Option<u32>,
-        probe: &Probe<'_>,
-        bound: &mut Bound<'a>,
-        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
-        let mut chain = ArenaList::new(self.arena);
-        if let Some(hash) = hash {
-            match skew {
-                Some((table, at)) => table.skew_chain(at, &mut chain)?,
-                None => frozen.chain_of(hash, &mut chain)?,
-            }
-        }
-        let jointype = probe.jointype;
-        let mut matched = false;
-        // A NULL key matches nothing (the hash clauses are strict).
-        let outer_null = self.has_null(bound, probe.keys, true);
-        for &place in chain.as_slice() {
-            let (row, flag) = match skew {
-                Some((table, _)) => {
-                    let (_, hashed, _) = table.skew_rows.borrowed_slice()[place as usize];
-                    (hashed, &table.skew_matched[place as usize])
-                }
-                None => (
-                    frozen.memory[place as usize].hashed,
-                    &frozen.matched[place as usize],
-                ),
-            };
-            if Some(row.hash) != hash
-                || outer_null
-                || self.has_null(row.row, probe.keys, false)
-                || self.compare_sides(bound, row.row, probe.keys)? != Ordering::Equal
-            {
-                continue;
-            }
-            self.bind(bound, row.row, probe.inner_relids);
-            if !self.equal(bound, probe.quals.0)? {
-                probe.join.join_filtered();
-                continue;
-            }
-            matched = true;
-            // A right semi join returns each inner row at its first match.
-            if flag.replace(true) && jointype == JoinType::RightSemi {
-                continue;
-            }
-            if jointype == JoinType::Anti {
-                break;
-            }
-            if jointype == JoinType::RightAnti {
-                continue;
-            }
-            if self.equal(bound, probe.quals.1)? {
-                probe.join.row();
-                if !sink(bound)? {
-                    return Ok(false);
-                }
-            } else {
-                probe.join.filtered();
-            }
-            if jointype == JoinType::Semi {
-                break;
-            }
-        }
-        if !matched && jointype.fills_outer() {
-            self.null_extend(bound, probe.inner_relids);
-            if self.equal(bound, probe.quals.1)? {
-                probe.join.row();
-                if !sink(bound)? {
-                    return Ok(false);
-                }
-            } else {
-                probe.join.filtered();
-            }
-        }
-        Ok(true)
-    }
-
-    /// The bound rows of `relids`, flat by the query's FROM positions: the
-    /// outer row a parameterized scan or a `LATERAL` subquery reads.
-    fn outer_values(&self, bound: &Bound<'a>, relids: Relids) -> Result<OuterValues<'a>, SqlError> {
-        let n = self.scope.n;
-        let offsets = self
-            .arena
-            .alloc_slice_with(n, |_| 0usize)
-            .map_err(|_| arena_full())?;
-        let mut width = 0;
-        for (table, offset) in offsets.iter_mut().enumerate() {
-            *offset = width;
-            width += self.scope.stored_width(table);
-        }
-        let values = self
-            .arena
-            .alloc_slice_with(width, |_| Datum::Null)
-            .map_err(|_| arena_full())?;
-        for table in 0..n {
-            if let Some(row) = bound[table]
-                && relids.contains(table as u32)
-            {
-                let columns = self.columns_of(row.values);
-                values[offsets[table]..offsets[table] + columns.len()].copy_from_slice(columns);
-            }
-        }
-        let forms = self
-            .arena
-            .alloc_slice_with(width, |_| StoredForm::Inline)
-            .map_err(|_| arena_full())?;
-        self.flat_forms(bound, Some(relids), forms);
-        Ok((values, offsets, forms))
-    }
-
-    /// A `LATERAL` subquery's rows for the bound outer row: its query run
-    /// with the outer columns it reads bound, its nodes counted in the
-    /// relation's block as `EXPLAIN` plans them.
-    fn lateral_scan(
-        &self,
-        rel: usize,
-        lateral: &super::index_paths::join_query::LateralRel<'a>,
-        bound: &mut Bound<'a>,
-        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
-        let (values, offsets, forms) = self.outer_values(bound, lateral.relids)?;
-        let outer_row = JoinRow {
-            scope: self.scope,
-            values: JoinRowValues::Flat {
-                values,
-                offsets,
-                forms: Some(forms),
-            },
-            rowids: &[],
-            visible: self.scope.n,
-        };
-        let mut rows = ArenaList::new(self.arena);
-        {
-            let _block = super::instrument::enter_block(self.block.child(scan_segment(rel)));
-            super::select_into_rows(
-                self.storage,
-                self.txid,
-                lateral.select,
-                self.arena,
-                self.params,
-                Some(&outer_row),
-                self.hooks.sequences,
-                &mut |values, forms| {
-                    let encoded =
-                        crate::sql::exec::encode_projected_formed(values, forms, self.arena)?;
-                    rows.push(encoded).map_err(|_| arena_full())
-                },
-            )?;
-        }
-        let columns = lateral.widths.len();
-        let rows = rows.into_mut_slice().map_err(|_| arena_full())?;
-        for (at, encoded) in rows.iter().enumerate() {
-            let values = self
-                .arena
-                .alloc_slice_with(columns + self.model.expressions.len(), |_| Datum::Null)
-                .map_err(|_| arena_full())?;
-            for (column, value) in values.iter_mut().take(columns).enumerate() {
-                *value =
-                    crate::sql::exec::decode_projected_col_record(encoded, column, self.arena)?;
-            }
-            let forms = self
-                .arena
-                .alloc_slice_with(columns, |column| {
-                    crate::sql::exec::projected_stored_form(encoded, column)
-                })
-                .map_err(|_| arena_full())?;
-            bound[rel] = Some(BaseRow {
-                values,
-                forms,
-                rowid: None,
-            });
-            if !sink(bound)? {
-                // The subquery ran to its end: its nodes' counts would
-                // exceed PostgreSQL's, which stops reading it here.
-                if at + 1 < rows.len() && super::instrument::active() {
-                    return Err(crate::sql_err!(
-                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                        "EXPLAIN ANALYZE of a LATERAL subquery its join stops reading is not supported"
-                    ));
-                }
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Runs path `path` of relation `rel` (search path `id`) as planned: the
-    /// scan's own planning describes that path again, and a parameterized
-    /// path reads the bound outer rows' values.
-    fn scan(
-        &self,
-        id: u32,
-        rel: usize,
-        path: u16,
-        bound: &mut Bound<'a>,
-        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
-        let modeled = self.model.rels[rel];
-        if let Some(lateral) = modeled.lateral.as_ref() {
-            return self.lateral_scan(rel, lateral, bound, sink);
-        }
-        let mut record = self.scan_nodes[id as usize].try_borrow_mut().map_err(|_| {
-            crate::sql_err!(
-                crate::sql::eval::sqlstate::INTERNAL_ERROR,
-                "a join's scan ran inside itself"
-            )
-        })?;
-        // The scan's nodes and the rows it returns count in its relation's
-        // block.
-        let _block = super::instrument::enter_block(self.block.child(scan_segment(rel)));
-        if record.is_none() {
-            let scan = modeled.scan(self.storage, self.txid, path, self.params, self.arena)?;
-            let node = super::scan::PathScan::new(
-                self.storage,
-                self.txid,
-                modeled.from,
-                scan.condition,
-                scan.path,
-                self.arena,
-                self.params,
-                self.hooks,
-            )?;
-            let outer = self
-                .arena
-                .alloc_slice_with(self.width, |_| Datum::Null)
-                .map_err(|_| arena_full())?;
-            let outer_forms = self
-                .arena
-                .alloc_slice_with(self.width, |_| StoredForm::Inline)
-                .map_err(|_| arena_full())?;
-            *record = Some(ScanRecord {
-                node,
-                param: scan.param,
-                outer,
-                outer_forms,
-            });
-        }
-        let record = record.as_mut().expect("the scan's node was made");
-        let ScanRecord {
-            node,
-            param,
-            outer: outer_values,
-            outer_forms,
-        } = record;
-        // The bound rows of the relations the scan's join clauses read.
-        let outer_row;
-        let outer: Option<&dyn ColumnLookup<'a>> = if *param != Relids::EMPTY {
-            for table in 0..self.scope.n {
-                let start = self.offsets[table];
-                let width = self.scope.stored_width(table);
-                let slots = &mut outer_values[start..start + width];
-                match bound[table] {
-                    Some(row) if param.contains(table as u32) => {
-                        let columns = self.columns_of(row.values);
-                        slots[..columns.len()].copy_from_slice(columns);
-                        slots[columns.len()..].fill(Datum::Null);
-                    }
-                    _ => slots.fill(Datum::Null),
-                }
-            }
-            self.flat_forms(bound, Some(*param), outer_forms);
-            outer_row = JoinRow {
-                scope: self.scope,
-                values: JoinRowValues::Flat {
-                    values: outer_values,
-                    offsets: self.offsets,
-                    forms: Some(outer_forms),
-                },
-                rowids: &[],
-                visible: self.scope.n,
-            };
-            Some(&outer_row)
-        } else {
-            None
-        };
-        node.rescan();
-        while node.next(
-            self.storage,
-            crate::storage::CursorScratch::Statement,
-            self.arena,
-            self.params,
-            self.hooks,
-            outer,
-        )? {
-            let columns = node.values();
-            let values = self
-                .arena
-                .alloc_slice_with(columns.len() + self.model.expressions.len(), |_| {
-                    Datum::Null
-                })
-                .map_err(|_| arena_full())?;
-            values[..columns.len()].copy_from_slice(columns);
-            // The relation's expression members, computed by its scan.
-            let row = node.row();
-            for (id, expression) in self.model.expressions.iter().enumerate() {
-                if expression.of(rel) {
-                    values[columns.len() + id] = crate::sql::eval::eval_full(
-                        expression.expression,
-                        self.arena,
-                        self.params,
-                        &row,
-                        self.hooks,
-                    )?;
-                }
-            }
-            bound[rel] = Some(BaseRow {
-                values,
-                forms: node.stored_forms(self.arena)?,
-                rowid: node.rowid(),
-            });
-            if !sink(bound)? {
-                node.stop();
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Every row of path `id`, in its order.
-    fn hold(&self, id: u32, bound: &mut Bound<'a>) -> Result<Held<'a>, SqlError> {
-        let mut rows = ArenaList::new(self.arena);
-        let saved = *bound;
-        self.exec(id, bound, &mut |bound| {
-            rows.push(self.keep(bound)?).map_err(|_| arena_full())?;
-            Ok(true)
-        })?;
-        *bound = saved;
-        Ok(Held { rows })
-    }
-
-    /// The held inner rows without NULL keys, ordered by key and, among
-    /// equal keys, in the order a probe walks their bucket's chain: newest
-    /// first as `ExecHashTableInsert` prepends them, unless the table held
-    /// more rows than its planned buckets, when `ExecHashIncreaseNumBuckets`
-    /// prepends them again walking its memory chunks, newest chunk first.
-    fn hash_index(
-        &self,
-        held: &Held<'a>,
-        keys: &KeySides,
-        inner: u32,
-        buckets: u32,
-    ) -> Result<(&'a [u32], usize), SqlError> {
-        /// `HASH_CHUNK_SIZE` and `HASH_CHUNK_THRESHOLD`.
-        const CHUNK: usize = 32 * 1024;
-        const THRESHOLD: usize = CHUNK / 4;
-        let rows = held.rows.borrowed_slice();
-        let mut count = 0;
-        let index = self
-            .arena
-            .alloc_slice_with(rows.len(), |_| 0u32)
-            .map_err(|_| arena_full())?;
-        for (at, row) in rows.iter().enumerate() {
-            if !self.has_null(row, keys, false) {
-                index[count] = at as u32;
-                count += 1;
-            }
-        }
-        let index = &mut index[..count];
-        // Each inserted row's place in its chain: lower walks first.
-        let rank = self
-            .arena
-            .alloc_slice_with(rows.len(), |_| 0i64)
-            .map_err(|_| arena_full())?;
-        // Each inserted row's minimal tuple length.
-        let lengths = self
-            .arena
-            .alloc_slice_with(count, |_| 0usize)
-            .map_err(|_| arena_full())?;
-        let mut bytes = 0usize;
-        for (at, &row) in index.iter().enumerate() {
-            lengths[at] = self.tuple_len(rows[row as usize], inner)?;
-            // `HJTUPLE_OVERHEAD` and the tuple, as `spaceUsed` counts them.
-            bytes += 16 + lengths[at];
-        }
-        if count > buckets as usize + 1 {
-            // The chunk list as `dense_alloc` links it: a new chunk heads
-            // it, an oversized row's own chunk goes after the head.
-            let chunk_of = self
-                .arena
-                .alloc_slice_with(count, |_| 0u32)
-                .map_err(|_| arena_full())?;
-            let list = self
-                .arena
-                .alloc_slice_with(count, |_| 0u32)
-                .map_err(|_| arena_full())?;
-            // (maxlen, used) per chunk.
-            let space = self
-                .arena
-                .alloc_slice_with(count, |_| (0usize, 0usize))
-                .map_err(|_| arena_full())?;
-            let mut chunks = 0usize;
-            for at in 0..count {
-                let length = lengths[at];
-                let size = (16 + length).next_multiple_of(8);
-                let id = chunks;
-                if size > THRESHOLD {
-                    space[id] = (size, size);
-                    let position = usize::from(chunks > 0);
-                    list.copy_within(position..chunks, position + 1);
-                    list[position] = id as u32;
-                    chunks += 1;
-                    chunk_of[at] = id as u32;
-                } else if chunks == 0 || {
-                    let (maxlen, used) = space[list[0] as usize];
-                    maxlen - used < size
-                } {
-                    space[id] = (CHUNK, size);
-                    list.copy_within(0..chunks, 1);
-                    list[0] = id as u32;
-                    chunks += 1;
-                    chunk_of[at] = id as u32;
-                } else {
-                    let head = list[0] as usize;
-                    space[head].1 += size;
-                    chunk_of[at] = head as u32;
-                }
-            }
-            let place = self
-                .arena
-                .alloc_slice_with(chunks, |_| 0usize)
-                .map_err(|_| arena_full())?;
-            for (position, &id) in list[..chunks].iter().enumerate() {
-                place[id as usize] = position;
-            }
-            // The walk: chunks in list order, each one's rows in insertion
-            // order; prepending them in that order puts the last walked
-            // first.
-            let walk = self
-                .arena
-                .alloc_slice_with(count, |at| (place[chunk_of[at] as usize], at, index[at]))
-                .map_err(|_| arena_full())?;
-            walk.sort_unstable();
-            let total = walk.len() as i64;
-            for (walked, &(_, _, row)) in walk.iter().enumerate() {
-                rank[row as usize] = total - walked as i64;
-            }
-        } else {
-            for &row in index.iter() {
-                rank[row as usize] = -i64::from(row);
-            }
-        }
-        let rank: &[i64] = rank;
-        crate::mem::arena::try_stable_sort_via(
-            self.arena,
-            index,
-            |&a, &b| {
-                for &(o, i) in JoinContext::keys(keys) {
-                    let order = crate::sql::eval::compare_datums_collated(
-                        self.storage,
-                        self.txid,
-                        self.collation(o),
-                        &self.value(rows[a as usize], i),
-                        &self.value(rows[b as usize], i),
-                    )?;
-                    if order != Ordering::Equal {
-                        return Ok(order);
-                    }
-                }
-                Ok(rank[a as usize].cmp(&rank[b as usize]))
-            },
-            |_| arena_full(),
-        )?;
-        Ok((index, bytes))
-    }
-
-    /// The first position of `index` whose keys are not below the bound
-    /// outer row's, when that row's keys have no NULL.
-    fn first_match(
-        &self,
-        bound: &[Option<BaseRow<'a>>],
-        rows: &[Row<'a>],
-        index: &[u32],
-        keys: &KeySides,
-    ) -> Result<Option<usize>, SqlError> {
-        if self.has_null(bound, keys, true) {
-            return Ok(None);
-        }
-        let (mut low, mut high) = (0usize, index.len());
-        while low < high {
-            let middle = (low + high) / 2;
-            if self.compare_sides(bound, rows[index[middle] as usize], keys)? == Ordering::Greater {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        Ok(Some(low))
-    }
-
-    /// A `Unique` over a `Sort` of a semi join's compared columns: the
-    /// input's rows sorted by them (`pg_qsort`, NULLs last) and the first
-    /// of each run of equal values, NULLs equal (`execTuplesUnique`).
-    fn unique(
+    /// A `Unique` over a `Sort` of a semi join's compared columns, whose
+    /// values each row of `keys` holds: the rows' positions sorted by them
+    /// (`pg_qsort`, NULLs last), the first of each run of equal values,
+    /// NULLs equal (`execTuplesUnique`).
+    fn unique_order(
         &self,
         input: u32,
-        keys: &[super::index_paths::joins::Member],
-        bound: &mut Bound<'a>,
-        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
-        let held = self.hold(input, bound)?;
-        let rows = held.rows.borrowed_slice();
-        let relids = self.model.plan.path(input).relids;
-        let column = |member: &super::index_paths::joins::Member| {
-            (usize::from(member.rel), usize::from(member.column))
-        };
-        let compare =
-            |a: &[Option<BaseRow<'a>>], b: &[Option<BaseRow<'a>>]| -> Result<Ordering, SqlError> {
-                for member in keys {
-                    let (one, two) = (self.value(a, column(member)), self.value(b, column(member)));
-                    let order = match (one.is_null(), two.is_null()) {
-                        (true, true) => Ordering::Equal,
-                        (true, false) => Ordering::Greater,
-                        (false, true) => Ordering::Less,
-                        (false, false) => crate::sql::eval::compare_datums_collated(
-                            self.storage,
-                            self.txid,
-                            self.collation(column(member)),
-                            &one,
-                            &two,
-                        )?,
-                    };
-                    if order != Ordering::Equal {
-                        return Ok(order);
-                    }
+        keys: &[&[Datum<'a>]],
+        sizes: &[(usize, usize)],
+        members: &[(usize, usize)],
+    ) -> Result<(&'a [u32], super::instrument::SortSpace), SqlError> {
+        let compare = |a: u32, b: u32| -> Result<Ordering, SqlError> {
+            for (at, &member) in members.iter().enumerate() {
+                let (one, two) = (&keys[a as usize][at], &keys[b as usize][at]);
+                let order = match (one.is_null(), two.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => crate::sql::eval::compare_datums_collated(
+                        self.storage,
+                        self.txid,
+                        self.collation(member),
+                        one,
+                        two,
+                    )?,
+                };
+                if order != Ordering::Equal {
+                    return Ok(order);
                 }
-                Ok(Ordering::Equal)
-            };
-        let (order, _) = self.tuplesort(input, rows, &mut |a, b| {
-            compare(rows[a as usize], rows[b as usize])
-        })?;
-        let mut previous: Option<u32> = None;
-        for &at in order.iter() {
-            if let Some(held) = previous
-                && compare(rows[held as usize], rows[at as usize])? == Ordering::Equal
-            {
+            }
+            Ok(Ordering::Equal)
+        };
+        let (order, space) = self.tuplesort((input, members), sizes, &mut |a, b| compare(a, b))?;
+        let kept = self
+            .arena
+            .alloc_slice_with(order.len(), |_| 0u32)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for &at in order {
+            if count > 0 && compare(kept[count - 1], at)? == Ordering::Equal {
                 continue;
             }
-            previous = Some(at);
-            self.bind(bound, rows[at as usize], relids);
-            if !sink(bound)? {
-                return Ok(false);
-            }
+            kept[count] = at;
+            count += 1;
         }
-        Ok(true)
+        Ok((&kept[..count], space))
     }
 
     /// A `HashAggregate` making a semi join's inner relation unique: the
-    /// first input row of each group of equal compared columns (NULLs
-    /// equal), returned in the order `ExecAgg` walks its `simplehash` table
-    /// (`TupleHashTableHash`'s `murmurhash32` of the combined hashes, robin
-    /// hood insertion, growth by doubling, `SH_START_ITERATE` from the
-    /// first empty bucket backwards).
-    fn unique_hashed(
+    /// positions of the first row of each group of equal compared columns,
+    /// whose values each row of `keys` holds (NULLs equal), in the order
+    /// `ExecAgg` walks its `simplehash` table (`TupleHashTableHash`'s
+    /// `murmurhash32` of the combined hashes, robin hood insertion, growth
+    /// by doubling, `SH_START_ITERATE` from the first empty bucket
+    /// backwards).
+    fn unique_hashed_order(
         &self,
         input: u32,
-        keys: &[super::index_paths::joins::Member],
+        keys: &[&[Datum<'a>]],
+        members: &[(usize, usize)],
         groups: f64,
-        bound: &mut Bound<'a>,
-        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
-        let held = self.hold(input, bound)?;
-        let rows = held.rows.borrowed_slice();
-        let relids = self.model.plan.path(input).relids;
+    ) -> Result<(&'a [u32], super::hashagg::HashAggFigures), SqlError> {
         let width = self.model.plan.path(input).width;
-        let column = |member: &super::index_paths::joins::Member| {
-            (usize::from(member.rel), usize::from(member.column))
-        };
         let row_hash = |row: usize| -> Result<u32, SqlError> {
             let mut hash = 0u32;
-            for (at, member) in keys.iter().enumerate() {
+            for (at, value) in keys[row].iter().enumerate() {
                 if at != 0 {
                     hash = hash.rotate_left(1);
                 }
-                let value = self.value(rows[row], column(member));
                 if value.is_null() {
                     continue;
                 }
-                hash ^= datum_hash(&value).ok_or_else(|| {
+                hash ^= datum_hash(value).ok_or_else(|| {
                     crate::sql_err!(
                         crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
                         "a hashed unique-ified relation over keys of this type is not supported"
@@ -4141,20 +1727,17 @@ impl<'r, 'a> Runner<'r, 'a> {
             Ok(super::simplehash::murmur32(hash))
         };
         let same = |a: usize, b: usize| -> Result<bool, SqlError> {
-            for member in keys {
-                let (one, two) = (
-                    self.value(rows[a], column(member)),
-                    self.value(rows[b], column(member)),
-                );
+            for (at, &member) in members.iter().enumerate() {
+                let (one, two) = (&keys[a][at], &keys[b][at]);
                 let equal = match (one.is_null(), two.is_null()) {
                     (true, true) => true,
                     (false, false) => {
                         crate::sql::eval::compare_datums_collated(
                             self.storage,
                             self.txid,
-                            self.collation(column(member)),
-                            &one,
-                            &two,
+                            self.collation(member),
+                            one,
+                            two,
                         )? == Ordering::Equal
                     }
                     _ => false,
@@ -4165,37 +1748,36 @@ impl<'r, 'a> Runner<'r, 'a> {
             }
             Ok(true)
         };
-        let sizing =
-            super::index_paths::plain_hash_sizing(width, groups, keys.len()).ok_or_else(|| {
+        let sizing = super::index_paths::plain_hash_sizing(width, groups, members.len())
+            .ok_or_else(|| {
                 crate::sql_err!(
                     crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
                     "a hashed unique-ified relation over {} columns is not supported",
-                    keys.len()
+                    members.len()
                 )
             })?;
         let hashes = self
             .arena
-            .alloc_slice_with(rows.len(), |_| 0u32)
-            .map_err(|_| crate::sql::eval::arena_full())?;
+            .alloc_slice_with(keys.len(), |_| 0u32)
+            .map_err(|_| arena_full())?;
         let lens = self
             .arena
-            .alloc_slice_with(rows.len(), |_| 0usize)
-            .map_err(|_| crate::sql::eval::arena_full())?;
-        for row in 0..rows.len() {
+            .alloc_slice_with(keys.len(), |_| 0usize)
+            .map_err(|_| arena_full())?;
+        for row in 0..keys.len() {
             hashes[row] = row_hash(row)?;
             lens[row] = super::postgres_memory::minimal_tuple_len_with_tids(
                 None,
-                keys.iter()
-                    .map(|member| self.value(rows[row], column(member))),
+                keys[row].iter().copied(),
                 0,
             )
             .ok_or_else(super::instrument::unsized_value)?;
         }
         let order = self
             .arena
-            .alloc_slice_with(rows.len(), |_| 0u32)
-            .map_err(|_| crate::sql::eval::arena_full())?;
-        let (count, _) = super::hashagg::hashed_row_order(
+            .alloc_slice_with(keys.len(), |_| 0u32)
+            .map_err(|_| arena_full())?;
+        let (count, figures) = super::hashagg::hashed_row_order(
             self.storage.plan_build(),
             sizing,
             hashes,
@@ -4203,41 +1785,23 @@ impl<'r, 'a> Runner<'r, 'a> {
             same,
             order,
         )?;
-        let order = &order[..count];
-        for &row in order {
-            self.bind(bound, rows[row as usize], relids);
-            if !sink(bound)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok((&order[..count], figures))
     }
 
-    /// The held rows' order after a sort by `keys` (PostgreSQL's tuplesort,
-    /// NULLs last), or as held without keys, and the space the sort reports.
-    fn sorted(
+    /// The order of rows whose sort key values each row of `keys` holds
+    /// after a sort by `members` with `flags` (PostgreSQL's tuplesort,
+    /// NULLs last unless a key puts them first), and the space the sort
+    /// reports.
+    fn sort_order(
         &self,
-        held: &Held<'a>,
-        keys: &Keys,
-        relids: Relids,
         id: u32,
+        keys: &[&[Datum<'a>]],
+        sizes: &[(usize, usize)],
+        (members, flags): (&[(usize, usize)], &[u8]),
     ) -> Result<(&'a [u32], super::instrument::SortSpace), SqlError> {
-        let rows = held.rows.borrowed_slice();
-        let mut columns = [((0usize, 0usize), 0u8); 8];
-        for (at, &key) in keys.as_slice().iter().enumerate() {
-            let class = key & KEY_CLASS;
-            let member = self.model.plan.classes[usize::from(class)]
-                .sort_member(relids)
-                .expect("a sort key reads its input");
-            columns[at] = (self.model.member(class, member as u8), key);
-        }
-        let columns = &columns[..keys.as_slice().len()];
-        self.tuplesort(id, rows, &mut |a, b| {
-            for &(column, key) in columns {
-                let (one, two) = (
-                    self.value(rows[a as usize], column),
-                    self.value(rows[b as usize], column),
-                );
+        self.tuplesort((id, members), sizes, &mut |a, b| {
+            for (at, (&member, &key)) in members.iter().zip(flags).enumerate() {
+                let (one, two) = (&keys[a as usize][at], &keys[b as usize][at]);
                 let first = key & KEY_NULLS_FIRST != 0;
                 let order = match (one.is_null(), two.is_null()) {
                     (true, true) => Ordering::Equal,
@@ -4249,9 +1813,9 @@ impl<'r, 'a> Runner<'r, 'a> {
                         let order = crate::sql::eval::compare_datums_collated(
                             self.storage,
                             self.txid,
-                            self.collation(column),
-                            &one,
-                            &two,
+                            self.collation(member),
+                            one,
+                            two,
                         )?;
                         if key & KEY_DESCENDING != 0 {
                             order.reverse()
@@ -4268,25 +1832,20 @@ impl<'r, 'a> Runner<'r, 'a> {
         })
     }
 
-    /// PostgreSQL's tuplesort of the `id` path's `rows` in arrival order, as
+    /// PostgreSQL's tuplesort of the `id` path's rows, of `sizes`, in arrival order, as
     /// `tuplesort.c` runs it: each tuple (the path's target list) is charged
     /// as it arrives, a sort that outgrows `work_mem` forms its runs where
     /// `dumptuples` does and merges them as `mergeruns` does, any other is
     /// one `pg_qsort`. Rows `compare` ranks equal come out in that order.
     fn tuplesort(
         &self,
-        id: u32,
-        rows: &[Row<'a>],
+        (id, keys): (u32, &[(usize, usize)]),
+        sizes: &[(usize, usize)],
         compare: &mut dyn FnMut(u32, u32) -> Result<Ordering, SqlError>,
     ) -> Result<(&'a [u32], super::instrument::SortSpace), SqlError> {
         use super::postgres_memory::{SortTuples, TuplesortModel};
-        // `ExecInitSort`: a sort of a single column sorts datums.
-        let mut columns = 0;
-        self.model
-            .plan
-            .target_list(self.model.plan.path(id).relids, &mut |_| columns += 1);
         let mut model = TuplesortModel::new(
-            if columns == 1 {
+            if self.sorts_datums(id, keys) {
                 SortTuples::Datum
             } else {
                 SortTuples::Bump
@@ -4296,11 +1855,10 @@ impl<'r, 'a> Runner<'r, 'a> {
         // The row counts of the runs `dumptuples` wrote.
         let runs = self
             .arena
-            .alloc_slice_with(rows.len() + 1, |_| 0u32)
+            .alloc_slice_with(sizes.len() + 1, |_| 0u32)
             .map_err(|_| arena_full())?;
         let mut run_count = 0usize;
-        for row in rows {
-            let (length, written) = self.tuple_sizes(row, id, columns == 1)?;
+        for &(length, written) in sizes {
             if let Some(run) = model.push(length, written) {
                 runs[run_count] = run as u32;
                 run_count += 1;
@@ -4312,13 +1870,13 @@ impl<'r, 'a> Runner<'r, 'a> {
         }
         let order = self
             .arena
-            .alloc_slice_with(rows.len(), |at| at as u32)
+            .alloc_slice_with(sizes.len(), |at| at as u32)
             .map_err(|_| arena_full())?;
         if let Some(merge_order) = model.merge_order() {
             let scratch = crate::sql::pg_qsort::RunScratch {
                 moved: self
                     .arena
-                    .alloc_slice_with(rows.len(), |_| 0u32)
+                    .alloc_slice_with(sizes.len(), |_| 0u32)
                     .map_err(|_| arena_full())?,
                 bounds: self
                     .arena

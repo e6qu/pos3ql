@@ -186,6 +186,14 @@ pub(crate) struct TruncateEvent {
 }
 
 impl TruncateEvent {
+    pub(crate) fn target_count(&self) -> usize {
+        self.targets.len()
+    }
+
+    pub(crate) fn target_slot(&self, index: usize) -> usize {
+        usize::from(self.targets[index].slot)
+    }
+
     fn plan_event(&self, created_at: u64) -> super::plan_invalidations::PlanInvalidationEvent {
         super::plan_invalidations::PlanInvalidationEvent {
             scope: self.scope,
@@ -2408,6 +2416,24 @@ impl TxnState {
             .push(event)
             .expect("TRUNCATE event capacity checked before mutation");
         Ok(())
+    }
+
+    /// Whether a TRUNCATE of table `slot` keeps its files, as PostgreSQL's
+    /// does for a table created or already truncated in the current
+    /// subtransaction.
+    pub(crate) fn truncate_in_place(&self, slot: usize) -> bool {
+        let (ddl_mark, truncate_mark) = self.savepoints.last().map_or((0, 0), |savepoint| {
+            (savepoint.ddl_mark, savepoint.truncate_mark)
+        });
+        self.ddl[ddl_mark..]
+            .iter()
+            .any(|undo| matches!(undo, DdlUndo::Created(created) if *created as usize == slot))
+            || self.truncates[truncate_mark..].iter().any(|event| {
+                event
+                    .targets
+                    .iter()
+                    .any(|target| usize::from(target.slot) == slot)
+            })
     }
 
     pub(crate) fn truncates(&self) -> &[TruncateEvent] {

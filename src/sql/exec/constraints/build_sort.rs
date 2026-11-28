@@ -208,6 +208,11 @@ pub(crate) type BuildRowVisit<'v> =
 pub(crate) type BuildRows<'r> =
     dyn FnMut(bool, &mut BuildRowVisit<'_>) -> Result<(), SqlError> + 'r;
 
+/// Visits a layout's rows in any order, decoding at least the columns of
+/// the mask when one is given (others may read as NULL).
+pub(crate) type LayoutRows<'r> =
+    dyn FnMut(Option<u64>, &mut BuildRowVisit<'_>) -> Result<(), SqlError> + 'r;
+
 /// The unique and exclusion constraints a build checks.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuildKeys {
@@ -659,6 +664,492 @@ fn sort_once<'a, B: crate::storage::DefinitionBacking>(
         }
     }
     sorted
+}
+
+/// A btree whose build layout is measured: a table's `UNIQUE` or `PRIMARY
+/// KEY` column or constraint, or an explicit index.
+#[derive(Clone, Copy)]
+pub(crate) enum LayoutKey<'d> {
+    Column(usize),
+    Table(&'d crate::storage::UniqueKey),
+    Index(&'d crate::storage::IndexDef),
+}
+
+/// Whether a btree operator class over `ctype` under `collation` lets equal
+/// keys share posting lists (support function 4, `btequalimage` or
+/// `btvarstrequalimage`): a string type does under a deterministic
+/// collation.
+fn equal_image(
+    storage: &Storage,
+    txid: u32,
+    ctype: crate::sql::types::ColType,
+    collation: Collation,
+) -> Result<bool, SqlError> {
+    use crate::sql::types::ColType;
+    Ok(match ctype {
+        ColType::Bool
+        | ColType::Bytea
+        | ColType::Char
+        | ColType::Int2
+        | ColType::Int4
+        | ColType::Int8
+        | ColType::Oid
+        | ColType::Regtype
+        | ColType::Regproc
+        | ColType::Regprocedure
+        | ColType::Regoper
+        | ColType::Regoperator
+        | ColType::Regclass
+        | ColType::Regnamespace
+        | ColType::Regrole
+        | ColType::Regconfig
+        | ColType::Regdictionary
+        | ColType::Regcollation
+        | ColType::Tid
+        | ColType::OidVector
+        | ColType::Macaddr
+        | ColType::Macaddr8
+        | ColType::Money
+        | ColType::Inet
+        | ColType::Cidr
+        | ColType::Date
+        | ColType::Time
+        | ColType::Timetz
+        | ColType::Timestamp
+        | ColType::Timestamptz
+        | ColType::Bit { .. }
+        | ColType::Uuid
+        | ColType::PgLsn
+        | ColType::Enum(_)
+        | ColType::Xid8 => true,
+        ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
+            let crate::sql::ast::Collation::Catalog(catalog) = collation else {
+                return Ok(true);
+            };
+            storage
+                .collations_visible_to(txid)
+                .find(|(slot, _)| storage.collation(*slot).binding() == catalog)
+                .map(|(_, definition)| definition.deterministic)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "index key collation does not exist"
+                    )
+                })?
+        }
+        _ => false,
+    })
+}
+
+/// The pages, root level and leaf pages PostgreSQL's build of the btree
+/// `layout_key` of `def` writes over the rows `rows` visits (`_bt_load`),
+/// and its entries. Each entry is formed as `index_form_tuple` forms it; in
+/// key order, equal keys of an index that deduplicates share posting lists
+/// of at most `MAX_POSTING_SIZE` bytes, and a page split's pivot keeps the
+/// key columns up to the first that differs from the tuple before
+/// (`_bt_truncate`), or all of them and a heap TID.
+pub(crate) fn btree_build_layout<'a>(
+    storage: &Storage,
+    txid: u32,
+    def: &crate::storage::TableDef,
+    layout_key: LayoutKey<'_>,
+    rows: &mut LayoutRows<'_>,
+    arena: &'a Arena,
+) -> Result<(crate::storage::btree_layout::BtreeLayout, u64), SqlError> {
+    use crate::storage::btree_layout::{
+        BtreeBuild, DEFAULT_FILLFACTOR, MAX_POSTING_SIZE, posting_size,
+    };
+    let key = match layout_key {
+        LayoutKey::Column(column) => BuildKey::plain(
+            def.column_key_name(column).unwrap_or(SqlName::EMPTY),
+            &[column as u16],
+            &[def.columns()[column].collation],
+            true,
+        ),
+        LayoutKey::Table(unique) => {
+            let mut collations = [Collation::None; MAX_INDEX_COLS];
+            for (position, column) in unique.columns().iter().enumerate() {
+                collations[position] = def.columns()[usize::from(*column)].collation;
+            }
+            BuildKey::plain(
+                unique.name,
+                unique.columns(),
+                &collations[..unique.columns().len()],
+                !unique.kind.nulls_not_distinct(),
+            )
+        }
+        LayoutKey::Index(index) => BuildKey::index(storage, txid, index, arena)?,
+    };
+    let n_cols = key.n_cols;
+    let width = n_cols + key.n_include_cols;
+    // An index of plain columns reads only them.
+    let decoded = (key.predicate.is_none()
+        && key.expressions[..n_cols].iter().all(Option::is_none))
+    .then(|| {
+        key.columns[..n_cols]
+            .iter()
+            .chain(&key.include_columns[..key.n_include_cols])
+            .try_fold(0u64, |mask, &column| {
+                (column < 64).then(|| mask | 1u64 << column)
+            })
+    })
+    .flatten();
+    // Each value's declared type: a `name` key is stored as `cstring`.
+    let declared = |column: u16| -> Result<Option<i32>, SqlError> {
+        Ok(Some(
+            match storage.declared_column_type(&def.columns()[usize::from(column)], txid)? {
+                crate::storage::DeclaredColumnType::Builtin { oid }
+                | crate::storage::DeclaredColumnType::UserDefined { oid, .. } => oid,
+            },
+        ))
+    };
+    let mut hints = [None; 2 * MAX_INDEX_COLS];
+    for position in 0..n_cols {
+        if key.expressions[position].is_none() {
+            hints[position] = declared(key.columns[position])?.map(|oid| {
+                if oid == crate::sql::types::oid::NAME {
+                    crate::sql::types::oid::CSTRING
+                } else {
+                    oid
+                }
+            });
+        }
+    }
+    for (position, column) in key.include_columns[..key.n_include_cols].iter().enumerate() {
+        hints[n_cols + position] = declared(*column)?;
+    }
+    let (unique, fillfactor, deduplicate_items) = match layout_key {
+        LayoutKey::Column(_) | LayoutKey::Table(_) => (true, DEFAULT_FILLFACTOR, true),
+        LayoutKey::Index(index) => (
+            index.unique,
+            index
+                .mutable
+                .options
+                .fillfactor
+                .unwrap_or(DEFAULT_FILLFACTOR),
+            index.mutable.options.deduplicate_items != Some(false),
+        ),
+    };
+    let mut deduplicate = !unique && key.n_include_cols == 0 && deduplicate_items;
+    if deduplicate && let LayoutKey::Index(index) = layout_key {
+        let classes = super::resolve_index_operator_classes(index)?;
+        for position in 0..n_cols {
+            let collation = index.collations[position];
+            deduplicate &= match classes[position] {
+                Some(IndexOperatorClass::Btree(class)) if class.is_pattern() => true,
+                Some(IndexOperatorClass::Btree(_)) => {
+                    let ctype = match &index.expressions[position] {
+                        Some(text) => {
+                            let mark = arena.mark();
+                            let typed = crate::sql::exec::analyze_indexes::expression_key(
+                                storage,
+                                txid,
+                                def,
+                                index,
+                                position,
+                                text.as_str(),
+                                arena,
+                            )
+                            .map(|key| key.map(|(_, ctype)| ctype));
+                            // SAFETY: only the key's type leaves the binding.
+                            unsafe { arena.rewind_to(mark) };
+                            typed?
+                        }
+                        None => Some(def.columns()[usize::from(index.columns[position])].ctype),
+                    };
+                    match ctype {
+                        Some(ctype) => equal_image(storage, txid, ctype, collation)?,
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+        }
+    }
+    let full = || {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "the entries of index \"{}\" exceed the statement arena",
+            key.name.as_str()
+        )
+    };
+    let no_size = || {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "sizing a btree entry of index \"{}\" holding a value with no PostgreSQL size here is not supported",
+            key.name.as_str()
+        )
+    };
+    let mut count = 0usize;
+    let mut key_bytes = 0usize;
+    rows(decoded, &mut |rowid, values, _| {
+        let length = arena
+            .with_remaining_region(|region| -> Result<Option<usize>, SqlError> {
+                let _site = KeyScope::enter(rowid, key.index_oid);
+                if let Some(predicate) = key.predicate
+                    && !super::index_predicate_matches(
+                        storage, txid, def, values, predicate, region,
+                    )?
+                {
+                    return Ok(None);
+                }
+                let keys = super::index_key_values(
+                    storage,
+                    txid,
+                    def,
+                    values,
+                    &key.columns[..n_cols],
+                    &key.expressions[..n_cols],
+                    region,
+                )?;
+                let mut tuple = [Datum::Null; 2 * MAX_INDEX_COLS];
+                tuple[..n_cols].copy_from_slice(&keys[..n_cols]);
+                for (position, column) in
+                    key.include_columns[..key.n_include_cols].iter().enumerate()
+                {
+                    tuple[n_cols + position] = values[usize::from(*column)];
+                }
+                Ok(Some(crate::sql::exec::projected_row_len(&tuple[..width])?))
+            })
+            .map_err(|_| full())??;
+        if let Some(length) = length {
+            count += 1;
+            key_bytes = key_bytes.checked_add(length).ok_or_else(full)?;
+        }
+        Ok(())
+    })?;
+    if count == 0 {
+        return Ok((crate::storage::btree_layout::BtreeLayout::EMPTY, 0));
+    }
+    let entries = arena
+        .alloc_slice_with(count, |_| Entry {
+            offset: 0,
+            length: 0,
+            tuple_bytes: 0,
+        })
+        .map_err(|_| full())?;
+    let buffer = arena
+        .alloc_slice_with(key_bytes, |_| 0u8)
+        .map_err(|_| full())?;
+    let changed = || {
+        sql_err!(
+            sqlstate::SERIALIZATION_FAILURE,
+            "index build rows changed while measuring its layout"
+        )
+    };
+    let mut filled = 0usize;
+    let mut written = 0usize;
+    let mark = arena.mark();
+    let filling = rows(decoded, &mut |rowid, values, _| {
+        let entry = arena
+            .with_remaining_region(|region| -> Result<Option<Entry>, SqlError> {
+                let _site = KeyScope::enter(rowid, key.index_oid);
+                if let Some(predicate) = key.predicate
+                    && !super::index_predicate_matches(
+                        storage, txid, def, values, predicate, region,
+                    )?
+                {
+                    return Ok(None);
+                }
+                let keys = super::index_key_values(
+                    storage,
+                    txid,
+                    def,
+                    values,
+                    &key.columns[..n_cols],
+                    &key.expressions[..n_cols],
+                    region,
+                )?;
+                let mut tuple = [Datum::Null; 2 * MAX_INDEX_COLS];
+                tuple[..n_cols].copy_from_slice(&keys[..n_cols]);
+                for (position, column) in
+                    key.include_columns[..key.n_include_cols].iter().enumerate()
+                {
+                    tuple[n_cols + position] = values[usize::from(*column)];
+                }
+                let tuple_bytes = super::btree_tuple_size(
+                    &tuple[..width],
+                    &hints[..width],
+                    storage,
+                    txid,
+                    region,
+                )?
+                .ok_or_else(no_size)?;
+                let length = crate::sql::exec::encode_projected_into(
+                    &tuple[..width],
+                    buffer.get_mut(written..).ok_or_else(changed)?,
+                )?;
+                Ok(Some(Entry {
+                    offset: u32::try_from(written).map_err(|_| full())?,
+                    length: u32::try_from(length).map_err(|_| full())?,
+                    tuple_bytes: u32::try_from(tuple_bytes).map_err(|_| full())?,
+                }))
+            })
+            .map_err(|_| full())??;
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        *entries.get_mut(filled).ok_or_else(changed)? = entry;
+        filled += 1;
+        written += entry.length as usize;
+        Ok(())
+    });
+    // SAFETY: the row source's scan state is consumed by the pass; entries
+    // and keys precede the mark.
+    unsafe { arena.rewind_to(mark) };
+    filling?;
+    if filled != count {
+        return Err(changed());
+    }
+    let order = arena
+        .alloc_slice_with(count, |position| position as u32)
+        .map_err(|_| full())?;
+    let buffer: &'a [u8] = buffer;
+    let decode = |entry: Entry, out: &mut [Datum<'a>; 2 * MAX_INDEX_COLS]| {
+        let bytes = &buffer[entry.offset as usize..][..entry.length as usize];
+        crate::sql::exec::decode_projected_row_into(bytes, arena, &mut out[..width])
+    };
+    // The first key column at which two entries' keys differ under the
+    // index's order, `None` when they are equal (NULLs equal NULLs).
+    let difference = |left: &[Datum<'_>], right: &[Datum<'_>]| -> Result<Option<usize>, SqlError> {
+        for column in 0..n_cols {
+            let (a, b) = (left[column], right[column]);
+            let ordering = match (a.is_null(), b.is_null()) {
+                (true, true) => Ordering::Equal,
+                (true, false) | (false, true) => return Ok(Some(column)),
+                (false, false) => match key.order[column].order {
+                    KeyOrder::Collated(collation) => {
+                        compare_datums_collated(storage, txid, collation, &a, &b)?
+                    }
+                    KeyOrder::Bytes => {
+                        compare_datums_collated(storage, txid, Collation::C, &a, &b)?
+                    }
+                    KeyOrder::Function(function) => crate::sql::query::execute_index_comparison(
+                        storage, txid, function, a, b, arena,
+                    )?,
+                },
+            };
+            if ordering != Ordering::Equal {
+                return Ok(Some(column));
+            }
+        }
+        Ok(None)
+    };
+    let mut compare = |left_position: u32, right_position: u32| -> Result<Ordering, SqlError> {
+        let mark = arena.mark();
+        let compared = (|| {
+            let mut left = [Datum::Null; 2 * MAX_INDEX_COLS];
+            let mut right = [Datum::Null; 2 * MAX_INDEX_COLS];
+            decode(entries[left_position as usize], &mut left)?;
+            decode(entries[right_position as usize], &mut right)?;
+            for column in 0..n_cols {
+                let (a, b) = (left[column], right[column]);
+                let KeyColumn {
+                    order,
+                    descending,
+                    nulls_first,
+                } = key.order[column];
+                let ordering = match (a.is_null(), b.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) if nulls_first => Ordering::Less,
+                    (true, false) => Ordering::Greater,
+                    (false, true) if nulls_first => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => {
+                        let ordering = match order {
+                            KeyOrder::Collated(collation) => {
+                                compare_datums_collated(storage, txid, collation, &a, &b)?
+                            }
+                            KeyOrder::Bytes => {
+                                compare_datums_collated(storage, txid, Collation::C, &a, &b)?
+                            }
+                            KeyOrder::Function(function) => {
+                                crate::sql::query::execute_index_comparison(
+                                    storage, txid, function, a, b, arena,
+                                )?
+                            }
+                        };
+                        if descending {
+                            ordering.reverse()
+                        } else {
+                            ordering
+                        }
+                    }
+                };
+                if ordering != Ordering::Equal {
+                    return Ok(ordering);
+                }
+            }
+            // Equal keys sort by heap position.
+            Ok(left_position.cmp(&right_position))
+        })();
+        // SAFETY: decoded keys and comparison scratch are consumed; only an
+        // ordering or an owned error escapes.
+        unsafe { arena.rewind_to(mark) };
+        compared
+    };
+    crate::sql::pg_qsort::pg_qsort(order, &mut compare)?;
+    let mut build = BtreeBuild::new(fillfactor);
+    let mut previous: Option<Entry> = None;
+    let mut at = 0usize;
+    while at < count {
+        crate::sql::query::check_timeout()?;
+        let mark = arena.mark();
+        let added = (|| {
+            let base = entries[order[at] as usize];
+            let mut base_values = [Datum::Null; 2 * MAX_INDEX_COLS];
+            decode(base, &mut base_values)?;
+            let base_size = base.tuple_bytes as usize;
+            let mut tids = 1usize;
+            if deduplicate {
+                let mut next = [Datum::Null; 2 * MAX_INDEX_COLS];
+                while at + tids < count && posting_size(base_size, tids + 1) <= MAX_POSTING_SIZE {
+                    decode(entries[order[at + tids] as usize], &mut next)?;
+                    if difference(&base_values[..n_cols], &next[..n_cols])?.is_some() {
+                        break;
+                    }
+                    tids += 1;
+                }
+            }
+            let (size, truncatable) = if tids == 1 {
+                (base_size, 0)
+            } else {
+                let size = posting_size(base_size, tids);
+                (size, size - base_size)
+            };
+            // The pivot separating this tuple from the one before keeps the
+            // key columns through the first that differs, or every key
+            // column and a heap TID.
+            let pivot = match previous {
+                None => 0,
+                Some(previous) => {
+                    let mut before = [Datum::Null; 2 * MAX_INDEX_COLS];
+                    decode(previous, &mut before)?;
+                    let (kept, tid) = match difference(&before[..n_cols], &base_values[..n_cols])? {
+                        Some(column) => (column + 1, 0),
+                        None => (n_cols, 8),
+                    };
+                    super::btree_tuple_size(
+                        &base_values[..kept],
+                        &hints[..kept],
+                        storage,
+                        txid,
+                        arena,
+                    )?
+                    .ok_or_else(no_size)?
+                        + tid
+                }
+            };
+            build.add_leaf(size, truncatable, pivot)?;
+            previous = Some(base);
+            Ok::<usize, SqlError>(tids)
+        })();
+        // SAFETY: decoded keys and sizing scratch are consumed; only a count
+        // or an owned error escapes.
+        unsafe { arena.rewind_to(mark) };
+        at += added?;
+    }
+    Ok((build.finish()?, count as u64))
 }
 
 /// Whether PostgreSQL's tuplesort keeps tuples of these sizes in memory under

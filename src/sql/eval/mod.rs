@@ -3260,6 +3260,8 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
+    /// Calls a stored routine or catalog operator: its result, and how the
+    /// routine held the datum it returned.
     fn call_routine<'a>(
         &self,
         _target: RoutineCallTarget<'_>,
@@ -3271,7 +3273,7 @@ pub trait CatalogAccess {
         )
             -> Result<(Datum<'a>, crate::sql::toast::DatumForm), SqlError>,
         _arena: &'a Arena,
-    ) -> Result<Datum<'a>, SqlError> {
+    ) -> Result<(Datum<'a>, crate::sql::toast::DatumForm), SqlError> {
         Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "resolved routine execution is unavailable"
@@ -3280,15 +3282,23 @@ pub trait CatalogAccess {
     /// Executes a support function already bound to a durable catalog object.
     /// Aggregate and JSON conversion definitions use this boundary so a later
     /// rename cannot turn a validated dependency into an unresolved text lookup.
+    /// `argument_forms` says how the caller holds each argument, which the
+    /// routine is passed unchanged; the result comes with how the routine
+    /// holds it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a bound support call carries its arguments' values, forms and types"
+    )]
     fn call_routine_oid<'a>(
         &self,
         _oid: i32,
         _arguments: &[Datum<'a>],
+        _argument_forms: &[crate::sql::toast::DatumForm],
         _argument_type_oids: &[i32],
         _input_collation: super::ast::Collation,
         _access: RoutineCallAccess,
         _arena: &'a Arena,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
+    ) -> Result<Option<(Datum<'a>, crate::sql::toast::DatumForm)>, SqlError> {
         Ok(None)
     }
     /// JSON's Other category may use a function cast after array/composite
@@ -3319,10 +3329,17 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
+    /// Runs a selected cast of `value`, held as `form`, which a cast
+    /// function is passed unchanged.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a cast runs on a value with its held form, typmod, collation and storage"
+    )]
     fn execute_bound_cast<'a>(
         &self,
         _cast: &BoundCast,
         _value: Datum<'a>,
+        _form: crate::sql::toast::DatumForm,
         _target_type_mod: i32,
         _input_collation: super::ast::Collation,
         _arena: &'a Arena,
@@ -3338,17 +3355,20 @@ pub trait CatalogAccess {
         clippy::too_many_arguments,
         reason = "cast execution preserves target type modifier and input collation"
     )]
+    /// `form` is how the caller holds `value`, which a cast function is
+    /// passed unchanged.
     fn cast_defined<'a>(
         &self,
         _source_oid: i32,
         _target_oid: i32,
         _target_type_mod: i32,
         _value: Datum<'a>,
+        _form: crate::sql::toast::DatumForm,
         _context: DefinedCastContext,
         _input_collation: super::ast::Collation,
         _arena: &'a Arena,
         _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
+    ) -> Result<Option<(Datum<'a>, crate::sql::toast::DatumForm)>, SqlError> {
         Ok(None)
     }
     /// Whether resolving this unqualified symbol can select a user-defined
@@ -3375,6 +3395,7 @@ pub trait CatalogAccess {
         &self,
         _name: &str,
         _arguments: [Datum<'a>; 2],
+        _argument_forms: [crate::sql::toast::DatumForm; 2],
         _argument_type_oids: [i32; 2],
         _input_collation: super::ast::Collation,
         _argument_collations: [super::ast::Collation; 2],
@@ -3995,9 +4016,10 @@ pub trait CatalogAccess {
     fn enum_creation_of_name(&self, _type_name: &str) -> Option<crate::storage::TypeCreation> {
         None
     }
-    /// Casts to a catalog-defined domain, enum, or its automatically-created
-    /// array type. `Ok(None)` means the name is not a visible user-defined
-    /// type; `Some` contains the fully coerced and validated value.
+    /// Casts `value`, held as `form`, to a catalog-defined domain, enum, or
+    /// its automatically-created array type. `Ok(None)` means the name is not
+    /// a visible user-defined type; `Some` contains the fully coerced and
+    /// validated value.
     fn cast_user_type<'a>(
         &self,
         _type_name: &str,
@@ -4005,6 +4027,7 @@ pub trait CatalogAccess {
         _coercion: DomainCoercion,
         _arena: &'a Arena,
         _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+        _form: crate::sql::toast::DatumForm,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
@@ -6268,6 +6291,8 @@ fn invalid_escape_string() -> SqlError {
 pub struct OperatorEvaluation<'a> {
     pub value: Datum<'a>,
     pub first_argument: Datum<'a>,
+    /// How the operator's function held the datum it returned.
+    pub form: crate::sql::toast::DatumForm,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6282,6 +6307,9 @@ struct BinaryExpression<'expression, 'a> {
     right: &'expression Expr<'a>,
     search_catalog: bool,
     nulls: OperatorNulls,
+    /// The written operator expression, which a user-defined operator's
+    /// result is recorded against.
+    site: Option<&'expression Expr<'a>>,
 }
 
 fn validate_enum_operator_types<'a>(
@@ -7157,6 +7185,7 @@ fn eval_binary_values<'a>(
         right,
         search_catalog,
         nulls,
+        site,
     } = expression;
     let comparison = operators::Comparison::from_binary(operator);
     if search_catalog
@@ -7171,12 +7200,19 @@ fn eval_binary_values<'a>(
             coercion_input_collation(left, row, hooks.catalog)?,
             coercion_input_collation(right, row, hooks.catalog)?,
         ];
+        // The operator's function is passed its operands' datums as the
+        // operands hold them.
+        let forms = [
+            crate::sql::toast::held_form(left, row, hooks.catalog, &l)?,
+            crate::sql::toast::held_form(right, row, hooks.catalog, &r)?,
+        ];
         if let Some(value) = crate::sql::query::with_call_arguments(
             left.folds_to_constant() && right.folds_to_constant(),
             || {
                 catalog.call_operator(
                     name,
                     [l, r],
+                    forms,
                     [left_oid, right_oid],
                     input_collation,
                     argument_collations,
@@ -7185,12 +7221,20 @@ fn eval_binary_values<'a>(
                 )
             },
         )? {
+            if let Some(site) = site {
+                crate::sql::toast::record_call_result(site, &value.value, value.form);
+            }
             return Ok(value);
         }
     }
     if let Some(name) = operator.operator_name() {
         require_builtin_operator_execute(name, Some(left), right, row, hooks)?;
     }
+    // The builtin `@@@` is `@@` for the `tsvector` and `tsquery` pairs it has.
+    let operator = match operator {
+        BinaryOp::TextSearchMatchAlias => BinaryOp::TextSearchMatch,
+        operator => operator,
+    };
     validate_cstring_operator_types(
         operator.operator_name().unwrap_or("?"),
         operator == BinaryOp::Concat,
@@ -7291,6 +7335,7 @@ fn eval_binary_values<'a>(
         return Ok(OperatorEvaluation {
             value,
             first_argument: l,
+            form: crate::sql::toast::DatumForm::Formed,
         });
     }
     if (l.is_null() || r.is_null())
@@ -7305,6 +7350,7 @@ fn eval_binary_values<'a>(
             return Ok(OperatorEvaluation {
                 value: Datum::Null,
                 first_argument: l,
+                form: crate::sql::toast::DatumForm::Formed,
             });
         }
     }
@@ -7343,6 +7389,7 @@ fn eval_binary_values<'a>(
         return Ok(OperatorEvaluation {
             value,
             first_argument: l,
+            form: crate::sql::toast::DatumForm::Formed,
         });
     }
     if matches!(
@@ -7354,6 +7401,7 @@ fn eval_binary_values<'a>(
         return Ok(OperatorEvaluation {
             value: operators::array_set_op(operator, l, r, hooks.catalog)?,
             first_argument: l,
+            form: crate::sql::toast::DatumForm::Formed,
         });
     }
     if let Some(comparison) = comparison
@@ -7364,6 +7412,7 @@ fn eval_binary_values<'a>(
         return Ok(OperatorEvaluation {
             value: Datum::Bool(comparison.holds(ordering)),
             first_argument: l,
+            form: crate::sql::toast::DatumForm::Formed,
         });
     }
     if comparison.is_some()
@@ -7376,6 +7425,7 @@ fn eval_binary_values<'a>(
         return Ok(OperatorEvaluation {
             value: operators::record_compare(operator, a, b, &type_name)?,
             first_argument: l,
+            form: crate::sql::toast::DatumForm::Formed,
         });
     }
     Ok(OperatorEvaluation {
@@ -7383,6 +7433,7 @@ fn eval_binary_values<'a>(
             unknown_operand_input_failure(error, [(left, left_unknown), (right, right_unknown)])
         })?,
         first_argument: l,
+        form: crate::sql::toast::DatumForm::Formed,
     })
 }
 
@@ -8044,6 +8095,7 @@ fn eval_full_unpositioned<'a>(
             }
         }
         let position = super::query::input_progress::enter_expression(expression)?;
+        let written = expression;
         let bound;
         let expression = if let (
             Some(oid),
@@ -8167,6 +8219,13 @@ fn eval_full_unpositioned<'a>(
             // Deferred engine calls have no value yet. Only a completed,
             // unsaved value makes a later expression restart unsafe.
             super::query::record_unowned_value();
+        }
+        // A call bound to its routine ran as a copy; its result belongs to
+        // the written call.
+        if let Ok(value) = &result
+            && !core::ptr::eq(expression, written)
+        {
+            crate::sql::toast::moved_call_result(expression, written, value);
         }
         result
     };
@@ -8862,6 +8921,7 @@ fn eval_full_inner<'a>(
                 right,
                 search_catalog: true,
                 nulls: OperatorNulls::RoutineStrictness,
+                site: Some(expression),
             },
             arena,
             params,
@@ -9013,11 +9073,12 @@ fn eval_full_inner<'a>(
                 }
                 if let Some(target_oid) = target_oid
                     && source_oid != target_oid
-                    && let Some(value) = catalog.cast_defined(
+                    && let Some((value, form)) = catalog.cast_defined(
                         source_oid,
                         target_oid,
                         type_mod,
                         v,
+                        crate::sql::toast::held_form(operand, row, hooks.catalog, &v)?,
                         defined_cast_context(context),
                         coercion_input_collation(operand, row, hooks.catalog)?,
                         arena,
@@ -9031,6 +9092,7 @@ fn eval_full_inner<'a>(
                             value, target, type_mod, coercion, arena,
                         );
                     }
+                    crate::sql::toast::record_call_result(expression, &value, form);
                     return Ok(value);
                 }
             }
@@ -9106,8 +9168,14 @@ fn eval_full_inner<'a>(
             // resolve and validate there.
             if ColType::from_sql_name(type_name).is_none() {
                 if let Some(cat) = hooks.catalog
-                    && let Some(value) =
-                        cat.cast_user_type(type_name, v, coercion, arena, hooks.sequences)?
+                    && let Some(value) = cat.cast_user_type(
+                        type_name,
+                        v,
+                        coercion,
+                        arena,
+                        hooks.sequences,
+                        crate::sql::toast::held_form(operand, row, hooks.catalog, &v)?,
+                    )?
                 {
                     return Ok(value);
                 }
@@ -9276,7 +9344,7 @@ fn eval_full_inner<'a>(
                     if let RoutineCallTarget::Builtin { oid, schema } = target {
                         selected_builtin = Some((oid, schema));
                     } else {
-                        return catalog.call_routine(
+                        let (value, form) = catalog.call_routine(
                             target,
                             args,
                             types,
@@ -9285,7 +9353,9 @@ fn eval_full_inner<'a>(
                                 routine_argument(argument, arena, params, &[], row, hooks)
                             },
                             arena,
-                        );
+                        )?;
+                        crate::sql::toast::record_call_result(expression, &value, form);
+                        return Ok(value);
                     }
                 }
                 if let Some(oid) = bound_oid
@@ -9325,6 +9395,7 @@ fn eval_full_inner<'a>(
                         right: args[1],
                         search_catalog: false,
                         nulls: OperatorNulls::RoutineStrictness,
+                        site: None,
                     },
                     arena,
                     params,
@@ -9347,6 +9418,7 @@ fn eval_full_inner<'a>(
                     star,
                     builtin: selected_builtin,
                     kind,
+                    site: Some(expression),
                 },
                 arena,
                 params,
@@ -11271,9 +11343,17 @@ fn execute_array_constructor<'a>(
     let element = plan.element;
     let vals = super::array::alloc_items(arena, plan.inputs.len())?;
     for (target, input) in vals.iter_mut().zip(plan.inputs) {
-        let value = match input.nested {
-            Some(nested) => execute_array_constructor(nested, arena, params, row, hooks)?,
-            None => eval_full(input.expression, arena, params, row, hooks)?,
+        let (value, form) = match input.nested {
+            Some(nested) => (
+                execute_array_constructor(nested, arena, params, row, hooks)?,
+                crate::sql::toast::DatumForm::Formed,
+            ),
+            None => {
+                let value = eval_full(input.expression, arena, params, row, hooks)?;
+                let form =
+                    crate::sql::toast::held_form(input.expression, row, hooks.catalog, &value)?;
+                (value, form)
+            }
         };
         let value = match input.cast {
             Some(cast) => {
@@ -11286,6 +11366,7 @@ fn execute_array_constructor<'a>(
                     .execute_bound_cast(
                         cast,
                         value,
+                        form,
                         plan.target_type_mod,
                         coercion_input_collation(input.expression, row, hooks.catalog)?,
                         arena,
@@ -11308,6 +11389,7 @@ fn execute_array_constructor<'a>(
                         plan.coercion,
                         arena,
                         hooks.sequences,
+                        crate::sql::toast::DatumForm::Unknown,
                     )?
                     .ok_or_else(|| {
                         sql_err!(
@@ -11420,6 +11502,7 @@ fn coerce_array_constructor_element<'a>(
                 coercion,
                 arena,
                 hooks.sequences,
+                crate::sql::toast::DatumForm::Unknown,
             )?
             .ok_or_else(|| {
                 sql_err!(
@@ -11935,11 +12018,12 @@ pub(crate) fn builtin_operator_function<'a>(
             let value = if source == target.oid() {
                 value
             } else if let Some(catalog) = hooks.catalog
-                && let Some(value) = catalog.cast_defined(
+                && let Some((value, _)) = catalog.cast_defined(
                     source,
                     target.oid(),
                     -1,
                     value,
+                    crate::sql::toast::held_form(expression, row, hooks.catalog, &value)?,
                     DefinedCastContext::Implicit,
                     coercion_input_collation(expression, row, hooks.catalog)?,
                     arena,
@@ -11999,6 +12083,7 @@ pub(crate) fn builtin_operator_function<'a>(
                 right,
                 search_catalog: false,
                 nulls: OperatorNulls::RoutineStrictness,
+                site: None,
             },
             values[0],
             values[1],
@@ -12048,6 +12133,7 @@ pub(crate) fn call_builtin_oid<'a>(
                 star: false,
                 builtin: Some((oid, declaration.schema)),
                 kind: super::ast::CallKind::Routine,
+                site: None,
             },
             arena,
             values,
@@ -12064,6 +12150,8 @@ struct CallSyntax<'slice, 'text> {
     star: bool,
     builtin: Option<(i32, &'static str)>,
     kind: super::ast::CallKind,
+    /// The written call, which a routine's result is recorded against.
+    site: Option<&'slice Expr<'text>>,
 }
 
 impl CallSyntax<'static, 'static> {
@@ -12074,6 +12162,7 @@ impl CallSyntax<'static, 'static> {
             star: false,
             builtin: None,
             kind: super::ast::CallKind::Routine,
+            site: None,
         }
     }
 }
@@ -12093,6 +12182,7 @@ fn call<'a>(
         star,
         builtin,
         kind,
+        site,
     } = syntax;
     let args = if let Some((oid, _)) = builtin {
         if let Some(catalog) = hooks.catalog {
@@ -12394,14 +12484,18 @@ fn call<'a>(
             if matches!(target, RoutineCallTarget::Builtin { .. }) {
                 return undefined_function(written_name, args, row, hooks);
             }
-            return catalog.call_routine(
+            let (value, form) = catalog.call_routine(
                 target,
                 args,
                 argument_type_oids,
                 &|argument| routine_argument_collation(argument, row, hooks.catalog),
                 &mut |argument| routine_argument(argument, arena, params, &[], row, hooks),
                 arena,
-            );
+            )?;
+            if let Some(site) = site {
+                crate::sql::toast::record_call_result(site, &value, form);
+            }
+            return Ok(value);
         }
     }
     match name {
@@ -15134,6 +15228,7 @@ pub(crate) fn input_error<'a>(
             DomainCoercion::Input,
             arena,
             hooks.sequences,
+            crate::sql::toast::DatumForm::Unknown,
         ) {
             Ok(Some(_)) => return Ok(None),
             Ok(None) => None,
@@ -16768,6 +16863,7 @@ mod tests {
                 &self,
                 _: &str,
                 arguments: [Datum<'a>; 2],
+                _: [crate::sql::toast::DatumForm; 2],
                 _: [i32; 2],
                 collation: Collation,
                 _: [Collation; 2],
@@ -16779,6 +16875,7 @@ mod tests {
                 Ok(Some(OperatorEvaluation {
                     value: Datum::Bool(true),
                     first_argument: arguments[0],
+                    form: crate::sql::toast::DatumForm::Formed,
                 }))
             }
         }
@@ -16872,11 +16969,12 @@ mod tests {
                 target: i32,
                 target_type_mod: i32,
                 _: Datum<'a>,
+                _: crate::sql::toast::DatumForm,
                 context: DefinedCastContext,
                 collation: Collation,
                 _: &'a Arena,
                 _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-            ) -> Result<Option<Datum<'a>>, SqlError> {
+            ) -> Result<Option<(Datum<'a>, crate::sql::toast::DatumForm)>, SqlError> {
                 if target == crate::sql::types::oid::TEXT {
                     return Ok(None);
                 }
@@ -16885,7 +16983,10 @@ mod tests {
                 assert_eq!(context, DefinedCastContext::Explicit);
                 assert_eq!(target_type_mod, -1);
                 self.0.set(collation);
-                Ok(Some(Datum::Int4(42)))
+                Ok(Some((
+                    Datum::Int4(42),
+                    crate::sql::toast::DatumForm::Formed,
+                )))
             }
         }
         with_arena(|arena| {

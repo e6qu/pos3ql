@@ -760,7 +760,6 @@ pub(crate) enum PathKind {
         inner: u32,
         clauses: ClauseList,
         hash: ClauseList,
-        buckets: u32,
         batches: u32,
         /// The inner relation is unique for the join's clauses.
         inner_unique: bool,
@@ -1034,6 +1033,8 @@ pub(crate) struct UpperProblem {
     /// The `LIMIT`'s rows, when not `ALL` or NULL, and the `OFFSET`'s, when
     /// either is given as a constant.
     pub(crate) limit: Option<(Option<f64>, f64)>,
+    /// The share of the rows a cursor over the query plans for.
+    pub(crate) cursor: crate::sql::ast::CursorFraction,
     /// The width of the query's target list, its ordering columns
     /// included (`apply_scanjoin_target_to_paths`).
     pub(crate) width: f64,
@@ -1362,10 +1363,8 @@ pub(crate) fn search<'a>(
         buckets: ArenaList::new(arena),
         all_baserels: Relids::below(n as u32) & !problem.removed,
         has_lateral: problem.rels.iter().any(|rel| rel.lateral != Relids::EMPTY),
-        consider_startup: problem
-            .upper
-            .limit
-            .is_some_and(|(count, _)| count.is_some()),
+        consider_startup: super::root_tuple_fraction(problem.upper.cursor, problem.upper.limit)
+            > 0.0,
     };
     for clause in problem.clauses {
         search.clauses.push(*clause).map_err(|_| arena_full())?;
@@ -3079,18 +3078,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             final_count = count;
             stored += usize::from(accepted);
         }
-        // `set_cheapest`'s cheapest total path.
-        let mut chosen = finals[0];
-        for &at in &finals[1..final_count] {
-            let compared = compare_costs(&store[chosen as usize], &store[at as usize], false);
-            if compared > 0
-                || (compared == 0
-                    && compare_keys(&store[chosen as usize].keys, &store[at as usize].keys)
-                        == KeysOrder::Better2)
-            {
-                chosen = at;
-            }
-        }
+        let chosen = final_path(&finals[..final_count], &store, upper.cursor);
         let (top, sort, input) = below[chosen as usize];
         let joined = self.path(top);
         Ok((
@@ -3692,17 +3680,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             final_count = count;
             stored += usize::from(accepted);
         }
-        let mut chosen = finals[0];
-        for &at in &finals[1..final_count] {
-            let compared = compare_costs(&store[chosen as usize], &store[at as usize], false);
-            if compared > 0
-                || (compared == 0
-                    && compare_keys(&store[chosen as usize].keys, &store[at as usize].keys)
-                        == KeysOrder::Better2)
-            {
-                chosen = at;
-            }
-        }
+        let chosen = final_path(&finals[..final_count], &store, upper.cursor);
         let (top, plan) = plans[chosen as usize];
         let joined = self.path(top);
         Ok((
@@ -5393,7 +5371,6 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     inner,
                     clauses: restrict,
                     hash,
-                    buckets: sizing.buckets,
                     batches: sizing.batches,
                     inner_unique: inputs.inner_unique,
                 },
@@ -5766,6 +5743,45 @@ fn compare_fuzzily(new: &Path, old: &Path, fuzz: f64, consider_startup: bool) ->
 }
 
 /// `compare_path_costs`: negative when `first` is cheaper.
+/// The final relation's path `standard_planner` plans: `set_cheapest`'s
+/// cheapest total path among `finals` (positions in `store`), unless
+/// another returns a cursor's fraction of its rows cheaper
+/// (`get_cheapest_fractional_path`, `compare_fractional_path_costs`).
+fn final_path(finals: &[u32], store: &[Path], cursor: crate::sql::ast::CursorFraction) -> u32 {
+    let mut cheapest = finals[0];
+    for &at in &finals[1..] {
+        let compared = compare_costs(&store[cheapest as usize], &store[at as usize], false);
+        if compared > 0
+            || (compared == 0
+                && compare_keys(&store[cheapest as usize].keys, &store[at as usize].keys)
+                    == KeysOrder::Better2)
+        {
+            cheapest = at;
+        }
+    }
+    let fraction = cursor.value();
+    if fraction <= 0.0 {
+        return cheapest;
+    }
+    let cost = |path: &Path| path.startup + fraction * (path.total - path.startup);
+    let mut best = cheapest;
+    for &at in finals {
+        if at == cheapest {
+            continue;
+        }
+        let (held, path) = (&store[best as usize], &store[at as usize]);
+        let better = if path.disabled != held.disabled {
+            path.disabled < held.disabled
+        } else {
+            cost(path) < cost(held)
+        };
+        if better {
+            best = at;
+        }
+    }
+    best
+}
+
 fn compare_costs(first: &Path, second: &Path, startup: bool) -> i32 {
     if first.disabled != second.disabled {
         return if first.disabled < second.disabled {
@@ -6005,6 +6021,7 @@ mod tests {
             upper: UpperProblem {
                 sort: Keys::NONE,
                 limit: None,
+                cursor: crate::sql::ast::CursorFraction::ALL,
                 width: 20.0,
                 target_cost: 0.0,
                 group: None,
@@ -6113,6 +6130,7 @@ mod tests {
             upper: UpperProblem {
                 sort: Keys::NONE,
                 limit: None,
+                cursor: crate::sql::ast::CursorFraction::ALL,
                 width: 16.0,
                 target_cost: 0.0,
                 group: None,

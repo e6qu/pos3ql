@@ -2726,6 +2726,7 @@ pub(crate) fn minmax_subquery<'a>(
             limit: Some(one),
             offset: None,
             minmax_subquery: Some(core::ptr::from_ref(aggregate) as usize),
+            cursor_fraction: crate::sql::ast::CursorFraction::ALL,
             ..*statement
         })
         .map_err(|_| arena_full())?;

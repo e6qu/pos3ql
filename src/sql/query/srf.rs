@@ -4823,9 +4823,12 @@ struct TableFunctionRows<'a> {
 
 /// A scalar call in FROM produces one row, even for a null result. Anonymous
 /// OUT records expose their fields here; named composites are expanded later.
+/// The one row a scalar function in `FROM` gives: its tuple holds the datum
+/// the function returned as it was held, in a TOAST form it kept.
 fn scalar_function_row<'a>(
     routine: &RoutineDef,
     value: Datum<'a>,
+    form: crate::sql::toast::DatumForm,
     arena: &'a Arena,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let encoded = if let Some(columns) = routine.record_result_columns() {
@@ -4854,7 +4857,12 @@ fn scalar_function_row<'a>(
         }
         crate::sql::exec::encode_projected_pub(values, arena)?
     } else {
-        crate::sql::exec::encode_projected_pub(&[value], arena)?
+        let stored = match form {
+            crate::sql::toast::DatumForm::Stored(stored) => stored,
+            crate::sql::toast::DatumForm::Formed => crate::storage::StoredForm::Inline,
+            crate::sql::toast::DatumForm::Unknown => crate::storage::StoredForm::Unmodelled,
+        };
+        crate::sql::exec::encode_projected_formed(&[value], &[stored], arena)?
     };
     arena
         .alloc_slice_copy(&[encoded])
@@ -6532,7 +6540,12 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             else {
                 if !routine.kind.is_set_returning() {
                     composite = routine_composite_result(routine, storage, txid)?;
-                    return scalar_function_row(routine, Datum::Null, arena);
+                    return scalar_function_row(
+                        routine,
+                        Datum::Null,
+                        crate::sql::toast::DatumForm::Formed,
+                        arena,
+                    );
                 }
                 return Ok(&[]);
             };
@@ -6552,7 +6565,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 );
             }
             if !routine.kind.is_set_returning() {
-                let value = catalog
+                let (value, form) = catalog
                     .execute_routine(
                         routine_slot,
                         routine,
@@ -6571,7 +6584,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                             "scalar function produced no result"
                         )
                     })?;
-                return scalar_function_row(routine, value, arena);
+                return scalar_function_row(routine, value, form, arena);
             }
             let _input_body = super::input_progress::enter_body();
             let table_columns = routine.table_columns();

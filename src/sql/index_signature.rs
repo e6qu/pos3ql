@@ -192,7 +192,12 @@ pub(crate) fn predicate(search: Datum<'_>, operator: BinaryOp) -> SignaturePredi
                 }
             }
         }
-        Datum::TsQuery(query) if operator == BinaryOp::TextSearchMatch => {
+        Datum::TsQuery(query)
+            if matches!(
+                operator,
+                BinaryOp::TextSearchMatch | BinaryOp::TextSearchMatchAlias
+            ) =>
+        {
             let none = QueryRequirement {
                 all: TokenSignature::default(),
                 any: TokenSignature::default(),
@@ -296,7 +301,12 @@ pub(crate) fn posting_probe(
                 _ => PostingProbe::Unusable,
             }
         }
-        Datum::TsQuery(query) if operator == BinaryOp::TextSearchMatch => {
+        Datum::TsQuery(query)
+            if matches!(
+                operator,
+                BinaryOp::TextSearchMatch | BinaryOp::TextSearchMatchAlias
+            ) =>
+        {
             let Some(indexable) = super::full_text::fold_query_lexemes(
                 query.as_str(),
                 |_, prefix| !prefix,

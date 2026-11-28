@@ -169,7 +169,10 @@ plan. Covered:
   holds both scans' conditions and `IS NOT NULL` of each joined column not
   declared `NOT NULL` (`976`); `EXPLAIN` of such a join whose scans an
   expression class member or a subquery reads fails with `0A000`; inequality and `OR` join conditions
-  (`neqjoinsel`, `clauselist_selectivity_or`, `852`);
+  (`neqjoinsel`, `clauselist_selectivity_or`, `852`), also comparing one
+  relation's column or expression with another's (`a.v <> b.id % 7`,
+  `a.v < b.id * 2`: `neqjoinsel` over the expression's default distinct
+  count, `scalarltjoinsel`), whose outer side keys a `Memoize` (`1001`);
   `extract_restriction_or_clauses` (`883`); cross-type integer and float keys
   (`882`).
 - `EXISTS`, `NOT EXISTS`, `IN` and `ANY` subqueries pulled up as semi and anti
@@ -248,8 +251,10 @@ items joined by equalities hash the second (`811`); later items join in
 nested loops. `EXPLAIN` with costs of such a join fails with `0A000` naming the
 join node (`810`); `COSTS OFF` prints the tree pos3ql runs. A query of
 analyzed tables reading a shape the search cannot plan (a full join's merged
-column, a `USING` join beside a parenthesized one) fails with `0A000` rather
-than run that order.
+column, a `USING` join beside a parenthesized one, a shape the search
+itself declines) fails with `0A000` rather than run that order, and
+`EXPLAIN` of any other join of analyzed tables outside the model fails with
+`0A000` rather than print it (`1001`).
 
 An `UPDATE ... FROM` or `DELETE ... USING` of one plain analyzed FROM table
 without an index on the columns its conditions read runs the hash join or
@@ -265,28 +270,82 @@ statistics (`631`, `651`-`653`): a hash join building on the smaller relation,
 or a nested loop over a `Materialize` without an equality; a join keeping both
 sides without an equality fails as PostgreSQL's full join does (`0A000`).
 
-### Pull-based join executor (planned)
+### Pull-based join executor
 
-The search's plan runs in `join_exec.rs`, which pushes each joined row
-through a callback; the retained executor (`retained/`) pulls rows and
-resumes after a storage wait but runs only nested-loop and hash levels in
-FROM order. The planned single executor replaces both: one node record per
-plan path from a pool reserved at startup (`54000` naming the pool when a
-plan needs more), each exposing its current row as per-relation slots that
-stay valid until its next advance, so no row grows the statement arena.
-Sort runs `tuplesort.c`'s port, HashAggregate drives `hashagg.rs`, and
-`EXPLAIN ANALYZE` counters live in the node records. Its scan node
-already reads a join's base relations: one record per plan path in a
-`plan_build_bytes` lease (`54000` naming the pool when it is full), which
-resumes mid-scan after a storage wait: sequential heap scans through
-`RowCursor`, and index, index-only and bitmap scans through
-`CandidateCursor`, which keeps its place in the path's candidates and
-reads each row under the snapshot captured when it opened. A rescan finds
-the candidates for the new outer row in the node's own storage, which grows
-to at most twice the most candidates one execution found; a row the scan's
-condition rejects releases its bytes. Built-in set-returning functions
-advance one row at a time (`FunctionRows`); a `LATERAL` subquery will run as
-a subtree of the same plan.
+A plan the search chooses runs as **pull nodes**: scans, nested loops
+(inner, left, semi and anti), hash joins and merge joins (every join type),
+`Materialize`, `Memoize`, `Unique` and the scan of a `LATERAL` item
+(`src/sql/query/join_exec/pull.rs`). A result stream or cursor reads a
+plan without a `LATERAL` item a row at a time, and a storage wait
+at any node returns to the reader with every node's position kept, so the
+same call resumes without counting a row twice (`pull_join_waits`). Each
+node's record lives in one `plan_build_bytes` lease per plan path (`54000`
+naming the pool when it is full); the reader keeps the chosen plan, each
+relation's scan and these records (about 18 KB for an analyzed table joined
+with itself, which a stream's estimate counts exactly), while the search and
+its analysis run in the statement's memory.
+
+The general executor (any other statement, `EXPLAIN ANALYZE` among them)
+reads the same nodes. Its consumers keep the rows they are passed, so no
+row is released there: stored rows stay bound as they were read rather
+than encoded, nodes keep their stores and hash tables in the statement's
+memory instead of `plan_build_bytes` leases (so a plan of 130 joined
+relations needs no lease per node), only the paths the plan runs get a
+record, a `Materialize` reads its input only as far as a loop
+fetches (`ExecMaterial`), and a `LATERAL` item runs its subquery whole for
+each outer row. Under `EXPLAIN ANALYZE` each node counts its loops, rows
+and the rows its join conditions remove; a loop opens at a node's first
+read and closes when it ends, is rescanned or the statement stops reading.
+A `Hash` counts its builds and tables, a merge join's sorts and its
+`Materialize` count what each execution fetched, and a `Memoize` reports
+its hits, misses, evictions and memory (`1000`). A storage wait in the
+general executor restarts the statement.
+
+- A scan node holds its sequential cursor or its index path's candidates,
+  its filter, the chosen path's counts and its `LIMIT` stop, and reads each
+  row under the snapshot captured when it opened. A rescan finds the
+  candidates for the new outer row in the node's own storage, which grows to
+  at most twice the most candidates one execution found.
+- A `Materialize` keeps its input's rows, with their stored forms, encoded in
+  `plan_build_bytes` leases and reads them again at each rescan.
+- A hash join keeps its table there too: inner rows and the outer rows it
+  saves to later batches are encoded in its store, and its skew buckets,
+  chunks, batch files and match flags are leased lists, so its buckets and
+  batches grow as `ExecHashJoin`'s do. A batch's saved outer rows hold only
+  the query's relations and are read in place (`979`); a one-batch table is
+  probed again at a rescan.
+- A merge join runs `ExecMergeJoin`'s states one row per call. An outer
+  input already in merge order (an index scan) is read as the join advances;
+  a sorted input is read whole at its first fetch and ordered by
+  PostgreSQL's tuplesort comparison. The inner input is always kept in the
+  node's store, sorted or in its own order, so marking and restoring a
+  position is an index into it.
+- A `Memoize` keeps each entry's key and rows encoded in leases, finds
+  entries through its own hash table and evicts the least recently used ones
+  when the entries and rows PostgreSQL would count exceed `hash_mem`
+  (`work_mem` times `hash_mem_multiplier`), as `cache_reduce_memory` does; an
+  entry a semi join left unfinished is read again at its next lookup. Dead
+  bytes are reclaimed by copying the live entries once they outweigh them.
+- A sorted or hashed `Unique` reads its input into the node's store and
+  returns the first row of each run or group in its sort's or hash table's
+  order.
+- Ordering a store decodes all of its rows into the reader's memory at once
+  and releases them after, so a sort input larger than that memory fails
+  with `54000`.
+- No node keeps a `Storage` or `Arena` reference between calls: each call
+  passes them, and a reader's type does not carry the storage borrow, so the
+  compiler rejects a node that would keep one.
+
+Every join the model plans has keys whose type `datum_hash` hashes: a join
+clause over any other type is outside the model. Under `EXPLAIN ANALYZE`
+a semi join's unique-ified relation reports its `HashAggregate`'s batches
+and memory or its `Sort`'s method and memory, and a merge join's inner
+index scan read in part counts the rows its filter removed before each row
+the join fetched (`1002`); with `BUFFERS` such a filtered scan, and a join
+stopping early in a `LATERAL` subquery it read whole, fail with `0A000`. Joins outside the search run in the retained reader's own
+nested-loop and hash levels, in FROM order, up to eight items.
+[PLAN.md](../PLAN.md#pause-and-resume-every-query-path) lists the work
+that moves every plan onto pull nodes.
 
 ## Sorting, hashing and memory figures
 

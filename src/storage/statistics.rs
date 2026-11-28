@@ -1,5 +1,6 @@
 //! Statistics visibility and saved-image acknowledgements have separate ownership.
 
+pub(crate) mod btree_layout;
 mod columns;
 pub(crate) mod distribution;
 pub(crate) mod elements;
@@ -117,6 +118,9 @@ struct StatisticsState {
     dirty: bool,
     wal_dirty: bool,
     relation_revision: u64,
+    /// The catalog sequence when the relation counts were last written,
+    /// which orders them against a TRUNCATE.
+    counts_written: u64,
     has_index_at: Option<NonZeroU64>,
 }
 
@@ -138,6 +142,7 @@ impl TableStatisticsOwner {
                 dirty: false,
                 wal_dirty: false,
                 relation_revision: 0,
+                counts_written: 0,
                 has_index_at: None,
             })),
         })
@@ -672,6 +677,7 @@ impl Storage {
         statistics: TableStatistics,
     ) -> Result<(), SqlError> {
         self.validate_table_statistics(table_slot, txid, &statistics)?;
+        let written = self.next_relation_counts_stamp()?;
         let name = self.tables[table_slot].definition().name;
         let mut state = self.tables[table_slot].statistics.write();
         if state.pending.is_some_and(|head| head.transaction != txid) {
@@ -727,6 +733,7 @@ impl Storage {
             transaction: txid,
             tail: slot,
         });
+        state.counts_written = written;
         // PostgreSQL keeps relation counts after rollback; columns stay private.
         state.committed.valid = statistics.valid;
         state.committed.rows = statistics.rows;
@@ -827,6 +834,17 @@ impl Storage {
         }
     }
 
+    /// A fresh catalog-sequence stamp ordering relation count writes against
+    /// TRUNCATE.
+    pub(crate) fn next_relation_counts_stamp(&self) -> Result<u64, SqlError> {
+        self.catalog_sequence.next()
+    }
+
+    /// The stamp of the last write of the relation counts of table `slot`.
+    pub(crate) fn relation_counts_written(&self, table_slot: usize) -> u64 {
+        self.tables[table_slot].statistics.read().counts_written
+    }
+
     /// Relation estimates change in place; column statistics keep their owner.
     pub(crate) fn write_relation_counts(
         &self,
@@ -834,6 +852,7 @@ impl Storage {
         statistics: TableStatistics,
         dirty_wal: bool,
     ) -> Result<(), SqlError> {
+        let written = self.next_relation_counts_stamp()?;
         let mut state = self.tables[table_slot].statistics.write();
         let revision = state.relation_revision.checked_add(1).ok_or_else(|| {
             sql_err!(
@@ -841,6 +860,7 @@ impl Storage {
                 "table statistics relation revision is exhausted"
             )
         })?;
+        state.counts_written = written;
         state.committed.valid = statistics.valid;
         state.committed.rows = statistics.rows;
         state.committed.average_row_width = statistics.average_row_width;

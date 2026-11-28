@@ -6,7 +6,8 @@ use crate::mem::lease_pool::SharedSlice;
 
 #[derive(Clone, Copy)]
 pub(crate) enum FunctionOutput<'a> {
-    Scalar(Datum<'a>),
+    /// A value and how the function holds the datum it returns.
+    Scalar(Datum<'a>, DatumForm),
     Rows(&'a [&'a [u8]]),
 }
 
@@ -92,18 +93,17 @@ impl ReturnBinding {
         let output = match (self, flow) {
             (
                 Self::Value | Self::OutputValue(_) | Self::OutputRecord(_),
-                Some(TriggerFlow::Return(TriggerReturnValue::Value(value))),
-            ) => Ok(FunctionOutput::Scalar(value)),
+                Some(TriggerFlow::Return(TriggerReturnValue::Value(value, form))),
+            ) => Ok(FunctionOutput::Scalar(value, form)),
             (Self::Void, None | Some(TriggerFlow::Return(TriggerReturnValue::Void))) => {
-                Ok(FunctionOutput::Scalar(Datum::Text("")))
+                Ok(FunctionOutput::Scalar(Datum::Text(""), DatumForm::Formed))
             }
             (
                 Self::OutputValue(local),
                 None | Some(TriggerFlow::Return(TriggerReturnValue::Void)),
             ) => {
-                Ok(FunctionOutput::Scalar(local.map_or(Datum::Null, |index| {
-                    execution.values[index].value
-                })))
+                let slot = local.map_or(LocalSlot::NULL, |index| execution.values[index]);
+                Ok(FunctionOutput::Scalar(slot.value, slot.form))
             }
             (
                 Self::OutputRecord(outputs),
@@ -131,7 +131,10 @@ impl ReturnBinding {
                             .map_or(Datum::Null, |index| execution.values[index].value),
                     };
                 }
-                Ok(FunctionOutput::Scalar(Datum::Record(fields)))
+                Ok(FunctionOutput::Scalar(
+                    Datum::Record(fields),
+                    DatumForm::Formed,
+                ))
             }
             (Self::Rows, None | Some(TriggerFlow::Return(TriggerReturnValue::Void))) => {
                 Ok(FunctionOutput::Rows(
@@ -150,17 +153,26 @@ impl ReturnBinding {
             _ => Err(unsupported_trigger_body()),
         }?;
         match output {
-            FunctionOutput::Scalar(value) => Ok(FunctionOutput::Scalar(cast_to(
-                super::plpgsql_conversion_input(
-                    detach_routine_datum(value, arena)?,
-                    storage.routine_type_oid(result_type, None, txid),
-                    storage,
-                    txid,
+            FunctionOutput::Scalar(value, form) => {
+                let detached = detach_routine_datum(value, arena)?;
+                let converted = cast_to(
+                    super::plpgsql_conversion_input(
+                        detached,
+                        storage.routine_type_oid(result_type, None, txid),
+                        storage,
+                        txid,
+                        arena,
+                    )?,
+                    result_type,
                     arena,
-                )?,
-                result_type,
-                arena,
-            )?)),
+                )?;
+                // Detaching copies the datum as it is held; a conversion
+                // that forms a new one holds it as formed.
+                Ok(FunctionOutput::Scalar(
+                    converted,
+                    form.converted(&detached, &converted),
+                ))
+            }
             FunctionOutput::Rows(rows) => Ok(FunctionOutput::Rows(rows)),
         }
     }
@@ -188,7 +200,7 @@ fn convert_result<'a>(
     result: RoutineArgumentDef,
     check: Option<&mut Option<super::super::query::RoutineInvocationState>>,
 ) -> Result<FunctionOutput<'a>, SqlError> {
-    let FunctionOutput::Scalar(value) = output else {
+    let FunctionOutput::Scalar(value, form) = output else {
         return Ok(output);
     };
     if result.user_type.is_none() {
@@ -199,7 +211,7 @@ fn convert_result<'a>(
     execute_procedural_query(context, false, check, |storage, sequences| {
         coerce_routine_argument(value, result, storage, txid, arena, Some(sequences))
     })
-    .map(FunctionOutput::Scalar)
+    .map(|converted| FunctionOutput::Scalar(converted, form.converted(&value, &converted)))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -326,14 +338,14 @@ impl PendingConversion {
         check: Option<super::super::query::RoutineInvocationState>,
         rows: &std::sync::Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
-        let FunctionOutput::Scalar(value) = output else {
+        let FunctionOutput::Scalar(value, form) = output else {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "set-returning function result waited in a domain check"
             ));
         };
         let mut saved = local_values::SavedValues::new(rows)?;
-        saved.replace(&[value])?;
+        saved.replace_held(&[value], &[form])?;
         Ok(Self {
             value: saved,
             check,
@@ -489,10 +501,12 @@ impl SuspendedFunctionState {
         let invocation = self.binding.invocation(&[], arena)?;
         let pending = self.conversion.as_mut().ok_or_else(changed)?;
         let value = pending.value.read(0, arena)?;
+        let mut form = [DatumForm::Formed];
+        pending.value.held_forms(&mut form)?;
         admission.commit();
         let result = convert_result(
             context,
-            FunctionOutput::Scalar(value),
+            FunctionOutput::Scalar(value, form[0]),
             self.binding.result_type,
             Some(&mut pending.check),
         )

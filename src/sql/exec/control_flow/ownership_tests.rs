@@ -190,6 +190,7 @@ fn unfinished_returns_preserve_values_after_failed_capture_and_workspace_destruc
         let text = workspace.alloc_slice_with(1024, |_| b'r').unwrap();
         frames.progress = ExecutionProgress::Flow(TriggerFlow::Return(TriggerReturnValue::Value(
             Datum::Text(core::str::from_utf8(text).unwrap()),
+            crate::sql::toast::DatumForm::Formed,
         )));
         let held = rows.lease::<u8>(1024).unwrap();
         let (execution, error) = execution.suspend().err().unwrap();

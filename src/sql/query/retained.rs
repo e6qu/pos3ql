@@ -1575,7 +1575,7 @@ fn retained_join_scope<'a>(
                     return Ok(None);
                 };
                 Ok(Some(
-                    super::join_exec::pulls(&model, &planned_scope)
+                    super::join_exec::pulls(&model)
                         && model.scope(&planned_scope).n <= MAX_RETAINED_SOURCES
                         && pulled_join_admitted(
                             statement,
@@ -1995,6 +1995,7 @@ fn appended_select<'a>(
             windows: &[],
             written: crate::sql::ast::WrittenQuery::PLAIN,
             minmax_subquery: None,
+            cursor_fraction: crate::sql::ast::CursorFraction::ALL,
         })
         .map_err(|_| arena_full())?;
     Ok(Some(&*wrapper))
@@ -2082,6 +2083,7 @@ pub(crate) fn set_query_select<'a>(
             windows: &[],
             written: crate::sql::ast::WrittenQuery::PLAIN,
             minmax_subquery: None,
+            cursor_fraction: crate::sql::ast::CursorFraction::ALL,
         })
         .map(|select| &*select)
         .map_err(|_| arena_full())
@@ -4069,7 +4071,7 @@ impl<'a> RetainedSelect<'a> {
                 else {
                     return Ok(None);
                 };
-                if !super::join_exec::pulls(&model, &scope) {
+                if !super::join_exec::pulls(&model) {
                     return Ok(None);
                 }
                 let modeled = super::join_exec::ModeledPull::new(

@@ -53,6 +53,24 @@ struct BoundQuery<'a> {
     bindings: &'a [crate::sql::parser::NamedParameter<'a>],
     inputs: &'a [crate::sql::type_inputs::Binding<'a>],
     image: crate::sql::type_inputs::InputImage,
+    /// The share of its rows the cursor plans for, taken from
+    /// `cursor_tuple_fraction` as it opened.
+    fraction: crate::sql::ast::CursorFraction,
+}
+
+/// `select` planned as a declared cursor's query (`CURSOR_OPT_FAST_PLAN`).
+fn fast_plan<'a>(
+    select: &'a Select<'a>,
+    fraction: crate::sql::ast::CursorFraction,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    arena
+        .alloc(Select {
+            cursor_fraction: fraction,
+            ..*select
+        })
+        .map(|select| &*select)
+        .map_err(|_| crate::sql::query::arena_full_pub())
 }
 
 /// A cursor query parsed again into a statement's arena.
@@ -340,6 +358,7 @@ impl CursorQuery {
                 "a cursor query with data-modifying WITH queries must be a SELECT"
             ));
         };
+        let statement = fast_plan(statement, bound.fraction, arena)?;
         Ok(ReparsedQuery {
             statement,
             params,
@@ -437,8 +456,16 @@ impl CursorQuery {
             inputs,
             validate,
         )?;
+        // Every cursor opened here is declared, by `DECLARE` or a
+        // procedural `OPEN`, and plans for the fraction of its rows
+        // `cursor_tuple_fraction` sets as it opens.
+        let fraction = crate::sql::ast::CursorFraction::fast_plan(crate::sql::guc::planner_value(
+            "cursor_tuple_fraction",
+        ));
         let statement = match statement {
-            Stmt::Select(select) => CursorStatement::Select(select),
+            Stmt::Select(select) => {
+                CursorStatement::Select(fast_plan(select, fraction, &self.arena)?)
+            }
             Stmt::SetQuery(query) => CursorStatement::SetQuery(query),
             _ => {
                 return Err(sql_err!(
@@ -455,6 +482,7 @@ impl CursorQuery {
             bindings,
             inputs,
             image,
+            fraction,
         };
         // The parser only borrows the copied source and this private arena.
         // Parameter encoding and structural decoding copy every borrowed

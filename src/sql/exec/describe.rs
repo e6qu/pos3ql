@@ -5399,7 +5399,7 @@ pub(crate) fn builtin_binary_type(
         }
         And | Or | Like | ILike | RegexMatch | RegexIMatch | NotLike | NotILike | RegexNotMatch
         | RegexNotIMatch => of(ColType::Bool),
-        TextSearchMatch => of(ColType::Bool),
+        TextSearchMatch | TextSearchMatchAlias => of(ColType::Bool),
         TextSearchPhrase => of(ColType::TsQuery),
         Overlaps if lo == oid::TSQUERY || ro == oid::TSQUERY => of(ColType::TsQuery),
         Contains | ContainedBy | Overlaps | NotRightOf | NotLeftOf | Adjacent => of(ColType::Bool),

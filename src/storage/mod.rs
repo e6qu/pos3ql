@@ -114,6 +114,7 @@ mod definition_pool;
 mod index_bindings;
 mod index_statistics;
 use index_statistics::IndexCounterSlot;
+pub(crate) use index_statistics::{IndexLayout, IndexRelationCounts};
 pub(crate) use index_statistics::{IndexStatisticsCapture, IndexStatisticsTicket};
 mod key_preparation;
 pub(crate) use index_bindings::{IndexRelationKind, IndexRelationSource};
@@ -205,11 +206,11 @@ pub(crate) mod statistics;
 mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
 pub(crate) use statistics::distribution::ColumnDistribution;
-pub(crate) use statistics::heap_layout;
 pub(crate) use statistics::{
     AnalyzedColumn, ColumnImages, INHERITED, PARTITIONED_PAGES, StatisticsOrigin,
 };
 use statistics::{StatisticsVersions, TableStatisticsOwner};
+pub(crate) use statistics::{btree_layout, heap_layout};
 mod spill_generations;
 use snapshot_leases::{
     ExportedSnapshot, StatementSnapshot, snapshot_owner_bytes, statement_snapshot_capacity,
@@ -18199,6 +18200,9 @@ pub(crate) struct RelationTransactionStatistics {
     pub(crate) n_tup_upd: u64,
     pub(crate) n_tup_del: u64,
     truncated: bool,
+    /// The counts stamp of the last TRUNCATE that gave the table new files
+    /// (0 when none): counts written before it read as new files'.
+    truncated_counts: u64,
     pre_truncate_n_tup_ins: u64,
     pre_truncate_n_tup_upd: u64,
     pre_truncate_n_tup_del: u64,
@@ -18229,6 +18233,7 @@ impl RelationTransactionStatistics {
             n_tup_upd: 0,
             n_tup_del: 0,
             truncated: false,
+            truncated_counts: 0,
             pre_truncate_n_tup_ins: 0,
             pre_truncate_n_tup_upd: 0,
             pre_truncate_n_tup_del: 0,
@@ -20834,10 +20839,13 @@ impl Storage {
         )
     }
 
+    /// Records a TRUNCATE of `table`; `counts_stamp` orders the counts of
+    /// one that gave the table new files against later count writes.
     pub(crate) fn record_relation_transaction_truncate(
         &self,
         txid: u32,
         table: usize,
+        counts_stamp: Option<u64>,
     ) -> Result<(), SqlError> {
         let identity = self.tables[table].identity();
         self.with_relation_transaction_statistics(
@@ -20854,8 +20862,29 @@ impl Storage {
                 statistics.n_tup_ins = 0;
                 statistics.n_tup_upd = 0;
                 statistics.n_tup_del = 0;
+                if let Some(stamp) = counts_stamp {
+                    statistics.truncated_counts = stamp;
+                }
             },
         )
+    }
+
+    /// The counts stamp of the last TRUNCATE in transaction `txid` that gave
+    /// table `table` new files, or 0.
+    pub(crate) fn transaction_truncate_stamp(&self, txid: u32, table: usize) -> u64 {
+        let identity = self.tables[table].identity();
+        self.cumulative_statistics()
+            .relation_transactions
+            .iter()
+            .filter(|entry| {
+                entry.txid == txid
+                    && entry.table as usize == table
+                    && entry.database == identity.database
+                    && entry.created_at == identity.created_at
+            })
+            .map(|entry| entry.truncated_counts)
+            .max()
+            .unwrap_or(0)
     }
 
     pub(crate) fn finish_cumulative_subtransactions(
@@ -20948,6 +20977,8 @@ impl Storage {
                     .idx_tup_fetch
                     .saturating_add(transaction.idx_tup_fetch);
                 if committed {
+                    parent.truncated_counts =
+                        parent.truncated_counts.max(transaction.truncated_counts);
                     if transaction.truncated {
                         if !parent.truncated {
                             parent.pre_truncate_n_tup_ins = parent.n_tup_ins;

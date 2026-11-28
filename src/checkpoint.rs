@@ -9878,6 +9878,31 @@ impl Checkpointer {
                             })?;
                     }
                 }
+                Some("ixc") => {
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
+                    let database = crate::storage::DatabaseOid::parse(parse_field(
+                        words.next(),
+                        "ixc database",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("bad ixc database"))?;
+                    let oid: i32 = parse_field(words.next(), "ixc index")?;
+                    let counts = crate::storage::IndexRelationCounts {
+                        pages: parse_field(words.next(), "ixc pages")?,
+                        tuples: f32::from_bits(parse_field(words.next(), "ixc tuples")?),
+                        layout: crate::storage::IndexLayout {
+                            pages: parse_field(words.next(), "ixc layout pages")?,
+                            height: parse_field(words.next(), "ixc layout height")?,
+                            leaves: parse_field(words.next(), "ixc layout leaves")?,
+                            changes: parse_field(words.next(), "ixc layout changes")?,
+                        },
+                    };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing ixc fields"));
+                    }
+                    storage
+                        .restore_index_relation_counts(database, oid, counts)
+                        .map_err(CheckpointSetupError::Replay)?;
+                }
                 Some("end") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     saw_end = true;
@@ -13639,6 +13664,22 @@ impl Checkpointer {
                 ),
             )?;
         }
+        let output = &mut self.manifest_output;
+        storage.for_each_index_relation_counts(&mut |database, oid, counts| {
+            write_manifest(
+                output,
+                format_args!(
+                    "ixc {} {oid} {} {} {} {} {} {}",
+                    database.get(),
+                    counts.pages,
+                    counts.tuples.to_bits(),
+                    counts.layout.pages,
+                    counts.layout.height,
+                    counts.layout.leaves,
+                    counts.layout.changes
+                ),
+            )
+        })?;
         for (_, dependency) in storage.checkpoint_extension_dependencies() {
             write_database_context(
                 &mut self.manifest_output,

@@ -3092,7 +3092,7 @@ pub(crate) fn binary<'a>(
             }
             _ => concat(l, r, l_unknown, r_unknown, arena),
         },
-        TextSearchMatch => {
+        TextSearchMatch | TextSearchMatchAlias => {
             if l.is_null() || r.is_null() {
                 return Ok(Datum::Null);
             }

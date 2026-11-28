@@ -18,10 +18,10 @@ struct Pointer {
     eof: bool,
 }
 
-/// A merge join's materialized inner rows, `lengths` each one's `t_len`.
-pub(crate) struct MaterialStore<'l> {
+/// A merge join's materialized inner rows. Each call passes `lengths`, every
+/// inner row's `t_len` in the order the input returns them.
+pub(crate) struct MaterialStore {
     store: Tuplestore,
-    lengths: &'l [usize],
     /// The read pointer (0) and the mark (1).
     pointers: [Pointer; 2],
     deleted: usize,
@@ -29,11 +29,10 @@ pub(crate) struct MaterialStore<'l> {
     appended: usize,
 }
 
-impl<'l> MaterialStore<'l> {
-    pub(crate) fn new(lengths: &'l [usize]) -> Self {
+impl MaterialStore {
+    pub(crate) fn new() -> Self {
         Self {
             store: Tuplestore::new(),
-            lengths,
             pointers: [Pointer {
                 current: 0,
                 eof: false,
@@ -46,7 +45,7 @@ impl<'l> MaterialStore<'l> {
 
     /// `ExecMaterial`: the next row, from the tuplestore when the read
     /// pointer is not at its end, else appended from the input.
-    pub(crate) fn next(&mut self) -> Result<(), SqlError> {
+    pub(crate) fn next(&mut self, lengths: &[usize]) -> Result<(), SqlError> {
         if !self.pointers[0].eof {
             if self.pointers[0].current < self.store.count() {
                 self.pointers[0].current += 1;
@@ -54,7 +53,7 @@ impl<'l> MaterialStore<'l> {
             }
             self.pointers[0].eof = true;
         }
-        let Some(&length) = self.lengths.get(self.appended) else {
+        let Some(&length) = lengths.get(self.appended) else {
             return Ok(());
         };
         // `tuplestore_puttupleslot` moves a mark at the end past the row.
@@ -76,9 +75,9 @@ impl<'l> MaterialStore<'l> {
     }
 
     /// `ExecMaterialMarkPos`.
-    pub(crate) fn mark(&mut self) {
+    pub(crate) fn mark(&mut self, lengths: &[usize]) {
         self.pointers[1] = self.pointers[0];
-        self.trim();
+        self.trim(lengths);
     }
 
     /// `ExecMaterialRestrPos`.
@@ -87,7 +86,7 @@ impl<'l> MaterialStore<'l> {
     }
 
     /// `tuplestore_trim`.
-    fn trim(&mut self) {
+    fn trim(&mut self, lengths: &[usize]) {
         let count = self.store.count();
         let oldest = self
             .pointers
@@ -100,7 +99,7 @@ impl<'l> MaterialStore<'l> {
         }
         self.store.update_most();
         for row in self.deleted..removed {
-            self.store.release(self.lengths[self.base + row]);
+            self.store.release(lengths[self.base + row]);
         }
         self.deleted = removed;
         if removed < count / 8 {

@@ -591,6 +591,33 @@ struct LocalCleanup {
     heap_changed: bool,
 }
 
+/// SKIP_LOCKED's warning for a named relation it passes over.
+fn warn_maintenance_skipped(
+    responder: &mut Responder,
+    verb: &str,
+    target: &ast::MaintenanceTarget<'_>,
+) -> Result<(), WireFull> {
+    responder.warning(
+        sqlstate::LOCK_NOT_AVAILABLE,
+        stack_format!(
+            160,
+            "skipping {} of \"{}\" --- lock not available",
+            verb,
+            target.table.name
+        )
+        .as_str(),
+    )
+}
+
+/// How ANALYZE holds its relations' locks: all taken before it runs, or,
+/// under SKIP_LOCKED, each taken as it is reached unless another holder has
+/// it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MaintenanceLocking {
+    Held,
+    SkipUnavailable,
+}
+
 #[derive(Clone, Copy)]
 enum LocalCleanupSource {
     Checkpoint,
@@ -1124,7 +1151,7 @@ fn calls_routines_outside_queries(statement: &Stmt<'_>, txn: &TxnState) -> bool 
         Stmt::CreateIndex { .. } => txn.concurrent_index.is_none(),
         Stmt::Reindex { .. }
         | Stmt::Cluster { .. }
-        | Stmt::Analyze(_)
+        | Stmt::Analyze { .. }
         | Stmt::Vacuum { .. }
         | Stmt::RefreshMaterializedView { .. }
         | Stmt::CreateTableAs { .. } => true,
@@ -1171,7 +1198,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DeclareCursor { .. }
         | Stmt::FetchCursor { .. }
         | Stmt::CloseCursor(_)
-        | Stmt::Analyze(_)
+        | Stmt::Analyze { .. }
         | Stmt::Listen(_)
         | Stmt::Unlisten(_) => false,
         Stmt::Call { .. } | Stmt::Do { .. } => true,
@@ -1581,7 +1608,7 @@ pub(crate) fn unquoted_body_unsupported_tag(statement: &Stmt<'_>) -> Option<&'st
         Stmt::CommitPrepared(_) => "COMMIT PREPARED",
         Stmt::RollbackPrepared(_) => "ROLLBACK PREPARED",
         Stmt::Vacuum { .. } => "VACUUM",
-        Stmt::Analyze(_) => "ANALYZE",
+        Stmt::Analyze { .. } => "ANALYZE",
         Stmt::Checkpoint => "CHECKPOINT",
         Stmt::Set { .. }
         | Stmt::SetRole { .. }
@@ -1780,7 +1807,7 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         }
         Stmt::AlterDefaultPrivileges { .. } => "ALTER DEFAULT PRIVILEGES",
         Stmt::DropOwned { .. } => "DROP OWNED",
-        Stmt::Analyze(_) | Stmt::Vacuum { .. } => return None,
+        Stmt::Analyze { .. } | Stmt::Vacuum { .. } => return None,
         Stmt::CreateEventTrigger(_)
         | Stmt::AlterEventTrigger { .. }
         | Stmt::DropEventTrigger { .. } => return None,
@@ -2165,6 +2192,53 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
     SUPPORTED_EVENT_TRIGGER_TAGS
         .iter()
         .any(|known| known.eq_ignore_ascii_case(tag))
+}
+
+/// Whether a statement runs at the top level or inside a routine:
+/// PostgreSQL's `isTopLevel`, which decides how its transaction-block checks
+/// (`RequireTransactionBlock`, `WarnNoTransactionBlock`,
+/// `PreventInTransactionBlock`) treat a statement outside a block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatementLevel {
+    TopLevel,
+    Nested,
+}
+
+impl StatementLevel {
+    /// Whether `CheckTransactionBlock` reports this statement as outside a
+    /// transaction block: only a top-level one in no block, implicit or
+    /// explicit, and no subtransaction.
+    fn outside_transaction_block(self, txn: &TxnState) -> bool {
+        self == Self::TopLevel && !txn.is_transaction_block() && !txn.has_savepoints()
+    }
+}
+
+/// `PreventInTransactionBlock`'s error for `command` run inside a routine:
+/// a block or subtransaction reports itself before the routine does.
+fn nested_top_level_only_error(command: TopLevelCommand, txn: &TxnState) -> SqlError {
+    if txn.is_transaction_block() || txn.has_savepoints() {
+        sql_err!(
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            "{} cannot run inside a transaction block",
+            command.label()
+        )
+    } else {
+        sql_err!(
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            "{} cannot be executed from a function",
+            command.label()
+        )
+    }
+}
+
+/// The level of a statement the executor runs: a nested routine statement
+/// keeps the enclosing query's workspace.
+const fn statement_level(reset_workspace: bool) -> StatementLevel {
+    if reset_workspace {
+        StatementLevel::TopLevel
+    } else {
+        StatementLevel::Nested
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -7183,6 +7257,22 @@ impl Engine {
                 return Err(error);
             }
         }
+        // A committed TRUNCATE's new files have 0 pages and are uncounted.
+        for event_index in 0..txn.truncates().len() {
+            for target_index in 0..txn.truncates()[event_index].target_count() {
+                let slot = txn.truncates()[event_index].target_slot(target_index);
+                let stamp = self.storage.transaction_truncate_stamp(txn.txid, slot);
+                if stamp == 0 || !self.storage.table_slot_visible_to(slot, txn.txid) {
+                    continue;
+                }
+                if let Err(error) =
+                    exec::reset_truncated_counts(&self.storage, slot, txn.txid, stamp, &self.work)
+                {
+                    self.rollback_txn(txn, guc);
+                    return Err(error);
+                }
+            }
+        }
         for i in 0..txn.touched().len() {
             let (table, rowid, _) = txn.touched()[i];
             // A row may be written several times in one transaction; journal
@@ -7341,6 +7431,40 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
+        }
+        // Index relation counts change in place, like a table's: a commit
+        // journals every visible index's unjournaled counts.
+        let mut from = 0;
+        while let Some((slot, revision, image)) = self.storage.next_unjournaled_index_counts(from) {
+            from = slot + 1;
+            let Some((owner, database, _)) =
+                crate::sql::catalog::index_statistics_source(&self.storage, txn.txid, image.oid)
+            else {
+                continue;
+            };
+            if database != image.database || database != self.storage.current_database_oid() {
+                continue;
+            }
+            let (crate::storage::IndexStatisticsOwner::Implicit(table)
+            | crate::storage::IndexStatisticsOwner::Explicit(table)) = owner;
+            if self
+                .storage
+                .table_def(usize::from(table), txn.txid)
+                .persistence
+                != crate::storage::RelationPersistence::Temporary
+                && let Err(error) = self.wal.stage_reserved(
+                    txn.txid,
+                    self.storage.bump_lsn(),
+                    &WalOp::IndexRelationCounts {
+                        oid: image.oid,
+                        counts: image.counts,
+                    },
+                )
+            {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.stage_index_counts(slot, revision, txn.txid);
         }
         // pg_statistic column rows are transactional, but PostgreSQL updates
         // pg_class reltuples/relpages in place. A later commit therefore also
@@ -8202,6 +8326,7 @@ impl Engine {
                 self.storage.clear_brin_maintenance_dirty(slot);
             }
         }
+        self.storage.acknowledge_index_counts(txn.txid);
         statistics_receipts.acknowledge();
         self.wal.commit();
         if let txn::CommitTarget::CommitPrepared { slot, .. }
@@ -10449,10 +10574,14 @@ impl Engine {
         })
     }
 
+    /// ANALYZE of `targets`; without VACUUM (`measure_indexes`) it also
+    /// counts each table's indexes, as `do_analyze_rel` does.
     fn analyze_targets(
         &mut self,
         targets: &[ast::MaintenanceTarget<'_>],
         txn: &mut TxnState,
+        measure_indexes: bool,
+        locking: MaintenanceLocking,
     ) -> Result<u64, SqlError> {
         self.validate_maintenance_targets(targets, txn.txid)?;
         let _snapshot = self.storage.analyze_snapshot();
@@ -10465,6 +10594,12 @@ impl Engine {
                         .storage
                         .relation_visible_to_current_session(slot, txn.txid)
                     && self.maintenance_permitted(slot, txn.txid)
+                    && self.maintenance_lock_available(
+                        slot,
+                        txn.txid,
+                        locking,
+                        ast::TableLockMode::ShareUpdateExclusive,
+                    )?
                 {
                     txn.record_statistics(slot as u32)?;
                     self.work.reset();
@@ -10488,6 +10623,18 @@ impl Engine {
                         &self.work,
                     )?;
                     drop(indexes);
+                    if measure_indexes {
+                        exec::measure_index_counts(
+                            &self.storage,
+                            slot,
+                            txn.txid,
+                            exec::IndexSelection::All,
+                            exec::IndexMeasurement::Analyze {
+                                rows: statistics.rows,
+                            },
+                            &self.work,
+                        )?;
+                    }
                     if statistics.relation_estimates_changed(&previous) {
                         txn.record_statistics_plan_change(&self.storage, slot as u32);
                     }
@@ -10520,6 +10667,12 @@ impl Engine {
                         && (target.inheritance == ast::RelationInheritance::Only
                             || !self.storage.relation_descends_from(slot, root, txn.txid)))
                     || !self.maintenance_permitted(slot, txn.txid)
+                    || !self.maintenance_lock_available(
+                        slot,
+                        txn.txid,
+                        locking,
+                        ast::TableLockMode::ShareUpdateExclusive,
+                    )?
                 {
                     continue;
                 }
@@ -10558,6 +10711,18 @@ impl Engine {
                 );
                 drop(indexes);
                 let statistics = statistics?;
+                if measure_indexes {
+                    exec::measure_index_counts(
+                        &self.storage,
+                        slot,
+                        txn.txid,
+                        exec::IndexSelection::All,
+                        exec::IndexMeasurement::Analyze {
+                            rows: statistics.rows,
+                        },
+                        &self.work,
+                    )?;
+                }
                 if statistics.relation_estimates_changed(&previous) {
                     txn.record_statistics_plan_change(&self.storage, slot as u32);
                 }
@@ -10589,57 +10754,105 @@ impl Engine {
             .is_partitioned()
     }
 
+    /// VACUUM's in-place counts of the table in slot `slot` and of its
+    /// indexes. Indexes are vacuumed, and recounted, only when dead rows
+    /// left entries to remove on at least 2% of the table's pages
+    /// (`BYPASS_THRESHOLD_PAGES`), or always or never as `INDEX_CLEANUP`
+    /// asks; VACUUM FULL rebuilt them already.
+    fn vacuum_relation_counts(
+        &mut self,
+        slot: usize,
+        txid: u32,
+        options: ast::VacuumOptions,
+    ) -> Result<(), SqlError> {
+        let dead = self.storage.relation_cumulative_statistics(slot).n_dead_tup;
+        let previous_pages = self.storage.table_statistics(slot, txid).pages;
+        self.storage
+            .refresh_relation_counts(slot, txid, &self.work)?;
+        let pages = self
+            .storage
+            .table_statistics(slot, txid)
+            .pages
+            .max(previous_pages);
+        let vacuum_indexes = match options.index_cleanup {
+            ast::IndexCleanup::Auto => dead as f64 >= 0.02 * pages as f64,
+            ast::IndexCleanup::On => true,
+            ast::IndexCleanup::Off => false,
+        };
+        if !options.full && dead != 0 && vacuum_indexes {
+            exec::measure_index_counts(
+                &self.storage,
+                slot,
+                txid,
+                exec::IndexSelection::All,
+                exec::IndexMeasurement::Vacuum,
+                &self.work,
+            )?;
+        }
+        Ok(())
+    }
+
     fn record_vacuum_targets(
         &mut self,
         targets: &[ast::MaintenanceTarget<'_>],
         txid: u32,
-        full: bool,
+        options: ast::VacuumOptions,
+        locking: MaintenanceLocking,
         elapsed_micros: u64,
     ) -> Result<(), SqlError> {
         if targets.is_empty() {
             for slot in 0..self.storage.table_count() {
-                if self.storage.table_slot_visible_to(slot, txid)
-                    && self.storage.relation_visible_to_current_session(slot, txid)
-                    && self.maintenance_permitted(slot, txid)
-                    && self.vacuums_storage(slot, txid)
-                {
-                    self.work.reset();
-                    if full {
-                        // VACUUM FULL rebuilds the table's indexes.
-                        exec::rebuild_table_index_keys(&self.storage, txid, slot, &self.work)?;
-                        self.work.reset();
-                    }
-                    self.storage
-                        .refresh_relation_counts(slot, txid, &self.work)?;
-                    self.storage.vacuum_relation_index_hint(slot)?;
-                    self.storage.record_relation_vacuum(slot, elapsed_micros);
-                }
+                self.vacuum_slot(slot, txid, options, locking, elapsed_micros)?;
             }
             return Ok(());
         }
         for target in targets {
             let root = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
             for slot in 0..self.storage.table_count() {
-                if self.storage.table_slot_visible_to(slot, txid)
-                    && self.storage.relation_visible_to_current_session(slot, txid)
-                    && (slot == root
-                        || (target.inheritance == ast::RelationInheritance::Descendants
-                            && self.storage.relation_descends_from(slot, root, txid)))
-                    && self.maintenance_permitted(slot, txid)
-                    && self.vacuums_storage(slot, txid)
+                if slot == root
+                    || (target.inheritance == ast::RelationInheritance::Descendants
+                        && self.storage.relation_descends_from(slot, root, txid))
                 {
-                    self.work.reset();
-                    if full {
-                        // VACUUM FULL rebuilds the table's indexes.
-                        exec::rebuild_table_index_keys(&self.storage, txid, slot, &self.work)?;
-                        self.work.reset();
-                    }
-                    self.storage
-                        .refresh_relation_counts(slot, txid, &self.work)?;
-                    self.storage.vacuum_relation_index_hint(slot)?;
-                    self.storage.record_relation_vacuum(slot, elapsed_micros);
+                    self.vacuum_slot(slot, txid, options, locking, elapsed_micros)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// VACUUM of the table in slot `slot`, when it is one this session may
+    /// vacuum and, under SKIP_LOCKED, its lock is free.
+    fn vacuum_slot(
+        &mut self,
+        slot: usize,
+        txid: u32,
+        options: ast::VacuumOptions,
+        locking: MaintenanceLocking,
+        elapsed_micros: u64,
+    ) -> Result<(), SqlError> {
+        let mode = if options.full {
+            ast::TableLockMode::AccessExclusive
+        } else {
+            ast::TableLockMode::ShareUpdateExclusive
+        };
+        if !(self.storage.table_slot_visible_to(slot, txid)
+            && self.storage.relation_visible_to_current_session(slot, txid)
+            && self.maintenance_permitted(slot, txid)
+            && self.vacuums_storage(slot, txid)
+            && self.maintenance_lock_available(slot, txid, locking, mode)?)
+        {
+            return Ok(());
+        }
+        self.work.reset();
+        if options.full {
+            // VACUUM FULL rebuilds the table's indexes.
+            exec::rebuild_table_index_keys(&self.storage, txid, slot, &self.work)?;
+            self.work.reset();
+        }
+        self.vacuum_relation_counts(slot, txid, options)?;
+        self.storage.vacuum_relation_index_hint(slot)?;
+        if !options.full {
+            self.storage.record_relation_vacuum(slot, elapsed_micros);
         }
         Ok(())
     }
@@ -10719,38 +10932,67 @@ impl Engine {
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if options.only_database_stats {
+            return Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "VACUUM option ONLY_DATABASE_STATS is not supported"
+            )));
+        }
         let started = datetime::now_micros();
         let mode = if options.full {
             ast::TableLockMode::AccessExclusive
         } else {
             ast::TableLockMode::ShareUpdateExclusive
         };
+        let locking = if options.skip_locked {
+            MaintenanceLocking::SkipUnavailable
+        } else {
+            MaintenanceLocking::Held
+        };
+        let (kept, kept_count) = match self
+            .lockable_maintenance_targets(targets, txn.txid, locking, mode, "vacuum", responder)?
+        {
+            Ok(kept) => kept,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !targets.is_empty() && kept_count == 0 {
+            responder.command_complete("VACUUM")?;
+            return Ok(Ok(()));
+        }
+        let targets = &kept[..kept_count];
         if let Err(error) = self.warn_maintenance_denials(targets, txn.txid, "vacuum", responder)? {
             return Ok(Err(error));
         }
-        if let Err(error) = self.lock_maintenance_targets(targets, txn.txid, mode) {
+        if locking == MaintenanceLocking::Held
+            && let Err(error) = self.lock_maintenance_targets(targets, txn.txid, mode)
+        {
             return Ok(Err(error));
         }
         let validation = if options.analyze {
-            self.analyze_targets(targets, txn).map(|_| ())
+            self.analyze_targets(targets, txn, false, locking)
+                .map(|_| ())
         } else {
             self.validate_maintenance_targets(targets, txn.txid)
         };
         if let Err(error) = validation {
             return Ok(Err(error));
         }
-        if self.ckpt.is_some()
-            && let Err(error) = self.checkpoint()
-        {
-            return Ok(Err(error));
-        }
-        if let Err(error) = self.record_vacuum_targets(
-            targets,
-            txn.txid,
-            options.full,
-            datetime::now_micros().saturating_sub(started).max(0) as u64,
-        ) {
-            return Ok(Err(error));
+        // PROCESS_MAIN false leaves the tables themselves unvacuumed.
+        if options.process_main {
+            if self.ckpt.is_some()
+                && let Err(error) = self.checkpoint()
+            {
+                return Ok(Err(error));
+            }
+            if let Err(error) = self.record_vacuum_targets(
+                targets,
+                txn.txid,
+                options,
+                locking,
+                datetime::now_micros().saturating_sub(started).max(0) as u64,
+            ) {
+                return Ok(Err(error));
+            }
         }
         responder.command_complete("VACUUM")?;
         Ok(Ok(()))
@@ -10759,26 +11001,144 @@ impl Engine {
     pub(crate) fn execute_analyze_statement(
         &mut self,
         targets: &[ast::MaintenanceTarget<'_>],
+        options: ast::AnalyzeOptions,
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let locking = if options.skip_locked {
+            MaintenanceLocking::SkipUnavailable
+        } else {
+            MaintenanceLocking::Held
+        };
+        let (kept, kept_count) = match self.lockable_maintenance_targets(
+            targets,
+            txn.txid,
+            locking,
+            ast::TableLockMode::ShareUpdateExclusive,
+            "analyze",
+            responder,
+        )? {
+            Ok(kept) => kept,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !targets.is_empty() && kept_count == 0 {
+            responder.command_complete("ANALYZE")?;
+            return Ok(Ok(()));
+        }
+        let targets = &kept[..kept_count];
         if let Err(error) =
             self.warn_maintenance_denials(targets, txn.txid, "analyze", responder)?
         {
             return Ok(Err(error));
         }
-        if let Err(error) = self.lock_maintenance_targets(
-            targets,
-            txn.txid,
-            ast::TableLockMode::ShareUpdateExclusive,
-        ) {
+        if locking == MaintenanceLocking::Held
+            && let Err(error) = self.lock_maintenance_targets(
+                targets,
+                txn.txid,
+                ast::TableLockMode::ShareUpdateExclusive,
+            )
+        {
             return Ok(Err(error));
         }
-        if let Err(error) = self.analyze_targets(targets, txn) {
+        if let Err(error) = self.analyze_targets(targets, txn, true, locking) {
             return Ok(Err(error));
         }
         responder.command_complete("ANALYZE")?;
         Ok(Ok(()))
+    }
+
+    /// The relations of `targets` a maintenance command goes on with. Under
+    /// SKIP_LOCKED it passes over a named relation it cannot lock at once in
+    /// `mode`, warning that it is `verb`-ing it; its members and a
+    /// database-wide command's tables are passed over silently, as
+    /// `vacuum_open_relation` does. As in `expand_vacuum_rel`, every named
+    /// relation is first probed with an ACCESS SHARE lock, released at once,
+    /// before any is locked for the command itself.
+    #[expect(clippy::type_complexity, reason = "fixed-capacity kept target list")]
+    fn lockable_maintenance_targets<'t>(
+        &mut self,
+        targets: &[ast::MaintenanceTarget<'t>],
+        txid: u32,
+        locking: MaintenanceLocking,
+        mode: ast::TableLockMode,
+        verb: &str,
+        responder: &mut Responder,
+    ) -> Result<Result<([ast::MaintenanceTarget<'t>; 64], usize), SqlError>, WireFull> {
+        let mut kept = [ast::MaintenanceTarget {
+            table: ast::QualName::bare(""),
+            columns: &[],
+            inheritance: ast::RelationInheritance::Descendants,
+        }; 64];
+        let mut kept_count = 0usize;
+        for target in targets {
+            if locking == MaintenanceLocking::SkipUnavailable {
+                let root = match exec::resolve_dml_table(&self.storage, &target.table, txid) {
+                    Ok(root) => root,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if self.maintenance_permitted(root, txid) {
+                    let mark = self.storage.lock_mark();
+                    let probe =
+                        self.storage
+                            .lock_table(txid, root, ast::TableLockMode::AccessShare, true);
+                    self.storage.rollback_locks_to(txid, mark);
+                    match probe {
+                        Ok(()) => {}
+                        Err(error) if error.sqlstate == sqlstate::LOCK_NOT_AVAILABLE => {
+                            warn_maintenance_skipped(responder, verb, target)?;
+                            continue;
+                        }
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+            }
+            kept[kept_count] = *target;
+            kept_count += 1;
+        }
+        if locking == MaintenanceLocking::SkipUnavailable {
+            let mut locked = 0usize;
+            for index in 0..kept_count {
+                let target = kept[index];
+                let root = match exec::resolve_dml_table(&self.storage, &target.table, txid) {
+                    Ok(root) => root,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if self.maintenance_permitted(root, txid) {
+                    match self.maintenance_lock_available(root, txid, locking, mode) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn_maintenance_skipped(responder, verb, &target)?;
+                            continue;
+                        }
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+                kept[locked] = target;
+                locked += 1;
+            }
+            kept_count = locked;
+        }
+        Ok(Ok((kept, kept_count)))
+    }
+
+    /// Whether a maintenance command may go on with `slot`: always when its
+    /// locks were taken beforehand, and under SKIP_LOCKED when its lock in
+    /// `mode` is free now.
+    fn maintenance_lock_available(
+        &self,
+        slot: usize,
+        txid: u32,
+        locking: MaintenanceLocking,
+        mode: ast::TableLockMode,
+    ) -> Result<bool, SqlError> {
+        if locking == MaintenanceLocking::Held {
+            return Ok(true);
+        }
+        match self.storage.lock_table(txid, slot, mode, true) {
+            Ok(()) => Ok(true),
+            Err(error) if error.sqlstate == sqlstate::LOCK_NOT_AVAILABLE => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn execute_listen_statement(
@@ -10852,6 +11212,7 @@ impl Engine {
         value: &str,
         local: bool,
         syntax: ast::SettingSyntax,
+        level: StatementLevel,
         txn: &mut TxnState,
         guc: &GucState,
         arena: &Arena,
@@ -10862,7 +11223,7 @@ impl Engine {
         {
             return Ok(Err(error));
         }
-        if local && !txn.is_explicit() {
+        if local && level.outside_transaction_block(txn) {
             responder.warning(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                 "SET LOCAL can only be used in transaction blocks",
@@ -11077,10 +11438,11 @@ impl Engine {
         tables: &[ast::QualName<'_>],
         mode: ast::TableLockMode,
         nowait: bool,
+        level: StatementLevel,
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if !txn.is_explicit() {
+        if level.outside_transaction_block(txn) {
             return Ok(Err(sql_err!(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                 "LOCK TABLE can only be used in transaction blocks"
@@ -11113,6 +11475,7 @@ impl Engine {
         &mut self,
         targets: ast::ConstraintTargets<'_>,
         mode: ast::ConstraintMode,
+        level: StatementLevel,
         txn: &mut TxnState,
         guc: &GucState,
         cursors: &mut cursor::CursorPool,
@@ -11120,7 +11483,9 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let _atomic_reads = self.atomic_block_read_scope();
-        if !txn.is_explicit() {
+        // Outside any block the mode would end with the statement's own
+        // transaction, so only the warning remains.
+        if level.outside_transaction_block(txn) {
             responder.warning(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                 "SET CONSTRAINTS can only be used in transaction blocks",
@@ -19824,8 +20189,8 @@ impl Engine {
                     .map_err(BodyError::Wire)?
                     .map_err(BodyError::Sql)?;
                 match output {
-                    exec::FunctionOutput::Scalar(value) => {
-                        exec::encode_projected_pub(&[value], scratch)
+                    exec::FunctionOutput::Scalar(value, form) => {
+                        exec::encode_projected_held(&[value], &[form], scratch)
                     }
                     exec::FunctionOutput::Rows(rows) => exec::pack_projected_rows(rows, scratch),
                 }
@@ -19939,8 +20304,8 @@ impl Engine {
                     scratch,
                     responder,
                 )? {
-                    exec::FunctionOutput::Scalar(value) => {
-                        exec::encode_projected_pub(&[value], scratch)
+                    exec::FunctionOutput::Scalar(value, form) => {
+                        exec::encode_projected_held(&[value], &[form], scratch)
                     }
                     exec::FunctionOutput::Rows(rows) => exec::pack_projected_rows(rows, scratch),
                 }
@@ -22220,7 +22585,7 @@ impl Engine {
                 if routine.language == crate::storage::RoutineLanguage::PlPgSql {
                     let txid = txn.txid;
                     guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
-                    let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                    let mut output_values = exec::ProcedureOutputValues::new();
                     let (instance, conflict) = match self.plpgsql_instance_owner(
                         routine,
                         input_collation,
@@ -22270,7 +22635,8 @@ impl Engine {
                     if let Some(capture) = capture.as_deref_mut() {
                         if let Err(error) = capture.record(
                             routine,
-                            &output_values[..output_count],
+                            &output_values.values[..output_count],
+                            &output_values.forms[..output_count],
                             &self.storage,
                             txn.txid,
                             arena,
@@ -22310,8 +22676,8 @@ impl Engine {
                                 type_oid,
                                 parameter.ctype.typlen(),
                             );
-                            output_values[output_index] = match eval::cast_to(
-                                output_values[output_index],
+                            output_values.values[output_index] = match eval::cast_to(
+                                output_values.values[output_index],
                                 parameter.ctype,
                                 arena,
                             ) {
@@ -22321,7 +22687,7 @@ impl Engine {
                             output_index += 1;
                         }
                         responder.row_description(&description[..output_count])?;
-                        responder.data_row(&output_values[..output_count])?;
+                        responder.data_row(&output_values.values[..output_count])?;
                     }
                     return responder.command_complete("CALL").map(|_| Ok(()));
                 }
@@ -22577,9 +22943,12 @@ impl Engine {
                             )));
                         }
                         if let Some(capture) = capture.as_deref_mut() {
+                            // A SQL procedure's output row does not carry
+                            // its values' forms.
                             if let Err(error) = capture.record(
                                 routine,
                                 &output_values[..output_count],
+                                &crate::sql::toast::UNRECORDED_ARGUMENTS[..output_count],
                                 &self.storage,
                                 txn.txid,
                                 arena,
@@ -23245,7 +23614,6 @@ impl Engine {
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
-        transaction_context: exec::PlpgsqlTransactionContext,
         arena: &Arena,
         responder: &mut Responder,
         execute: F,
@@ -23271,14 +23639,8 @@ impl Engine {
                 ),
             )));
         }
-        if transaction_context == exec::PlpgsqlTransactionContext::Atomic
-            && let Some(command) = top_level_only_command(statement)
-        {
-            return Ok(Err(sql_err!(
-                sqlstate::ACTIVE_SQL_TRANSACTION,
-                "{} cannot run inside a transaction block",
-                command.label()
-            )));
+        if let Some(command) = top_level_only_command(statement) {
+            return Ok(Err(nested_top_level_only_error(command, txn)));
         }
         if txn.read_only && statement_writes(statement) {
             return Ok(Err(sql_err!(
@@ -23378,6 +23740,13 @@ impl Engine {
             && let Err(error) = self
                 .storage
                 .reconcile_partition_triggers(txn, event_ddl_mark)
+        {
+            return Ok(Err(error));
+        }
+        // A statement that created indexes leaves them measured as built.
+        if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = exec::measure_unmeasured_indexes(&self.storage, txn.txid, arena)
         {
             return Ok(Err(error));
         }
@@ -23561,14 +23930,17 @@ impl Engine {
                 ),
             )));
         }
-        if routine_transaction_context == exec::PlpgsqlTransactionContext::Atomic
-            && let Some(command) = top_level_only_command(statement)
-        {
-            return Ok(Err(sql_err!(
-                sqlstate::ACTIVE_SQL_TRANSACTION,
-                "{} cannot run inside a transaction block",
-                command.label()
-            )));
+        if let Some(command) = top_level_only_command(statement) {
+            if !reset_workspace {
+                return Ok(Err(nested_top_level_only_error(command, txn)));
+            }
+            if routine_transaction_context == exec::PlpgsqlTransactionContext::Atomic {
+                return Ok(Err(sql_err!(
+                    sqlstate::ACTIVE_SQL_TRANSACTION,
+                    "{} cannot run inside a transaction block",
+                    command.label()
+                )));
+            }
         }
         if txn.read_only && statement_writes(statement) {
             return Ok(Err(sql_err!(
@@ -24169,8 +24541,24 @@ impl Engine {
                             Err(error) => return Ok(Err(error)),
                         }
                     }
+                    // `EXPLAIN DECLARE` plans the cursor's query as the
+                    // cursor would (`CURSOR_OPT_FAST_PLAN`); `ANALYZE` runs
+                    // it without opening a cursor.
+                    Stmt::DeclareCursor { sql, .. } => match explain::declared_query(sql, arena) {
+                        Ok(declared) => (declared, None),
+                        Err(error) => return Ok(Err(error)),
+                    },
                     _ => (&**statement, None),
                 };
+                // A scrollable cursor's plan runs backward, under a
+                // `Materialize` when its nodes cannot.
+                let scrollable = matches!(
+                    **statement,
+                    Stmt::DeclareCursor {
+                        scroll: cursor::CursorScroll::Scroll,
+                        ..
+                    }
+                );
                 // `ExplainExecuteQuery` evaluates the arguments, then takes
                 // the statement's cached plan (`GetCachedPlan`): a custom plan
                 // folds the argument values in, a generic one prints `$n`.
@@ -24240,6 +24628,19 @@ impl Engine {
                         let plan = plan.and_then(|plan| {
                             explain::refuse_parallel_candidates(&plan, &self.storage, txn.txid)
                                 .map(|()| plan)
+                        });
+                        let plan = plan.and_then(|plan| {
+                            if scrollable {
+                                explain::scrollable_plan(
+                                    plan,
+                                    &self.storage,
+                                    txn.txid,
+                                    options.analyze,
+                                    arena,
+                                )
+                            } else {
+                                Ok(plan)
+                            }
                         });
                         match plan {
                             Ok(plan) => Some(plan),
@@ -26341,7 +26742,14 @@ impl Engine {
                 tables,
                 mode,
                 nowait,
-            } => self.execute_lock_table_statement(tables, *mode, *nowait, txn, responder),
+            } => self.execute_lock_table_statement(
+                tables,
+                *mode,
+                *nowait,
+                statement_level(reset_workspace),
+                txn,
+                responder,
+            ),
             Stmt::Savepoint(name) => {
                 if !txn.is_explicit() {
                     return Ok(Err(sql_err!(
@@ -26409,16 +26817,31 @@ impl Engine {
                 Ok(Ok(()))
             }
             Stmt::SetConstraints { targets, mode } => self.execute_set_constraints_statement(
-                *targets, *mode, txn, guc, cursors, arena, responder,
+                *targets,
+                *mode,
+                statement_level(reset_workspace),
+                txn,
+                guc,
+                cursors,
+                arena,
+                responder,
             ),
             Stmt::Set {
                 name,
                 value,
                 local,
                 syntax,
-            } => {
-                self.execute_set_statement(name, value, *local, *syntax, txn, guc, arena, responder)
-            }
+            } => self.execute_set_statement(
+                name,
+                value,
+                *local,
+                *syntax,
+                statement_level(reset_workspace),
+                txn,
+                guc,
+                arena,
+                responder,
+            ),
             Stmt::SetCatalog(_) => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "current database cannot be changed"
@@ -26597,7 +27020,9 @@ impl Engine {
             // ANALYZE resolves every requested relation/column and walks its
             // MVCC-visible row state. Cardinality and widths are exact for that
             // snapshot; distinct counts use the fixed-size estimator.
-            Stmt::Analyze(targets) => self.execute_analyze_statement(targets, txn, responder),
+            Stmt::Analyze { targets, options } => {
+                self.execute_analyze_statement(targets, *options, txn, responder)
+            }
             Stmt::Listen(channel) => self.execute_listen_statement(channel, txn, responder),
             Stmt::Unlisten(channel) => self.execute_unlisten_statement(*channel, txn, responder),
             Stmt::Notify { channel, payload } => {
@@ -26761,6 +27186,13 @@ impl Engine {
             && let Err(error) = self
                 .storage
                 .reconcile_partition_triggers(txn, event_ddl_mark)
+        {
+            return Ok(Err(error));
+        }
+        // A statement that created indexes leaves them measured as built.
+        if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = exec::measure_unmeasured_indexes(&self.storage, txn.txid, arena)
         {
             return Ok(Err(error));
         }
@@ -33882,6 +34314,9 @@ fn apply_wal_op(
             index.restore_expression_dependencies(expression_dependencies.entries())?;
             let slot = storage.create_index(index, 0)?;
             storage.commit_index_create(slot)?;
+        }
+        WalOp::IndexRelationCounts { oid, counts } => {
+            storage.restore_index_relation_counts(storage.current_database_oid(), oid, counts)?;
         }
         WalOp::BrinMaintenance {
             index_created_at,

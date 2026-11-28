@@ -20,6 +20,19 @@ pub(super) struct IndexCounterSlot {
     reservations: usize,
     readers: usize,
     pub(super) statistics: IndexCumulativeStatistics,
+    /// `pg_class.relpages` and `reltuples`, which no statistics reset
+    /// touches, and whether a commit still has to journal them.
+    relation: Option<IndexRelationCounts>,
+    relation_revision: u64,
+    /// The catalog sequence when the counts were last written, which
+    /// orders them against a TRUNCATE.
+    relation_written: u64,
+    relation_dirty: bool,
+    /// The transaction whose commit journaled the counts, and their
+    /// revision then.
+    relation_staged: Option<(u32, u64)>,
+    /// A measurement found the index's layout outside the model.
+    relation_unmodelled: bool,
 }
 
 impl IndexCounterSlot {
@@ -30,12 +43,22 @@ impl IndexCounterSlot {
         reservations: 0,
         readers: 0,
         statistics: IndexCumulativeStatistics::EMPTY,
+        relation: None,
+        relation_revision: 0,
+        relation_written: 0,
+        relation_dirty: false,
+        relation_staged: None,
+        relation_unmodelled: false,
     };
 
     pub(super) fn reclaim(&mut self) {
         if !self.catalog_owned && self.reservations == 0 && self.readers == 0 {
             self.source = None;
             self.statistics = IndexCumulativeStatistics::EMPTY;
+            self.relation = None;
+            self.relation_dirty = false;
+            self.relation_staged = None;
+            self.relation_unmodelled = false;
         }
     }
 }
@@ -101,6 +124,10 @@ impl<const N: usize> IndexStatisticsAdmission<'_, N> {
                 let entry = &mut statistics.indexes[position];
                 entry.generation += 1;
                 entry.source = Some(source);
+                entry.relation = None;
+                entry.relation_dirty = false;
+                entry.relation_staged = None;
+                entry.relation_unmodelled = false;
                 entry.statistics = IndexCumulativeStatistics {
                     owner: Some(source.owner),
                     database: source.database,
@@ -382,5 +409,287 @@ impl Storage {
             },
             source,
         })
+    }
+}
+
+/// `pg_class.relpages` and `reltuples` of one index, which CREATE INDEX,
+/// REINDEX, VACUUM and ANALYZE overwrite in place (PostgreSQL's
+/// `vac_update_relstats`) and a later commit journals, and the layout of its
+/// pages the planner reads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct IndexRelationCounts {
+    pub(crate) pages: u32,
+    /// -1 until something counts the index's tuples.
+    pub(crate) tuples: f32,
+    pub(crate) layout: IndexLayout,
+}
+
+/// The pages an index's file holds, as last measured: its build's layout,
+/// never fewer pages than an earlier measurement found until a rebuild
+/// (PostgreSQL keeps deleted btree pages in the file).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IndexLayout {
+    pub(crate) pages: u64,
+    /// The root's level (`btm_level`).
+    pub(crate) height: u32,
+    pub(crate) leaves: u64,
+    /// [`Storage::relation_row_changes`] of the table when measured: the
+    /// layout describes the index while no row has changed since.
+    pub(crate) changes: u64,
+}
+
+/// One index's counts a commit journals.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IndexCountsImage {
+    pub(crate) database: DatabaseOid,
+    pub(crate) oid: i32,
+    pub(crate) counts: IndexRelationCounts,
+}
+
+impl Storage {
+    fn index_counter_position(
+        statistics: &CumulativeStatistics,
+        database: DatabaseOid,
+        oid: i32,
+    ) -> Option<usize> {
+        statistics.indexes.iter().position(|entry| {
+            entry.source.is_some()
+                && (entry.catalog_owned || entry.reservations != 0)
+                && entry.statistics.database == database
+                && entry.statistics.oid == oid
+        })
+    }
+
+    /// The relation counts of index `oid` of `database`, once something
+    /// counted them.
+    pub(crate) fn index_relation_counts(
+        &self,
+        database: DatabaseOid,
+        oid: i32,
+    ) -> Option<IndexRelationCounts> {
+        let statistics = self.cumulative_statistics();
+        Self::index_counter_position(&statistics, database, oid)
+            .and_then(|position| statistics.indexes[position].relation)
+    }
+
+    /// Overwrites the relation counts of index `oid` of the current
+    /// database in place; the next commit journals them.
+    pub(crate) fn set_index_relation_counts(
+        &self,
+        oid: i32,
+        counts: IndexRelationCounts,
+    ) -> Result<(), SqlError> {
+        let written = self.next_relation_counts_stamp()?;
+        let mut statistics = self.cumulative_statistics();
+        let position = Self::index_counter_position(&statistics, current_database(), oid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "index {} has no admitted statistics slot",
+                    oid
+                )
+            })?;
+        let entry = &mut statistics.indexes[position];
+        entry.relation_written = written;
+        entry.relation_revision = entry.relation_revision.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "index relation count revision exhausted"
+            )
+        })?;
+        entry.relation = Some(counts);
+        entry.relation_dirty = true;
+        Ok(())
+    }
+
+    /// The catalog sequence when index `oid` of the current database last
+    /// had its counts written (0 when never).
+    pub(crate) fn index_counts_written(&self, oid: i32) -> u64 {
+        let statistics = self.cumulative_statistics();
+        Self::index_counter_position(&statistics, current_database(), oid)
+            .map_or(0, |position| statistics.indexes[position].relation_written)
+    }
+
+    /// The first counter slot at or after `from` of an index of the current
+    /// database nothing has measured, its table's slot and the index OID.
+    pub(crate) fn next_unmeasured_index(&self, from: usize) -> Option<(usize, usize, i32)> {
+        let database = current_database();
+        let statistics = self.cumulative_statistics();
+        statistics
+            .indexes
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find_map(|(slot, entry)| {
+                let owner = entry.statistics.owner?;
+                (entry.source.is_some()
+                    && entry.relation.is_none()
+                    && !entry.relation_unmodelled
+                    && entry.statistics.database == database)
+                    .then(|| {
+                        let (IndexStatisticsOwner::Implicit(table)
+                        | IndexStatisticsOwner::Explicit(table)) = owner;
+                        (slot, usize::from(table), entry.statistics.oid)
+                    })
+            })
+    }
+
+    /// Records that index `oid` of the current database has a layout the
+    /// model does not measure, so later sweeps pass it by.
+    pub(crate) fn mark_index_counts_unmodelled(&self, oid: i32) {
+        let mut statistics = self.cumulative_statistics();
+        if let Some(position) = Self::index_counter_position(&statistics, current_database(), oid) {
+            statistics.indexes[position].relation_unmodelled = true;
+        }
+    }
+
+    /// Restores journaled or checkpointed counts, which need no journal.
+    pub(crate) fn restore_index_relation_counts(
+        &self,
+        database: DatabaseOid,
+        oid: i32,
+        counts: IndexRelationCounts,
+    ) -> Result<(), SqlError> {
+        if counts.tuples.is_nan() || counts.tuples < -1.0 || counts.layout.pages == 0 {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "invalid index relation counts"
+            ));
+        }
+        let mut statistics = self.cumulative_statistics();
+        let position =
+            Self::index_counter_position(&statistics, database, oid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "relation counts name unknown index {}",
+                    oid
+                )
+            })?;
+        let entry = &mut statistics.indexes[position];
+        entry.relation = Some(counts);
+        entry.relation_dirty = false;
+        Ok(())
+    }
+
+    /// The counter slot at or after `from` holding counts no commit has
+    /// journaled since they changed, their revision and the counts.
+    pub(crate) fn next_unjournaled_index_counts(
+        &self,
+        from: usize,
+    ) -> Option<(usize, u64, IndexCountsImage)> {
+        let statistics = self.cumulative_statistics();
+        let (slot, entry) = statistics
+            .indexes
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find(|(_, entry)| entry.relation_dirty && entry.relation.is_some())?;
+        Some((
+            slot,
+            entry.relation_revision,
+            IndexCountsImage {
+                database: entry.statistics.database,
+                oid: entry.statistics.oid,
+                counts: entry.relation?,
+            },
+        ))
+    }
+
+    /// Records that `transaction`'s commit carries revision `revision` of
+    /// the counts in counter slot `slot`.
+    pub(crate) fn stage_index_counts(&self, slot: usize, revision: u64, transaction: u32) {
+        let mut statistics = self.cumulative_statistics();
+        let entry = &mut statistics.indexes[slot];
+        if entry.relation_revision == revision {
+            entry.relation_staged = Some((transaction, revision));
+        }
+    }
+
+    /// Marks the counts `transaction` staged journaled once its commit is
+    /// durable, unless they changed since.
+    pub(crate) fn acknowledge_index_counts(&self, transaction: u32) {
+        let mut statistics = self.cumulative_statistics();
+        for entry in statistics.indexes.iter_mut() {
+            if let Some((staged_by, revision)) = entry.relation_staged
+                && staged_by == transaction
+            {
+                entry.relation_staged = None;
+                if revision == entry.relation_revision {
+                    entry.relation_dirty = false;
+                }
+            }
+        }
+    }
+
+    /// The rows `txid` and committed transactions have inserted, updated or
+    /// deleted in the table in slot `table`: an index layout measured at one
+    /// count describes the index until it moves.
+    pub(crate) fn relation_row_changes(&self, table: usize, txid: u32) -> u64 {
+        let committed = self.relation_cumulative_statistics(table);
+        let pending = self.relation_transaction_statistics(txid, table);
+        committed
+            .n_tup_ins
+            .saturating_add(committed.n_tup_upd)
+            .saturating_add(committed.n_tup_del)
+            .saturating_add(pending.n_tup_ins)
+            .saturating_add(pending.n_tup_upd)
+            .saturating_add(pending.n_tup_del)
+    }
+
+    /// Visits every admitted index's counts, for a checkpoint.
+    pub(crate) fn for_each_index_relation_counts(
+        &self,
+        each: &mut dyn FnMut(DatabaseOid, i32, IndexRelationCounts) -> Result<(), SqlError>,
+    ) -> Result<(), SqlError> {
+        let statistics = self.cumulative_statistics();
+        for entry in statistics.indexes.iter() {
+            if entry.catalog_owned
+                && let Some(counts) = entry.relation
+                && let Some(owner) = entry.statistics.owner
+                && self.index_counts_durable(owner, entry.statistics.database, entry.statistics.oid)
+            {
+                each(entry.statistics.database, entry.statistics.oid, counts)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a checkpoint saves index `oid`'s definition: a committed
+    /// index of a committed, non-temporary table.
+    fn index_counts_durable(
+        &self,
+        owner: IndexStatisticsOwner,
+        database: DatabaseOid,
+        oid: i32,
+    ) -> bool {
+        let (IndexStatisticsOwner::Implicit(table) | IndexStatisticsOwner::Explicit(table)) = owner;
+        let table = usize::from(table);
+        let identity = self.tables[table].identity();
+        if identity.database != database || !identity.existence.committed_exists() {
+            return false;
+        }
+        let definition = self.table_def(table, 0);
+        if definition.persistence == super::RelationPersistence::Temporary {
+            return false;
+        }
+        match owner {
+            IndexStatisticsOwner::Explicit(_) => self
+                .checkpoint_indexes()
+                .any(|(_, index)| index.relation_oid() == oid),
+            IndexStatisticsOwner::Implicit(_) => {
+                (0..definition.columns().len()).any(|column| {
+                    definition
+                        .column_index_identity(column)
+                        .is_some_and(|identity| identity.oid() == oid)
+                }) || definition.uniques().iter().any(|key| {
+                    key.index_identity
+                        .is_some_and(|identity| identity.oid() == oid)
+                }) || definition.exclusions().iter().any(|exclusion| {
+                    exclusion
+                        .index_identity
+                        .is_some_and(|identity| identity.oid() == oid)
+                })
+            }
+        }
     }
 }

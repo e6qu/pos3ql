@@ -2136,15 +2136,30 @@ pub(super) fn add_paths(
 /// `set_cheapest`: the lowest total cost, then startup cost, then the
 /// longer pathkeys; the first on a tie.
 fn cheapest_total(paths: &[Option<Candidate>]) -> Option<Candidate> {
-    paths.iter().flatten().copied().reduce(|best, path| {
-        let order = path
-            .disabled
-            .cmp(&best.disabled)
-            .then(path.total.total_cmp(&best.total))
-            .then(path.startup.total_cmp(&best.startup))
-            .then(best.presorted.cmp(&path.presorted));
-        if order.is_lt() { path } else { best }
-    })
+    cheapest_total_at(paths).and_then(|at| paths[at])
+}
+
+/// The position of [`cheapest_total`]'s path among `paths`.
+fn cheapest_total_at(paths: &[Option<Candidate>]) -> Option<usize> {
+    let mut best: Option<(usize, Candidate)> = None;
+    for (at, path) in paths.iter().enumerate() {
+        let Some(path) = *path else { continue };
+        best = match best {
+            Some((_, held))
+                if !path
+                    .disabled
+                    .cmp(&held.disabled)
+                    .then(path.total.total_cmp(&held.total))
+                    .then(path.startup.total_cmp(&held.startup))
+                    .then(held.presorted.cmp(&path.presorted))
+                    .is_lt() =>
+            {
+                best
+            }
+            _ => Some((at, path)),
+        };
+    }
+    best.map(|(at, _)| at)
 }
 
 /// `estimate_num_groups` of the relation's `columns` over its `rows`.
@@ -2446,7 +2461,17 @@ pub(crate) fn scan_path<'a>(
     let mut layouts = [(1.0, 0u32, 1.0, false); MAX_INDEXES];
     for (position, index) in planner.indexes.iter().enumerate() {
         if index.catalog.method == IndexAccessMethod::Btree {
-            layouts[position] = super::btree_layout(&planner, index, entries);
+            let (pages, height, leaves, deduplicated) =
+                super::btree_layout(&planner, index, entries);
+            layouts[position] = match super::measured_layout(storage, slot, txid, &index.catalog) {
+                Some(layout) => (
+                    layout.pages as f64,
+                    layout.height,
+                    layout.leaves as f64,
+                    deduplicated,
+                ),
+                None => (pages, height, leaves, deduplicated),
+            };
         }
     }
     let indexes = arena
@@ -2584,8 +2609,8 @@ pub(crate) fn scan_path<'a>(
         Err(clauses::CONTRADICTION) => return Ok(Planned::NotTable),
         Err(shape) => return Ok(Planned::Outside(shape)),
     };
-    // The join clauses, each `column = value` of a value unknown until
-    // the outer row is read, costing one operator.
+    // The join clauses, each comparing with a value unknown until the
+    // outer row is read.
     let join_params = arena
         .alloc_slice_with(join_count, |_| None::<Restriction<'a>>)
         .map_err(|_| crate::sql::eval::arena_full())?;
@@ -2594,6 +2619,9 @@ pub(crate) fn scan_path<'a>(
             Ok(restriction) => restriction,
             Err(shape) => return Ok(Planned::Outside(shape)),
         };
+        // A column, or an expression of the relation's columns, compared
+        // with the other relation's value; its cost is the whole clause's
+        // (`cost_qual_eval`).
         if !matches!(
             restriction.clause,
             Clause::Compare {
@@ -2606,17 +2634,11 @@ pub(crate) fn scan_path<'a>(
                 constant: None,
                 pattern: false,
                 ..
-            }
+            } | Clause::Expression { bound: None, .. }
         ) {
             return Ok(Planned::Outside("a join clause the model does not read"));
         }
-        join_params[at] = Some(Restriction {
-            cost: QualCost {
-                startup: 0.0,
-                per_tuple: planner.costs.cpu_operator,
-            },
-            ..restriction
-        });
+        join_params[at] = Some(restriction);
     }
     let join_params = &*arena
         .alloc_slice_with(join_count, |at| {
@@ -2687,13 +2709,16 @@ pub(crate) fn scan_path<'a>(
         };
         let (pages, height, leaves, deduplicated) =
             super::btree_layout(&planner, &planner.indexes[position], entries);
-        partial_layouts[position] = Some((
-            pages,
-            height,
-            leaves,
-            deduplicated,
-            entries.min(size.tuples),
-        ));
+        let catalog = &planner.indexes[position].catalog;
+        let (pages, height, leaves) = match super::measured_layout(storage, slot, txid, catalog) {
+            Some(layout) => (layout.pages as f64, layout.height, layout.leaves as f64),
+            None => (pages, height, leaves),
+        };
+        // `estimate_rel_size` of the index: its counted tuple density over
+        // its pages, the metapage left out.
+        let tuples = super::partial_index_tuples(&planner, catalog, pages);
+        partial_layouts[position] =
+            Some((pages, height, leaves, deduplicated, tuples.min(size.tuples)));
     }
     // The restrictions each usable predicate implies (`indrestrictinfo`); a
     // write's target keeps them all.
@@ -3497,7 +3522,8 @@ fn grouped<'a>(
         .map_err(|_| crate::sql::eval::arena_full())?;
     let mut final_paths = [None::<Candidate>; MAX_CANDIDATES];
     let final_count = add_paths(limited, consider_startup, &mut final_paths);
-    let chosen = cheapest_total(&final_paths[..final_count]).expect("an ordered path is kept");
+    let chosen = cheapest_fractional(&final_paths[..final_count], shape.cursor.value())
+        .expect("an ordered path is kept");
     let hashed_chosen = chosen.presorted == 0;
     let aggregate = grouped_paths
         .iter()
@@ -4224,11 +4250,37 @@ fn join_index_paths<'a>(
     Ok(Ok(()))
 }
 
-/// `rel->consider_startup`: a `LIMIT` gives the query a tuple fraction.
+/// `rel->consider_startup`: a `LIMIT` or a cursor gives the query a tuple
+/// fraction.
 fn consider_startup(shape: QueryShape) -> bool {
-    shape
-        .limit
-        .is_some_and(|(count, _)| count.is_some_and(|count| count > 0.0))
+    super::root_tuple_fraction(shape.cursor, shape.limit) > 0.0
+}
+
+/// `get_cheapest_fractional_path`: the cheapest total path, unless another
+/// returns `fraction` of its rows cheaper (`compare_fractional_path_costs`),
+/// fewer disabled nodes first; the earliest such path wins a tie.
+fn cheapest_fractional(paths: &[Option<Candidate>], fraction: f64) -> Option<Candidate> {
+    let cheapest = cheapest_total_at(paths)?;
+    let mut best = paths[cheapest].expect("the cheapest path is kept");
+    if fraction <= 0.0 {
+        return Some(best);
+    }
+    let cost = |path: &Candidate| path.startup + fraction * (path.total - path.startup);
+    for (at, path) in paths.iter().enumerate() {
+        let Some(path) = path else { continue };
+        if at == cheapest {
+            continue;
+        }
+        let better = if path.disabled != best.disabled {
+            path.disabled < best.disabled
+        } else {
+            cost(path) < cost(&best)
+        };
+        if better {
+            best = *path;
+        }
+    }
+    Some(best)
 }
 
 /// The path the query chooses above a relation's `kept` paths, and the
@@ -4360,7 +4412,8 @@ pub(super) fn upper_paths(
         .map_err(|_| crate::sql::eval::arena_full())?;
     let mut final_paths = [None::<Candidate>; MAX_CANDIDATES];
     let final_paths_count = add_paths(limited, consider_startup, &mut final_paths);
-    let chosen = cheapest_total(&final_paths[..final_paths_count]).expect("a path is kept");
+    let chosen = cheapest_fractional(&final_paths[..final_paths_count], shape.cursor.value())
+        .expect("a path is kept");
     // The scan's own costs, under any sort and limit.
     let scan = kept
         .iter()

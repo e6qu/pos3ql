@@ -91,9 +91,17 @@ pub(crate) struct PathScan<'a> {
     bitmap_node: instrument::Node,
     tree_nodes: &'a [instrument::Node],
     loops: Option<ExecutionLoops<'a>>,
+    /// The rows the scan's `Filter` removed since [`Self::take_removed`]
+    /// last read them, counted as its node counts them.
+    removed: core::cell::Cell<u64>,
 }
 
 impl<'a> PathScan<'a> {
+    /// The rows the scan's `Filter` removed since the last call.
+    pub(crate) fn take_removed(&self) -> u64 {
+        self.removed.replace(0)
+    }
+
     /// The scan of `from`, a plain table, by `path` under `condition`.
     /// Its nodes count in the current `EXPLAIN ANALYZE` block. The first
     /// call to [`Self::next`] after [`Self::rescan`] starts an execution.
@@ -222,6 +230,7 @@ impl<'a> PathScan<'a> {
             bitmap_node,
             tree_nodes,
             loops: None,
+            removed: core::cell::Cell::new(0),
         })
     }
 
@@ -637,6 +646,7 @@ impl<'a> PathScan<'a> {
         {
             if chosen_path_reaches(self.counts, rowid, false, arena, params, &chained, hooks)? {
                 self.scan_node.filtered();
+                self.removed.set(self.removed.get() + 1);
             }
             return Ok(false);
         }

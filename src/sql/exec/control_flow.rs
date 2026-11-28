@@ -444,7 +444,7 @@ enum ExecutionProgress<'a> {
 impl ExecutionProgress<'_> {
     fn return_value(&self) -> Option<Datum<'_>> {
         match self {
-            Self::Flow(TriggerFlow::Return(TriggerReturnValue::Value(value))) => Some(*value),
+            Self::Flow(TriggerFlow::Return(TriggerReturnValue::Value(value, _))) => Some(*value),
             _ => None,
         }
     }
@@ -461,7 +461,9 @@ impl ExecutionProgress<'_> {
                     TriggerReturnValue::Old => TriggerReturnValue::Old,
                     TriggerReturnValue::Null => TriggerReturnValue::Null,
                     TriggerReturnValue::Void => TriggerReturnValue::Void,
-                    TriggerReturnValue::Value(_) => TriggerReturnValue::Value(Datum::Null),
+                    TriggerReturnValue::Value(_, form) => {
+                        TriggerReturnValue::Value(Datum::Null, form)
+                    }
                 }),
             }),
             Self::Error(error) => ExecutionProgress::Error(error),
@@ -646,7 +648,7 @@ impl SuspendedControlFrames {
                     return Err((saved, error));
                 }
             };
-            let ExecutionProgress::Flow(TriggerFlow::Return(TriggerReturnValue::Value(slot))) =
+            let ExecutionProgress::Flow(TriggerFlow::Return(TriggerReturnValue::Value(slot, _))) =
                 &mut frames.progress
             else {
                 unreachable!("saved return value belongs to its unfinished return")

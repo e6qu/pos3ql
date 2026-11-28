@@ -100,6 +100,10 @@ BEGIN
   SELECT big INTO b FROM pv WHERE id = 1;
   CALL psize_proc(b);
   CALL psize_proc(b || '');
+  -- EXECUTE passes each USING value's datum on as it is held.
+  EXECUTE 'CALL psize_proc($1)' USING b;
+  EXECUTE 'CALL psize_proc($1)' USING b || '';
+  EXECUTE 'CALL psize_proc($1)' USING 'lit'::text;
 END $$;
 -- A value a query forms is held as its result tuple formed it, and a
 -- FETCH reads a cursor's row as its query gave it.

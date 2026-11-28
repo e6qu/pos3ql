@@ -327,6 +327,7 @@ impl ParseError {
     }
 }
 
+mod analyze_options;
 mod copy_options;
 mod expr;
 mod typmod;
@@ -3354,6 +3355,7 @@ impl<'a> Parser<'a> {
                 grouping: grouping_written,
             },
             minmax_subquery: None,
+            cursor_fraction: crate::sql::ast::CursorFraction::ALL,
         })
     }
 
@@ -3631,6 +3633,7 @@ impl<'a> Parser<'a> {
                 ..crate::sql::ast::WrittenQuery::PLAIN
             },
             minmax_subquery: None,
+            cursor_fraction: crate::sql::ast::CursorFraction::ALL,
         })
     }
 
@@ -3663,6 +3666,7 @@ impl<'a> Parser<'a> {
                 locking: query.locking,
                 written: crate::sql::ast::WrittenQuery::PLAIN,
                 minmax_subquery: None,
+                cursor_fraction: crate::sql::ast::CursorFraction::ALL,
             }),
             _ => Err(self.err_here("query must end in SELECT, TABLE, or VALUES")),
         }
@@ -3746,6 +3750,7 @@ impl<'a> Parser<'a> {
                 locking: &[],
                 written: crate::sql::ast::WrittenQuery::PLAIN,
                 minmax_subquery: None,
+                cursor_fraction: crate::sql::ast::CursorFraction::ALL,
             })
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         let mut ctes = ArenaList::new(self.arena);
@@ -4068,6 +4073,7 @@ impl<'a> Parser<'a> {
                         ..crate::sql::ast::WrittenQuery::PLAIN
                     },
                     minmax_subquery: None,
+                    cursor_fraction: crate::sql::ast::CursorFraction::ALL,
                 },
             };
             let boxed = self
@@ -4128,6 +4134,7 @@ impl<'a> Parser<'a> {
                         ..crate::sql::ast::WrittenQuery::PLAIN
                     },
                     minmax_subquery: None,
+                    cursor_fraction: crate::sql::ast::CursorFraction::ALL,
                 };
                 let leaf = self.alloc_set(SetTree::Select(
                     self.arena
@@ -4218,6 +4225,7 @@ impl<'a> Parser<'a> {
                 locking: &[],
                 written: crate::sql::ast::WrittenQuery::PLAIN,
                 minmax_subquery: None,
+                cursor_fraction: crate::sql::ast::CursorFraction::ALL,
             };
             return self.alloc_set(SetTree::Select(
                 self.arena
@@ -5306,6 +5314,7 @@ impl<'a> Parser<'a> {
                 locking: &[],
                 written: crate::sql::ast::WrittenQuery::PLAIN,
                 minmax_subquery: None,
+                cursor_fraction: crate::sql::ast::CursorFraction::ALL,
             })
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         Ok(TableRef {
@@ -5694,118 +5703,22 @@ impl<'a> Parser<'a> {
     /// table with an optional column list.
     fn vacuum_or_analyze(&mut self, is_vacuum: bool) -> Result<Stmt<'a>, ParseError> {
         self.advance()?; // the VACUUM / ANALYZE keyword
-        let mut options = crate::sql::ast::VacuumOptions {
-            analyze: !is_vacuum,
-            ..crate::sql::ast::VacuumOptions::DEFAULT
-        };
-        let mut saw_full = false;
-        let mut saw_analyze = false;
+        let mut written = analyze_options::WrittenMaintenanceOptions::new(is_vacuum);
         if self.eat_op("(")? {
-            loop {
-                let option = self.any_ident("VACUUM option")?;
-                let value = {
-                    let _ = self.eat_op("=")?;
-                    self.explain_bool()?
-                };
-                if option.eq_ignore_ascii_case("full") && is_vacuum {
-                    if core::mem::replace(&mut saw_full, true) {
-                        return Err(self.err_here("VACUUM option FULL specified more than once"));
-                    }
-                    options.full = value;
-                } else if (option.eq_ignore_ascii_case("analyze")
-                    || option.eq_ignore_ascii_case("analyse"))
-                    && is_vacuum
-                {
-                    if core::mem::replace(&mut saw_analyze, true) {
-                        return Err(self.err_here("VACUUM option ANALYZE specified more than once"));
-                    }
-                    options.analyze = value;
-                } else {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(
-                            PARSE_MESSAGE_BYTES,
-                            "unsupported {} option \"{}\"",
-                            if is_vacuum { "VACUUM" } else { "ANALYZE" },
-                            option
-                        ),
-                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                        cursor: None,
-                        hint: None,
-                        near: None,
-                        detail: None,
-                    });
-                }
-                if self.eat_op(")")? {
-                    break;
-                }
-                self.expect_op(",")?;
-            }
+            self.maintenance_options(&mut written, is_vacuum)?;
         } else {
-            loop {
-                if self.eat_ident("full")? && is_vacuum {
-                    if core::mem::replace(&mut saw_full, true) {
-                        return Err(self.err_here("VACUUM option FULL specified more than once"));
-                    }
-                    options.full = true;
-                    continue;
+            // `VACUUM opt_full opt_freeze opt_verbose opt_analyze` and
+            // `ANALYZE opt_verbose`, in that order.
+            let words: &[&str] = if is_vacuum {
+                &["full", "freeze", "verbose", "analyze"]
+            } else {
+                &["verbose"]
+            };
+            for &word in words {
+                let at = self.peek_at;
+                if self.eat_ident(word)? || (word == "analyze" && self.eat_ident("analyse")?) {
+                    written.write(word, copy_options::Argument::Absent, at, is_vacuum);
                 }
-                if self.eat_ident("analyze")? || self.eat_ident("analyse")? {
-                    if !is_vacuum {
-                        return Err(ParseError {
-                            at: self.peek_at,
-                            message: stack_format!(
-                                PARSE_MESSAGE_BYTES,
-                                "unsupported ANALYZE option \"ANALYZE\""
-                            ),
-                            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                            cursor: None,
-                            hint: None,
-                            near: None,
-                            detail: None,
-                        });
-                    }
-                    if core::mem::replace(&mut saw_analyze, true) {
-                        return Err(self.err_here("VACUUM option ANALYZE specified more than once"));
-                    }
-                    options.analyze = true;
-                    continue;
-                }
-                if matches!(
-                    self.peeked,
-                    Tok::Ident(
-                        "full"
-                            | "freeze"
-                            | "verbose"
-                            | "skip_locked"
-                            | "disable_page_skipping"
-                            | "index_cleanup"
-                            | "process_main"
-                            | "process_toast"
-                            | "truncate"
-                            | "parallel"
-                            | "skip_database_stats"
-                            | "only_database_stats"
-                            | "buffer_usage_limit"
-                    )
-                ) {
-                    let option = self.any_ident("maintenance option")?;
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(
-                            PARSE_MESSAGE_BYTES,
-                            "unsupported {} option \"{}\"",
-                            if is_vacuum { "VACUUM" } else { "ANALYZE" },
-                            option
-                        ),
-                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                        cursor: None,
-                        hint: None,
-                        near: None,
-                        detail: None,
-                    });
-                }
-                break;
             }
         }
         // An optional table list, each with an optional column list.
@@ -5856,11 +5769,28 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        if !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+            return Err(self.syntax_error_here());
+        }
         let targets = self.arena_slice(&targets[..target_count])?;
+        let written = written.checked(
+            is_vacuum,
+            !targets.is_empty(),
+            targets.iter().any(|target| !target.columns.is_empty()),
+        )?;
         Ok(if is_vacuum {
-            Stmt::Vacuum { targets, options }
+            Stmt::Vacuum {
+                targets,
+                options: crate::sql::ast::VacuumOptions {
+                    skip_locked: written.analyze.skip_locked,
+                    ..written.vacuum
+                },
+            }
         } else {
-            Stmt::Analyze(targets)
+            Stmt::Analyze {
+                targets,
+                options: written.analyze,
+            }
         })
     }
 

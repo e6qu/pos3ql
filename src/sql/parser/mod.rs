@@ -5769,6 +5769,9 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        if !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+            return Err(self.syntax_error_here());
+        }
         let targets = self.arena_slice(&targets[..target_count])?;
         let written = written.checked(
             is_vacuum,

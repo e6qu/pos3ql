@@ -54680,16 +54680,16 @@ fn vacuum_and_analyze() {
             "{cmd}: {text}"
         );
     }
-    for cmd in [
-        "VACUUM PROCESS_MAIN vt",
-        "VACUUM SKIP_DATABASE_STATS",
-        "VACUUM ONLY_DATABASE_STATS",
+    for (command, sqlstate) in [
+        ("VACUUM PROCESS_MAIN vt", "42601"),
+        ("VACUUM SKIP_DATABASE_STATS", "42P01"),
+        ("VACUUM ONLY_DATABASE_STATS", "42P01"),
     ] {
-        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
-        assert!(text.contains("42601"), "{cmd}: {text}");
+        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, command)).to_string();
+        assert!(text.contains(sqlstate), "{command}: {text}");
     }
     for cmd in [
-        "VACUUM VERBOSE FREEZE vt",
+        "VACUUM FREEZE VERBOSE vt",
         "VACUUM (VERBOSE) vt",
         "ANALYZE (VERBOSE) vt",
         "ANALYZE VERBOSE vt",

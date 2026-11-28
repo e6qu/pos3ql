@@ -59,6 +59,7 @@ VACUUM vo (a);
 VACUUM (ANALYZE false) vo (a);
 VACUUM (FREEZE) vo (a);
 VACUUM (foo) missing_table;
+VACUUM (foo) vo extra;
 VACUUM (skip_locked) missing_table;
 VACUUM PROCESS_MAIN vo;
 VACUUM FREEZE FULL vo;

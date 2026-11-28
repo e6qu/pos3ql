@@ -88,6 +88,11 @@ pub(crate) enum RowForms<'c> {
     /// A row whose source does not record its forms: a value TOAST may have
     /// stored otherwise is not modelled.
     Unrecorded,
+    /// A row formed anew from values that hold no stored form: a view's row
+    /// a whole-row reference flattens (`toast_build_flattened_tuple`), or a
+    /// foreign table's row its wrapper builds from the remote text. Every
+    /// value is as `heap_form_tuple` forms it.
+    Formed,
 }
 
 impl RowForms<'_> {
@@ -114,6 +119,7 @@ impl RowForms<'_> {
                     *form = DatumForm::Stored(*stored);
                 }
             }
+            Self::Formed => forms.fill(DatumForm::Stored(StoredForm::Inline)),
             Self::Unrecorded => {
                 for (form, value) in forms.iter_mut().zip(values) {
                     *form = DatumForm::Stored(crate::sql::toast::uncarried_form(value));
@@ -188,10 +194,12 @@ pub(crate) struct ImageForms<'c> {
 }
 
 impl<'c> ImageForms<'c> {
-    /// Neither row records its forms.
-    pub(crate) const UNRECORDED: Self = Self {
-        old: RowForms::Unrecorded,
-        new: RowForms::Unrecorded,
+    /// A foreign table's rows, which its wrapper forms from the remote
+    /// text: the row read and, for an `AFTER` trigger, the row the remote
+    /// write returned.
+    pub(crate) const FOREIGN: Self = Self {
+        old: RowForms::Formed,
+        new: RowForms::Formed,
     };
 
     /// An `INSERT`: a new row the write forms.
@@ -210,6 +218,16 @@ impl<'c> ImageForms<'c> {
     ) -> Self {
         Self {
             old: RowForms::Stored(old),
+            new: RowForms::Written(carried),
+        }
+    }
+
+    /// An `INSTEAD OF` firing on a view's row: `OLD` is the view's row
+    /// flattened, `NEW` (absent for a `DELETE`) the row the write forms, its
+    /// unassigned values `OLD`'s.
+    pub(crate) const fn instead_of(carried: &'c crate::sql::toast::CarriedForms) -> Self {
+        Self {
+            old: RowForms::Formed,
             new: RowForms::Written(carried),
         }
     }

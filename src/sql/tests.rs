@@ -54671,16 +54671,26 @@ fn vacuum_and_analyze() {
         "VACUUM FULL vt",
         "VACUUM (FULL, ANALYZE) vt",
         "VACUUM ANALYZE vt, vt",
-    ] {
-        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
-        assert!(text.contains("VACUUM"), "{cmd}: {text}");
-    }
-    for cmd in [
         "VACUUM FREEZE vt",
         "VACUUM (SKIP_LOCKED) vt",
+    ] {
+        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
+        assert!(
+            text.contains("VACUUM") && !text.contains("ERROR"),
+            "{cmd}: {text}"
+        );
+    }
+    for cmd in [
         "VACUUM PROCESS_MAIN vt",
         "VACUUM SKIP_DATABASE_STATS",
         "VACUUM ONLY_DATABASE_STATS",
+    ] {
+        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
+        assert!(text.contains("42601"), "{cmd}: {text}");
+    }
+    for cmd in [
+        "VACUUM VERBOSE FREEZE vt",
+        "VACUUM (VERBOSE) vt",
         "ANALYZE (VERBOSE) vt",
         "ANALYZE VERBOSE vt",
     ] {

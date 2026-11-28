@@ -354,16 +354,16 @@ struct LazyPages<'a> {
 }
 
 /// Counts an execution of the index scan `lazy` a join read in part:
-/// `fetched` rows, and by `pages` the index entry and heap page of each
+/// `fetched` rows and those its filter `removed`, and by `pages` the index entry and heap page of each
 /// fetched row of identity `rowids`.
 fn count_read_in_part(
     lazy: super::instrument::Node,
     pages: Option<LazyPages<'_>>,
-    fetched: usize,
+    (fetched, removed): (usize, u64),
     rowids: impl Iterator<Item = Option<u64>>,
 ) {
     let _scan = lazy.start();
-    lazy.rows(fetched as u64);
+    lazy.add_counted(fetched as u64, removed);
     let Some(pages) = pages else {
         return;
     };
@@ -1537,10 +1537,12 @@ impl<'r, 'a> JoinContext<'r, 'a> {
         })
     }
 
-    /// Whether the join can count an index scan of `rel` read in part: an
-    /// index or index-only scan without a filter, whose rows are each one
-    /// fetch.
-    fn counts_lazily(&self, rel: usize, path: u16) -> Result<bool, SqlError> {
+    /// Whether the join can count an index scan of `rel` read in part, and
+    /// whether it filters: an index or index-only scan without a filter,
+    /// whose rows are each one fetch, or an index scan with one when its
+    /// pages are not counted, whose fetches count the rows its filter
+    /// removed before them.
+    fn counts_lazily(&self, rel: usize, path: u16) -> Result<Option<bool>, SqlError> {
         let modeled = self.model.rels[rel];
         let scan = modeled.scan(self.storage, self.txid, path, self.params, self.arena)?;
         let conjuncts = modeled.restriction.map_or(0, |restriction| {
@@ -1549,10 +1551,16 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             super::plan::flatten_and(restriction, &mut parts, &mut count);
             count
         });
-        Ok(matches!(
-            scan.path.kind,
-            super::index_paths::ScanKind::Index | super::index_paths::ScanKind::IndexOnly
-        ) && scan.path.absorbed.len() == conjuncts)
+        let filtered = scan.path.absorbed.len() != conjuncts;
+        Ok(match scan.path.kind {
+            super::index_paths::ScanKind::Index
+                if !filtered || !super::instrument::buffers_counted() =>
+            {
+                Some(filtered)
+            }
+            super::index_paths::ScanKind::IndexOnly if !filtered => Some(false),
+            _ => None,
+        })
     }
 
     /// Whether two Memoize keys are equal: NULLs equal each other.
@@ -1647,7 +1655,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
         keys: &[&[Datum<'a>]],
         sizes: &[(usize, usize)],
         members: &[(usize, usize)],
-    ) -> Result<&'a [u32], SqlError> {
+    ) -> Result<(&'a [u32], super::instrument::SortSpace), SqlError> {
         let compare = |a: u32, b: u32| -> Result<Ordering, SqlError> {
             for (at, &member) in members.iter().enumerate() {
                 let (one, two) = (&keys[a as usize][at], &keys[b as usize][at]);
@@ -1669,7 +1677,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             }
             Ok(Ordering::Equal)
         };
-        let (order, _) = self.tuplesort((input, members), sizes, &mut |a, b| compare(a, b))?;
+        let (order, space) = self.tuplesort((input, members), sizes, &mut |a, b| compare(a, b))?;
         let kept = self
             .arena
             .alloc_slice_with(order.len(), |_| 0u32)
@@ -1682,7 +1690,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             kept[count] = at;
             count += 1;
         }
-        Ok(&kept[..count])
+        Ok((&kept[..count], space))
     }
 
     /// A `HashAggregate` making a semi join's inner relation unique: the
@@ -1698,7 +1706,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
         keys: &[&[Datum<'a>]],
         members: &[(usize, usize)],
         groups: f64,
-    ) -> Result<&'a [u32], SqlError> {
+    ) -> Result<(&'a [u32], super::hashagg::HashAggFigures), SqlError> {
         let width = self.model.plan.path(input).width;
         let row_hash = |row: usize| -> Result<u32, SqlError> {
             let mut hash = 0u32;
@@ -1769,7 +1777,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             .arena
             .alloc_slice_with(keys.len(), |_| 0u32)
             .map_err(|_| arena_full())?;
-        let (count, _) = super::hashagg::hashed_row_order(
+        let (count, figures) = super::hashagg::hashed_row_order(
             self.storage.plan_build(),
             sizing,
             hashes,
@@ -1777,7 +1785,7 @@ impl<'r, 'a> JoinContext<'r, 'a> {
             same,
             order,
         )?;
-        Ok(&order[..count])
+        Ok((&order[..count], figures))
     }
 
     /// The order of rows whose sort key values each row of `keys` holds

@@ -751,6 +751,15 @@ impl PathNodes {
             ),
             PathKind::Material { .. } => (node(Role::Materialize, id), [none; 2], none),
             PathKind::Memoize { .. } => (node(Role::Memoize, id), [none; 2], none),
+            PathKind::Unique { method, .. }
+                if method != super::super::index_paths::joins::UniqueMethod::Noop =>
+            {
+                (
+                    node(Role::JoinUnique, id),
+                    [node(Role::JoinUniqueSort, id), none],
+                    none,
+                )
+            }
             PathKind::Scan { .. } | PathKind::Unique { .. } | PathKind::Dummy => {
                 (none, [none; 2], none)
             }
@@ -962,7 +971,7 @@ impl<'a, M: Borrow<ModeledJoin<'a>>> ModeledPull<'a, M> {
                         let cx = JoinContext::new(
                             storage, scope, txid, model, arena, params, hooks, &layout,
                         );
-                        record.count_inner_in_part(cx, block, inner)?;
+                        record.count_inner_in_part(cx, &space, block, inner)?;
                     }
                     Record::MergeJoin(record)
                 }
@@ -1611,18 +1620,42 @@ impl<'a> Step<'_, '_, 'a> {
         let Record::Unique { rows, at, mark } = &mut self.records[id as usize] else {
             unreachable!("a unique's record");
         };
+        let nodes = &self.nodes[id as usize];
+        let hashed = method == super::super::index_paths::joins::UniqueMethod::Hash;
         if !rows.arranged {
             let (members, count) = JoinContext::unique_members(keys);
             let members = &members[..count];
-            if method == super::super::index_paths::joins::UniqueMethod::Hash {
+            if hashed {
+                let mut figures = None;
                 rows.arrange(cx, members, input, |held, _| {
                     cx.unique_hashed_order(input, held, members, groups)
+                        .map(|(order, counted)| {
+                            figures = Some(counted);
+                            order
+                        })
                 })?;
+                if let Some(figures) = figures {
+                    nodes.rows.hash_agg_figures(figures);
+                }
             } else {
+                let mut space = None;
                 rows.arrange(cx, members, input, |held, sizes| {
                     cx.unique_order(input, held, sizes, members)
+                        .map(|(order, sorted)| {
+                            space = Some(sorted);
+                            order
+                        })
                 })?;
+                if let Some(space) = space {
+                    nodes.sides[0].sorted(space);
+                }
             }
+        }
+        // Each execution's first fetch reads the `Sort` under a `Unique`
+        // whole: it returns every input row.
+        if !hashed && *at == 0 {
+            let _sort = nodes.sides[0].start();
+            nodes.sides[0].rows((rows.store.entries.len() / rows.width) as u64);
         }
         Self::release(cx.arena, self.keep, mark);
         if *at >= rows.len() {

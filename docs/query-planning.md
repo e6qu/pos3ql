@@ -169,7 +169,10 @@ plan. Covered:
   holds both scans' conditions and `IS NOT NULL` of each joined column not
   declared `NOT NULL` (`976`); `EXPLAIN` of such a join whose scans an
   expression class member or a subquery reads fails with `0A000`; inequality and `OR` join conditions
-  (`neqjoinsel`, `clauselist_selectivity_or`, `852`);
+  (`neqjoinsel`, `clauselist_selectivity_or`, `852`), also comparing one
+  relation's column or expression with another's (`a.v <> b.id % 7`,
+  `a.v < b.id * 2`: `neqjoinsel` over the expression's default distinct
+  count, `scalarltjoinsel`), whose outer side keys a `Memoize` (`1001`);
   `extract_restriction_or_clauses` (`883`); cross-type integer and float keys
   (`882`).
 - `EXISTS`, `NOT EXISTS`, `IN` and `ANY` subqueries pulled up as semi and anti
@@ -248,8 +251,10 @@ items joined by equalities hash the second (`811`); later items join in
 nested loops. `EXPLAIN` with costs of such a join fails with `0A000` naming the
 join node (`810`); `COSTS OFF` prints the tree pos3ql runs. A query of
 analyzed tables reading a shape the search cannot plan (a full join's merged
-column, a `USING` join beside a parenthesized one) fails with `0A000` rather
-than run that order.
+column, a `USING` join beside a parenthesized one, a shape the search
+itself declines) fails with `0A000` rather than run that order, and
+`EXPLAIN` of any other join of analyzed tables outside the model fails with
+`0A000` rather than print it (`1001`).
 
 An `UPDATE ... FROM` or `DELETE ... USING` of one plain analyzed FROM table
 without an index on the columns its conditions read runs the hash join or
@@ -332,10 +337,12 @@ general executor restarts the statement.
   compiler rejects a node that would keep one.
 
 Every join the model plans has keys whose type `datum_hash` hashes: a join
-clause over any other type is outside the model. `EXPLAIN ANALYZE` of a
-semi join whose inner relation is made unique (`Unique` or `HashAggregate`)
-fails with `0A000`, as does one whose `LATERAL` subquery its join stops
-reading early. Joins outside the search run in the retained reader's own
+clause over any other type is outside the model. Under `EXPLAIN ANALYZE`
+a semi join's unique-ified relation reports its `HashAggregate`'s batches
+and memory or its `Sort`'s method and memory, and a merge join's inner
+index scan read in part counts the rows its filter removed before each row
+the join fetched (`1002`); with `BUFFERS` such a filtered scan, and a join
+stopping early in a `LATERAL` subquery it read whole, fail with `0A000`. Joins outside the search run in the retained reader's own
 nested-loop and hash levels, in FROM order, up to eight items.
 [PLAN.md](../PLAN.md#pause-and-resume-every-query-path) lists the work
 that moves every plan onto pull nodes.

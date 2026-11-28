@@ -1611,6 +1611,10 @@ models the same forms:
   `char(3)` reads 6). A value a query forms anew, such as `SELECT big || ''
   INTO w`, reads 3004 through `FOR`, `EXECUTE ... INTO` and `FETCH`, and a
   cursor's rows keep the forms its query gave them (`992`).
+- `UPDATE ... FROM` and `MERGE` keep the source column's stored form as it
+  reaches a row trigger. View triggers receive a flattened `OLD` row and
+  the written forms in `NEW`. A row moved to another partition carries its
+  value forms into the destination's insert triggers (`1014`).
 
 Forms pos3ql does not carry yet fail with `0A000` wherever the form decides a
 size; [PLAN.md](../PLAN.md#close-application-compatibility-gaps) lists them.

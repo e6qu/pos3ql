@@ -60,6 +60,9 @@ pub(super) struct MergeRecord<'a> {
     /// but counts as far as it fetched: its node and the pages it counts,
     /// or `None` for an inner input in order the join cannot count so.
     in_part: Option<Option<(instrument::Node, Option<LazyPages<'a>>)>>,
+    /// For such a scan with a filter, the rows the filter removed before
+    /// each kept row, and after the last.
+    removed_before: Option<(NodeList<'a, u64>, u64)>,
 }
 
 /// What one execution of a merge join fetched from the inputs it keeps in
@@ -71,6 +74,9 @@ struct Counts<'a> {
     inner_reached: usize,
     /// The inner input was fetched from.
     inner_opened: bool,
+    /// The rows an inner scan read in part removed by its filter before
+    /// the rows fetched.
+    inner_removed: u64,
     /// The tuplestore of a `Materialize` over the inner input, replayed
     /// over each inner row's `t_len` in fetch order.
     material: Option<(
@@ -85,6 +91,7 @@ impl Counts<'_> {
         inner_fetches: 0,
         inner_reached: 0,
         inner_opened: false,
+        inner_removed: 0,
         material: None,
     };
 }
@@ -121,6 +128,7 @@ impl<'a> MergeRecord<'a> {
                 .map_err(|_| arena_full())?,
             counts: Counts::NONE,
             in_part: None,
+            removed_before: None,
         })
     }
 
@@ -130,11 +138,19 @@ impl<'a> MergeRecord<'a> {
     pub(super) fn count_inner_in_part(
         &mut self,
         cx: JoinContext<'_, 'a>,
+        space: &Space<'a>,
         block: instrument::BlockId,
         inner: u32,
     ) -> Result<(), SqlError> {
+        let lazily = match cx.model.plan.path(inner).kind {
+            PathKind::Scan { rel, path } => cx.counts_lazily(usize::from(rel), path)?,
+            _ => None,
+        };
+        if lazily == Some(true) {
+            self.removed_before = Some((space.list().map_err(store_full)?, 0));
+        }
         self.in_part = Some(match cx.model.plan.path(inner).kind {
-            PathKind::Scan { rel, path } if cx.counts_lazily(usize::from(rel), path)? => {
+            PathKind::Scan { rel, path } if lazily.is_some() => {
                 let rel = usize::from(rel);
                 let _block = instrument::enter_block(block.child(scan_segment(rel)));
                 let buffers = instrument::buffers_counted();
@@ -188,7 +204,7 @@ impl<'a> MergeRecord<'a> {
             count_read_in_part(
                 node,
                 pages,
-                read,
+                (read, counts.inner_removed),
                 inner.order.as_slice()[..read.min(inner.len())]
                     .iter()
                     .map(|&row| inner.store.entries.as_slice()[row as usize * inner.width].rowid),
@@ -225,6 +241,10 @@ impl<'a> MergeRecord<'a> {
         let inner_cleared = reread_inner || !self.inner.filled;
         if inner_cleared {
             self.inner.clear();
+            if let Some((removed, trailing)) = &mut self.removed_before {
+                removed.clear();
+                *trailing = 0;
+            }
         }
         (outer_cleared, inner_cleared)
     }
@@ -576,7 +596,11 @@ impl<'a> Step<'_, '_, 'a> {
         };
         {
             let _suspended = in_part.then(instrument::suspend);
-            self.fill(id, join.inner, |record| merge_record_rows(record, false))?;
+            if record.removed_before.is_some() {
+                self.fill_counting_removed(id, join.inner)?;
+            } else {
+                self.fill(id, join.inner, |record| merge_record_rows(record, false))?;
+            }
         }
         let record = merge_record(self.records, id);
         if !record.inner.arranged {
@@ -618,6 +642,14 @@ impl<'a> Step<'_, '_, 'a> {
             record.inner_at = None;
             None
         };
+        // The scan examined the rows its filter removed on the way.
+        if let Some((removed, trailing)) = &record.removed_before {
+            let row = fetched.map(|at| record.inner.order.as_slice()[at] as usize);
+            record.counts.inner_removed += match row {
+                Some(row) => removed.as_slice()[row],
+                None => *trailing,
+            };
+        }
         if let Some((store, lengths)) = record.counts.material.as_mut() {
             store.next(lengths.as_slice())?;
         }
@@ -628,6 +660,31 @@ impl<'a> Step<'_, '_, 'a> {
             }
             None => Ok(MergeEval::EndOfJoin),
         }
+    }
+
+    /// Reads the inner index scan whole into the store, noting the rows its
+    /// filter removed before each kept row and after the last.
+    fn fill_counting_removed(&mut self, id: u32, input: u32) -> Result<(), SqlError> {
+        let cx = self.cx;
+        let relids = cx.model.plan.path(input).relids;
+        let removed = |records: &[Record<'a>]| match &records[input as usize] {
+            Record::Scan { record, .. } => record.node.take_removed(),
+            _ => unreachable!("an index scan read in part"),
+        };
+        while !merge_record(self.records, id).inner.filled {
+            let found = self.next(input)?;
+            let before = removed(self.records);
+            let record = merge_record(self.records, id);
+            let (list, trailing) = record.removed_before.as_mut().expect("a filtered scan");
+            if !found {
+                *trailing = before;
+                record.inner.filled = true;
+                break;
+            }
+            list.push(before).map_err(store_full)?;
+            record.inner.store.save(cx, self.bound, relids)?;
+        }
+        Ok(())
     }
 
     /// Binds the current outer row's relations again.

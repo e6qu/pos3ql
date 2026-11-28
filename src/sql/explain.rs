@@ -7022,6 +7022,17 @@ fn plan_pulled_select<'a>(
             "EXPLAIN of a LATERAL subquery PostgreSQL may memoize is not supported"
         ));
     }
+    // Any other join of analyzed tables the join search does not plan
+    // would print pos3ql's own join order.
+    if modeled.is_none()
+        && let (Some(scope), Some(from)) = (scope.as_ref(), statement.from.as_ref())
+        && query::index_paths::join_query::searched_tables(storage, txid, scope, from)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a join PostgreSQL's join search does not plan here is not supported"
+        ));
+    }
     // Windows over a join the join search does not plan would print
     // pos3ql's own join order and sorts.
     if modeled.is_none() && scope.as_ref().is_some_and(|scope| scope.n > 1) && has_window(statement)

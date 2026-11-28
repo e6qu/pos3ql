@@ -659,6 +659,28 @@ impl CarriedForms {
         Ok(())
     }
 
+    /// These datums and `other`'s; a datum both carry keeps the form this
+    /// one gives it.
+    pub(crate) fn joined(mut self, other: &Self) -> Result<Self, crate::sql::eval::SqlError> {
+        for carried in &other.entries[..other.count] {
+            if self.entries[..self.count]
+                .iter()
+                .any(|kept| kept.identity == carried.identity)
+            {
+                continue;
+            }
+            let entry = self.entries.get_mut(self.count).ok_or_else(|| {
+                crate::sql_err!(
+                    crate::sql::eval::sqlstate::TOO_MANY_COLUMNS,
+                    "a written row passes on more stored values than a row has columns"
+                )
+            })?;
+            *entry = *carried;
+            self.count += 1;
+        }
+        Ok(self)
+    }
+
     /// These datums after a copy turned the values `before` into `after`
     /// (a trigger's detached row): each copy of a carried datum carries it.
     pub(crate) fn rebased(

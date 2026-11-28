@@ -469,19 +469,39 @@ pub struct MaintenanceTarget<'a> {
     pub inheritance: RelationInheritance,
 }
 
-/// The VACUUM modes this object-native engine can execute. Other PostgreSQL
-/// options are rejected at parsing rather than accepted without an effect.
+/// The VACUUM options that change what it does. The others PostgreSQL
+/// accepts are checked as it checks them and select nothing this engine has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VacuumOptions {
     pub full: bool,
     pub analyze: bool,
+    /// Skip a relation whose lock is not immediately available.
+    pub skip_locked: bool,
+    /// Vacuum the tables themselves (`PROCESS_MAIN`), not only analyze them.
+    pub process_main: bool,
+    pub index_cleanup: IndexCleanup,
+    /// Update only the database-wide statistics, vacuuming no table.
+    pub only_database_stats: bool,
 }
 
 impl VacuumOptions {
     pub const DEFAULT: Self = Self {
         full: false,
         analyze: false,
+        skip_locked: false,
+        process_main: true,
+        index_cleanup: IndexCleanup::Auto,
+        only_database_stats: false,
     };
+}
+
+/// VACUUM's `INDEX_CLEANUP`: whether it removes dead rows' index entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexCleanup {
+    /// Unless the dead rows leave entries on fewer than 2% of the pages.
+    Auto,
+    On,
+    Off,
 }
 
 /// The ANALYZE options that change what it does. `BUFFER_USAGE_LIMIT` is

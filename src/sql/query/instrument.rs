@@ -110,6 +110,10 @@ pub(crate) enum Role {
     Memoize(u16),
     /// The sort of a merge join's outer (0) or inner (1) input.
     MergeSort(u16, u8),
+    /// The `Unique` or `HashAggregate` making a semi join's inner relation
+    /// unique, and the `Sort` under a `Unique`.
+    JoinUnique(u16),
+    JoinUniqueSort(u16),
     /// The block's aggregation or grouping.
     Aggregate,
     /// The sort of the input a `GroupAggregate` groups.

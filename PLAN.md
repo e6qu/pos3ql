@@ -160,38 +160,28 @@ the pull executor.
 
 **Finish the pull executor (in progress), in this order:**
 
-1. [x] Every plan the join search makes pulls: merge join, `Memoize` and
-   `Unique` pull nodes run beside the others (`997`), and a hash join's
-   keys always have a ported hash function, since the model plans joins
-   only over such types. `EXPLAIN ANALYZE` counters live in the pull nodes
-   (`1000`). Still open: a semi join's unique-ified relation (`Unique`,
-   `HashAggregate`) under `EXPLAIN ANALYZE` fails with `0A000`, and a
-   pulled-up subquery's join reads as a retained reader.
-2. [ ] The general executor runs the same nodes and the push-based `Runner`
-   is gone (`LATERAL` items included, their subquery run whole per outer
-   row). Its nodes keep their stores in the statement's memory, not a
-   `plan_build_bytes` lease each, so joins of 33 and 130 relations run
-   (`972`, `978`). Still open: the retained reader's `JoinState` levels and
-   `MAX_RETAINED_SOURCES` (the eight-item limit on retained joins) serve
-   joins outside the search, chiefly of never-analyzed tables, so they go
-   with step 5.
-3. [ ] Sort on the `tuplesort` port, `HashAggregate` on `hashagg.rs` and
-   `LATERAL` bodies run as subtrees a retained reader holds (it holds no
-   plan scanning a `LATERAL` item today). `ORDER BY` without a limit over a
-   join larger than the statement arena then sorts in runs over
-   `plan_build_bytes` leases (`54000` today).
-4. [x] A declared cursor (`DECLARE`, PL/pgSQL `OPEN`) plans for
-   `cursor_tuple_fraction` of its rows (`CURSOR_OPT_FAST_PLAN`, `995`), and
-   `EXPLAIN DECLARE` shows that plan, under a `Materialize` when a scrollable
-   cursor's nodes cannot run backward. Still open: a set operation's members
-   plan for every row, a grouping keeps only its cheapest paths under a tuple
-   fraction (its sorted read of an index-ordered scan must first stop copying
-   each whole row into the statement arena), and `EXPLAIN` of a scrollable
-   cursor needing that `Materialize` fails with `0A000` under `ANALYZE` or
-   when its plan has InitPlans.
-5. [ ] Plan joins of never-analyzed tables by PostgreSQL's search (they keep
-   pos3ql's join order today); this needs steps 1 to 3 so the result-stream
-   and cursor tests keep streaming.
+1. [x] The general executor uses the same pull nodes as retained readers for
+   modeled joins. Merge join, `Memoize` and `Unique` pull rows (`997`), and
+   `EXPLAIN ANALYZE` counts their work, including semi-joins that make an
+   input unique (`1000`, `1002`). The push-based runner is gone. The general
+   executor keeps node stores in statement memory so joins of 33 and 130
+   relations fit (`972`, `978`). It runs each `LATERAL` subquery in full per
+   outer row.
+2. [ ] Run a pulled-up subquery's join as a retained reader.
+3. [ ] Keep sorts on the `tuplesort` port, `HashAggregate` on `hashagg.rs`
+   and `LATERAL` bodies as subtrees a retained reader can resume. An
+   unbounded `ORDER BY` on a join larger than the statement arena needs
+   sorted runs held in `plan_build_bytes` leases (`54000` today).
+4. [x] `DECLARE` and PL/pgSQL `OPEN` plan for `cursor_tuple_fraction`;
+   `EXPLAIN DECLARE` shows that plan, adding `Materialize` for a scrollable
+   cursor when its nodes cannot run backward (`995`).
+5. [ ] Keep grouped and set-operation cursor plans sensitive to the tuple
+   fraction. Make `EXPLAIN` of a scrollable cursor needing `Materialize`
+   work with `ANALYZE` and with InitPlans (each `0A000` today).
+6. [ ] Plan joins of never-analyzed tables with PostgreSQL's search and
+   retire the retained reader's `JoinState` levels and
+   `MAX_RETAINED_SOURCES` eight-item limit. This depends on steps 1–3 so
+   streams and cursors can keep pulling rows.
 
 **Other paths that still block or restart:**
 
@@ -310,11 +300,10 @@ Fixture numbers refer to `tests/external/differential_exact/`.
   deferred and engine-moved firings), an explicit domain cast's `VALUE`, an
   aggregate's transition state, sorted and `DISTINCT` inputs and final
   function state, and an array constructor element's cast keep theirs
-  (`1010`, `1011`). Still `0A000` where the form decides a size
-  (`pg_column_size`):
-  - an `INSTEAD OF` trigger's rows, a foreign table's trigger rows, a row a
-    partition move or logical replication passes on in its TOAST form, and
-    a `MERGE` source datum a `BEFORE` trigger's `NEW` holds;
+  (`1010`, `1011`). Written rows in `UPDATE ... FROM`, `MERGE`, view
+  triggers and partition moves keep the forms checked by fixture `1014`.
+  Still open where the form decides a size (`pg_column_size`):
+  - trigger rows on foreign tables and forms passed by logical replication;
   - `VALUE` of a domain checked by a table write, a routine argument's
     coercion or a validation scan;
   - a SQL function body that returns a parameter without being inlined: its
@@ -703,10 +692,9 @@ These fail with `0A000` (or the code shown) and need implementing.
 - [ ] `COPY` to or from a server file or program, `COPY ... FREEZE`, and
   `ENCODING` other than UTF8: implement, or record each as an architecture
   boundary in the compatibility guide.
-- [ ] `ANALYZE VERBOSE`, whose report of sampled pages, timing and buffer
-  usage this engine does not reproduce; `VACUUM` options other than `FULL`
-  and `ANALYZE`. `ANALYZE`'s `SKIP_LOCKED` and `BUFFER_USAGE_LIMIT` work
-  (`1013`).
+- [ ] `ANALYZE VERBOSE` and `VACUUM VERBOSE` reports of sampled pages,
+  timing and buffer usage return `0A000`. Maintenance option validation
+  and table selection are covered by `1013` and `1015`.
 
 **Logical replication and postgres_fdw**
 

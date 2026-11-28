@@ -338,9 +338,17 @@ impl<'a> Analyzer<'_, '_, 'a> {
         operator: BinaryOp,
         right: &'a Expr<'a>,
     ) -> Result<Option<Clause<'a>>, SqlError> {
+        // Another relation's value a parameterized scan compares is a
+        // constant of unknown value, as a parameter is.
+        let outer = |expression: &'a Expr<'a>| {
+            self.outer_operands
+                .iter()
+                .any(|held| core::ptr::eq(*held, expression))
+        };
         let constant = |expression: &'a Expr<'a>| {
             (expression.is_constant(false) && !expression.calls_routine())
                 || matches!(expression, Expr::Param(_))
+                || outer(expression)
         };
         let (expression, value, on_left) = if constant(right) && self.estimated_expression(left) {
             (left, right, true)
@@ -371,6 +379,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
         };
         // A strict operator's NULL operand matches no row.
         let null = !matches!(value, Expr::Param(_))
+            && !outer(value)
             && matches!(
                 crate::sql::eval::eval(
                     value,
@@ -413,6 +422,11 @@ impl<'a> Analyzer<'_, '_, 'a> {
             };
         let (bound, selectivity) = match comparison {
             _ if null => (None, 0.0),
+            // A join clause is no range bound (`addRangeClause` pairs
+            // pseudoconstant comparisons only).
+            Comparison::Lt | Comparison::Le | Comparison::Gt | Comparison::Ge if outer(value) => {
+                (None, super::DEFAULT_INEQ_SEL)
+            }
             Comparison::Eq => (None, equal),
             Comparison::Ne => (None, 1.0 - equal),
             Comparison::Lt | Comparison::Le => (Some((key, false)), super::DEFAULT_INEQ_SEL),

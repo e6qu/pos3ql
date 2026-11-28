@@ -5703,109 +5703,22 @@ impl<'a> Parser<'a> {
     /// table with an optional column list.
     fn vacuum_or_analyze(&mut self, is_vacuum: bool) -> Result<Stmt<'a>, ParseError> {
         self.advance()?; // the VACUUM / ANALYZE keyword
-        let mut options = crate::sql::ast::VacuumOptions {
-            analyze: !is_vacuum,
-            ..crate::sql::ast::VacuumOptions::DEFAULT
-        };
-        let mut saw_full = false;
-        let mut saw_analyze = false;
-        let mut analyze = analyze_options::WrittenAnalyzeOptions {
-            options: crate::sql::ast::AnalyzeOptions { skip_locked: false },
-            verbose: false,
-            error: None,
-        };
-        if !is_vacuum {
-            if self.eat_op("(")? {
-                analyze = self.analyze_options()?;
-            } else {
-                analyze.verbose = self.eat_ident("verbose")?;
-            }
-        } else if self.eat_op("(")? {
-            loop {
-                let option = self.any_ident("VACUUM option")?;
-                let value = self.explain_bool()?;
-                if option.eq_ignore_ascii_case("full") {
-                    if core::mem::replace(&mut saw_full, true) {
-                        return Err(self.err_here("VACUUM option FULL specified more than once"));
-                    }
-                    options.full = value;
-                } else if option.eq_ignore_ascii_case("analyze")
-                    || option.eq_ignore_ascii_case("analyse")
-                {
-                    if core::mem::replace(&mut saw_analyze, true) {
-                        return Err(self.err_here("VACUUM option ANALYZE specified more than once"));
-                    }
-                    options.analyze = value;
-                } else {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(
-                            PARSE_MESSAGE_BYTES,
-                            "unsupported VACUUM option \"{}\"",
-                            option
-                        ),
-                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                        cursor: None,
-                        hint: None,
-                        near: None,
-                        detail: None,
-                    });
-                }
-                if self.eat_op(")")? {
-                    break;
-                }
-                self.expect_op(",")?;
-            }
+        let mut written = analyze_options::WrittenMaintenanceOptions::new(is_vacuum);
+        if self.eat_op("(")? {
+            self.maintenance_options(&mut written, is_vacuum)?;
         } else {
-            loop {
-                if self.eat_ident("full")? {
-                    if core::mem::replace(&mut saw_full, true) {
-                        return Err(self.err_here("VACUUM option FULL specified more than once"));
-                    }
-                    options.full = true;
-                    continue;
+            // `VACUUM opt_full opt_freeze opt_verbose opt_analyze` and
+            // `ANALYZE opt_verbose`, in that order.
+            let words: &[&str] = if is_vacuum {
+                &["full", "freeze", "verbose", "analyze"]
+            } else {
+                &["verbose"]
+            };
+            for &word in words {
+                let at = self.peek_at;
+                if self.eat_ident(word)? || (word == "analyze" && self.eat_ident("analyse")?) {
+                    written.write(word, copy_options::Argument::Absent, at, is_vacuum);
                 }
-                if self.eat_ident("analyze")? || self.eat_ident("analyse")? {
-                    if core::mem::replace(&mut saw_analyze, true) {
-                        return Err(self.err_here("VACUUM option ANALYZE specified more than once"));
-                    }
-                    options.analyze = true;
-                    continue;
-                }
-                if matches!(
-                    self.peeked,
-                    Tok::Ident(
-                        "full"
-                            | "freeze"
-                            | "verbose"
-                            | "skip_locked"
-                            | "disable_page_skipping"
-                            | "index_cleanup"
-                            | "process_main"
-                            | "process_toast"
-                            | "truncate"
-                            | "parallel"
-                            | "skip_database_stats"
-                            | "only_database_stats"
-                            | "buffer_usage_limit"
-                    )
-                ) {
-                    let option = self.any_ident("maintenance option")?;
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(
-                            PARSE_MESSAGE_BYTES,
-                            "unsupported VACUUM option \"{}\"",
-                            option
-                        ),
-                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                        cursor: None,
-                        hint: None,
-                        near: None,
-                        detail: None,
-                    });
-                }
-                break;
             }
         }
         // An optional table list, each with an optional column list.
@@ -5857,23 +5770,23 @@ impl<'a> Parser<'a> {
             }
         }
         let targets = self.arena_slice(&targets[..target_count])?;
-        if let Some(error) = analyze.error {
-            return Err(error);
-        }
-        // VERBOSE reports PostgreSQL's page sampling and its timing and
-        // buffer usage, which this engine does not reproduce.
-        if analyze.verbose {
-            return Err(ParseError {
-                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                ..ParseError::new(self.peek_at, "ANALYZE option VERBOSE is not supported")
-            });
-        }
+        let written = written.checked(
+            is_vacuum,
+            !targets.is_empty(),
+            targets.iter().any(|target| !target.columns.is_empty()),
+        )?;
         Ok(if is_vacuum {
-            Stmt::Vacuum { targets, options }
+            Stmt::Vacuum {
+                targets,
+                options: crate::sql::ast::VacuumOptions {
+                    skip_locked: written.analyze.skip_locked,
+                    ..written.vacuum
+                },
+            }
         } else {
             Stmt::Analyze {
                 targets,
-                options: analyze.options,
+                options: written.analyze,
             }
         })
     }

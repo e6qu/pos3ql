@@ -1121,6 +1121,7 @@ fn analyze_qual<'a>(
     constants: &mut Constants<'a>,
     expressions: &mut Expressions<'_, 'a>,
     full_clauses: &[join_tree::Var],
+    compared: &mut Option<(Member, Member)>,
 ) -> Result<Option<Qual>, SqlError> {
     // `COALESCE(left, right) = constant` of two relations' columns or such
     // `COALESCE`s, written or a full join's merged column.
@@ -1248,8 +1249,21 @@ fn analyze_qual<'a>(
         }
         _ => Shape::Other,
     };
+    // `left op right` of a column or one relation's expression on each
+    // side, of two relations: `neqjoinsel` or `scalarltjoinsel` estimates
+    // it through the operands' statistics (`examine_variable`), and a
+    // `Memoize` keys by its outer operand.
+    *compared = if rels.count_ones() > 1 && shape == Shape::Other && !volatile {
+        compared_operands(scope, expressions, expression)?
+    } else {
+        None
+    };
     // A condition above one relation must be one the model estimates.
-    if rels.count_ones() > 1 && shape == Shape::Other && !join_condition(scope, expression) {
+    if rels.count_ones() > 1
+        && shape == Shape::Other
+        && compared.is_none()
+        && !join_condition(scope, expression)
+    {
         return Ok(None);
     }
     let Some(strict) = strict else {
@@ -1266,6 +1280,41 @@ fn analyze_qual<'a>(
         forced_null,
         shape,
     }))
+}
+
+/// The operands of `left op right` (`<>`, `<`, `<=`, `>`, `>=`) whose sides
+/// are each a column or an expression of one relation, of two relations,
+/// comparable as one operator family's.
+fn compared_operands<'a>(
+    scope: &QueryScope<'a>,
+    expressions: &mut Expressions<'_, 'a>,
+    expression: &'a Expr<'a>,
+) -> Result<Option<(Member, Member)>, SqlError> {
+    let Expr::Binary {
+        operator: BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
+        left,
+        right,
+        ..
+    } = expression
+    else {
+        return Ok(None);
+    };
+    if plain_constant(left).is_some() || plain_constant(right).is_some() {
+        return Ok(None);
+    }
+    let Some((one, left_type, left_collation)) = expressions.member(scope, left)? else {
+        return Ok(None);
+    };
+    let Some((two, right_type, right_collation)) = expressions.member(scope, right)? else {
+        return Ok(None);
+    };
+    Ok((one.reads == Relids::EMPTY
+        && two.reads == Relids::EMPTY
+        && one.rel != two.rel
+        && comparable_types(left_type, right_type)
+        && joinable(left_type)
+        && left_collation == right_collation)
+        .then_some((one, two)))
 }
 
 /// A condition of several relations the model estimates: a comparison of
@@ -2693,6 +2742,9 @@ fn modeled_join_over<'p, 'a: 'p>(
         count: 0,
     };
     let mut expressions = Expressions::new(storage, txid, arena);
+    // Each condition's operands when it compares one relation's column or
+    // expression with another's (`analyze_qual`).
+    let compared_quals = per_relation(planning, qual_capacity + 1, None::<(Member, Member)>)?;
     // The written left and right operands of each full join's equality
     // clause, in pairs, which a `COALESCE` above it must name in order.
     let full_clauses = per_relation(planning, 2 * (qual_capacity + 1), (0u8, 0u16))?;
@@ -2708,12 +2760,14 @@ fn modeled_join_over<'p, 'a: 'p>(
         };
         for &conjunct in conjuncts_of(condition, arena)? {
             let conjunct = flatten_merged(scope, conjunct, arena)?;
+            let mut compared = None;
             let Some(qual) = analyze_qual(
                 scope,
                 conjunct,
                 &mut constants,
                 &mut expressions,
                 &full_clauses[..full_clause_count],
+                &mut compared,
             )?
             else {
                 return Ok(None);
@@ -2734,6 +2788,7 @@ fn modeled_join_over<'p, 'a: 'p>(
                 return Err(preparation_full());
             };
             quals[usize::from(id)] = conjunct;
+            compared_quals[usize::from(id)] = compared;
         }
     }
     for (id, vars) in tree
@@ -2821,6 +2876,14 @@ fn modeled_join_over<'p, 'a: 'p>(
         )?
     };
     let quals = &quals[..=tree.qual_count];
+    // A merged self-join's conditions read the kept scan's columns.
+    if self_joins.removed != Relids::EMPTY {
+        for (compared, &qual) in compared_quals.iter_mut().zip(quals) {
+            if compared.is_some() {
+                *compared = compared_operands(scope, &mut expressions, qual)?;
+            }
+        }
+    }
     removed |= self_joins.removed;
     let self_join = self_joins.declined;
     let kept_for = self_joins.kept_for;
@@ -3826,6 +3889,14 @@ fn modeled_join_over<'p, 'a: 'p>(
                 reads: Relids::EMPTY,
             };
             clause.operands = Some((member(one), member(two)));
+        } else if let Some((one, two)) =
+            compared_quals[usize::from(clause.source.expect("written"))]
+        {
+            let nulled = |member: Member| Member {
+                nulling: clause.relids & nulling_relids[usize::from(member.rel)] & !BASE_RELIDS,
+                ..member
+            };
+            clause.operands = Some((nulled(one), nulled(two)));
         }
     }
     // Each relation's join clauses an index may apply: the outer joins'
@@ -4022,9 +4093,17 @@ fn modeled_join_over<'p, 'a: 'p>(
                         (Some((one, _)), Some((two, _))) if two == table && one != table => {
                             (NO_CLASS, one as u8)
                         }
-                        _ => {
-                            return Ok(None);
-                        }
+                        _ => match compared_quals[usize::from(clause.source.expect("written"))] {
+                            Some((one, two)) if usize::from(one.rel) == table => {
+                                (NO_CLASS, two.rel)
+                            }
+                            Some((one, two)) if usize::from(two.rel) == table => {
+                                (NO_CLASS, one.rel)
+                            }
+                            _ => {
+                                return Ok(None);
+                            }
+                        },
                     }
                 }
             };
@@ -4283,10 +4362,42 @@ fn modeled_join_over<'p, 'a: 'p>(
                 (1u64 << columns) - 1
             };
             let above = (output[table] | join_columns[table]) & all;
+            let loop_rows = arena
+                .alloc_slice_copy(rel_rows)
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            // `adjust_rowcount_for_semijoins`: a relation on the inside of a
+            // semi join whose outer side holds this one repeats a
+            // parameterized scan once per unique-ified row.
+            if pass == 2 {
+                for special in &prepared.specials[..prepared.special_count] {
+                    if special.kind != super::joins::SpecialKind::Semi
+                        || !special.syn_left.contains(table as u32)
+                    {
+                        continue;
+                    }
+                    let inner = special.syn_right & BASE_RELIDS;
+                    if inner.count_ones() != 1 {
+                        continue;
+                    }
+                    let rel = inner.trailing_zeros() as usize;
+                    if laterals[rel].is_some() {
+                        continue;
+                    }
+                    let unique = semi_unique_rows(
+                        storage,
+                        txid,
+                        scope,
+                        rel,
+                        special,
+                        rel_rows[rel],
+                        sized_indexes[rel],
+                        planning,
+                    );
+                    loop_rows[rel] = loop_rows[rel].min(unique);
+                }
+            }
             let scan = JoinScan {
-                rel_rows: arena
-                    .alloc_slice_copy(rel_rows)
-                    .map_err(|_| crate::sql::eval::arena_full())?,
+                rel_rows: loop_rows,
                 ..scans[table]
             };
             let joins = join_conjuncts[table];
@@ -4306,8 +4417,18 @@ fn modeled_join_over<'p, 'a: 'p>(
                     ..QueryShape::default()
                 },
             )?;
-            let Planned::Join(paths) = planned else {
-                return Ok(None);
+            let paths = match planned {
+                Planned::Join(paths) => paths,
+                // A scan the model does not cost is rejected rather than
+                // joined in another order.
+                Planned::Outside(shape) => {
+                    return Err(crate::sql_err!(
+                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                        "join search: {} is not supported",
+                        shape
+                    ));
+                }
+                _ => return Ok(None),
             };
             if pass < 2 {
                 rel_rows[table] = paths.rows;
@@ -4927,17 +5048,33 @@ fn modeled_join_over<'p, 'a: 'p>(
                 }
             }
         } else {
-            match join_estimate(
-                scope,
-                expression,
-                &early_reader,
-                &restriction,
-                &expression_cost,
-                costs,
-                planning,
-            )? {
-                Some(estimate) => estimate,
-                None => {
+            let compared = compared_quals[usize::from(clause.source.expect("written"))];
+            match (
+                join_estimate(
+                    scope,
+                    expression,
+                    &early_reader,
+                    &restriction,
+                    &expression_cost,
+                    costs,
+                    planning,
+                )?,
+                compared,
+            ) {
+                (Some(estimate), _) => estimate,
+                // `neqjoinsel` is the complement of `eqjoinsel`;
+                // `scalarltjoinsel` is `DEFAULT_INEQ_SEL`.
+                (None, Some((one, two))) => {
+                    let selectivity = match expression {
+                        Expr::Binary {
+                            operator: BinaryOp::NotEq,
+                            ..
+                        } => 1.0 - early_reader.equality(one, two)?.clamp(0.0, 1.0),
+                        _ => super::DEFAULT_INEQ_SEL,
+                    };
+                    (selectivity, expression_cost(expression))
+                }
+                (None, None) => {
                     return Ok(None);
                 }
             }
@@ -4976,6 +5113,27 @@ fn modeled_join_over<'p, 'a: 'p>(
                 super::joins::OtherShape::Inequality {
                     left_nulls: nulls(left),
                     right_nulls: nulls(right),
+                }
+            }
+            Expr::Binary {
+                operator: BinaryOp::NotEq,
+                ..
+            } if let Some((one, two)) =
+                compared_quals[usize::from(clause.source.expect("written"))] =>
+            {
+                let nulls = |member: Member| {
+                    let variable = early_reader
+                        .planner(member)
+                        .variable(early_reader.column(member));
+                    if variable.analyzed {
+                        variable.null_fraction
+                    } else {
+                        0.0
+                    }
+                };
+                super::joins::OtherShape::Inequality {
+                    left_nulls: nulls(one),
+                    right_nulls: nulls(two),
                 }
             }
             _ => super::joins::OtherShape::Plain,
@@ -5389,8 +5547,19 @@ fn modeled_join_over<'p, 'a: 'p>(
     };
     // The search works in the planning memory; the plan it chose is copied
     // out of it.
-    let Ok(plan) = super::joins::search(&problem, &reader, planning)? else {
-        return Ok(None);
+    // A shape the search does not reproduce is rejected rather than run in
+    // another join order.
+    let plan = match super::joins::search(&problem, &reader, planning)? {
+        Ok(plan) => plan,
+        // Removed joins left one relation, which runs as its scan.
+        Err(_) if problem.rels.len() < 2 => return Ok(None),
+        Err(outside) => {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "join search: {} is not supported",
+                outside
+            ));
+        }
     };
     let plan = plan.copy_into(arena, planning)?;
     // A hashed unique-ified relation returns its groups in its hash table's
@@ -6333,6 +6502,65 @@ pub(crate) fn column_of(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option
 
 /// A plain local table without descendants, indexes, row security or
 /// sampling, read under its own name.
+/// `estimate_num_groups` of a semi join's inner compared columns over
+/// `rows` rows of its one inner relation `rel` (one row without such
+/// columns, as for an empty list).
+#[allow(clippy::too_many_arguments)]
+fn semi_unique_rows(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    rel: usize,
+    special: &super::joins::SpecialJoin,
+    rows: f64,
+    indexes: &[super::IndexInfo],
+    planning: &Arena,
+) -> f64 {
+    let count = usize::from(special.semi_count);
+    if count == 0 {
+        return 1.0;
+    }
+    let definition = scope.defs.stored(rel).expect("plain table");
+    let slot = scope.slots[rel];
+    let statistics = storage.table_statistics(slot, txid);
+    let planner = Planner {
+        variables: super::ExpressionVariables {
+            first: definition.columns().len(),
+            variables: &[],
+        },
+        storage,
+        txid,
+        slot,
+        definition,
+        statistics: &statistics,
+        statistics_key: 0,
+        size: super::relation_size(storage, slot, txid),
+        costs: Costs::current(),
+        indexes,
+        extended: &[],
+        arena: planning,
+    };
+    let mut columns = [0usize; super::joins::MAX_KEYS];
+    for (slot, member) in columns.iter_mut().zip(&special.semi_rhs[..count]) {
+        *slot = usize::from(member.column);
+    }
+    let (groups, _) = super::paths::relation_groups(&planner, &columns[..count], rows);
+    groups.ceil().min(super::clamp_row_est(rows)).max(1.0)
+}
+
+/// Whether every FROM item of `from` is a plain, analyzed local table the
+/// join search plans, of at least two.
+pub(crate) fn searched_tables<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    from: &'a FromClause<'a>,
+) -> bool {
+    scope.n > 1
+        && scope.n == from.joins.len() + 1
+        && (0..scope.n).all(|table| plain_table(storage, txid, scope, table, source(from, table)))
+}
+
 fn plain_table(
     storage: &Storage,
     txid: u32,

@@ -2609,8 +2609,8 @@ pub(crate) fn scan_path<'a>(
         Err(clauses::CONTRADICTION) => return Ok(Planned::NotTable),
         Err(shape) => return Ok(Planned::Outside(shape)),
     };
-    // The join clauses, each `column = value` of a value unknown until
-    // the outer row is read, costing one operator.
+    // The join clauses, each comparing with a value unknown until the
+    // outer row is read.
     let join_params = arena
         .alloc_slice_with(join_count, |_| None::<Restriction<'a>>)
         .map_err(|_| crate::sql::eval::arena_full())?;
@@ -2619,6 +2619,9 @@ pub(crate) fn scan_path<'a>(
             Ok(restriction) => restriction,
             Err(shape) => return Ok(Planned::Outside(shape)),
         };
+        // A column, or an expression of the relation's columns, compared
+        // with the other relation's value; its cost is the whole clause's
+        // (`cost_qual_eval`).
         if !matches!(
             restriction.clause,
             Clause::Compare {
@@ -2631,17 +2634,11 @@ pub(crate) fn scan_path<'a>(
                 constant: None,
                 pattern: false,
                 ..
-            }
+            } | Clause::Expression { bound: None, .. }
         ) {
             return Ok(Planned::Outside("a join clause the model does not read"));
         }
-        join_params[at] = Some(Restriction {
-            cost: QualCost {
-                startup: 0.0,
-                per_tuple: planner.costs.cpu_operator,
-            },
-            ..restriction
-        });
+        join_params[at] = Some(restriction);
     }
     let join_params = &*arena
         .alloc_slice_with(join_count, |at| {

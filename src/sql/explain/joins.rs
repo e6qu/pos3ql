@@ -328,12 +328,11 @@ impl Writer<'_, '_, '_, '_> {
                 method: query::index_paths::joins::UniqueMethod::Hash,
             } => {
                 // A `HashAggregate` grouping by the compared columns.
-                let mut node = PlanNode {
-                    analyze_unsupported: Some(
-                        "EXPLAIN ANALYZE of a semi join's unique-ified relation is not supported",
-                    ),
-                    ..self.node("HashAggregate", &path, depth)
-                };
+                let mut node = self.keyed(
+                    self.node("HashAggregate", &path, depth),
+                    query::instrument::Role::JoinUnique,
+                    id,
+                );
                 let mut shown = PlanKeys {
                     label: KeyLabel::Group,
                     ..PlanKeys::NONE
@@ -377,25 +376,23 @@ impl Writer<'_, '_, '_, '_> {
                 // compared columns (`label_sort_with_costsize`), both
                 // returning their input's columns and the compared
                 // expressions it computes.
-                const UNSUPPORTED: Option<&str> =
-                    Some("EXPLAIN ANALYZE of a semi join's unique-ified relation is not supported");
                 let keys = self.model.plan.keys(keys, key_count);
                 let input_relids = self.model.plan.path(input).relids;
                 let above = self
                     .unique_input(input_relids, keys, true)?
                     .map(|(output, _)| output);
-                let mut unique = PlanNode {
-                    analyze_unsupported: UNSUPPORTED,
-                    ..self.node("Unique", &path, depth)
-                };
+                let mut unique = self.keyed(
+                    self.node("Unique", &path, depth),
+                    query::instrument::Role::JoinUnique,
+                    id,
+                );
                 unique.set_output(above);
                 plan.push(unique)?;
                 let input_path = *self.model.plan.path(input);
                 let (startup, total) =
                     query::index_paths::joins::sort_cost(&input_path, self.model.plan.settings);
-                let mut sort = PlanNode {
-                    analyze_unsupported: UNSUPPORTED,
-                    ..self.node(
+                let mut sort = self.keyed(
+                    self.node(
                         "Sort",
                         &Path {
                             startup,
@@ -403,8 +400,10 @@ impl Writer<'_, '_, '_, '_> {
                             ..input_path
                         },
                         depth + 1,
-                    )
-                };
+                    ),
+                    query::instrument::Role::JoinUniqueSort,
+                    id,
+                );
                 let mut shown = PlanKeys {
                     label: KeyLabel::Sort,
                     ..PlanKeys::NONE

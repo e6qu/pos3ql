@@ -88471,7 +88471,7 @@ fn merge_target<'a>(
                     source_members,
                     source: (!by_source).then_some(sv),
                     source_namespace_when_absent: false,
-                    source_forms: None,
+                    source_forms: (!by_source).then_some(sf),
                     old_name: None,
                     old: None,
                     new_name: None,
@@ -88546,7 +88546,7 @@ fn merge_target<'a>(
                         source_members,
                         source: (!by_source).then_some(sv),
                         source_namespace_when_absent: false,
-                        source_forms: None,
+                        source_forms: (!by_source).then_some(sf),
                         old_name: None,
                         old: None,
                         new_name: None,
@@ -88840,6 +88840,8 @@ fn merge_target<'a>(
                                 }
                                 let mut new_values = [Datum::Null; MAX_COLUMNS];
                                 new_values[..def.n_columns].copy_from_slice(pair_target);
+                                // The stored datums the assignments pass on.
+                                let mut assigned = crate::sql::toast::CarriedForms::NONE;
                                 let mut action_update_columns = ColumnSet::EMPTY;
                                 let mut action_targets = [0usize; MAX_COLUMNS];
                                 for (name, _) in assignments {
@@ -88914,18 +88916,19 @@ fn merge_target<'a>(
                                             }
                                         }
                                     } else {
-                                        match eval_merge_expression(
+                                        let scope = ProceduralMergeScope {
+                                            row: &lookup,
+                                            outer,
+                                            source_forms: None,
+                                        };
+                                        let value = match eval_merge_expression(
                                             expression,
                                             storage,
                                             txn.txid,
                                             seq_session,
                                             arena,
                                             params,
-                                            &ProceduralMergeScope {
-                                                row: &lookup,
-                                                outer,
-                                                source_forms: None,
-                                            },
+                                            &scope,
                                             Some((
                                                 &def.columns()[ci],
                                                 match assignment_casts.selected(
@@ -88941,7 +88944,21 @@ fn merge_target<'a>(
                                         ) {
                                             Ok(value) => value,
                                             Err(error) => return sql_fail(error),
+                                        };
+                                        // A source datum keeps its stored form.
+                                        let catalog =
+                                            super::query::storage_catalog(storage, arena, txn.txid);
+                                        if let Err(error) = crate::sql::toast::passed_form(
+                                            expression,
+                                            &scope,
+                                            Some(&catalog),
+                                            &value,
+                                        )
+                                        .and_then(|form| assigned.carry(&value, form, None))
+                                        {
+                                            return sql_fail(error);
                                         }
+                                        value
                                     };
                                     new_values[ci] = value;
                                 }
@@ -88964,6 +88981,7 @@ fn merge_target<'a>(
                                         pair_physical,
                                         true,
                                     )
+                                    .and_then(|carried| carried.joined(&assigned))
                                     .map(|carried| (forms, carried))
                                 }) {
                                     Ok(forms) => forms,
@@ -89213,7 +89231,9 @@ fn merge_target<'a>(
                                     pair_schema,
                                     pair_physical,
                                     in_place,
-                                ) {
+                                )
+                                .and_then(|carried| carried.joined(&assigned))
+                                {
                                     Ok(carried) => carried,
                                     Err(error) => return sql_fail(error),
                                 };
@@ -92243,6 +92263,11 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 Ok(row) => row,
                                 Err(error) => return sql_fail(error),
                             };
+                        // The source row's stored datums keep their forms.
+                        let carried = match crate::sql::toast::CarriedForms::of_projected(bytes) {
+                            Ok(carried) => carried,
+                            Err(error) => return sql_fail(error),
+                        };
                         let mut values = [Datum::Null; MAX_COLUMNS];
                         let mut explicit = [false; MAX_COLUMNS];
                         for (source, column) in
@@ -92291,6 +92316,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             },
                             checks,
                             view_description,
+                            &carried,
                         ) {
                             Ok(Ok(true)) => {}
                             Ok(Ok(false)) => continue,
@@ -92369,6 +92395,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         }
                         let mut values = [Datum::Null; MAX_COLUMNS];
                         let mut explicit = [false; MAX_COLUMNS];
+                        let mut carried = crate::sql::toast::CarriedForms::NONE;
                         {
                             let sequences =
                                 crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
@@ -92401,6 +92428,16 @@ pub(crate) fn instead_of_view_dml<'a>(
                                     Ok(value) => value,
                                     Err(error) => return sql_fail(error),
                                 };
+                                if let Err(error) = crate::sql::toast::passed_form(
+                                    expression,
+                                    &NoColumns,
+                                    Some(&catalog),
+                                    &values[column],
+                                )
+                                .and_then(|form| carried.carry(&values[column], form, None))
+                                {
+                                    return sql_fail(error);
+                                }
                                 explicit[column] = true;
                             }
                         }
@@ -92441,6 +92478,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             },
                             checks,
                             view_description,
+                            &carried,
                         ) {
                             Ok(Ok(true)) => {}
                             Ok(Ok(false)) => continue,
@@ -92548,6 +92586,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                         alias: update.alias,
                     };
                     let mut new = old;
+                    // The stored datums the assignments pass on.
+                    let mut assigned = crate::sql::toast::CarriedForms::NONE;
                     if let Some(from) = update.from {
                         let mut expressions = [&Expr::Null; MAX_COLUMNS];
                         for (index, (_, expression)) in update.assignments.iter().enumerate() {
@@ -92590,6 +92630,13 @@ pub(crate) fn instead_of_view_dml<'a>(
                                         &combined,
                                         &hooks,
                                     )?;
+                                    let form = crate::sql::toast::passed_form(
+                                        expression,
+                                        combined,
+                                        Some(&catalog),
+                                        &new[column],
+                                    )?;
+                                    assigned.carry(&new[column], form, None)?;
                                 }
                                 Ok(())
                             },
@@ -92661,14 +92708,29 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 Ok(value) => value,
                                 Err(error) => return sql_fail(error),
                             };
+                            if let Err(error) = crate::sql::toast::passed_form(
+                                expression,
+                                &context,
+                                Some(&catalog),
+                                &new[column],
+                            )
+                            .and_then(|form| assigned.carry(&new[column], form, None))
+                            {
+                                return sql_fail(error);
+                            }
                         }
                     }
                     // A joined source can expose storage-backed datums. Detach the
                     // completed NEW image before the trigger body mutates storage.
-                    let new = match detached_values(&new[..def.n_columns], arena) {
+                    let detached = match detached_values(&new[..def.n_columns], arena) {
                         Ok(values) => values,
                         Err(error) => return sql_fail(error),
                     };
+                    let assigned = match assigned.rebased(&new[..def.n_columns], detached) {
+                        Ok(assigned) => assigned,
+                        Err(error) => return sql_fail(error),
+                    };
+                    let new = detached;
                     match fire_view_row_trigger(
                         storage,
                         txn,
@@ -92680,7 +92742,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         event,
                         Some(&old[..def.n_columns]),
                         Some(new),
-                        trigger_firing::ImageForms::UNRECORDED,
+                        trigger_firing::ImageForms::instead_of(&assigned),
                     ) {
                         Ok(true) => {}
                         Ok(false) => continue,
@@ -92909,7 +92971,9 @@ pub(crate) fn instead_of_view_dml<'a>(
                         event,
                         Some(&old[..def.n_columns]),
                         None,
-                        trigger_firing::ImageForms::UNRECORDED,
+                        trigger_firing::ImageForms::instead_of(
+                            &crate::sql::toast::CarriedForms::NONE,
+                        ),
                     ) {
                         Ok(true) => {}
                         Ok(false) => continue,
@@ -93163,6 +93227,7 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
     position: ChangedRow,
     checks: Option<ViewCheck<'a>>,
     description: constraints::RowDescription,
+    carried: &crate::sql::toast::CarriedForms,
 ) -> Result<Result<bool, SqlError>, WireFull> {
     let seq_session = services.seq_session;
     let fired = match fire_view_row_trigger(
@@ -93176,7 +93241,7 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
         event,
         None,
         Some(values),
-        trigger_firing::ImageForms::UNRECORDED,
+        trigger_firing::ImageForms::insert(carried),
     ) {
         Ok(fired) => fired,
         Err(error) => return Ok(Err(error)),
@@ -97109,6 +97174,8 @@ pub(crate) fn update<'a>(
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 row_layout.project(&physical_old, &mut values);
                 let mut logical_new = values;
+                // The stored datums the assignments pass on.
+                let mut assigned = crate::sql::toast::CarriedForms::NONE;
                 let context = RowCtx {
                     table_oid: Some(crate::sql::catalog::user_table_oid(storage, row_table) as u32),
                     def: crate::storage::RelationDefinition::from_definition(def),
@@ -97224,7 +97291,7 @@ pub(crate) fn update<'a>(
                                             &hooks,
                                         )?;
                                     } else {
-                                        logical_new[targets[a]] = eval_prepared_assignment(
+                                        let value = eval_prepared_assignment(
                                             assignment_casts,
                                             expression,
                                             &def.columns()[targets[a]],
@@ -97235,6 +97302,15 @@ pub(crate) fn update<'a>(
                                             &combined,
                                             &hooks,
                                         )?;
+                                        // A FROM row's datum keeps its stored form.
+                                        let form = crate::sql::toast::passed_form(
+                                            expression,
+                                            combined,
+                                            Some(&catalog),
+                                            &value,
+                                        )?;
+                                        assigned.carry(&value, form, None)?;
+                                        logical_new[targets[a]] = value;
                                     }
                                 }
                                 Ok(())
@@ -97319,35 +97395,39 @@ pub(crate) fn update<'a>(
                             continue;
                         }
                         let col = &def.columns()[targets[a]];
-                        let value = if let Some(outer) = outer_lookup {
-                            let scope = TriggerDmlScope {
-                                row: &context,
-                                outer,
-                            };
-                            eval_prepared_assignment(
-                                assignment_casts,
-                                expression,
-                                col,
-                                storage,
-                                txn.txid,
-                                arena,
-                                params,
-                                &scope,
-                                &hooks,
-                            )
-                        } else {
-                            eval_prepared_assignment(
-                                assignment_casts,
-                                expression,
-                                col,
-                                storage,
-                                txn.txid,
-                                arena,
-                                params,
-                                &context,
-                                &hooks,
-                            )
+                        let scope;
+                        let row: &dyn ColumnLookup<'_> = match outer_lookup {
+                            Some(outer) => {
+                                scope = TriggerDmlScope {
+                                    row: &context,
+                                    outer,
+                                };
+                                &scope
+                            }
+                            None => &context,
                         };
+                        // A variable's stored datum keeps its form.
+                        let value = eval_prepared_assignment(
+                            assignment_casts,
+                            expression,
+                            col,
+                            storage,
+                            txn.txid,
+                            arena,
+                            params,
+                            &row,
+                            &hooks,
+                        )
+                        .and_then(|value| {
+                            let form = crate::sql::toast::passed_form(
+                                expression,
+                                row,
+                                Some(&catalog),
+                                &value,
+                            )?;
+                            assigned.carry(&value, form, None)?;
+                            Ok(value)
+                        });
                         match value {
                             Ok(value) => logical_new[targets[a]] = value,
                             Err(error) => return sql_fail(error),
@@ -97375,6 +97455,7 @@ pub(crate) fn update<'a>(
                     &physical_old[..row_definition.n_columns],
                     true,
                 )
+                .and_then(|carried| carried.joined(&assigned))
                 .and_then(|carried| {
                     carried.rebased(&physical_new[..row_definition.n_columns], new_physical)
                 }) {
@@ -97679,7 +97760,7 @@ pub(crate) fn update<'a>(
                     updated_columns,
                     Some(&old_transition[..def.n_columns]),
                     Some(&mut new_values[..def.n_columns]),
-                    trigger_firing::ImageForms::UNRECORDED,
+                    trigger_firing::ImageForms::FOREIGN,
                 ) {
                     return sql_fail(error);
                 }
@@ -98947,7 +99028,7 @@ pub(crate) fn delete<'a>(
                     ColumnSet::EMPTY,
                     Some(&old_values[..def.n_columns]),
                     None,
-                    trigger_firing::ImageForms::UNRECORDED,
+                    trigger_firing::ImageForms::FOREIGN,
                 ) {
                     Ok(run) => run,
                     Err(error) => return sql_fail(error),
@@ -99024,7 +99105,7 @@ pub(crate) fn delete<'a>(
                     ColumnSet::EMPTY,
                     Some(&old_transition[..def.n_columns]),
                     None,
-                    trigger_firing::ImageForms::UNRECORDED,
+                    trigger_firing::ImageForms::FOREIGN,
                 ) {
                     return sql_fail(error);
                 }

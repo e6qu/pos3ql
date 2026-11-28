@@ -592,15 +592,17 @@ struct LocalCleanup {
 }
 
 /// SKIP_LOCKED's warning for a named relation it passes over.
-fn warn_analyze_skipped(
+fn warn_maintenance_skipped(
     responder: &mut Responder,
+    verb: &str,
     target: &ast::MaintenanceTarget<'_>,
 ) -> Result<(), WireFull> {
     responder.warning(
         sqlstate::LOCK_NOT_AVAILABLE,
         stack_format!(
             160,
-            "skipping analyze of \"{}\" --- lock not available",
+            "skipping {} of \"{}\" --- lock not available",
+            verb,
             target.table.name
         )
         .as_str(),
@@ -10592,7 +10594,12 @@ impl Engine {
                         .storage
                         .relation_visible_to_current_session(slot, txn.txid)
                     && self.maintenance_permitted(slot, txn.txid)
-                    && self.maintenance_lock_available(slot, txn.txid, locking)?
+                    && self.maintenance_lock_available(
+                        slot,
+                        txn.txid,
+                        locking,
+                        ast::TableLockMode::ShareUpdateExclusive,
+                    )?
                 {
                     txn.record_statistics(slot as u32)?;
                     self.work.reset();
@@ -10660,7 +10667,12 @@ impl Engine {
                         && (target.inheritance == ast::RelationInheritance::Only
                             || !self.storage.relation_descends_from(slot, root, txn.txid)))
                     || !self.maintenance_permitted(slot, txn.txid)
-                    || !self.maintenance_lock_available(slot, txn.txid, locking)?
+                    || !self.maintenance_lock_available(
+                        slot,
+                        txn.txid,
+                        locking,
+                        ast::TableLockMode::ShareUpdateExclusive,
+                    )?
                 {
                     continue;
                 }
@@ -10745,12 +10757,13 @@ impl Engine {
     /// VACUUM's in-place counts of the table in slot `slot` and of its
     /// indexes. Indexes are vacuumed, and recounted, only when dead rows
     /// left entries to remove on at least 2% of the table's pages
-    /// (`BYPASS_THRESHOLD_PAGES`); VACUUM FULL rebuilt them already.
+    /// (`BYPASS_THRESHOLD_PAGES`), or always or never as `INDEX_CLEANUP`
+    /// asks; VACUUM FULL rebuilt them already.
     fn vacuum_relation_counts(
         &mut self,
         slot: usize,
         txid: u32,
-        full: bool,
+        options: ast::VacuumOptions,
     ) -> Result<(), SqlError> {
         let dead = self.storage.relation_cumulative_statistics(slot).n_dead_tup;
         let previous_pages = self.storage.table_statistics(slot, txid).pages;
@@ -10761,7 +10774,12 @@ impl Engine {
             .table_statistics(slot, txid)
             .pages
             .max(previous_pages);
-        if !full && dead != 0 && dead as f64 >= 0.02 * pages as f64 {
+        let vacuum_indexes = match options.index_cleanup {
+            ast::IndexCleanup::Auto => dead as f64 >= 0.02 * pages as f64,
+            ast::IndexCleanup::On => true,
+            ast::IndexCleanup::Off => false,
+        };
+        if !options.full && dead != 0 && vacuum_indexes {
             exec::measure_index_counts(
                 &self.storage,
                 slot,
@@ -10778,52 +10796,62 @@ impl Engine {
         &mut self,
         targets: &[ast::MaintenanceTarget<'_>],
         txid: u32,
-        full: bool,
+        options: ast::VacuumOptions,
+        locking: MaintenanceLocking,
         elapsed_micros: u64,
     ) -> Result<(), SqlError> {
         if targets.is_empty() {
             for slot in 0..self.storage.table_count() {
-                if self.storage.table_slot_visible_to(slot, txid)
-                    && self.storage.relation_visible_to_current_session(slot, txid)
-                    && self.maintenance_permitted(slot, txid)
-                    && self.vacuums_storage(slot, txid)
-                {
-                    self.work.reset();
-                    if full {
-                        // VACUUM FULL rebuilds the table's indexes.
-                        exec::rebuild_table_index_keys(&self.storage, txid, slot, &self.work)?;
-                        self.work.reset();
-                    }
-                    self.vacuum_relation_counts(slot, txid, full)?;
-                    self.storage.vacuum_relation_index_hint(slot)?;
-                    self.storage.record_relation_vacuum(slot, elapsed_micros);
-                }
+                self.vacuum_slot(slot, txid, options, locking, elapsed_micros)?;
             }
             return Ok(());
         }
         for target in targets {
             let root = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
             for slot in 0..self.storage.table_count() {
-                if self.storage.table_slot_visible_to(slot, txid)
-                    && self.storage.relation_visible_to_current_session(slot, txid)
-                    && (slot == root
-                        || (target.inheritance == ast::RelationInheritance::Descendants
-                            && self.storage.relation_descends_from(slot, root, txid)))
-                    && self.maintenance_permitted(slot, txid)
-                    && self.vacuums_storage(slot, txid)
+                if slot == root
+                    || (target.inheritance == ast::RelationInheritance::Descendants
+                        && self.storage.relation_descends_from(slot, root, txid))
                 {
-                    self.work.reset();
-                    if full {
-                        // VACUUM FULL rebuilds the table's indexes.
-                        exec::rebuild_table_index_keys(&self.storage, txid, slot, &self.work)?;
-                        self.work.reset();
-                    }
-                    self.vacuum_relation_counts(slot, txid, full)?;
-                    self.storage.vacuum_relation_index_hint(slot)?;
-                    self.storage.record_relation_vacuum(slot, elapsed_micros);
+                    self.vacuum_slot(slot, txid, options, locking, elapsed_micros)?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// VACUUM of the table in slot `slot`, when it is one this session may
+    /// vacuum and, under SKIP_LOCKED, its lock is free.
+    fn vacuum_slot(
+        &mut self,
+        slot: usize,
+        txid: u32,
+        options: ast::VacuumOptions,
+        locking: MaintenanceLocking,
+        elapsed_micros: u64,
+    ) -> Result<(), SqlError> {
+        let mode = if options.full {
+            ast::TableLockMode::AccessExclusive
+        } else {
+            ast::TableLockMode::ShareUpdateExclusive
+        };
+        if !(self.storage.table_slot_visible_to(slot, txid)
+            && self.storage.relation_visible_to_current_session(slot, txid)
+            && self.maintenance_permitted(slot, txid)
+            && self.vacuums_storage(slot, txid)
+            && self.maintenance_lock_available(slot, txid, locking, mode)?)
+        {
+            return Ok(());
+        }
+        self.work.reset();
+        if options.full {
+            // VACUUM FULL rebuilds the table's indexes.
+            exec::rebuild_table_index_keys(&self.storage, txid, slot, &self.work)?;
+            self.work.reset();
+        }
+        self.vacuum_relation_counts(slot, txid, options)?;
+        self.storage.vacuum_relation_index_hint(slot)?;
+        self.storage.record_relation_vacuum(slot, elapsed_micros);
         Ok(())
     }
 
@@ -10902,20 +10930,44 @@ impl Engine {
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        // ONLY_DATABASE_STATS updates `pg_database.datfrozenxid` alone,
+        // which this engine does not track: no table is vacuumed.
+        if options.only_database_stats {
+            responder.command_complete("VACUUM")?;
+            return Ok(Ok(()));
+        }
         let started = datetime::now_micros();
         let mode = if options.full {
             ast::TableLockMode::AccessExclusive
         } else {
             ast::TableLockMode::ShareUpdateExclusive
         };
+        let locking = if options.skip_locked {
+            MaintenanceLocking::SkipUnavailable
+        } else {
+            MaintenanceLocking::Held
+        };
+        let (kept, kept_count) = match self
+            .lockable_maintenance_targets(targets, txn.txid, locking, mode, "vacuum", responder)?
+        {
+            Ok(kept) => kept,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !targets.is_empty() && kept_count == 0 {
+            responder.command_complete("VACUUM")?;
+            return Ok(Ok(()));
+        }
+        let targets = &kept[..kept_count];
         if let Err(error) = self.warn_maintenance_denials(targets, txn.txid, "vacuum", responder)? {
             return Ok(Err(error));
         }
-        if let Err(error) = self.lock_maintenance_targets(targets, txn.txid, mode) {
+        if locking == MaintenanceLocking::Held
+            && let Err(error) = self.lock_maintenance_targets(targets, txn.txid, mode)
+        {
             return Ok(Err(error));
         }
         let validation = if options.analyze {
-            self.analyze_targets(targets, txn, false, MaintenanceLocking::Held)
+            self.analyze_targets(targets, txn, false, locking)
                 .map(|_| ())
         } else {
             self.validate_maintenance_targets(targets, txn.txid)
@@ -10923,18 +10975,22 @@ impl Engine {
         if let Err(error) = validation {
             return Ok(Err(error));
         }
-        if self.ckpt.is_some()
-            && let Err(error) = self.checkpoint()
-        {
-            return Ok(Err(error));
-        }
-        if let Err(error) = self.record_vacuum_targets(
-            targets,
-            txn.txid,
-            options.full,
-            datetime::now_micros().saturating_sub(started).max(0) as u64,
-        ) {
-            return Ok(Err(error));
+        // PROCESS_MAIN false leaves the tables themselves unvacuumed.
+        if options.process_main {
+            if self.ckpt.is_some()
+                && let Err(error) = self.checkpoint()
+            {
+                return Ok(Err(error));
+            }
+            if let Err(error) = self.record_vacuum_targets(
+                targets,
+                txn.txid,
+                options,
+                locking,
+                datetime::now_micros().saturating_sub(started).max(0) as u64,
+            ) {
+                return Ok(Err(error));
+            }
         }
         responder.command_complete("VACUUM")?;
         Ok(Ok(()))
@@ -10952,69 +11008,17 @@ impl Engine {
         } else {
             MaintenanceLocking::Held
         };
-        // SKIP_LOCKED passes over a named relation it cannot lock at once,
-        // with a warning; its members and a database-wide ANALYZE's tables
-        // are passed over silently, as `vacuum_open_relation` does. As in
-        // `expand_vacuum_rel`, every named relation is first probed with an
-        // ACCESS SHARE lock, released at once, before any is locked for the
-        // analysis itself.
-        let mut kept = [ast::MaintenanceTarget {
-            table: ast::QualName::bare(""),
-            columns: &[],
-            inheritance: ast::RelationInheritance::Descendants,
-        }; 64];
-        let mut kept_count = 0usize;
-        for target in targets {
-            if locking == MaintenanceLocking::SkipUnavailable {
-                let root = match exec::resolve_dml_table(&self.storage, &target.table, txn.txid) {
-                    Ok(root) => root,
-                    Err(error) => return Ok(Err(error)),
-                };
-                if self.maintenance_permitted(root, txn.txid) {
-                    let mark = self.storage.lock_mark();
-                    let probe = self.storage.lock_table(
-                        txn.txid,
-                        root,
-                        ast::TableLockMode::AccessShare,
-                        true,
-                    );
-                    self.storage.rollback_locks_to(txn.txid, mark);
-                    match probe {
-                        Ok(()) => {}
-                        Err(error) if error.sqlstate == sqlstate::LOCK_NOT_AVAILABLE => {
-                            warn_analyze_skipped(responder, target)?;
-                            continue;
-                        }
-                        Err(error) => return Ok(Err(error)),
-                    }
-                }
-            }
-            kept[kept_count] = *target;
-            kept_count += 1;
-        }
-        if locking == MaintenanceLocking::SkipUnavailable {
-            let mut locked = 0usize;
-            for index in 0..kept_count {
-                let target = kept[index];
-                let root = match exec::resolve_dml_table(&self.storage, &target.table, txn.txid) {
-                    Ok(root) => root,
-                    Err(error) => return Ok(Err(error)),
-                };
-                if self.maintenance_permitted(root, txn.txid) {
-                    match self.maintenance_lock_available(root, txn.txid, locking) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            warn_analyze_skipped(responder, &target)?;
-                            continue;
-                        }
-                        Err(error) => return Ok(Err(error)),
-                    }
-                }
-                kept[locked] = target;
-                locked += 1;
-            }
-            kept_count = locked;
-        }
+        let (kept, kept_count) = match self.lockable_maintenance_targets(
+            targets,
+            txn.txid,
+            locking,
+            ast::TableLockMode::ShareUpdateExclusive,
+            "analyze",
+            responder,
+        )? {
+            Ok(kept) => kept,
+            Err(error) => return Ok(Err(error)),
+        };
         if !targets.is_empty() && kept_count == 0 {
             responder.command_complete("ANALYZE")?;
             return Ok(Ok(()));
@@ -11041,21 +11045,94 @@ impl Engine {
         Ok(Ok(()))
     }
 
-    /// Whether ANALYZE may go on with `slot`: always when its locks were
-    /// taken beforehand, and under SKIP_LOCKED when its lock is free now.
+    /// The relations of `targets` a maintenance command goes on with. Under
+    /// SKIP_LOCKED it passes over a named relation it cannot lock at once in
+    /// `mode`, warning that it is `verb`-ing it; its members and a
+    /// database-wide command's tables are passed over silently, as
+    /// `vacuum_open_relation` does. As in `expand_vacuum_rel`, every named
+    /// relation is first probed with an ACCESS SHARE lock, released at once,
+    /// before any is locked for the command itself.
+    #[expect(clippy::type_complexity, reason = "fixed-capacity kept target list")]
+    fn lockable_maintenance_targets<'t>(
+        &mut self,
+        targets: &[ast::MaintenanceTarget<'t>],
+        txid: u32,
+        locking: MaintenanceLocking,
+        mode: ast::TableLockMode,
+        verb: &str,
+        responder: &mut Responder,
+    ) -> Result<Result<([ast::MaintenanceTarget<'t>; 64], usize), SqlError>, WireFull> {
+        let mut kept = [ast::MaintenanceTarget {
+            table: ast::QualName::bare(""),
+            columns: &[],
+            inheritance: ast::RelationInheritance::Descendants,
+        }; 64];
+        let mut kept_count = 0usize;
+        for target in targets {
+            if locking == MaintenanceLocking::SkipUnavailable {
+                let root = match exec::resolve_dml_table(&self.storage, &target.table, txid) {
+                    Ok(root) => root,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if self.maintenance_permitted(root, txid) {
+                    let mark = self.storage.lock_mark();
+                    let probe =
+                        self.storage
+                            .lock_table(txid, root, ast::TableLockMode::AccessShare, true);
+                    self.storage.rollback_locks_to(txid, mark);
+                    match probe {
+                        Ok(()) => {}
+                        Err(error) if error.sqlstate == sqlstate::LOCK_NOT_AVAILABLE => {
+                            warn_maintenance_skipped(responder, verb, target)?;
+                            continue;
+                        }
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+            }
+            kept[kept_count] = *target;
+            kept_count += 1;
+        }
+        if locking == MaintenanceLocking::SkipUnavailable {
+            let mut locked = 0usize;
+            for index in 0..kept_count {
+                let target = kept[index];
+                let root = match exec::resolve_dml_table(&self.storage, &target.table, txid) {
+                    Ok(root) => root,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if self.maintenance_permitted(root, txid) {
+                    match self.maintenance_lock_available(root, txid, locking, mode) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn_maintenance_skipped(responder, verb, &target)?;
+                            continue;
+                        }
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+                kept[locked] = target;
+                locked += 1;
+            }
+            kept_count = locked;
+        }
+        Ok(Ok((kept, kept_count)))
+    }
+
+    /// Whether a maintenance command may go on with `slot`: always when its
+    /// locks were taken beforehand, and under SKIP_LOCKED when its lock in
+    /// `mode` is free now.
     fn maintenance_lock_available(
         &self,
         slot: usize,
         txid: u32,
         locking: MaintenanceLocking,
+        mode: ast::TableLockMode,
     ) -> Result<bool, SqlError> {
         if locking == MaintenanceLocking::Held {
             return Ok(true);
         }
-        match self
-            .storage
-            .lock_table(txid, slot, ast::TableLockMode::ShareUpdateExclusive, true)
-        {
+        match self.storage.lock_table(txid, slot, mode, true) {
             Ok(()) => Ok(true),
             Err(error) if error.sqlstate == sqlstate::LOCK_NOT_AVAILABLE => Ok(false),
             Err(error) => Err(error),
